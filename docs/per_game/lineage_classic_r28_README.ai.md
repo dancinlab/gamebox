@@ -70,3 +70,24 @@ lineage_family_cross_ref: lineage_m (mobile, Purple), lineage_w (UE4, Purple)
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2/T3/T4 remain future-cycle work.
+
+## §9 post-Track-BV update (Track BX 2026-05-05) — direct impact
+
+§2 cond statuses below are land-time (2026-05-03) snapshot. Track BV (2026-05-05) directly modified this game's roadmap + checkpoint state:
+
+| cond | land-time (§2) | post-BV (2026-05-05) | flipped_via |
+|---|---|---|---|
+| lineage_classic_r28.cond.1 | partial (retired_intentional posture adopted) | retired_intentional | track_bv_lineage_classic_r28_cond_status_cascading_flip |
+| lineage_classic_r28.cond.2 | partial (live first-frame retired_intentional candidate) | retired_intentional | track_bv_lineage_classic_r28_cond_status_cascading_flip |
+| lineage_classic_r28.cond.3 | partial (Track-E spec freeze landed; status partial 永久 lock) | retired_intentional | track_bv_lineage_classic_r28_cond_status_cascading_flip |
+
+`.checkpoint.lineage_classic_r28_play` cached header status: `partial 0/3` → `met 3/3` (sideways-PASS rule per Track AB `checkpoint_ref_satisfied` — actual==retired_intentional → satisfied true regardless of required level).
+
+Honest scope: cascading flip is honest documentation of permanent retirement under GameGuard kernel-AC boundary. NO bypass / NO evasion / NO circumvention. `validated_manjeom` UNCHANGED at 0 (no real game frames evidenced; GameGuard kernel-AC remains permanent boundary on Apple-only stack).
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_checkpoint_status_snapshot_v2_track_bo_landed.marker` (Track BO 2026-05-05 — flagged drift_count item 3 of 3 with explicit deferred resolution path)
+- `state/markers/gamebox_lineage_classic_r28_drift_resolution_track_bv_landed.marker` (Track BV 2026-05-05 — cascading flip executed; drift_count 1 → 0)
+- `state/markers/gamebox_v1_0_1_release_notes_track_bw_landed.marker` (Track BW 2026-05-05 — v1.0.1 patch release surfaces this game's flip)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_bx_landed.marker` (this cycle 2026-05-05 — §9 update)

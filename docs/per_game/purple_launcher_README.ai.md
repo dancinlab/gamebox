@@ -70,3 +70,23 @@ mk1_narrative_refs: (none in roadmap header)
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2/T3/T4 remain future-cycle work.
+
+## §9 post-Track-BU/BV update (Track BX 2026-05-05) — indirect impact via cross-cutting loader
+
+§2 cond statuses unchanged for purple_launcher at this cycle (cond.1+cond.2 remain met via offline shim Track-B; cond.3 remains partial, plaync OAuth gate).
+
+| event | track | iso | impact on purple_launcher |
+|---|---|---|---|
+| Win32 fn coverage 91.49% → 100% milestone | BP | 2026-05-05 | skeleton-tier surface threshold breach (relevant indirectly — purple launcher itself has loader_count=0 PE binary direct, but downstream lineage_m / lineage_w / lineage_classic_r28 use loader_win32 surface) |
+| .checkpoint.win32_full_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh; 100% threshold passed (skeleton-tier surface) |
+| .checkpoint.lineage_m_purple_play | (no flip) | 2026-05-05 | derived partial 3/5 unchanged (lineage_m cond.2/cond.3 still partial) |
+| .checkpoint.lineage_w_purple_play | (no flip) | 2026-05-05 | derived partial 3/5 unchanged (lineage_w cond.2/cond.3 still partial) |
+
+Honest scope: `validated_manjeom` UNCHANGED at 0 — no real plaync OAuth network round-trip evidenced. Purple launcher OAuth + 2FA TOTP gate (cond.3) remains partial; user secret + network endpoint dependency unresolved.
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_win32_cycle60_62_bundled_increment_landed.marker` (Track BP — Win32 100% milestone)
+- `state/markers/gamebox_readme_game_list_and_win32_checkpoint_flip_track_bu_landed.marker` (Track BU — Game Coverage section + win32 flips)
+- `state/markers/gamebox_v1_0_1_release_notes_track_bw_landed.marker` (Track BW — v1.0.1 release)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_bx_landed.marker` (this cycle 2026-05-05 — §9 update)

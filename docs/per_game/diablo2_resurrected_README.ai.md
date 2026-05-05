@@ -67,3 +67,24 @@ manjeom review pending separate cycle — D2R-specific manjeom doc not yet lande
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance.raw_270_271_272_273_triplet field flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2 (lint extension), T3 (hierarchy connection direction), T4 (full module-by-module spec freeze) remain future-cycle work.
+
+## §9 post-Track-BU/BV update (Track BX 2026-05-05) — indirect impact via cross-cutting loader
+
+§2 cond statuses unchanged for d2r at this cycle. Cross-cutting loader_win32 milestone reached, indirectly relevant via `.checkpoint.d2r_battlenet_offline_play` cond_refs[] which include `loader_pe.cond.1` + `loader_dx.cond.1` (still partial) + d2r/battlenet conds.
+
+| event | track | iso | impact on d2r |
+|---|---|---|---|
+| Win32 fn coverage 91.49% → 100% milestone | BP | 2026-05-05 | skeleton-tier surface threshold breach, no real syscall dispatch promotion |
+| .checkpoint.win32_50pct_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh; 50% threshold passed |
+| .checkpoint.win32_full_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh; 100% threshold passed (skeleton-tier surface) |
+| .checkpoint.d2r_battlenet_offline_play | (no flip) | 2026-05-05 | derived partial 3/7 unchanged (loader_pe + loader_dx + d2r cond.1/cond.3 still partial) |
+| .checkpoint.d2r_battlenet_online_play | (no flip) | 2026-05-05 | derived partial 3/8 unchanged (Warden L2 long-horizon) |
+
+Honest scope: `validated_manjeom` UNCHANGED at 0 — no real D2R frames evidenced. cond.1 (PE parse + IAT real-resolve) and cond.3 (D3D11 first-frame) remain partial. d2r remains the canonical first-frame target for production smoke gate (Track AU recommended path A own1, multi-year horizon).
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_win32_cycle60_62_bundled_increment_landed.marker` (Track BP — Win32 100% milestone; relevant via loader_win32 cross-cutting roadmap)
+- `state/markers/gamebox_readme_game_list_and_win32_checkpoint_flip_track_bu_landed.marker` (Track BU — README Game Coverage section + 2 win32 checkpoint flips)
+- `state/markers/gamebox_v1_0_1_release_notes_track_bw_landed.marker` (Track BW — v1.0.1 release)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_bx_landed.marker` (this cycle 2026-05-05 — §9 update)

@@ -72,3 +72,23 @@ manjeom review pending separate cycle — Battle.net-specific manjeom doc not ye
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2/T3/T4 remain future-cycle work.
+
+## §9 post-Track-BU/BV update (Track BX 2026-05-05) — indirect impact via cross-cutting loader
+
+§2 cond statuses unchanged for battlenet at this cycle (cond.1+cond.2 remain met via offline shim Track-A; cond.3 remains partial, network-dependent).
+
+| event | track | iso | impact on battlenet |
+|---|---|---|---|
+| Win32 fn coverage 91.49% → 100% milestone | BP | 2026-05-05 | skeleton-tier surface threshold breach; loader_win32 100% reach (kernel32 / advapi32 / wininet / etc. surface) |
+| .checkpoint.win32_full_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh; 100% threshold passed (skeleton-tier surface) |
+| .checkpoint.d2r_battlenet_offline_play | (no flip) | 2026-05-05 | derived partial 3/7 unchanged (battlenet cond.1+cond.2 satisfied; loader_pe + loader_dx + d2r cond.1/cond.3 still partial) |
+| .checkpoint.d2r_battlenet_online_play | (no flip) | 2026-05-05 | derived partial 3/8 unchanged (Warden L2 long-horizon transitive blocker) |
+
+Honest scope: `validated_manjeom` UNCHANGED at 0 — no real Battle.net Agent network round-trip evidenced. Battlenet OAuth + chat/login state track (cond.3) remains partial; online endpoint dependency unresolved. L1-L5 online-expansion lock-in carries per `.roadmap.battlenet`.
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_win32_cycle60_62_bundled_increment_landed.marker` (Track BP — Win32 100% milestone)
+- `state/markers/gamebox_readme_game_list_and_win32_checkpoint_flip_track_bu_landed.marker` (Track BU — Game Coverage section + win32 flips)
+- `state/markers/gamebox_v1_0_1_release_notes_track_bw_landed.marker` (Track BW — v1.0.1 release)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_bx_landed.marker` (this cycle 2026-05-05 — §9 update)
