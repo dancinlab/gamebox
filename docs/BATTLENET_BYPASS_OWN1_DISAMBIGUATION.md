@@ -256,7 +256,7 @@ PASS verdict = 본 module 측 다음 사항:
 | `state/markers/airgenome_gamebox_warden_honest_freeze_landed.marker` | Track-J (Warden honest freeze) |
 | `state/markers/airgenome_gamebox_d2r_realm_protocol_honest_freeze_landed.marker` | Track-L (D2R realm protocol honest freeze) |
 | `state/markers/airgenome_gamebox_battlenet_bypass_own1_disambiguation_landed.marker` | **본 cycle marker (Track-P)** |
-| `docs/airgenome_gamebox_battlenet_bypass_own1_disambiguation_landed_2026_05_03.ai.md` | **본 cycle handoff (Track-P)** |
+| `airgenome/doc/airgenome_gamebox_battlenet_bypass_own1_disambiguation_landed_2026_05_03.ai.md` | **본 cycle handoff (Track-P)** |
 
 ### 5.4 retired_intentional / online expansion lock-in / honest disambiguation 3 posture
 

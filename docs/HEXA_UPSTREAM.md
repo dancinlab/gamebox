@@ -268,7 +268,7 @@ fn int_pct_parse(s: str) -> int                              // "30.34" -> 30340
 fn fixed_point_x1000(num: int, denom: int) -> int            // partial-credit 계산
 ```
 
-**Track AG hit count**: Track AG (`docs/airgenome_gamebox_closure_orchestrator_weighted_threshold_awareness_landed_2026_05_04.ai.md`)
+**Track AG hit count**: Track AG (`airgenome/doc/airgenome_gamebox_closure_orchestrator_weighted_threshold_awareness_landed_2026_05_04.ai.md`)
 에서 13 helper fn — `parse_uint_safe_local` / `parse_progress_pct_x1000` / `format_x1000_decimal` /
 `progress_source_marker_path` / `read_progress_field_from_marker` /
 `checkpoint_weighted_contribution_x1000` / `per_checkpoint_contribution_x1000` /

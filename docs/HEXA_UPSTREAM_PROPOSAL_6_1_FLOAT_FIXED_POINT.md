@@ -18,7 +18,7 @@ doc-only / additive / migration 0 / destructive 0 / sibling repo modifications 0
 
 ## §1 problem statement
 
-Track AG (`docs/airgenome_gamebox_closure_orchestrator_weighted_threshold_awareness_landed_2026_05_04.ai.md`)
+Track AG (`airgenome/doc/airgenome_gamebox_closure_orchestrator_weighted_threshold_awareness_landed_2026_05_04.ai.md`)
 에서 closure_orchestrator 의 weighted threshold contribution 계산이 percentage / ratio /
 partial-credit 산술을 모두 x1000 정수 hand-encode 로 우회. hexa stage1 의 float arithmetic 가
 broken (`*`, `>`, `<`, `==` 잘못된 결과 반환 — `probe.hexa` 실측) 이라 일반 fp 산술이 신뢰

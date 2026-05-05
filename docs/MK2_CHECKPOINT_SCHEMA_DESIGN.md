@@ -54,7 +54,7 @@
 - "Win32 50% coverage milestone" — `.roadmap.loader_win32` cond.1 + cond.2 + cond.3 측 cumulative coverage % 측 milestone (cycle 35 30.34% → 50%)
 
 이 형태 측 cross-roadmap aggregation 측 현재 cycle 측 manual hand-tracking 측 누적:
-- handoff doc (`docs/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md` etc) 측 prose narrative 측 cross-cite
+- handoff doc (`airgenome/doc/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md` etc) 측 prose narrative 측 cross-cite
 - closure_orchestrator (Track S) 측 closure_pct + cm_ratio 측 single global aggregate (vs per-checkpoint specific)
 - `.roadmap.<game>` cond.<n> 측 evidence row 측 sister cond cross-cite (e.g., `.roadmap.diablo2_resurrected` cond.1 evidence 측 ".roadmap.battlenet cond.1 met cross-link" 측 hand-edit append)
 
@@ -197,7 +197,7 @@ confidence HIGH (matrix 생략, rationale 측 충분 — single rational answer 
 # .checkpoint.d2r_battlenet_offline_play mk1 — cross-roadmap intermediate goal SSOT (peer perspective, additive layer over .roadmap.* cond/blk).
 # Header on next line; entries follow.
 # Status enum candidates: unmet | partial | met | retired_intentional (mk2 cond enum reuse, D3 권고 a)
-{"type":"header","kind":"checkpoint","name":"d2r_battlenet_offline_play","mk":1,"perspective":"peer","goal":"D2R offline single-player play 가능 — Battle.net launcher offline shim 측 D2R.exe launch + MPQ archive parse + offline savegame d2s round-trip 측 cumulative AND aggregation","cond_refs":["diablo2_resurrected.cond.1","diablo2_resurrected.cond.2","battlenet.cond.1","battlenet.cond.2"],"aggregation":"all_must_be_met","status":"partial","progress":{"met_count":3,"partial_count":1,"unmet_count":0,"retired_count":0,"total":4},"evidence":["docs/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md cross-link","docs/airgenome_gamebox_d2r_cond1_synthetic_round_trip_landed_2026_05_03.ai.md cross-link"],"blockers":[{"id":"d2r_battlenet_offline_play.blk.1","desc":"D2R cond.1 측 partial 영구 (production binary smoke gated on Battle.net launcher install 측 permanent)","type":"cascading_partial","status":"open","resolution_path":"production smoke gated on user binary install"}],"status":"active","since":"2026-05-04"}
+{"type":"header","kind":"checkpoint","name":"d2r_battlenet_offline_play","mk":1,"perspective":"peer","goal":"D2R offline single-player play 가능 — Battle.net launcher offline shim 측 D2R.exe launch + MPQ archive parse + offline savegame d2s round-trip 측 cumulative AND aggregation","cond_refs":["diablo2_resurrected.cond.1","diablo2_resurrected.cond.2","battlenet.cond.1","battlenet.cond.2"],"aggregation":"all_must_be_met","status":"partial","progress":{"met_count":3,"partial_count":1,"unmet_count":0,"retired_count":0,"total":4},"evidence":["airgenome/doc/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md cross-link","airgenome/doc/airgenome_gamebox_d2r_cond1_synthetic_round_trip_landed_2026_05_03.ai.md cross-link"],"blockers":[{"id":"d2r_battlenet_offline_play.blk.1","desc":"D2R cond.1 측 partial 영구 (production binary smoke gated on Battle.net launcher install 측 permanent)","type":"cascading_partial","status":"open","resolution_path":"production smoke gated on user binary install"}],"status":"active","since":"2026-05-04"}
 ```
 
 ### §6.3 핵심 field 측 narrative 측 의미

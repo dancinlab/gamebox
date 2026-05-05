@@ -55,7 +55,7 @@ mk1_narrative_refs: (none in roadmap header — Lineage W-specific manjeom doc n
 
 ## §6 mk1 narrative pointer
 
-manjeom review pending separate cycle — Lineage W-specific manjeom doc not yet landed; cross-references via `docs/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md` §4 (Track-B Purple→Lineage chain handoff). cond.1 met via cascading purple_launcher offline shim + new loader sub-module land.
+manjeom review pending separate cycle — Lineage W-specific manjeom doc not yet landed; cross-references via `airgenome/doc/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md` §4 (Track-B Purple→Lineage chain handoff). cond.1 met via cascading purple_launcher offline shim + new loader sub-module land.
 
 ## §7 cycle history (markers referencing this game)
 

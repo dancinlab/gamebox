@@ -2,7 +2,7 @@
 
 > **status**: 검토일 **2026-05-03** / **만점 가능성: 부분 가능 (offline launch / 스펙 동결 한정)** — closure path B 의 PE map / IAT bind / OpenGL renderer 는 우호적이나, **GameGuard kernel-mode anti-cheat** 가 live KR 서버 진입 측 closure path B 차단 → **gameplay 만점 불가, retired_intentional 정식 채택**.
 > 작성: 2026-05-03 (Track-B Purple → Lineage chain cycle)
-> SSOT: `.roadmap.lineage_classic_r28` (mk2 JSONL header) / `docs/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md` (handoff)
+> SSOT: `.roadmap.lineage_classic_r28` (mk2 JSONL header) / `airgenome/doc/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md` (handoff)
 > 결론 한줄: **Lineage Classic R28 = PE32+ x64 + OpenGL 4.3 path 측 own1 친화 (D2R / Lineage 2 같은 구버전 family precedent), 단 GameGuard kernel driver 측 Apple OS 영구 차단 → cond.1 partial 영구 lock + retired_intentional 정식 채택 (block-acknowledged honest documentation = PASS-equivalent posture).**
 
 ---

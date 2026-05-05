@@ -264,7 +264,7 @@ own1 enforcement 정합 — gamebox 측 Wine / CrossOver / Whisky / GPTK / commu
 | `state/markers/airgenome_gamebox_battlenet_d2r_offline_shim_landed.marker` | Battle.net + D2R offline shim parallel cycle |
 | `state/markers/airgenome_gamebox_d4_retired_intentional_adoption_landed.marker` | D4 retired_intentional family (L4 lock-in 측 D4 unchanged 정합) |
 | `state/markers/airgenome_gamebox_roadmap_op_self_impl_landed.marker` | Track I — cleanest-cycle posture (in_place_writes=0) reference |
-| `docs/airgenome_gamebox_d2r_realm_protocol_honest_freeze_landed_2026_05_03.ai.md` | **본 cycle handoff (Track L)** |
+| `airgenome/doc/airgenome_gamebox_d2r_realm_protocol_honest_freeze_landed_2026_05_03.ai.md` | **본 cycle handoff (Track L)** |
 | `state/markers/airgenome_gamebox_d2r_realm_protocol_honest_freeze_landed.marker` | **본 cycle marker (Track L)** |
 
 ---
@@ -391,8 +391,8 @@ C13 — **본 cycle in_place_writes=0 cleanest-cycle posture (Track I mirror)**:
 - airgenome-gamebox sister doc (kernel-AC family precedent) — `docs/GAMEGUARD_HONEST_FREEZE.md`
 - airgenome-gamebox sister doc (cross-layer AC family) — `docs/WARDEN_HONEST_FREEZE.md` (Track J parallel BG)
 - airgenome-gamebox Track I cleanest-cycle posture reference — `state/markers/airgenome_gamebox_roadmap_op_self_impl_landed.marker`
-- airgenome-gamebox Track-B parallel — `docs/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md`
-- airgenome-gamebox D4 retired_intentional family precedent — `docs/airgenome_gamebox_d4_retired_intentional_adoption_landed_2026_05_03.ai.md`
+- airgenome-gamebox Track-B parallel — `airgenome/doc/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md`
+- airgenome-gamebox D4 retired_intentional family precedent — `airgenome/doc/airgenome_gamebox_d4_retired_intentional_adoption_landed_2026_05_03.ai.md`
 
 ---
 

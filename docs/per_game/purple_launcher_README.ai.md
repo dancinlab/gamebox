@@ -59,7 +59,7 @@ mk1_narrative_refs: (none in roadmap header)
 
 ## §6 mk1 narrative pointer
 
-`docs/PURPLE_LINEAGE_MANJEOM_REVIEW.md` (Track-B sibling family) + Track-B handoff `docs/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md`. own1 Wine 0 + own2 honest emit, no plaync OAuth circumvention. cond.1+cond.2 offline-shim PASS posture, cond.3 awaits user lock-in.
+`docs/PURPLE_LINEAGE_MANJEOM_REVIEW.md` (Track-B sibling family) + Track-B handoff `airgenome/doc/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md`. own1 Wine 0 + own2 honest emit, no plaync OAuth circumvention. cond.1+cond.2 offline-shim PASS posture, cond.3 awaits user lock-in.
 
 ## §7 cycle history (markers referencing this launcher)
 

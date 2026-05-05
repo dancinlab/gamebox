@@ -662,7 +662,7 @@ v3 narrative 측 본 v2 supersede 가능 (markers 측 SSOT 변경 시 본 v2 sta
 | marker JSON parses | OK | (Verification step `jq` 측정) |
 | marker `in_place_writes` | 0 | (Verification step) |
 | sha256 pinned | 3 NEW files | (Verification step `shasum -a 256`) |
-| docs/airgenome_gamebox_session_aggregate_v2_track_bk_landed_2026_05_05.ai.md NEW | OK | (Write step) |
+| airgenome/doc/airgenome_gamebox_session_aggregate_v2_track_bk_landed_2026_05_05.ai.md NEW | OK | (Write step) |
 | state/markers/airgenome_gamebox_session_aggregate_v2_track_bk_landed.marker NEW | OK | (Write step) |
 | .roadmap.* MOD | 0 | OK (read-only reference) |
 | .checkpoint.* MOD | 0 | OK (read-only reference) |

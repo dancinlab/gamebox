@@ -236,9 +236,9 @@ lineage_classic_r28 = 5 게임 candidate 중 정식 adopted 첫 사례 (Track-B 
 |---|---|
 | `state/markers/airgenome_gamebox_per_game_roadmaps_landed.marker` | per-game 11 fan-out (lineage_classic_r28 진입점) |
 | `state/markers/airgenome_gamebox_purple_lineage_offline_shim_landed.marker` | Track-B (retired_intentional 정식 채택, 본 freeze doc separate-cycle hook 명시) |
-| `docs/airgenome_gamebox_per_game_roadmaps_landed_2026_05_03.ai.md` | per-game handoff |
-| `docs/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md` | Track-B handoff (본 doc next-cycle hook #3 명시) |
-| `docs/airgenome_gamebox_gameguard_honest_freeze_landed_2026_05_03.ai.md` | **본 cycle handoff (Track-E)** |
+| `airgenome/doc/airgenome_gamebox_per_game_roadmaps_landed_2026_05_03.ai.md` | per-game handoff |
+| `airgenome/doc/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md` | Track-B handoff (본 doc next-cycle hook #3 명시) |
+| `airgenome/doc/airgenome_gamebox_gameguard_honest_freeze_landed_2026_05_03.ai.md` | **본 cycle handoff (Track-E)** |
 | `state/markers/airgenome_gamebox_gameguard_honest_freeze_landed.marker` | **본 cycle marker (Track-E)** |
 
 ### 5.4 sister manjeom reference
@@ -336,7 +336,7 @@ C12 — **본 doc 의 path / cross-link 측 repo-relative 정합 (raw 15 env_laz
 - airgenome-gamebox sister manjeom (kernel AC family precedent) — `docs/DELTA_FORCE_MANJEOM_REVIEW.md` (ACE), `docs/CS2_MANJEOM_REVIEW.md` (VAC)
 - airgenome-gamebox sister manjeom (anti-tamper family precedent) — `docs/ELDEN_RING_MANJEOM_REVIEW.md` (EAC)
 - airgenome-gamebox sister manjeom (always-online DRM family precedent) — `docs/D4_MANJEOM_REVIEW.md`
-- airgenome-gamebox Track-B handoff (predecessor) — `docs/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md`
+- airgenome-gamebox Track-B handoff (predecessor) — `airgenome/doc/airgenome_gamebox_purple_lineage_offline_shim_landed_2026_05_03.ai.md`
 
 ---
 

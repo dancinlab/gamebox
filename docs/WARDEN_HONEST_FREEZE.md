@@ -279,7 +279,7 @@ D2R online = 첫 online expansion lock-in 정식 채택 사례. retired_intentio
 | `state/markers/airgenome_gamebox_battlenet_d2r_offline_shim_landed.marker` | Track-A (offline shim cond.1/cond.2 met, 본 cycle 의 cond.3 source) |
 | `state/markers/airgenome_gamebox_d4_retired_intentional_adoption_landed.marker` | parallel — d4 retired_intentional (L4 unchanged 영역) |
 | `state/markers/airgenome_gamebox_gameguard_honest_freeze_landed.marker` | sister cycle (Track-E, kernel-mode counterpart) |
-| `docs/airgenome_gamebox_warden_honest_freeze_landed_2026_05_03.ai.md` | **본 cycle handoff (Track-J)** |
+| `airgenome/doc/airgenome_gamebox_warden_honest_freeze_landed_2026_05_03.ai.md` | **본 cycle handoff (Track-J)** |
 | `state/markers/airgenome_gamebox_warden_honest_freeze_landed.marker` | **본 cycle marker (Track-J)** |
 
 ---
@@ -361,7 +361,7 @@ C10 — **외부 cite 측 vendor 공식 / 공개 textbook / 공식 lawsuit 한�
 
 C11 — **D4 retired_intentional unchanged + d2r online lock-in 동시 양립**: L4 lock-in 의 핵심 = D2R online single-target lock-in **이면서** D4 retired_intentional **unchanged**. 두 posture 가 동시 양립 (mk2 schema 측 status_enum + online_expansion_lockin 두 영역 분리 가능). 본 cycle 측 D4 측 reverte X — `.roadmap.diablo4` 측 untouched.
 
-C12 — **Track J/K/L parallel scope 측 file scope disjoint**: 본 cycle (Track-J) 의 file scope 는 본 prompt 측 명시한 5 file (`lib/perf/c_bnet_warden_environment_compat.hexa` 신규 + `docs/WARDEN_HONEST_FREEZE.md` 신규 + `docs/airgenome_gamebox_warden_honest_freeze_landed_2026_05_03.ai.md` 신규 handoff + `state/markers/airgenome_gamebox_warden_honest_freeze_landed.marker` 신규 marker + `.roadmap.battlenet` cond.3 surgical edit) 한정. Track-K (loader 측) + Track-L (D2R realm 측) 측 file 측 untouched 영구 정합.
+C12 — **Track J/K/L parallel scope 측 file scope disjoint**: 본 cycle (Track-J) 의 file scope 는 본 prompt 측 명시한 5 file (`lib/perf/c_bnet_warden_environment_compat.hexa` 신규 + `docs/WARDEN_HONEST_FREEZE.md` 신규 + `airgenome/doc/airgenome_gamebox_warden_honest_freeze_landed_2026_05_03.ai.md` 신규 handoff + `state/markers/airgenome_gamebox_warden_honest_freeze_landed.marker` 신규 marker + `.roadmap.battlenet` cond.3 surgical edit) 한정. Track-K (loader 측) + Track-L (D2R realm 측) 측 file 측 untouched 영구 정합.
 
 C13 — **본 doc 의 path / cross-link 측 repo-relative 정합 (raw 15 env_lazy)**: 본 doc 측 모든 path 는 repo-relative — `lib/...`, `docs/...`, `.roadmap.<game>`, `state/markers/...`. 사용자별 absolute path 0건, env() 측 lazy resolve 정합.
 
@@ -382,8 +382,8 @@ C14 — **본 cycle 의 silent-land + raw 168 minimum-viable additive**: 본 cyc
 - airgenome-gamebox sister freeze doc (kernel-mode counterpart) — `docs/GAMEGUARD_HONEST_FREEZE.md` (Track-E 2026-05-03 land 완료)
 - airgenome-gamebox sister freeze doc (network protocol counterpart) — `docs/D2R_REALM_PROTOCOL_HONEST_FREEZE.md` (Track-L 측 parallel BG, 본 cycle 측 untouched)
 - airgenome-gamebox sister manjeom (always-online DRM family) — `docs/D4_MANJEOM_REVIEW.md`
-- airgenome-gamebox Track-A handoff (predecessor) — `docs/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md`
-- airgenome-gamebox Track-E handoff (sister cycle) — `docs/airgenome_gamebox_gameguard_honest_freeze_landed_2026_05_03.ai.md`
+- airgenome-gamebox Track-A handoff (predecessor) — `airgenome/doc/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md`
+- airgenome-gamebox Track-E handoff (sister cycle) — `airgenome/doc/airgenome_gamebox_gameguard_honest_freeze_landed_2026_05_03.ai.md`
 
 ---
 

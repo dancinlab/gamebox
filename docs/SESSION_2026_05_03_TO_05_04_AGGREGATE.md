@@ -40,7 +40,7 @@ posture 으로 land — 신규 file 3건 (aggregate doc + handoff + marker), in-
 | 변경 file 수 (cumulative) | ~205 (≈185 git stat scope) | git diff --stat HEAD~7..HEAD = 185 files, +39176 / −31 |
 | 누적 LOC delta | +39297 LOC (≈+39176 git stat) | hexa-only, additive_only, no migration |
 | 누적 markers (`airgenome_gamebox_*`) | 40 | 본 cycle Track AN 추가 시 41 (추가 1건) |
-| 누적 handoffs (`docs/airgenome_gamebox_*.ai.md`) | 132 (전체 cycle) | session 35 cycle 동안 +N 추가 |
+| 누적 handoffs (`airgenome/doc/airgenome_gamebox_*.ai.md`) | 132 (전체 cycle) | session 35 cycle 동안 +N 추가 |
 
 **session 의 실질 성과 요약**:
 1. `.roadmap.*` 측 7 cond met 달성 (battlenet 1+2 / d2r 2 / purple 1+2 / lineage_m 1 / lineage_w 1)
@@ -571,7 +571,7 @@ mk2 narrative 측 본 doc 측 supersede 가능 (markers 측 SSOT 변경 시 본 
 | marker JSON parses | OK | (Verification step `jq` 측정) |
 | marker `in_place_writes` | 0 | (Verification step) |
 | sha256 pinned | 3 NEW files | (Verification step `shasum -a 256`) |
-| docs/airgenome_gamebox_session_aggregate_landed_2026_05_04.ai.md NEW | OK | (Write step) |
+| airgenome/doc/airgenome_gamebox_session_aggregate_landed_2026_05_04.ai.md NEW | OK | (Write step) |
 | state/markers/airgenome_gamebox_session_aggregate_landed.marker NEW | OK | (Write step) |
 | .roadmap.* MOD | 0 | OK (read-only reference) |
 | .checkpoint.* MOD | 0 | OK (read-only reference) |

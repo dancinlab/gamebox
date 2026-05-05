@@ -207,7 +207,7 @@ trigger any step; Track BR is documentation only.
 - Track AE — `state/markers/airgenome_gamebox_closure_orchestrator_weighted_threshold_awareness_landed.marker`
   (closure_orchestrator weighted_threshold awareness predecessor;
   documented derivation semantics this guard relies on)
-- Track AG — `docs/airgenome_gamebox_closure_orchestrator_checkpoint_integration_landed_2026_05_04.ai.md`
+- Track AG — `airgenome/doc/airgenome_gamebox_closure_orchestrator_checkpoint_integration_landed_2026_05_04.ai.md`
   (closure_orchestrator + checkpoint integration handoff predecessor)
 - Track AF — `state/markers/airgenome_gamebox_phase_2_4_checkpoints_landed.marker`
   (phase 2 SSOT predecessor; landed `.checkpoint.win32_full_coverage`)

@@ -59,7 +59,7 @@ mk1_narrative_refs:
 
 ## §6 mk1 narrative pointer
 
-manjeom review pending separate cycle — Battle.net-specific manjeom doc not yet landed; cross-references via `docs/BATTLENET_REAL_LAUNCH_PLAN.md` + `docs/BATTLENET_DAY1_PLAN.md` planning docs (predecessor REUSE) + Track-A Battle.net+D2R offline-shim cycle handoff `docs/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md`.
+manjeom review pending separate cycle — Battle.net-specific manjeom doc not yet landed; cross-references via `docs/BATTLENET_REAL_LAUNCH_PLAN.md` + `docs/BATTLENET_DAY1_PLAN.md` planning docs (predecessor REUSE) + Track-A Battle.net+D2R offline-shim cycle handoff `airgenome/doc/airgenome_gamebox_battlenet_d2r_offline_shim_landed_2026_05_03.ai.md`.
 
 ## §7 cycle history (markers referencing this launcher)
 
