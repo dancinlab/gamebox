@@ -226,8 +226,10 @@ For machine-parseable output, every subcmd emits:
 ### Roadmaps + Checkpoints (mk2 SSOT)
 
 - 14 `.roadmap.*` files: battlenet, cs2, delta_force, diablo2_resurrected, diablo4,
-  elden_ring, lineage_classic_r28, lineage_m, lineage_w, loader_dx, loader_pe,
-  loader_win32, purple_launcher, wow.
+  elden_ring (+ Shadow of the Erdtree DLC), elden_ring_nightreign, lineage_classic_r28,
+  lineage_m, lineage_w, loader_dx, loader_pe, loader_win32, purple_launcher.
+  (`.roadmap.wow` retained on disk as historical artifact post Track BY 2026-05-05;
+  removed from active Game Coverage table per user direction — see Track BY handoff.)
 - 7 `.checkpoint.*` files: d2r_battlenet_offline_play, d2r_battlenet_online_play,
   lineage_classic_r28_play, lineage_m_purple_play, lineage_w_purple_play,
   win32_50pct_coverage, win32_full_coverage. **1 met**: `win32_50pct_coverage`
@@ -243,7 +245,7 @@ Per **own2** mandate, 75 markers from the airgenome-gamebox 67-cycle session
 
 ## Game Coverage
 
-11 .roadmap targets (8 games + 3 launchers/runtimes):
+11 .roadmap targets (9 games + 2 launchers; 3 cross-cutting loader roadmaps listed separately below):
 
 | Target | Type | cond.1 | cond.2 | cond.3 | Notes |
 |---|---|---|---|---|---|
@@ -253,13 +255,13 @@ Per **own2** mandate, 75 markers from the airgenome-gamebox 67-cycle session
 | [purple_launcher](.roadmap.purple_launcher) | launcher | met | met | partial | offline shim PASS; plaync OAuth gate |
 | [lineage_m](.roadmap.lineage_m) | game | met | partial | partial | Android emul layer permanent boundary |
 | [lineage_w](.roadmap.lineage_w) | game | met | partial | partial | UE4 + Purple cascading |
-| [lineage_classic_r28](.roadmap.lineage_classic_r28) | game | partial | partial | partial | retired_intentional (GameGuard kernel AC) |
-| [wow](.roadmap.wow) | game | partial | partial | partial | retired_intentional (online MMO subscription) |
+| [lineage_classic_r28](.roadmap.lineage_classic_r28) | game | retired_intentional | retired_intentional | retired_intentional | retired_intentional (GameGuard kernel AC; cascading flip Track BV 2026-05-05) |
 | [cs2](.roadmap.cs2) | game | partial | partial | partial | retired_intentional (VAC AC) |
 | [delta_force](.roadmap.delta_force) | game | partial | partial | partial | retired_intentional (EAC kernel AC) |
-| [elden_ring](.roadmap.elden_ring) | game | partial | partial | partial | retired_intentional (EAC anti-tamper) |
+| [elden_ring](.roadmap.elden_ring) | game | partial | partial | partial | retired_intentional (EAC anti-tamper) — **scope = base game + Shadow of the Erdtree DLC** (2024-06-21) |
+| [elden_ring_nightreign](.roadmap.elden_ring_nightreign) | game | retired_intentional | retired_intentional | retired_intentional | retired_intentional (EAC anti-tamper inherited + FromSoft co-op matchmaking) — **standalone multiplayer co-op spinoff** (2025-05-30); Track BY documentation-only fan-out, lib module fan-out deferred |
 
-Per-game README index: [docs/per_game/](docs/per_game/) — 11 sub-page READMEs (raw 270 triplet T1 baseline 2026-05-03).
+Per-game README index: [docs/per_game/](docs/per_game/) — 12 sub-page READMEs (11 from raw 270 triplet T1 baseline 2026-05-03 + 1 elden_ring_nightreign T1 baseline 2026-05-05 from Track BY; `wow_README.ai.md` retained as historical artifact).
 
 3 cross-cutting loader roadmaps:
 - [.roadmap.loader_pe](.roadmap.loader_pe) — PE loader skeleton
