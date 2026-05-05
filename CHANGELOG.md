@@ -2,6 +2,42 @@
 
 All notable changes to `gamebox` are documented in this file.
 
+## [1.0.2] — 2026-05-05
+
+### Added
+
+- **Layout migration** (`1d28b4c refactor(layout 2026-05-05)`): canonical `<feature>/doc/` layout — `airgenome/doc/` (75 predecessor handoffs) + `gamebox/doc/` (9 native handoffs incl. CB-CC).
+- Track BX — per_game README §9 sections for 6 offline-relevant files (lineage_classic_r28 + d2r + battlenet + lineage_w + lineage_m + purple_launcher).
+- Track BY — README Game Coverage refresh: wow row removed (historical preserve), elden_ring DLC scope clarified (Shadow of the Erdtree 2024-06-21), elden_ring_nightreign added (2025-05-30 standalone multiplayer co-op spinoff, documentation-only fan-out).
+- NEW `.roadmap.elden_ring_nightreign` (documentation-only, 0 lib modules at land-time).
+- NEW `docs/per_game/elden_ring_nightreign_README.ai.md` T1 baseline.
+- `dlc_scope` + `spinoff_cross_link` + `ai_native_handoff_track_by` fields on `.roadmap.elden_ring`.
+- Track BZ — `gamebox/doc/gamebox_closure_orchestrator_paper_invocation_track_bz_landed_2026_05_05.ai.md` (real-invocation attempt + paper-mode derivation; hexa interp blocker).
+- Track CA — `gamebox/doc/gamebox_hexa_upstream_rfc_016_reassessment_track_ca_landed_2026_05_05.ai.md` + `docs/HEXA_UPSTREAM_RFC_016_REASSESSMENT_TRACK_CA_2026_05_05.md` (28-cycle null floor reaffirmed).
+- Track CB — README "Native markers" + "Resolver telemetry markers (gitignored)" subsections.
+- Track CC — per_game README §9 sections for 4 retired_intentional files (cs2 + delta_force + diablo4 + elden_ring); elden_ring §9 surfaces DLC scope narrative.
+- `.gitignore` patterns for hexa-resolver runtime telemetry markers.
+- 8 NEW `gamebox_*` markers post-v1.0.0 (BT through CC).
+
+### Changed
+
+- README.md TL;DR header: `.roadmap` 14 → 15 (14 active + 1 historical), `.checkpoint` met 1 → 3.
+- README.md architecture caption: terse 7-figure → detailed inventory (455 .hexa files, 9 tests, 88 markers across 3 classes).
+- README.md Loaders heading: `(35 modules)` → `(59 named groups across 455 .hexa files)`.
+- `.roadmap.elden_ring` goal: scope = base game + Shadow of the Erdtree DLC.
+- `docs/airgenome_*.ai.md` (75) → `airgenome/doc/` per layout migration.
+- `docs/gamebox_*.ai.md` (7) → `gamebox/doc/` per layout migration.
+- `state/markers/*.marker` cross-references updated (193 files / 621 lines via sed sweep in `1d28b4c`).
+- `hexa.toml` version: `1.0.1` → `1.0.2`.
+- README version badge: `version-1.0.1` → `version-1.0.2`.
+
+### Posture
+
+- Forensic verdict UNCHANGED: `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`.
+- `validated_manjeom` UNCHANGED: 0 (no real game frames).
+- own1: Wine 0 / hexa-only / no DRM / no AC / no GameGuard / no EAC / no FromSoft matchmaking bypass / no anima clone / `destructive_ops: 0`.
+- own2: honest emit; per_game §9 sections explicit about retired_intentional stable + cross-cutting impact + validated_manjeom carry.
+
 ## [1.0.1] — 2026-05-05
 
 ### Added

@@ -9,7 +9,7 @@
 > honest C3: validated_manjeom = 0 (no real game frames evidenced).
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.1-informational.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.2-informational.svg)](CHANGELOG.md)
 [![GitHub release](https://img.shields.io/github/v/release/need-singularity/gamebox?display_name=tag&sort=semver)](https://github.com/need-singularity/gamebox/releases)
 [![Forensic: SKELETON_TIER_100PCT_WIN32](https://img.shields.io/badge/forensic-SKELETON__TIER__100PCT__WIN32-brightgreen.svg)](#forensic-verdict)
 [![Win32 fn coverage: 435/435](https://img.shields.io/badge/win32__fn__coverage-435%2F435-success.svg)](#module-inventory)
