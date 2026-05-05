@@ -2,6 +2,38 @@
 
 All notable changes to `gamebox` are documented in this file.
 
+## [1.0.3] — 2026-05-05
+
+### Added
+
+- Track CE — `gamebox/doc/gamebox_closure_orchestrator_selftest_paper_mode_track_ce_landed_2026_05_05.ai.md` (S1-S11 paper-mode trace; BZ §11 hook partial resolution).
+- Track CF — `gamebox/doc/gamebox_hexa_toml_modules_audit_track_cf_landed_2026_05_05.ai.md` (40 entries audit; 1 drift item flagged for CG).
+- Track CG — `gamebox/doc/gamebox_c_d2r_archive_round_trip_drift_fix_track_cg_landed_2026_05_05.ai.md` (orphan reference option-b removal).
+- Track CH — `gamebox/doc/gamebox_session_aggregate_v3_track_ch_landed_2026_05_05.ai.md` (first standalone-repo session aggregate covering BT-CG).
+- hexa.toml `gamebox_perf_top_families` explanatory comment block (CG).
+- 4 NEW `gamebox_*` markers (CE / CF / CG / CH).
+- `.gitignore` pattern: `resource_op_[0-9]*.marker` (CE post-mortem).
+
+### Changed
+
+- `hexa.toml` version: `1.0.2` → `1.0.3`.
+- `hexa.toml` `gamebox_perf_top_families`: orphan `c_d2r_archive_round_trip` entry removed (CG).
+- `README.md` Version badge: `version-1.0.2` → `version-1.0.3`.
+- `README.md` perf families table: `c_d2r_archive_round_trip` row removed (CG).
+
+### Cumulative deltas (v1.0.2 → v1.0.3)
+
+- gamebox-native markers: 9 → 15 (BT-CH)
+- RFC 016 audit cumulative null floor: 28 → 34 cycles
+- hexa.toml audit drift items: 1 → 0
+- Forensic verdict: UNCHANGED (`SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`)
+- validated_manjeom: UNCHANGED (0)
+
+### Posture
+
+- own1: Wine 0 / hexa-only / no DRM / no AC / no anima clone / `destructive_ops: 0` (CG was reference-removal not file-deletion).
+- own2: paper-mode vs real-run distinction explicit; drift fix option chosen documented; v3 vs v1/v2 distinction explicit.
+
 ## [1.0.2] — 2026-05-05
 
 ### Added
