@@ -2,6 +2,42 @@
 
 All notable changes to `gamebox` are documented in this file.
 
+## [1.0.4] — 2026-05-05
+
+### Added
+
+- Track CK — `docs/VAC_HONEST_FREEZE.md` mk1 narrative (Valve Anti-Cheat user-mode AC + Trusted Mode; resolves cs2.cond.3 deferred hook).
+- Track CL — `docs/EAC_KERNEL_HONEST_FREEZE.md` mk1 narrative (EAC kernel + anti-tamper class; 3-cross-class delta_force + elden_ring base+DLC + nightreign).
+- Track CM — Nightreign lib module fan-out at skeleton-tier:
+  - `lib/loader/pe_elden_ring_nightreign_specific_track.hexa` (216 LOC)
+  - `lib/perf/c_nightreign_co_op_session_init.hexa` (133 LOC)
+  - `lib/perf/c_nightreign_matchmaking_probe.hexa` (129 LOC)
+  - `lib/perf/c_nightreign_dx12_first_frame_co_op_variant.hexa` (131 LOC)
+  - Total 609 LOC; retired_intentional posture inherited from blk.1 + blk.2.
+- Track CN — `gamebox/doc/gamebox_hexa_interp_closure_perpetual_deferral_ack_track_cn_landed_2026_05_05.ai.md` (formally closes CJ §11 hook 4 as perpetually deferred; multi-year horizon).
+- 4 NEW `gamebox_*` markers (CK + CL + CM + CN).
+- 4 NEW `gamebox/doc/` handoff docs (CK + CL + CM + CN).
+
+### Changed
+
+- `hexa.toml` version: `1.0.3` → `1.0.4`.
+- `README.md` Version badge: `version-1.0.3` → `version-1.0.4`.
+- `.roadmap.elden_ring_nightreign`: `loader_count: 0 → 1`, `perf_count: 0 → 3`, NEW `loader_pattern` + `perf_pattern` + `ai_native_handoff_track_cm` fields, NEW comment header line 6 documenting Track CM skeleton-tier fan-out (Track BY documentation-only narrative line 5 preserved verbatim).
+
+### Cumulative deltas (v1.0.3 → v1.0.4)
+
+- gamebox-native markers: 15 → 19
+- Honest freeze docs: 3 → 5 (Track-E predecessor + CK + CL)
+- lib/loader files: 455 → 456 (+1 nightreign loader)
+- lib/perf files: 242 → 245 (+3 nightreign perf)
+- Forensic verdict: UNCHANGED (`SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`)
+- validated_manjeom: UNCHANGED (0 — skeleton-tier per Track BL/BM forensic baseline)
+
+### Posture
+
+- own1: Wine 0 / hexa-only / no DRM bypass / no AC bypass (5 classes covered: VAC + GameGuard + EAC kernel + EAC anti-tamper + Warden) / no FromSoft matchmaking bypass / no anima clone / `destructive_ops: 0` (maintained).
+- own2: 4 CM modules emit RETIRED_INTENTIONAL posture annotation; CN explicit no-fake-PASS / no-fake-real-run-completion declaration; skeleton-tier vs real-tier distinction explicit; spec freeze ONLY scope explicit per CK + CL.
+
 ## [1.0.3] — 2026-05-05
 
 ### Added
