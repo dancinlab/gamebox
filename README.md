@@ -226,7 +226,6 @@ coverage milestone (Track BP 2026-05-05).
 | `c_bnet_warden_environment_compat` | 100% | own1: compat scaffold, NO Warden bypass |
 | `c_bigworld_core_dx11_first_frame` / `_shader_persist` | 100% | UE3-derived bigworld engine first-frame |
 | `c_cdn_chunk_assemble_track` / `_mirror_select` | 100% | CDN chunk assembly + mirror select |
-| `c_d2r_archive_round_trip` | 100% | D2R MPQ archive round-trip (cond1) |
 | `c_cs2_source2` / `_steam_api64` / `_tier0` | 100% | CS2 / Source2 / Steam API skeletons |
 | `c_amx_matrix_multiply` | 100% | Apple AMX matrix multiply |
 | `c_argument_buffer_tier2_map` | 100% | Metal argument-buffer Tier-2 mapping |
