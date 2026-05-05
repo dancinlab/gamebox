@@ -241,6 +241,47 @@ Per **own2** mandate, 75 markers from the airgenome-gamebox 67-cycle session
 
 ---
 
+## Game Coverage
+
+11 .roadmap targets (8 games + 3 launchers/runtimes):
+
+| Target | Type | cond.1 | cond.2 | cond.3 | Notes |
+|---|---|---|---|---|---|
+| [diablo2_resurrected](.roadmap.diablo2_resurrected) | game | partial | met | partial | offline single-player viable; online realm Warden L2 long-horizon |
+| [diablo4](.roadmap.diablo4) | game | partial | partial | partial | retired_intentional (always-online DRM) |
+| [battlenet](.roadmap.battlenet) | launcher | met | met | partial | offline shim PASS; online OAuth gate |
+| [purple_launcher](.roadmap.purple_launcher) | launcher | met | met | partial | offline shim PASS; plaync OAuth gate |
+| [lineage_m](.roadmap.lineage_m) | game | met | partial | partial | Android emul layer permanent boundary |
+| [lineage_w](.roadmap.lineage_w) | game | met | partial | partial | UE4 + Purple cascading |
+| [lineage_classic_r28](.roadmap.lineage_classic_r28) | game | partial | partial | partial | retired_intentional (GameGuard kernel AC) |
+| [wow](.roadmap.wow) | game | partial | partial | partial | retired_intentional (online MMO subscription) |
+| [cs2](.roadmap.cs2) | game | partial | partial | partial | retired_intentional (VAC AC) |
+| [delta_force](.roadmap.delta_force) | game | partial | partial | partial | retired_intentional (EAC kernel AC) |
+| [elden_ring](.roadmap.elden_ring) | game | partial | partial | partial | retired_intentional (EAC anti-tamper) |
+
+Per-game README index: [docs/per_game/](docs/per_game/) — 11 sub-page READMEs (raw 270 triplet T1 baseline 2026-05-03).
+
+3 cross-cutting loader roadmaps:
+- [.roadmap.loader_pe](.roadmap.loader_pe) — PE loader skeleton
+- [.roadmap.loader_win32](.roadmap.loader_win32) — Win32 fn coverage **435/435 (100%, skeleton-tier)** cycle 27→62
+- [.roadmap.loader_dx](.roadmap.loader_dx) — D3DMetal binary licence transitive blocker
+
+7 cross-roadmap checkpoints:
+
+| Checkpoint | Aggregation | Status | Notes |
+|---|---|---|---|
+| [.checkpoint.d2r_battlenet_offline_play](.checkpoint.d2r_battlenet_offline_play) | AND | partial 3/7 | D2R offline first-frame target |
+| [.checkpoint.d2r_battlenet_online_play](.checkpoint.d2r_battlenet_online_play) | AND | partial 3/8 | D2R online realm (Warden L2 long-horizon) |
+| [.checkpoint.lineage_classic_r28_play](.checkpoint.lineage_classic_r28_play) | AND | partial 0/3 | retired_intentional cascading reference |
+| [.checkpoint.lineage_m_purple_play](.checkpoint.lineage_m_purple_play) | AND | partial 3/5 | Android emul boundary |
+| [.checkpoint.lineage_w_purple_play](.checkpoint.lineage_w_purple_play) | AND | partial 3/5 | UE4 + Purple cascading |
+| [.checkpoint.win32_50pct_coverage](.checkpoint.win32_50pct_coverage) | weighted_threshold | **met** (100/50) | 1st checkpoint reached (Track BL+BO) |
+| [.checkpoint.win32_full_coverage](.checkpoint.win32_full_coverage) | weighted_threshold | **met** (100/100) | Track BP Win32 100% achieved (Track BU cached flip) |
+
+Honest scope (raw#10 C3): **0 games run a real frame yet (validated_manjeom = 0).** All cond/checkpoint progression is skeleton-tier (synthetic round-trip + scaffold logic). Real-game first-frame requires production smoke gate (Track AU recommended path A own1, multi-year horizon).
+
+---
+
 ## hexa-lang upstream
 
 4 RFCs merged this session into <https://github.com/need-singularity/hexa-lang>:
