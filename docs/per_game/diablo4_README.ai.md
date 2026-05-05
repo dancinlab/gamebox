@@ -71,3 +71,26 @@ mk1_narrative_refs:
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2/T3/T4 remain future-cycle work.
+
+## §9 post-Track-BU/BV/BY/CA update (Track CC 2026-05-05) — indirect impact, retired_intentional stable
+
+§2 cond statuses unchanged for diablo4 — all 3 cond actuals remain `partial` with `block_acknowledged_pass_equivalent` posture per blk.1 retired_intentional (always-online DRM class, adopted Track A2 first-mover 2026-05-03; D4 = first retired_intentional adoption precedent for the project).
+
+| event | track | iso | impact on diablo4 |
+|---|---|---|---|
+| Win32 fn coverage 91.49% → 100% milestone | BP | 2026-05-05 | skeleton-tier surface threshold breach; loader_win32 100% reach (relevant via D4.exe + battlenet launcher cross-cutting) |
+| .checkpoint.win32_full_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh |
+| Track BE c_d4_* family 100% completion | BE | 2026-05-05 | 27/27 c_d4_* perf modules cumulative annotation; status preserved partial (retired_intentional posture) |
+| Track BA c_d2r_d4_completion | BA | 2026-05-04 | d2r + d4 perf families joint completion |
+| README Game Coverage table | BY | 2026-05-05 | diablo4 row preserved with retired_intentional (always-online DRM) note |
+| Layout migration commit `1d28b4c` | — | 2026-05-05 | mk1 narrative `docs/D4_MANJEOM_REVIEW.md` + `docs/D2R_D4_COMPARISON.md` + `docs/D2R_D4_INSTALL_LAUNCH_ROADMAP.md` paths unchanged (catch-all docs/); predecessor handoff under `airgenome/doc/` |
+
+Honest scope: `validated_manjeom` UNCHANGED at 0 — no real D4 frames evidenced. Always-online DRM permanent boundary (own1 Wine 0 + own2 honest emit, no DRM bypass / no always-online evasion). D4 is the project's first retired_intentional adoption precedent — sibling games (cs2, delta_force, elden_ring, lineage_classic_r28, wow) inherit this class via Track-C 4-game adoption pattern.
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_perf_d2r_d4_completion_track_ba_landed.marker` (Track BA — d2r + d4 family completion 2026-05-04)
+- `state/markers/airgenome_gamebox_perf_d4_elden_completion_track_be_landed.marker` (Track BE — d4 + elden completion 2026-05-05)
+- `state/markers/gamebox_readme_game_list_and_win32_checkpoint_flip_track_bu_landed.marker` (Track BU — Game Coverage section)
+- `state/markers/gamebox_readme_game_coverage_refresh_plus_nightreign_fan_out_track_by_landed.marker` (Track BY — README refresh)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_cc_landed.marker` (this cycle 2026-05-05 — §9 closure)

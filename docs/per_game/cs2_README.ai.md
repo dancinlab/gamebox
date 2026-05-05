@@ -73,3 +73,24 @@ anticheat_family_cross_ref: delta_force (kernel-AC EAC), elden_ring (EAC anti-ta
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2/T3/T4 remain future-cycle work.
+
+## §9 post-Track-BU/BV/BY/CA update (Track CC 2026-05-05) — indirect impact, retired_intentional stable
+
+§2 cond statuses unchanged for cs2 — all 3 cond actuals remain `partial` with `block_acknowledged_pass_equivalent` posture per blk.1 retired_intentional (VAC user-mode AC class, adopted Track-C 2026-05-03).
+
+| event | track | iso | impact on cs2 |
+|---|---|---|---|
+| Win32 fn coverage 91.49% → 100% milestone | BP | 2026-05-05 | skeleton-tier surface threshold breach; loader_win32 100% reach (relevant for cs2.exe IAT real-resolve target) |
+| .checkpoint.win32_full_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh |
+| Track BM c_steam_drm_stub_track + Track BQ c_steam_* family 100% completion | BM/BQ | 2026-05-05 | cs2 cond.1 evidence row augment; status preserved partial |
+| README Game Coverage table | BY | 2026-05-05 | cs2 row preserved with retired_intentional (VAC AC) note |
+| Layout migration commit `1d28b4c` | — | 2026-05-05 | mk1 narrative `docs/CS2_MANJEOM_REVIEW.md` path unchanged (catch-all docs/); predecessor handoff under `airgenome/doc/` |
+
+Honest scope: `validated_manjeom` UNCHANGED at 0 — no real CS2 frames evidenced. VAC anti-cheat retired_intentional permanent boundary on Apple-only stack (own1 Wine 0 + own2 honest emit, no AC bypass / no Trusted Mode bypass). `docs/VAC_HONEST_FREEZE.md` mk1 narrative deferred future-cycle (Track CC+ candidate alongside `docs/EAC_KERNEL_HONEST_FREEZE.md`).
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_perf_cs2_retired_intentional_track_at_landed.marker` (Track AT — cs2 perf scope retired_intentional annotation 2026-05-04)
+- `state/markers/gamebox_readme_game_list_and_win32_checkpoint_flip_track_bu_landed.marker` (Track BU — Game Coverage section)
+- `state/markers/gamebox_readme_game_coverage_refresh_plus_nightreign_fan_out_track_by_landed.marker` (Track BY — README refresh)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_cc_landed.marker` (this cycle 2026-05-05 — §9 closure)

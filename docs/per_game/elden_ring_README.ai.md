@@ -73,3 +73,31 @@ anticheat_family_cross_ref: cs2 (VAC user-mode AC), delta_force (EAC kernel-AC)
 ## §8 raw 270 triplet T1 baseline note
 
 This README.ai.md satisfies the raw 270 triplet T1 baseline as of 2026-05-03 (predecessor `airgenome_gamebox_per_game_roadmaps_landed.marker` raw_compliance flagged README.ai.md emit deferred / baseline grandfather candidate vs 2026-06-01 promotion-day deadline — this cycle satisfies that deadline ahead of schedule). T2/T3/T4 remain future-cycle work.
+
+## §9 post-Track-BU/BV/BY/CA update (Track CC 2026-05-05) — DLC scope clarified + nightreign sibling spinoff
+
+§2 cond statuses unchanged for elden_ring — all 3 cond actuals remain `partial` with `block_acknowledged_pass_equivalent` posture per blk.1 retired_intentional (EAC anti-tamper class, adopted Track-C 2026-05-03).
+
+**Scope clarification (Track BY 2026-05-05)**: `.roadmap.elden_ring` scope = **base game (2022-02-25) + Shadow of the Erdtree DLC (2024-06-21)**. DLC inherits same EAC anti-tamper class as base; no separate cond entries needed for DLC. Sibling spinoff Elden Ring Nightreign (2025-05-30 standalone multiplayer co-op) tracked separately as `.roadmap.elden_ring_nightreign` per Track BY documentation-only fan-out (lib module fan-out deferred to Track CA+ candidate).
+
+| event | track | iso | impact on elden_ring |
+|---|---|---|---|
+| Win32 fn coverage 91.49% → 100% milestone | BP | 2026-05-05 | skeleton-tier surface threshold breach; loader_win32 100% reach (relevant via eldenring.exe IAT real-resolve target) |
+| .checkpoint.win32_full_coverage flip unmet → met | BU | 2026-05-05 | weighted_threshold derivation cached refresh |
+| Track BE c_elden_* family 100% completion | BE | 2026-05-05 | 10/10 c_elden_* perf modules cumulative annotation (Track AS 6 + Track BE 4); status preserved partial (retired_intentional posture) |
+| Track BM c_sote_realm_of_shadow_zone_load + c_sote_dlc_content_probe | BM | 2026-05-05 | Shadow of the Erdtree DLC zone load + DLC content probe scaffold; cond.2 + cond.3 evidence augment |
+| Track BQ c_sote_* family 100% completion reaffirm | BQ | 2026-05-05 | 2/2 c_sote_* modules already extended in Track BM; no re-touch in BQ |
+| **Track BY DLC scope clarification + nightreign fan-out** | **BY** | **2026-05-05** | **`.roadmap.elden_ring` goal field updated to mention base+DLC scope; new `dlc_scope` field added (Shadow of the Erdtree 2024-06-21); new `spinoff_cross_link` field references `.roadmap.elden_ring_nightreign`** |
+| Layout migration commit `1d28b4c` | — | 2026-05-05 | mk1 narrative `docs/ELDEN_RING_MANJEOM_REVIEW.md` path unchanged (catch-all docs/); predecessor handoff under `airgenome/doc/` |
+
+Honest scope: `validated_manjeom` UNCHANGED at 0 — no real Elden Ring frames evidenced (base or DLC). EAC anti-tamper retired_intentional permanent boundary on Apple-only stack (own1 Wine 0 + own2 honest emit, no AC bypass / no anti-tamper bypass / kernel driver avoid track honest). Sibling Elden Ring Nightreign inherits same class via Track BY fan-out.
+
+Markers added to cycle history:
+
+- `state/markers/airgenome_gamebox_perf_elden_retired_intentional_track_as_landed.marker` (Track AS — elden_ring perf scope retired_intentional annotation 2026-05-04)
+- `state/markers/airgenome_gamebox_perf_d4_elden_completion_track_be_landed.marker` (Track BE — d4 + elden completion 2026-05-05)
+- `state/markers/airgenome_gamebox_perf_remaining_family_inventory_v2_track_bm_landed.marker` (Track BM — c_sote_* DLC scaffold)
+- `state/markers/airgenome_gamebox_perf_bm_6family_completion_track_bq_landed.marker` (Track BQ — 6-family completion incl. c_sote_* reaffirm)
+- `state/markers/gamebox_readme_game_list_and_win32_checkpoint_flip_track_bu_landed.marker` (Track BU — Game Coverage section)
+- `state/markers/gamebox_readme_game_coverage_refresh_plus_nightreign_fan_out_track_by_landed.marker` (Track BY — DLC scope + nightreign fan-out)
+- `state/markers/gamebox_per_game_readme_post_bu_bv_update_track_cc_landed.marker` (this cycle 2026-05-05 — §9 closure)
