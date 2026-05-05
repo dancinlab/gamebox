@@ -1,4 +1,4 @@
-# gamebox — Apple-native Win32 Game Runtime
+# 🎮 gamebox — Apple-native Win32 Game Runtime
 
 > Apple-native Win32 game runtime. Hexa-only, Wine 0, D3DMetal-pinned.
 > Skeleton-tier 100% Win32 fn coverage (435/435) + 18+ perf families at 100%
