@@ -1,0 +1,472 @@
+// lib/loader/pe_msvc_encoded_ptr_real.hexa — MSVC EncodePointer/DecodePointer ROL+XOR tracker
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / community wrapper 0 줄.
+//        Microsoft KERNEL32 EncodePointer/DecodePointer public ABI 관찰 only —
+//        본 module 은 encode/decode/round_trip/cookie_change/pointer_kind telemetry
+//        기록 전용 (no synthetic memcpy, no actual EncodePointer call — host SHIM 영역).
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   KERNEL32!EncodePointer / DecodePointer 의 ROL + XOR 변환 (process-wide cookie 기반),
+//   encoded = (src ROL (cookie & 0x1F)) XOR cookie,
+//   decoded = ROR(enc XOR cookie, cookie & 0x1F),
+//   process cookie rotation + per-pointer kind classification.
+//
+// 각 record API 는 별도 TSV 에 append + r0_emit 1건 기록.
+//
+// persist schema (TSV — 5 separate tables):
+//   encode.tsv:
+//     enc_id<int> \t src_ptr_hex<str> \t encoded_ptr_hex<str> \t cookie_hex<str>
+//   decode.tsv:
+//     dec_id<int> \t encoded_ptr_hex<str> \t decoded_ptr_hex<str> \t cookie_hex<str>
+//   round_trip.tsv:
+//     rt_id<int> \t enc_id<int> \t dec_id<int> \t matches<int>
+//   cookie_change.tsv:
+//     change_id<int> \t old_cookie_hex<str> \t new_cookie_hex<str>
+//   pointer_kind.tsv:
+//     kind_id<int> \t ptr_hex<str> \t kind<int>
+//
+// kind code reference:
+//   pointer_kind: 0=fn_ptr 1=tls_ptr 2=heap_ptr 3=stack_ptr 4=unknown
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmep_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_encoded_ptr_real"
+}
+
+fn pmep_encode_path() -> str {
+    return pmep_dir() + "/encode.tsv"
+}
+
+fn pmep_decode_path() -> str {
+    return pmep_dir() + "/decode.tsv"
+}
+
+fn pmep_round_trip_path() -> str {
+    return pmep_dir() + "/round_trip.tsv"
+}
+
+fn pmep_cookie_change_path() -> str {
+    return pmep_dir() + "/cookie_change.tsv"
+}
+
+fn pmep_pointer_kind_path() -> str {
+    return pmep_dir() + "/pointer_kind.tsv"
+}
+
+fn pmep_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmep_dir() + "'")
+}
+
+fn cleanup_pmep() -> void {
+    pmep_ensure_dir()
+    let _ = exec("rm -f '" + pmep_encode_path() + "' '" + pmep_decode_path()
+        + "' '" + pmep_round_trip_path() + "' '" + pmep_cookie_change_path()
+        + "' '" + pmep_pointer_kind_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmep_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmep_append_row(path: str, row: str) -> void {
+    pmep_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmep_count_rows(path: str, min_cols: int) -> int {
+    let t = pmep_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name helper ───
+fn pointer_kind_name(k: int) -> str {
+    if k == 0 { return "fn" }
+    if k == 1 { return "tls" }
+    if k == 2 { return "heap" }
+    if k == 3 { return "stack" }
+    if k == 4 { return "unknown" }
+    return "?"
+}
+
+// ─── record_encode: EncodePointer milestone ───
+//   encoded = (src ROL (cookie & 0x1F)) XOR cookie
+fn record_encode(enc_id: int, src_ptr_hex: str, encoded_ptr_hex: str, cookie_hex: str) -> void {
+    if enc_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_encode] expected=enc_id>0 got=" + to_string(enc_id))
+    }
+    if src_ptr_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_encode] expected=src_ptr_hex!=empty got=empty")
+    }
+    if encoded_ptr_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_encode] expected=encoded_ptr_hex!=empty got=empty")
+    }
+    if cookie_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_encode] expected=cookie_hex!=empty got=empty")
+    }
+    let row = to_string(enc_id) + "\t" + src_ptr_hex + "\t"
+        + encoded_ptr_hex + "\t" + cookie_hex + "\n"
+    pmep_append_row(pmep_encode_path(), row)
+}
+
+// ─── record_decode: DecodePointer milestone ───
+//   decoded = ROR(enc XOR cookie, cookie & 0x1F)
+fn record_decode(dec_id: int, encoded_ptr_hex: str, decoded_ptr_hex: str, cookie_hex: str) -> void {
+    if dec_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_decode] expected=dec_id>0 got=" + to_string(dec_id))
+    }
+    if encoded_ptr_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_decode] expected=encoded_ptr_hex!=empty got=empty")
+    }
+    if decoded_ptr_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_decode] expected=decoded_ptr_hex!=empty got=empty")
+    }
+    if cookie_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_decode] expected=cookie_hex!=empty got=empty")
+    }
+    let row = to_string(dec_id) + "\t" + encoded_ptr_hex + "\t"
+        + decoded_ptr_hex + "\t" + cookie_hex + "\n"
+    pmep_append_row(pmep_decode_path(), row)
+}
+
+// ─── record_round_trip: encode→decode 가 원본과 일치 여부 ───
+fn record_round_trip(rt_id: int, enc_id: int, dec_id: int, matches: int) -> void {
+    if rt_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_round_trip] expected=rt_id>0 got=" + to_string(rt_id))
+    }
+    if enc_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_round_trip] expected=enc_id>0 got=" + to_string(enc_id))
+    }
+    if dec_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_round_trip] expected=dec_id>0 got=" + to_string(dec_id))
+    }
+    if matches < 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_round_trip] expected=matches>=0 got=" + to_string(matches))
+    }
+    if matches > 1 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_round_trip] expected=matches<=1 got=" + to_string(matches))
+    }
+    let row = to_string(rt_id) + "\t" + to_string(enc_id) + "\t"
+        + to_string(dec_id) + "\t" + to_string(matches) + "\n"
+    pmep_append_row(pmep_round_trip_path(), row)
+}
+
+// ─── record_cookie_change: process-wide cookie rotation ───
+fn record_cookie_change(change_id: int, old_cookie_hex: str, new_cookie_hex: str) -> void {
+    if change_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_cookie_change] expected=change_id>0 got=" + to_string(change_id))
+    }
+    if old_cookie_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_cookie_change] expected=old_cookie_hex!=empty got=empty")
+    }
+    if new_cookie_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_cookie_change] expected=new_cookie_hex!=empty got=empty")
+    }
+    let row = to_string(change_id) + "\t" + old_cookie_hex + "\t" + new_cookie_hex + "\n"
+    pmep_append_row(pmep_cookie_change_path(), row)
+}
+
+// ─── record_pointer_kind: 추적 대상 pointer 분류 (fn/tls/heap/stack/unknown) ───
+fn record_pointer_kind(kind_id: int, ptr_hex: str, kind: int) -> void {
+    if kind_id <= 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_pointer_kind] expected=kind_id>0 got=" + to_string(kind_id))
+    }
+    if ptr_hex == "" {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_pointer_kind] expected=ptr_hex!=empty got=empty")
+    }
+    if kind < 0 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_pointer_kind] expected=kind>=0 got=" + to_string(kind))
+    }
+    if kind > 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [record_pointer_kind] expected=kind<=4 got=" + to_string(kind))
+    }
+    let row = to_string(kind_id) + "\t" + ptr_hex + "\t" + to_string(kind) + "\n"
+    pmep_append_row(pmep_pointer_kind_path(), row)
+}
+
+// ─── statistics ───
+fn encode_count() -> int {
+    return pmep_count_rows(pmep_encode_path(), 4)
+}
+
+fn decode_count() -> int {
+    return pmep_count_rows(pmep_decode_path(), 4)
+}
+
+fn round_trip_count() -> int {
+    return pmep_count_rows(pmep_round_trip_path(), 4)
+}
+
+fn cookie_change_count() -> int {
+    return pmep_count_rows(pmep_cookie_change_path(), 3)
+}
+
+fn pointer_kind_count() -> int {
+    return pmep_count_rows(pmep_pointer_kind_path(), 3)
+}
+
+fn pmep_stats() -> array {
+    let mut out = []
+    out.push(encode_count())
+    out.push(decode_count())
+    out.push(round_trip_count())
+    out.push(cookie_change_count())
+    out.push(pointer_kind_count())
+    return out
+}
+
+// ─── self_test ≥ 17 record + r0_emit ≥ 20 ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pmep-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmep()
+
+    // process cookie (initial) — 0xBB40E64E.
+    // cookie & 0x1F = 0x0E = 14 (ROL shift count).
+    // 4 fn_ptr 의 encode 결과 (Python 검증):
+    //   src=0x0000000180001000 enc=0x00006000bf40e64e
+    //   src=0x0000000180001100 enc=0x00006000bf00e64e
+    //   src=0x0000000180001200 enc=0x00006000bfc0e64e
+    //   src=0x0000000180001300 enc=0x00006000bf80e64e
+    let cookie = "00000000bb40e64e"
+
+    // ─── 1. encode × 4 (4 fn ptr / cookie 0xBB40E64E) ───
+    record_encode(1, "0000000180001000", "00006000bf40e64e", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"encode\",\"enc_id\":1,\"src_ptr_hex\":\"0000000180001000\",\"encoded_ptr_hex\":\"00006000bf40e64e\",\"cookie_hex\":\"" + cookie + "\"")
+
+    record_encode(2, "0000000180001100", "00006000bf00e64e", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"encode\",\"enc_id\":2,\"src_ptr_hex\":\"0000000180001100\",\"encoded_ptr_hex\":\"00006000bf00e64e\",\"cookie_hex\":\"" + cookie + "\"")
+
+    record_encode(3, "0000000180001200", "00006000bfc0e64e", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"encode\",\"enc_id\":3,\"src_ptr_hex\":\"0000000180001200\",\"encoded_ptr_hex\":\"00006000bfc0e64e\",\"cookie_hex\":\"" + cookie + "\"")
+
+    record_encode(4, "0000000180001300", "00006000bf80e64e", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"encode\",\"enc_id\":4,\"src_ptr_hex\":\"0000000180001300\",\"encoded_ptr_hex\":\"00006000bf80e64e\",\"cookie_hex\":\"" + cookie + "\"")
+
+    // ─── 2. decode × 4 (위 4 encode 의 inverse) ───
+    record_decode(1, "00006000bf40e64e", "0000000180001000", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"decode\",\"dec_id\":1,\"encoded_ptr_hex\":\"00006000bf40e64e\",\"decoded_ptr_hex\":\"0000000180001000\",\"cookie_hex\":\"" + cookie + "\"")
+
+    record_decode(2, "00006000bf00e64e", "0000000180001100", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"decode\",\"dec_id\":2,\"encoded_ptr_hex\":\"00006000bf00e64e\",\"decoded_ptr_hex\":\"0000000180001100\",\"cookie_hex\":\"" + cookie + "\"")
+
+    record_decode(3, "00006000bfc0e64e", "0000000180001200", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"decode\",\"dec_id\":3,\"encoded_ptr_hex\":\"00006000bfc0e64e\",\"decoded_ptr_hex\":\"0000000180001200\",\"cookie_hex\":\"" + cookie + "\"")
+
+    record_decode(4, "00006000bf80e64e", "0000000180001300", cookie)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"decode\",\"dec_id\":4,\"encoded_ptr_hex\":\"00006000bf80e64e\",\"decoded_ptr_hex\":\"0000000180001300\",\"cookie_hex\":\"" + cookie + "\"")
+
+    // ─── 3. round_trip × 4 (matches=1 all — encode → decode = src) ───
+    record_round_trip(1, 1, 1, 1)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"round_trip\",\"rt_id\":1,\"enc_id\":1,\"dec_id\":1,\"matches\":1")
+
+    record_round_trip(2, 2, 2, 1)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"round_trip\",\"rt_id\":2,\"enc_id\":2,\"dec_id\":2,\"matches\":1")
+
+    record_round_trip(3, 3, 3, 1)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"round_trip\",\"rt_id\":3,\"enc_id\":3,\"dec_id\":3,\"matches\":1")
+
+    record_round_trip(4, 4, 4, 1)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"round_trip\",\"rt_id\":4,\"enc_id\":4,\"dec_id\":4,\"matches\":1")
+
+    // ─── 4. cookie_change × 1 (initial → entropy mix) ───
+    record_cookie_change(1, cookie, "deadbeef13371337")
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind\":\"cookie_change\",\"change_id\":1,\"old_cookie_hex\":\"" + cookie + "\",\"new_cookie_hex\":\"deadbeef13371337\"")
+
+    // ─── 5. pointer_kind × 4 (fn / tls / heap / stack) ───
+    record_pointer_kind(1, "0000000180001000", 0)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind_id\":1,\"ptr_hex\":\"0000000180001000\",\"kind\":0,\"kind_name\":\"fn\"")
+
+    record_pointer_kind(2, "00007ff800000040", 1)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind_id\":2,\"ptr_hex\":\"00007ff800000040\",\"kind\":1,\"kind_name\":\"tls\"")
+
+    record_pointer_kind(3, "00000200a0001000", 2)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind_id\":3,\"ptr_hex\":\"00000200a0001000\",\"kind\":2,\"kind_name\":\"heap\"")
+
+    record_pointer_kind(4, "0000007fffe00000", 3)
+    r0_emit("pe_msvc_encoded_ptr_real_record",
+        "\"kind_id\":4,\"ptr_hex\":\"0000007fffe00000\",\"kind\":3,\"kind_name\":\"stack\"")
+
+    // ─── assertions: count ───
+    let ec = encode_count()
+    if ec != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [encode_count] expected=4 got=" + to_string(ec))
+    }
+    let dc = decode_count()
+    if dc != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [decode_count] expected=4 got=" + to_string(dc))
+    }
+    let rtc = round_trip_count()
+    if rtc != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [round_trip_count] expected=4 got=" + to_string(rtc))
+    }
+    let ccc = cookie_change_count()
+    if ccc != 1 {
+        panic("pe_msvc_encoded_ptr_real FAIL [cookie_change_count] expected=1 got=" + to_string(ccc))
+    }
+    let pkc = pointer_kind_count()
+    if pkc != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_count] expected=4 got=" + to_string(pkc))
+    }
+
+    // ─── name helper sanity ───
+    if pointer_kind_name(0) != "fn" {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_name(0)] expected=fn got=" + pointer_kind_name(0))
+    }
+    if pointer_kind_name(1) != "tls" {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_name(1)] expected=tls got=" + pointer_kind_name(1))
+    }
+    if pointer_kind_name(2) != "heap" {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_name(2)] expected=heap got=" + pointer_kind_name(2))
+    }
+    if pointer_kind_name(3) != "stack" {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_name(3)] expected=stack got=" + pointer_kind_name(3))
+    }
+    if pointer_kind_name(4) != "unknown" {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_name(4)] expected=unknown got=" + pointer_kind_name(4))
+    }
+    if pointer_kind_name(99) != "?" {
+        panic("pe_msvc_encoded_ptr_real FAIL [pointer_kind_name(99)] expected=? got=" + pointer_kind_name(99))
+    }
+
+    // ─── stats sanity ───
+    let s = pmep_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_encoded_ptr_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [stats encode_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [stats decode_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [stats round_trip_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_msvc_encoded_ptr_real FAIL [stats cookie_change_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvc_encoded_ptr_real FAIL [stats pointer_kind_count] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (17 record emit + summary/stats/kpi = 20 ≥ 14) ───
+    r0_emit("pe_msvc_encoded_ptr_real_stats",
+        "\"encode_count\":" + to_string(s[0])
+        + ",\"decode_count\":" + to_string(s[1])
+        + ",\"round_trip_count\":" + to_string(s[2])
+        + ",\"cookie_change_count\":" + to_string(s[3])
+        + ",\"pointer_kind_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_encoded_ptr_real_summary",
+        "\"flow\":\"EncodePointer(rol+xor) -> DecodePointer(xor+ror) -> round_trip_match -> cookie_change -> pointer_kind(fn|tls|heap|stack)\",\"total_records\":17")
+
+    r0_emit("pe_msvc_encoded_ptr_real_kpi",
+        "\"round_trip_match_rate\":1.0,\"cookie_rotation_count\":1,\"pointer_kind_classes\":4,\"shift_bits\":14")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_encoded_ptr_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmep()
+    let s2 = pmep_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_encoded_ptr_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_encoded_ptr_real self_test PASS (encode="
+        + to_string(s[0]) + ", decode=" + to_string(s[1])
+        + ", round_trip=" + to_string(s[2]) + ", cookie_change=" + to_string(s[3])
+        + ", pointer_kind=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmep_stats()
+            println("encode_count\t" + to_string(s[0]))
+            println("decode_count\t" + to_string(s[1]))
+            println("round_trip_count\t" + to_string(s[2]))
+            println("cookie_change_count\t" + to_string(s[3]))
+            println("pointer_kind_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "kind-name" {
+            if len(a) >= 4 {
+                println("pointer_kind_name\t" + pointer_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_encoded_ptr_real.hexa kind-name <kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmep()
+            println("cleaned: " + pmep_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmep_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_encoded_ptr_real.hexa { self-test | stats | kind-name <k> | cleanup | dir }")
+}

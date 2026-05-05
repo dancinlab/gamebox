@@ -1,0 +1,392 @@
+// lib/loader/pe_change_notification.hexa — stage5 file system change watcher tracker
+//
+// Win32 FindFirstChangeNotification / ReadDirectoryChangesW → kqueue
+// EVFILT_VNODE / FSEvents bridge. file/dir change watcher 1 건 = 1 row.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 watcher tracker — 실 kqueue() / FSEventStreamCreate() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// change_kind code:
+//   1 = file_name
+//   2 = dir_name
+//   3 = attribute
+//   4 = size
+//   5 = last_write
+//   6 = security
+//
+// subtree code:
+//   0 = single dir only
+//   1 = recursive subtree
+//
+// persist schema (TSV — watches.tsv):
+//   watch_id<int> \t filter_flags<int> \t change_kind<int> \t subtree<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcn_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_change_notification"
+}
+
+fn pcn_watches_path() -> str {
+    return pcn_dir() + "/watches.tsv"
+}
+
+fn pcn_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcn_dir() + "'")
+}
+
+fn cleanup_pcn() -> void {
+    pcn_ensure_dir()
+    let _ = exec("rm -f '" + pcn_watches_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcn_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcn_append_row(path: str, row: str) -> void {
+    pcn_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_watch: change watcher 1 건 기록 ───
+fn record_watch(watch_id: int, filter_flags: int, change_kind: int, subtree: int) -> void {
+    if watch_id <= 0 {
+        panic("pe_change_notification FAIL [record_watch] expected=watch_id>0 got=" + to_string(watch_id))
+    }
+    if filter_flags < 0 {
+        panic("pe_change_notification FAIL [record_watch] expected=filter_flags>=0 got=" + to_string(filter_flags))
+    }
+    if change_kind < 1 {
+        panic("pe_change_notification FAIL [record_watch] expected=change_kind>=1 got=" + to_string(change_kind))
+    }
+    if change_kind > 6 {
+        panic("pe_change_notification FAIL [record_watch] expected=change_kind<=6 got=" + to_string(change_kind))
+    }
+    if subtree < 0 {
+        panic("pe_change_notification FAIL [record_watch] expected=subtree>=0 got=" + to_string(subtree))
+    }
+    if subtree > 1 {
+        panic("pe_change_notification FAIL [record_watch] expected=subtree<=1 got=" + to_string(subtree))
+    }
+    let row = to_string(watch_id) + "\t" + to_string(filter_flags)
+        + "\t" + to_string(change_kind) + "\t" + to_string(subtree) + "\n"
+    pcn_append_row(pcn_watches_path(), row)
+}
+
+// ─── watch_count: total watch 수 ───
+fn watch_count() -> int {
+    let t = pcn_read_table(pcn_watches_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_filter_flags: 모든 watch filter_flags 합 ───
+fn total_filter_flags() -> int {
+    let t = pcn_read_table(pcn_watches_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── subtree_count: subtree=1 인 watch 수 ───
+fn subtree_count() -> int {
+    let t = pcn_read_table(pcn_watches_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_change_kind: 특정 change_kind 의 watch 수 ───
+fn count_by_change_kind(kind: int) -> int {
+    let t = pcn_read_table(pcn_watches_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── watch_filter_flags: 특정 watch_id 의 filter_flags (없으면 0) ───
+fn watch_filter_flags(watch_id: int) -> int {
+    let t = pcn_read_table(pcn_watches_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == watch_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pcn_stats: [watch_count, total_filter_flags, subtree_count, count_by_change_kind(5)] ───
+fn pcn_stats() -> array {
+    let mut out = []
+    out.push(watch_count())
+    out.push(total_filter_flags())
+    out.push(subtree_count())
+    out.push(count_by_change_kind(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcn-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcn()
+
+    // 2. record 5 watches across ≥3 change_kinds with ≥2 subtree
+    record_watch(120001, 1, 1, 0)
+    r0_emit("pe_change_notification_record",
+        "\"watch_id\":120001,\"filter_flags\":1,\"change_kind\":1,\"subtree\":0,\"target\":\"file_name\"")
+
+    record_watch(120002, 2, 2, 1)
+    r0_emit("pe_change_notification_record",
+        "\"watch_id\":120002,\"filter_flags\":2,\"change_kind\":2,\"subtree\":1,\"target\":\"dir_name\"")
+
+    record_watch(120003, 16, 5, 0)
+    r0_emit("pe_change_notification_record",
+        "\"watch_id\":120003,\"filter_flags\":16,\"change_kind\":5,\"subtree\":0,\"target\":\"last_write\"")
+
+    record_watch(120004, 16, 5, 1)
+    r0_emit("pe_change_notification_record",
+        "\"watch_id\":120004,\"filter_flags\":16,\"change_kind\":5,\"subtree\":1,\"target\":\"last_write\"")
+
+    record_watch(120005, 8, 4, 0)
+    r0_emit("pe_change_notification_record",
+        "\"watch_id\":120005,\"filter_flags\":8,\"change_kind\":4,\"subtree\":0,\"target\":\"size\"")
+
+    // 3. watch_count = 5
+    let c = watch_count()
+    if c != 5 {
+        panic("pe_change_notification FAIL [watch_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_filter_flags = 1+2+16+16+8 = 43
+    let tf = total_filter_flags()
+    if tf != 43 {
+        panic("pe_change_notification FAIL [total_filter_flags] expected=43 got=" + to_string(tf))
+    }
+
+    // 5. subtree_count = 2 (120002, 120004)
+    let st = subtree_count()
+    if st != 2 {
+        panic("pe_change_notification FAIL [subtree_count] expected=2 got=" + to_string(st))
+    }
+
+    // 6. count_by_change_kind sanity
+    let k1 = count_by_change_kind(1)
+    if k1 != 1 {
+        panic("pe_change_notification FAIL [count_by_change_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_change_kind(2)
+    if k2 != 1 {
+        panic("pe_change_notification FAIL [count_by_change_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k4 = count_by_change_kind(4)
+    if k4 != 1 {
+        panic("pe_change_notification FAIL [count_by_change_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_change_kind(5)
+    if k5 != 2 {
+        panic("pe_change_notification FAIL [count_by_change_kind(5)] expected=2 got=" + to_string(k5))
+    }
+    let k99 = count_by_change_kind(99)
+    if k99 != 0 {
+        panic("pe_change_notification FAIL [count_by_change_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. watch_filter_flags sanity
+    let f2 = watch_filter_flags(120002)
+    if f2 != 2 {
+        panic("pe_change_notification FAIL [watch_filter_flags(120002)] expected=2 got=" + to_string(f2))
+    }
+    let f3 = watch_filter_flags(120003)
+    if f3 != 16 {
+        panic("pe_change_notification FAIL [watch_filter_flags(120003)] expected=16 got=" + to_string(f3))
+    }
+    let f_miss = watch_filter_flags(9999)
+    if f_miss != 0 {
+        panic("pe_change_notification FAIL [watch_filter_flags(9999)] expected=0 got=" + to_string(f_miss))
+    }
+
+    // 8. pcn_stats() = [5, 43, 2, 2]
+    let s = pcn_stats()
+    if len(s) != 4 {
+        panic("pe_change_notification FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_change_notification FAIL [stats watch_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 43 {
+        panic("pe_change_notification FAIL [stats total_filter_flags] expected=43 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_change_notification FAIL [stats subtree_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_change_notification FAIL [stats count_kind(5)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_change_notification_stats",
+        "\"watch_count\":" + to_string(s[0])
+        + ",\"total_filter_flags\":" + to_string(s[1])
+        + ",\"subtree_count\":" + to_string(s[2])
+        + ",\"kind_last_write\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_change_notification FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pcn()
+    let s2 = pcn_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_change_notification FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_change_notification self_test PASS (watches=" + to_string(s[0])
+        + ", flags=" + to_string(s[1]) + ", subtree=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcn_stats()
+            println("watch_count\t" + to_string(s[0]))
+            println("total_filter_flags\t" + to_string(s[1]))
+            println("subtree_count\t" + to_string(s[2]))
+            println("count_kind_last_write\t" + to_string(s[3]))
+            return
+        }
+        if sub == "flags" {
+            if len(a) >= 4 {
+                let wid = to_int(a[3])
+                println("watch_filter_flags\t" + to_string(watch_filter_flags(wid)))
+                return
+            }
+            println("usage: hexa run pe_change_notification.hexa flags <watch_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_change_kind\t" + to_string(count_by_change_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_change_notification.hexa count <change_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcn()
+            println("cleaned: " + pcn_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcn_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_change_notification.hexa { self-test | stats | flags <watch_id> | count <change_kind> | cleanup | dir }")
+}

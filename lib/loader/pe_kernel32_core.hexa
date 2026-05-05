@@ -1,0 +1,689 @@
+// lib/loader/pe_kernel32_core.hexa — KERNEL32.dll core syscall surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine / CrossOver / Whisky / GPTK / community wrapper 의존 0. ReactOS /
+//       Wine kernel32 source 측 코드 인용 0. WindowsBase / msvcrt / ntdll 직접 binding 0.
+//       windows.h / winbase.h / fileapi.h / heapapi.h / processthreadsapi.h reference shape
+//       만 (HANDLE / DWORD / SYSTEMTIME / PROCESS_INFORMATION). 실 CreateFileW / 실 ReadFile /
+//       실 HeapAlloc / 실 CreateProcessW / 실 GetSystemTime = 미수행.
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+//       PARTIAL emit 명시 — full coverage 측 multi-cycle long-horizon, production smoke pending.
+// online_expansion_lockin: L1 (EULA/ToS) + L2 (Warden long-horizon) + L3 (multi-year) +
+//                          L4 (D2R online single target) + L5 (Track J/K/L/O parallel) ALL OK
+//                          (사용자 lock-in 2026-05-03).
+//
+// Track O — KERNEL32 (kernel32.dll) core syscall surface coverage 18 fn (skeleton row 만).
+// Track K predecessor (3 network DLL skeleton-tier) 후 본 Track O 는 KERNEL32 측 핵심 system
+// primitive 측 4 group 측 baseline land — file I/O + memory + process + system. cycle 27 측
+// 8/435 (~1.8%) → cycle 28 측 26/435 (~5.98%) coverage progression (+18 fn 신규).
+//
+// Track W1 (cycle 32, 2026-05-04) — additive extension. 4 new group (15 fn 추가, additive_only):
+// sync_primitive(5) + locale(3) + file_extras(4) + thread(3). 기존 18 fn 0 라인 변경. cycle 28 26
+// → cycle 32 41/435 (~9.43%, KERNEL32 모듈 자체만 18 → 33 fn). 5 번째 TSV table ext_event 추가.
+//
+// 대상 fn (33 fn — 8 group, fn_kind 0..32 canonical map see fn_kind_name() below):
+//   File I/O (5):       CreateFileW(0) / CreateFileA(1) / ReadFile(2) / WriteFile(3) / CloseHandle(4)
+//   Memory (5):         HeapAlloc(5) / HeapFree(6) / VirtualAlloc(7) / VirtualFree(8) / GetProcessHeap(9)
+//   Process (5):        CreateProcessW(10) / OpenProcess(11) / GetCurrentProcess(12) /
+//                       TerminateProcess(13) / WaitForSingleObject(14)
+//   System (3):         GetSystemTime(15) / GetTickCount64(16) / Sleep(17)
+//   Sync primitive (5): InitializeCriticalSection(18) / EnterCriticalSection(19) /
+//                       LeaveCriticalSection(20) / DeleteCriticalSection(21) / CreateMutexW(22)
+//   Locale (3):         GetLocaleInfoW(23) / SetThreadLocale(24) / GetSystemDefaultLCID(25)
+//   File extras (4):    GetFileAttributesW(26) / SetFileAttributesW(27) / DeleteFileW(28) /
+//                       MoveFileExW(29)
+//   Thread (3):         CreateThread(30) / GetCurrentThreadId(31) / ResumeThread(32)
+//
+// synthetic FILE_HANDLE: handle_hex "0x00000400", path_w_synth "C:\\Battle.net\\D2R\\Save\\test.d2s",
+//   access_kind 0xC0000000 (GENERIC_READ|WRITE), create_kind 0x00000003 (OPEN_EXISTING).
+// synthetic PROCESS_INFORMATION (16 byte): hProcess 0x00000800 / hThread 0x00000804 /
+//   dwProcessId 0x00001234 / dwThreadId 0x00001238.
+// synthetic SYSTEMTIME (16 byte = 8 × WORD): 2026-05-03 12:00:00 UTC encoded LE.
+// synthetic heap shape: heap_base 0x10000000, alloc_size 4096, region_kind 0x00003000
+//   (MEM_COMMIT|RESERVE), protect_kind 0x00000004 (PAGE_READWRITE).
+// synthetic CRITICAL_SECTION (40 byte ref shape) at 0x30000100. synthetic mutex_handle 0x00000C00,
+//   thread_handle 0x00000D00, tid 0x00001238. synthetic LCID 0x00000412 (ko-KR) / 0x00000409 (en-US).
+//
+// persist schema (TSV — 5 table): syscall_invoke / file_io_round_trip / memory_lifecycle /
+//   proc_sys_event / ext_event (Track W1 cycle 32 추가).
+// 식별자 주의: type / mod / handle / class / interface / module / import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pkernel_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_kernel32_core"
+}
+
+fn pkernel_syscall_invoke_path() -> str {
+    return pkernel_dir() + "/syscall_invoke.tsv"
+}
+
+fn pkernel_file_io_round_trip_path() -> str {
+    return pkernel_dir() + "/file_io_round_trip.tsv"
+}
+
+fn pkernel_memory_lifecycle_path() -> str {
+    return pkernel_dir() + "/memory_lifecycle.tsv"
+}
+
+fn pkernel_proc_sys_event_path() -> str {
+    return pkernel_dir() + "/proc_sys_event.tsv"
+}
+
+// ─── cycle 32 W1 expansion: ext_event TSV table (sync_primitive / locale / file_extras / thread) ───
+fn pkernel_ext_event_path() -> str {
+    return pkernel_dir() + "/ext_event.tsv"
+}
+
+fn pkernel_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pkernel_dir() + "'")
+}
+
+fn cleanup_pkernel() -> void {
+    pkernel_ensure_dir()
+    let _ = exec("rm -f '" + pkernel_syscall_invoke_path() + "' '" + pkernel_file_io_round_trip_path()
+        + "' '" + pkernel_memory_lifecycle_path() + "' '" + pkernel_proc_sys_event_path()
+        + "' '" + pkernel_ext_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pkernel_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pkernel_append_row(path: str, row: str) -> void {
+    pkernel_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pkernel_count_rows(path: str, min_cols: int) -> int {
+    let t = pkernel_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (33 fn coverage, fn_kind 0..32) ───
+//   cycle 28 baseline (Track O): fn_kind 0..17 (18 fn, 4 group)
+//   cycle 32 W1 expansion (Track W1): fn_kind 18..32 (15 fn, 4 new group)
+//     Sync primitive (5): InitializeCriticalSection / EnterCriticalSection /
+//                         LeaveCriticalSection / DeleteCriticalSection / CreateMutexW
+//     Locale (3):         GetLocaleInfoW / SetThreadLocale / GetSystemDefaultLCID
+//     File extras (4):    GetFileAttributesW / SetFileAttributesW / DeleteFileW / MoveFileExW
+//     Thread (3):         CreateThread / GetCurrentThreadId / ResumeThread
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "CreateFileW" }
+    if k == 1 { return "CreateFileA" }
+    if k == 2 { return "ReadFile" }
+    if k == 3 { return "WriteFile" }
+    if k == 4 { return "CloseHandle" }
+    if k == 5 { return "HeapAlloc" }
+    if k == 6 { return "HeapFree" }
+    if k == 7 { return "VirtualAlloc" }
+    if k == 8 { return "VirtualFree" }
+    if k == 9 { return "GetProcessHeap" }
+    if k == 10 { return "CreateProcessW" }
+    if k == 11 { return "OpenProcess" }
+    if k == 12 { return "GetCurrentProcess" }
+    if k == 13 { return "TerminateProcess" }
+    if k == 14 { return "WaitForSingleObject" }
+    if k == 15 { return "GetSystemTime" }
+    if k == 16 { return "GetTickCount64" }
+    if k == 17 { return "Sleep" }
+    // ─── cycle 32 W1 expansion (sync_primitive 18..22) ───
+    if k == 18 { return "InitializeCriticalSection" }
+    if k == 19 { return "EnterCriticalSection" }
+    if k == 20 { return "LeaveCriticalSection" }
+    if k == 21 { return "DeleteCriticalSection" }
+    if k == 22 { return "CreateMutexW" }
+    // ─── cycle 32 W1 expansion (locale 23..25) ───
+    if k == 23 { return "GetLocaleInfoW" }
+    if k == 24 { return "SetThreadLocale" }
+    if k == 25 { return "GetSystemDefaultLCID" }
+    // ─── cycle 32 W1 expansion (file_extras 26..29) ───
+    if k == 26 { return "GetFileAttributesW" }
+    if k == 27 { return "SetFileAttributesW" }
+    if k == 28 { return "DeleteFileW" }
+    if k == 29 { return "MoveFileExW" }
+    // ─── cycle 32 W1 expansion (thread 30..32) ───
+    if k == 30 { return "CreateThread" }
+    if k == 31 { return "GetCurrentThreadId" }
+    if k == 32 { return "ResumeThread" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (8 group classification — 4 baseline + 4 W1 expansion) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 4 {
+            return "file_io"
+        }
+    }
+    if k >= 5 {
+        if k <= 9 {
+            return "memory"
+        }
+    }
+    if k >= 10 {
+        if k <= 14 {
+            return "process"
+        }
+    }
+    if k >= 15 {
+        if k <= 17 {
+            return "system"
+        }
+    }
+    if k >= 18 {
+        if k <= 22 {
+            return "sync_primitive"
+        }
+    }
+    if k >= 23 {
+        if k <= 25 {
+            return "locale"
+        }
+    }
+    if k >= 26 {
+        if k <= 29 {
+            return "file_extras"
+        }
+    }
+    if k >= 30 {
+        if k <= 32 {
+            return "thread"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: KERNEL32 fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_kernel32_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_kernel32_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 32 {
+        panic("pe_kernel32_core FAIL [record_syscall_invoke] expected=fn_kind<=32 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_kernel32_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_kernel32_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pkernel_append_row(pkernel_syscall_invoke_path(), row)
+}
+
+// ─── record_file_io_round_trip: CreateFile / ReadFile / WriteFile / CloseHandle synthetic byte counter ───
+fn record_file_io_round_trip(io_id: int, op_id: str, handle_hex: str, bytes_synth: int, status: str) -> void {
+    if io_id <= 0 {
+        panic("pe_kernel32_core FAIL [record_file_io_round_trip] expected=io_id>0 got=" + to_string(io_id))
+    }
+    if op_id == "" {
+        panic("pe_kernel32_core FAIL [record_file_io_round_trip] expected=op_id!=empty got=empty")
+    }
+    if handle_hex == "" {
+        panic("pe_kernel32_core FAIL [record_file_io_round_trip] expected=handle_hex!=empty got=empty")
+    }
+    if bytes_synth < 0 {
+        panic("pe_kernel32_core FAIL [record_file_io_round_trip] expected=bytes_synth>=0 got=" + to_string(bytes_synth))
+    }
+    if status == "" {
+        panic("pe_kernel32_core FAIL [record_file_io_round_trip] expected=status!=empty got=empty")
+    }
+    let row = to_string(io_id) + "\t" + op_id + "\t" + handle_hex + "\t"
+        + to_string(bytes_synth) + "\t" + status + "\n"
+    pkernel_append_row(pkernel_file_io_round_trip_path(), row)
+}
+
+// ─── record_memory_lifecycle: HeapAlloc / HeapFree / VirtualAlloc / VirtualFree / GetProcessHeap row ───
+fn record_memory_lifecycle(life_id: int, mem_kind: str, ptr_hex: str, size_synth: int, status: str) -> void {
+    if life_id <= 0 {
+        panic("pe_kernel32_core FAIL [record_memory_lifecycle] expected=life_id>0 got=" + to_string(life_id))
+    }
+    if mem_kind == "" {
+        panic("pe_kernel32_core FAIL [record_memory_lifecycle] expected=mem_kind!=empty got=empty")
+    }
+    if ptr_hex == "" {
+        panic("pe_kernel32_core FAIL [record_memory_lifecycle] expected=ptr_hex!=empty got=empty")
+    }
+    if size_synth < 0 {
+        panic("pe_kernel32_core FAIL [record_memory_lifecycle] expected=size_synth>=0 got=" + to_string(size_synth))
+    }
+    if status == "" {
+        panic("pe_kernel32_core FAIL [record_memory_lifecycle] expected=status!=empty got=empty")
+    }
+    let row = to_string(life_id) + "\t" + mem_kind + "\t" + ptr_hex + "\t"
+        + to_string(size_synth) + "\t" + status + "\n"
+    pkernel_append_row(pkernel_memory_lifecycle_path(), row)
+}
+
+// ─── record_proc_sys_event: process / system fn event row (PROCESS_INFORMATION + SYSTEMTIME synth) ───
+fn record_proc_sys_event(evt_id: int, proc_kind: str, fn_name: str, payload_hex: str, status: str) -> void {
+    if evt_id <= 0 {
+        panic("pe_kernel32_core FAIL [record_proc_sys_event] expected=evt_id>0 got=" + to_string(evt_id))
+    }
+    if proc_kind == "" {
+        panic("pe_kernel32_core FAIL [record_proc_sys_event] expected=proc_kind!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_kernel32_core FAIL [record_proc_sys_event] expected=fn_name!=empty got=empty")
+    }
+    if payload_hex == "" {
+        panic("pe_kernel32_core FAIL [record_proc_sys_event] expected=payload_hex!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_kernel32_core FAIL [record_proc_sys_event] expected=status!=empty got=empty")
+    }
+    let row = to_string(evt_id) + "\t" + proc_kind + "\t" + fn_name + "\t"
+        + payload_hex + "\t" + status + "\n"
+    pkernel_append_row(pkernel_proc_sys_event_path(), row)
+}
+
+// ─── cycle 32 W1: record_ext_event — sync_primitive / locale / file_extras / thread row ───
+fn record_ext_event(evt_id: int, ext_kind: str, fn_name: str, payload_hex: str, status: str) -> void {
+    if evt_id <= 0 {
+        panic("pe_kernel32_core FAIL [record_ext_event] expected=evt_id>0 got=" + to_string(evt_id))
+    }
+    if ext_kind == "" {
+        panic("pe_kernel32_core FAIL [record_ext_event] expected=ext_kind!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_kernel32_core FAIL [record_ext_event] expected=fn_name!=empty got=empty")
+    }
+    if payload_hex == "" {
+        panic("pe_kernel32_core FAIL [record_ext_event] expected=payload_hex!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_kernel32_core FAIL [record_ext_event] expected=status!=empty got=empty")
+    }
+    let row = to_string(evt_id) + "\t" + ext_kind + "\t" + fn_name + "\t"
+        + payload_hex + "\t" + status + "\n"
+    pkernel_append_row(pkernel_ext_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pkernel_count_rows(pkernel_syscall_invoke_path(), 4)
+}
+
+fn file_io_round_trip_count() -> int {
+    return pkernel_count_rows(pkernel_file_io_round_trip_path(), 5)
+}
+
+fn memory_lifecycle_count() -> int {
+    return pkernel_count_rows(pkernel_memory_lifecycle_path(), 5)
+}
+
+fn proc_sys_event_count() -> int {
+    return pkernel_count_rows(pkernel_proc_sys_event_path(), 5)
+}
+
+fn ext_event_count() -> int {
+    return pkernel_count_rows(pkernel_ext_event_path(), 5)
+}
+
+fn pkernel_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(file_io_round_trip_count())
+    out.push(memory_lifecycle_count())
+    out.push(proc_sys_event_count())
+    out.push(ext_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pkernel-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pkernel()
+
+    // ─── 1. syscall_invoke × 17 (one per fn, 4 group coverage) ───
+    //   File I/O group (5)
+    record_syscall_invoke(1, 0, "CreateFileW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL CreateFileW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"CreateFileW\",\"fn_group\":\"file_io\",\"status\":\"PARTIAL\",\"path_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\test.d2s\",\"access_kind\":\"0xC0000000\",\"create_kind\":\"0x00000003\"")
+    record_syscall_invoke(2, 1, "CreateFileA", "PARTIAL")
+    println("__KERNEL32__ PARTIAL CreateFileA")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"CreateFileA\",\"fn_group\":\"file_io\",\"status\":\"PARTIAL\",\"path_a_synth\":\"C:\\\\temp\\\\bn_log.txt\",\"access_kind\":\"0x40000000\"")
+    record_syscall_invoke(3, 2, "ReadFile", "PARTIAL")
+    println("__KERNEL32__ PARTIAL ReadFile")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"ReadFile\",\"fn_group\":\"file_io\",\"status\":\"PARTIAL\",\"bytes_synth\":1024,\"handle_hex\":\"0x00000400\"")
+    record_syscall_invoke(4, 3, "WriteFile", "PARTIAL")
+    println("__KERNEL32__ PARTIAL WriteFile")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"WriteFile\",\"fn_group\":\"file_io\",\"status\":\"PARTIAL\",\"bytes_synth\":2048,\"handle_hex\":\"0x00000400\"")
+    record_syscall_invoke(5, 4, "CloseHandle", "PARTIAL")
+    println("__KERNEL32__ PARTIAL CloseHandle")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"CloseHandle\",\"fn_group\":\"file_io\",\"status\":\"PARTIAL\",\"handle_hex\":\"0x00000400\"")
+
+    //   Memory group (5)
+    record_syscall_invoke(6, 5, "HeapAlloc", "PARTIAL")
+    println("__KERNEL32__ PARTIAL HeapAlloc")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"HeapAlloc\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"size_synth\":4096,\"heap_base\":\"0x10000000\",\"flags\":\"0x00000008\"")
+    record_syscall_invoke(7, 6, "HeapFree", "PARTIAL")
+    println("__KERNEL32__ PARTIAL HeapFree")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"HeapFree\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"ptr_hex\":\"0x10001000\"")
+    record_syscall_invoke(8, 7, "VirtualAlloc", "PARTIAL")
+    println("__KERNEL32__ PARTIAL VirtualAlloc")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"VirtualAlloc\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"size_synth\":65536,\"region_kind\":\"0x00003000\",\"protect_kind\":\"0x00000004\"")
+    record_syscall_invoke(9, 8, "VirtualFree", "PARTIAL")
+    println("__KERNEL32__ PARTIAL VirtualFree")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"VirtualFree\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"ptr_hex\":\"0x20000000\",\"region_kind\":\"0x00008000\"")
+    record_syscall_invoke(10, 9, "GetProcessHeap", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetProcessHeap")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"GetProcessHeap\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"heap_base\":\"0x10000000\"")
+
+    //   Process group (5: CreateProcessW + OpenProcess + GetCurrentProcess + TerminateProcess + WaitForSingleObject)
+    record_syscall_invoke(11, 10, "CreateProcessW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL CreateProcessW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"CreateProcessW\",\"fn_group\":\"process\",\"status\":\"PARTIAL\",\"image_path_w_synth\":\"C:\\\\Battle.net\\\\Agent.exe\",\"pi_synth_bytes\":16")
+    record_syscall_invoke(12, 11, "OpenProcess", "PARTIAL")
+    println("__KERNEL32__ PARTIAL OpenProcess")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"OpenProcess\",\"fn_group\":\"process\",\"status\":\"PARTIAL\",\"pid_synth\":\"0x00001234\",\"access_kind\":\"0x001F0FFF\"")
+    record_syscall_invoke(13, 12, "GetCurrentProcess", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetCurrentProcess")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":13,\"fn_kind\":12,\"fn_name\":\"GetCurrentProcess\",\"fn_group\":\"process\",\"status\":\"PARTIAL\",\"pseudo_handle_hex\":\"0xFFFFFFFF\"")
+    record_syscall_invoke(14, 13, "TerminateProcess", "PARTIAL")
+    println("__KERNEL32__ PARTIAL TerminateProcess")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":14,\"fn_kind\":13,\"fn_name\":\"TerminateProcess\",\"fn_group\":\"process\",\"status\":\"PARTIAL\",\"exit_code\":0,\"handle_hex\":\"0x00000800\"")
+    record_syscall_invoke(15, 14, "WaitForSingleObject", "PARTIAL")
+    println("__KERNEL32__ PARTIAL WaitForSingleObject")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":15,\"fn_kind\":14,\"fn_name\":\"WaitForSingleObject\",\"fn_group\":\"process\",\"status\":\"PARTIAL\",\"timeout_ms\":5000,\"handle_hex\":\"0x00000800\"")
+
+    //   System group (3: GetSystemTime + GetTickCount64 + Sleep — note Sleep uses fn_kind 17)
+    record_syscall_invoke(16, 15, "GetSystemTime", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetSystemTime")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":16,\"fn_kind\":15,\"fn_name\":\"GetSystemTime\",\"fn_group\":\"system\",\"status\":\"PARTIAL\",\"systemtime_hex\":\"EA0705000000030000000C0000000000\",\"year\":2026,\"month\":5,\"day\":3")
+    record_syscall_invoke(17, 16, "GetTickCount64", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetTickCount64")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":17,\"fn_kind\":16,\"fn_name\":\"GetTickCount64\",\"fn_group\":\"system\",\"status\":\"PARTIAL\",\"tick_synth\":\"0x000000010A2C8B40\"")
+    record_syscall_invoke(18, 17, "Sleep", "PARTIAL")
+    println("__KERNEL32__ PARTIAL Sleep")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":18,\"fn_kind\":17,\"fn_name\":\"Sleep\",\"fn_group\":\"system\",\"status\":\"PARTIAL\",\"ms\":1000")
+
+    // ─── cycle 32 W1 expansion: sync_primitive group (5: 18..22) ───
+    record_syscall_invoke(19, 18, "InitializeCriticalSection", "PARTIAL")
+    println("__KERNEL32__ PARTIAL InitializeCriticalSection")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":19,\"fn_kind\":18,\"fn_name\":\"InitializeCriticalSection\",\"fn_group\":\"sync_primitive\",\"status\":\"PARTIAL\",\"crit_sec_synth_bytes\":40,\"crit_sec_addr_hex\":\"0x30000100\"")
+    record_syscall_invoke(20, 19, "EnterCriticalSection", "PARTIAL")
+    println("__KERNEL32__ PARTIAL EnterCriticalSection")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":20,\"fn_kind\":19,\"fn_name\":\"EnterCriticalSection\",\"fn_group\":\"sync_primitive\",\"status\":\"PARTIAL\",\"crit_sec_addr_hex\":\"0x30000100\",\"recursion_count\":1")
+    record_syscall_invoke(21, 20, "LeaveCriticalSection", "PARTIAL")
+    println("__KERNEL32__ PARTIAL LeaveCriticalSection")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":21,\"fn_kind\":20,\"fn_name\":\"LeaveCriticalSection\",\"fn_group\":\"sync_primitive\",\"status\":\"PARTIAL\",\"crit_sec_addr_hex\":\"0x30000100\"")
+    record_syscall_invoke(22, 21, "DeleteCriticalSection", "PARTIAL")
+    println("__KERNEL32__ PARTIAL DeleteCriticalSection")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":22,\"fn_kind\":21,\"fn_name\":\"DeleteCriticalSection\",\"fn_group\":\"sync_primitive\",\"status\":\"PARTIAL\",\"crit_sec_addr_hex\":\"0x30000100\"")
+    record_syscall_invoke(23, 22, "CreateMutexW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL CreateMutexW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":23,\"fn_kind\":22,\"fn_name\":\"CreateMutexW\",\"fn_group\":\"sync_primitive\",\"status\":\"PARTIAL\",\"mutex_handle_hex\":\"0x00000C00\",\"name_w_synth\":\"Global\\\\D2R_SingleInstance\",\"initial_owner\":false")
+
+    // ─── cycle 32 W1 expansion: locale group (3: 23..25) ───
+    record_syscall_invoke(24, 23, "GetLocaleInfoW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetLocaleInfoW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":24,\"fn_kind\":23,\"fn_name\":\"GetLocaleInfoW\",\"fn_group\":\"locale\",\"status\":\"PARTIAL\",\"lcid_synth\":\"0x00000412\",\"lctype\":\"0x00000002\",\"locale_name_synth\":\"ko-KR\"")
+    record_syscall_invoke(25, 24, "SetThreadLocale", "PARTIAL")
+    println("__KERNEL32__ PARTIAL SetThreadLocale")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":25,\"fn_kind\":24,\"fn_name\":\"SetThreadLocale\",\"fn_group\":\"locale\",\"status\":\"PARTIAL\",\"lcid_synth\":\"0x00000409\",\"locale_name_synth\":\"en-US\"")
+    record_syscall_invoke(26, 25, "GetSystemDefaultLCID", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetSystemDefaultLCID")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":26,\"fn_kind\":25,\"fn_name\":\"GetSystemDefaultLCID\",\"fn_group\":\"locale\",\"status\":\"PARTIAL\",\"lcid_synth\":\"0x00000412\",\"locale_name_synth\":\"ko-KR\"")
+
+    // ─── cycle 32 W1 expansion: file_extras group (4: 26..29) ───
+    record_syscall_invoke(27, 26, "GetFileAttributesW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetFileAttributesW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":27,\"fn_kind\":26,\"fn_name\":\"GetFileAttributesW\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"path_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\test.d2s\",\"attr_synth\":\"0x00000020\"")
+    record_syscall_invoke(28, 27, "SetFileAttributesW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL SetFileAttributesW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":28,\"fn_kind\":27,\"fn_name\":\"SetFileAttributesW\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"path_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\test.d2s\",\"attr_synth\":\"0x00000001\"")
+    record_syscall_invoke(29, 28, "DeleteFileW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL DeleteFileW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":29,\"fn_kind\":28,\"fn_name\":\"DeleteFileW\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"path_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\old.d2s\"")
+    record_syscall_invoke(30, 29, "MoveFileExW", "PARTIAL")
+    println("__KERNEL32__ PARTIAL MoveFileExW")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":30,\"fn_kind\":29,\"fn_name\":\"MoveFileExW\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"src_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\new.d2s.tmp\",\"dst_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\new.d2s\",\"flags\":\"0x00000003\"")
+
+    // ─── cycle 32 W1 expansion: thread group (3: 30..32) ───
+    record_syscall_invoke(31, 30, "CreateThread", "PARTIAL")
+    println("__KERNEL32__ PARTIAL CreateThread")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":31,\"fn_kind\":30,\"fn_name\":\"CreateThread\",\"fn_group\":\"thread\",\"status\":\"PARTIAL\",\"thread_handle_hex\":\"0x00000D00\",\"tid_synth\":\"0x00001238\",\"start_addr_hex\":\"0x10010000\",\"stack_size\":0,\"flags\":\"0x00000000\"")
+    record_syscall_invoke(32, 31, "GetCurrentThreadId", "PARTIAL")
+    println("__KERNEL32__ PARTIAL GetCurrentThreadId")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":32,\"fn_kind\":31,\"fn_name\":\"GetCurrentThreadId\",\"fn_group\":\"thread\",\"status\":\"PARTIAL\",\"tid_synth\":\"0x00001238\"")
+    record_syscall_invoke(33, 32, "ResumeThread", "PARTIAL")
+    println("__KERNEL32__ PARTIAL ResumeThread")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":33,\"fn_kind\":32,\"fn_name\":\"ResumeThread\",\"fn_group\":\"thread\",\"status\":\"PARTIAL\",\"thread_handle_hex\":\"0x00000D00\",\"prev_suspend_count\":1")
+
+    // ─── 2. file_io_round_trip × 4 (open / read / write / close) ───
+    record_file_io_round_trip(1, "open", "0x00000400", 0, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"file_io_round_trip\",\"io_id\":1,\"op_id\":\"open\",\"handle_hex\":\"0x00000400\",\"bytes_synth\":0,\"path_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\test.d2s\",\"access_kind\":\"0xC0000000\",\"create_kind\":\"0x00000003\",\"status\":\"PARTIAL\"")
+    record_file_io_round_trip(2, "read", "0x00000400", 1024, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"file_io_round_trip\",\"io_id\":2,\"op_id\":\"read\",\"handle_hex\":\"0x00000400\",\"bytes_synth\":1024,\"buffer_synth\":\"DEADBEEFx256\",\"status\":\"PARTIAL\"")
+    record_file_io_round_trip(3, "write", "0x00000400", 2048, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"file_io_round_trip\",\"io_id\":3,\"op_id\":\"write\",\"handle_hex\":\"0x00000400\",\"bytes_synth\":2048,\"status\":\"PARTIAL\"")
+    record_file_io_round_trip(4, "close", "0x00000400", 0, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"file_io_round_trip\",\"io_id\":4,\"op_id\":\"close\",\"handle_hex\":\"0x00000400\",\"bytes_synth\":0,\"status\":\"PARTIAL\"")
+
+    // ─── 3. memory_lifecycle × 4 (heap alloc/free + virtual alloc/free) ───
+    record_memory_lifecycle(1, "heap_alloc", "0x10001000", 4096, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"memory_lifecycle\",\"life_id\":1,\"mem_kind\":\"heap_alloc\",\"ptr_hex\":\"0x10001000\",\"size_synth\":4096,\"heap_base\":\"0x10000000\",\"flags\":\"0x00000008\",\"status\":\"PARTIAL\"")
+    record_memory_lifecycle(2, "heap_free", "0x10001000", 4096, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"memory_lifecycle\",\"life_id\":2,\"mem_kind\":\"heap_free\",\"ptr_hex\":\"0x10001000\",\"size_synth\":4096,\"status\":\"PARTIAL\"")
+    record_memory_lifecycle(3, "virtual_alloc", "0x20000000", 65536, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"memory_lifecycle\",\"life_id\":3,\"mem_kind\":\"virtual_alloc\",\"ptr_hex\":\"0x20000000\",\"size_synth\":65536,\"region_kind\":\"0x00003000\",\"protect_kind\":\"0x00000004\",\"status\":\"PARTIAL\"")
+    record_memory_lifecycle(4, "virtual_free", "0x20000000", 65536, "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"memory_lifecycle\",\"life_id\":4,\"mem_kind\":\"virtual_free\",\"ptr_hex\":\"0x20000000\",\"size_synth\":0,\"region_kind\":\"0x00008000\",\"status\":\"PARTIAL\"")
+
+    // ─── 4. proc_sys_event × 4 (process create / wait + system time / tick) ───
+    record_proc_sys_event(1, "process", "CreateProcessW", "0008000004080000341200003812000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"proc_sys_event\",\"evt_id\":1,\"proc_kind\":\"process\",\"fn_name\":\"CreateProcessW\",\"pi_synth_hex\":\"0008000004080000341200003812000\",\"hProcess\":\"0x00000800\",\"hThread\":\"0x00000804\",\"dwProcessId\":\"0x00001234\",\"dwThreadId\":\"0x00001238\",\"image_path_w_synth\":\"C:\\\\Battle.net\\\\Agent.exe\",\"status\":\"PARTIAL\"")
+    record_proc_sys_event(2, "process", "WaitForSingleObject", "0008000088130000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"proc_sys_event\",\"evt_id\":2,\"proc_kind\":\"process\",\"fn_name\":\"WaitForSingleObject\",\"handle_hex\":\"0x00000800\",\"timeout_ms\":5000,\"wait_status_synth\":\"0x00000000\",\"status\":\"PARTIAL\"")
+    record_proc_sys_event(3, "system", "GetSystemTime", "EA0705000000030000000C0000000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"proc_sys_event\",\"evt_id\":3,\"proc_kind\":\"system\",\"fn_name\":\"GetSystemTime\",\"systemtime_hex\":\"EA0705000000030000000C0000000000\",\"year\":2026,\"month\":5,\"dayOfWeek\":0,\"day\":3,\"hour\":12,\"minute\":0,\"second\":0,\"ms\":0,\"status\":\"PARTIAL\"")
+    record_proc_sys_event(4, "system", "GetTickCount64", "408B2C0A01000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"proc_sys_event\",\"evt_id\":4,\"proc_kind\":\"system\",\"fn_name\":\"GetTickCount64\",\"tick_synth_hex\":\"408B2C0A01000000\",\"tick_synth_int\":4465687872,\"status\":\"PARTIAL\"")
+
+    // ─── 5. cycle 32 W1: ext_event × 8 (2 per new group — sync_primitive / locale / file_extras / thread) ───
+    //   sync_primitive group (2 row: init + enter/leave pair)
+    record_ext_event(1, "sync_primitive", "InitializeCriticalSection", "0001000030000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":1,\"ext_kind\":\"sync_primitive\",\"fn_name\":\"InitializeCriticalSection\",\"crit_sec_addr_hex\":\"0x30000100\",\"crit_sec_synth_bytes\":40,\"recursion_count\":0,\"status\":\"PARTIAL\"")
+    record_ext_event(2, "sync_primitive", "EnterCriticalSection", "0001000030000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":2,\"ext_kind\":\"sync_primitive\",\"fn_name\":\"EnterCriticalSection\",\"crit_sec_addr_hex\":\"0x30000100\",\"crit_sec_synth_bytes\":40,\"recursion_count\":1,\"status\":\"PARTIAL\"")
+    //   locale group (2 row: get + set)
+    record_ext_event(3, "locale", "GetLocaleInfoW", "1204000000000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":3,\"ext_kind\":\"locale\",\"fn_name\":\"GetLocaleInfoW\",\"lcid_synth\":\"0x00000412\",\"lctype\":\"0x00000002\",\"locale_name_synth\":\"ko-KR\",\"status\":\"PARTIAL\"")
+    record_ext_event(4, "locale", "GetSystemDefaultLCID", "1204000000000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":4,\"ext_kind\":\"locale\",\"fn_name\":\"GetSystemDefaultLCID\",\"lcid_synth\":\"0x00000412\",\"locale_name_synth\":\"ko-KR\",\"status\":\"PARTIAL\"")
+    //   file_extras group (2 row: get attr + move)
+    record_ext_event(5, "file_extras", "GetFileAttributesW", "2000000000000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":5,\"ext_kind\":\"file_extras\",\"fn_name\":\"GetFileAttributesW\",\"path_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\test.d2s\",\"attr_synth\":\"0x00000020\",\"status\":\"PARTIAL\"")
+    record_ext_event(6, "file_extras", "MoveFileExW", "0300000000000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":6,\"ext_kind\":\"file_extras\",\"fn_name\":\"MoveFileExW\",\"src_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\new.d2s.tmp\",\"dst_w_synth\":\"C:\\\\Battle.net\\\\D2R\\\\Save\\\\new.d2s\",\"flags\":\"0x00000003\",\"status\":\"PARTIAL\"")
+    //   thread group (2 row: create + resume)
+    record_ext_event(7, "thread", "CreateThread", "000D000038120000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":7,\"ext_kind\":\"thread\",\"fn_name\":\"CreateThread\",\"thread_handle_hex\":\"0x00000D00\",\"tid_synth\":\"0x00001238\",\"start_addr_hex\":\"0x10010000\",\"status\":\"PARTIAL\"")
+    record_ext_event(8, "thread", "ResumeThread", "000D000001000000", "PARTIAL")
+    r0_emit("pe_kernel32_core_record", "\"kind\":\"ext_event\",\"evt_id\":8,\"ext_kind\":\"thread\",\"fn_name\":\"ResumeThread\",\"thread_handle_hex\":\"0x00000D00\",\"prev_suspend_count\":1,\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 33 {
+        panic("pe_kernel32_core FAIL [syscall_invoke_count] expected=33 got=" + to_string(si))
+    }
+    let fi = file_io_round_trip_count()
+    if fi != 4 {
+        panic("pe_kernel32_core FAIL [file_io_round_trip_count] expected=4 got=" + to_string(fi))
+    }
+    let ml = memory_lifecycle_count()
+    if ml != 4 {
+        panic("pe_kernel32_core FAIL [memory_lifecycle_count] expected=4 got=" + to_string(ml))
+    }
+    let ps = proc_sys_event_count()
+    if ps != 4 {
+        panic("pe_kernel32_core FAIL [proc_sys_event_count] expected=4 got=" + to_string(ps))
+    }
+    let ee = ext_event_count()
+    if ee != 8 {
+        panic("pe_kernel32_core FAIL [ext_event_count] expected=8 got=" + to_string(ee))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "CreateFileW" { panic("pe_kernel32_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(5) != "HeapAlloc" { panic("pe_kernel32_core FAIL [fn_kind_name(5)]") }
+    if fn_kind_name(10) != "CreateProcessW" { panic("pe_kernel32_core FAIL [fn_kind_name(10)]") }
+    if fn_kind_name(15) != "GetSystemTime" { panic("pe_kernel32_core FAIL [fn_kind_name(15)]") }
+    if fn_kind_name(17) != "Sleep" { panic("pe_kernel32_core FAIL [fn_kind_name(17)]") }
+    if fn_kind_name(18) != "InitializeCriticalSection" { panic("pe_kernel32_core FAIL [fn_kind_name(18)]") }
+    if fn_kind_name(22) != "CreateMutexW" { panic("pe_kernel32_core FAIL [fn_kind_name(22)]") }
+    if fn_kind_name(23) != "GetLocaleInfoW" { panic("pe_kernel32_core FAIL [fn_kind_name(23)]") }
+    if fn_kind_name(26) != "GetFileAttributesW" { panic("pe_kernel32_core FAIL [fn_kind_name(26)]") }
+    if fn_kind_name(30) != "CreateThread" { panic("pe_kernel32_core FAIL [fn_kind_name(30)]") }
+    if fn_kind_name(32) != "ResumeThread" { panic("pe_kernel32_core FAIL [fn_kind_name(32)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_kernel32_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "file_io" { panic("pe_kernel32_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(5) != "memory" { panic("pe_kernel32_core FAIL [fn_group_name(5)]") }
+    if fn_group_name(10) != "process" { panic("pe_kernel32_core FAIL [fn_group_name(10)]") }
+    if fn_group_name(15) != "system" { panic("pe_kernel32_core FAIL [fn_group_name(15)]") }
+    if fn_group_name(18) != "sync_primitive" { panic("pe_kernel32_core FAIL [fn_group_name(18)]") }
+    if fn_group_name(23) != "locale" { panic("pe_kernel32_core FAIL [fn_group_name(23)]") }
+    if fn_group_name(26) != "file_extras" { panic("pe_kernel32_core FAIL [fn_group_name(26)]") }
+    if fn_group_name(30) != "thread" { panic("pe_kernel32_core FAIL [fn_group_name(30)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_kernel32_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pkernel_stats()
+    if len(s) != 5 { panic("pe_kernel32_core FAIL [stats len] expected=5 got=" + to_string(len(s))) }
+    if s[0] != 33 { panic("pe_kernel32_core FAIL [stats syscall_invoke_count] expected=33 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_kernel32_core FAIL [stats file_io_round_trip_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_kernel32_core FAIL [stats memory_lifecycle_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 4 { panic("pe_kernel32_core FAIL [stats proc_sys_event_count] expected=4 got=" + to_string(s[3])) }
+    if s[4] != 8 { panic("pe_kernel32_core FAIL [stats ext_event_count] expected=8 got=" + to_string(s[4])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_kernel32_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"file_io_round_trip_count\":" + to_string(s[1])
+        + ",\"memory_lifecycle_count\":" + to_string(s[2])
+        + ",\"proc_sys_event_count\":" + to_string(s[3])
+        + ",\"ext_event_count\":" + to_string(s[4]))
+
+    r0_emit("pe_kernel32_core_summary",
+        "\"target\":\"KERNEL32.dll\",\"fn_total\":33,\"fn_emit_partial\":33,\"groups\":[\"file_io\",\"memory\",\"process\",\"system\",\"sync_primitive\",\"locale\",\"file_extras\",\"thread\"],\"file_handle_synth\":\"0x00000400\",\"process_info_synth_bytes\":16,\"systemtime_synth_bytes\":16,\"crit_sec_synth_bytes\":40,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\",\"cycle_28_baseline_fn\":18,\"cycle_32_w1_expansion_fn\":15")
+
+    r0_emit("pe_kernel32_core_kpi",
+        "\"file_io_emits\":5,\"memory_emits\":5,\"process_emits\":5,\"system_emits\":3,\"sync_primitive_emits\":5,\"locale_emits\":3,\"file_extras_emits\":4,\"thread_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true")
+
+    // ─── cycle 27 → 28 → 32 KERNEL32 coverage progression evidence emit ───
+    r0_emit("pe_kernel32_core_coverage_progression",
+        "\"surface\":\"KERNEL32_full_435_fn\",\"cycle_27_count\":8,\"cycle_28_count\":26,\"cycle_32_w1_count\":41,\"delta_28\":18,\"delta_32_w1\":15,\"cycle_27_percent\":1.84,\"cycle_28_percent\":5.98,\"cycle_32_w1_percent\":9.43,\"cycle_28_module\":\"pe_kernel32_core.hexa\",\"cycle_32_module\":\"pe_kernel32_core.hexa (extend, additive)\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\"")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_kernel32_core_round_trip_matrix",
+        "\"surface\":\"KERNEL32_core_33_fn\",\"fn_partial\":33,\"fn_groups\":8,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real CreateFileW + ReadFile + HeapAlloc + CreateProcessW + EnterCriticalSection + CreateMutexW + CreateThread pending separate cycle\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\",\"track_w1_cross_link\":\"KERNEL32_extended + NTDLL_W2 + OLE32_W3 + OLEAUT32_W4 = bundled cycle 32-35\"")
+
+    // ─── Track W1 expansion emit (cycle 32, KERNEL32 +15 fn) ───
+    r0_emit("pe_kernel32_core_w1_expansion",
+        "\"track\":\"W1\",\"cycle\":32,\"surface\":\"KERNEL32_extend\",\"baseline_fn\":18,\"new_fn\":15,\"new_groups\":[\"sync_primitive\",\"locale\",\"file_extras\",\"thread\"],\"sync_primitive_count\":5,\"locale_count\":3,\"file_extras_count\":4,\"thread_count\":3,\"emit_format\":\"__KERNEL32__ PARTIAL <fn>\",\"additive_only\":true,\"existing_18_fn_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_kernel32_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pkernel()
+    let s2 = pkernel_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_kernel32_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_kernel32_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", file_io_round_trip=" + to_string(s[1])
+        + ", memory_lifecycle=" + to_string(s[2]) + ", proc_sys_event=" + to_string(s[3])
+        + ", ext_event=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pkernel_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("file_io_round_trip_count\t" + to_string(s[1]))
+            println("memory_lifecycle_count\t" + to_string(s[2]))
+            println("proc_sys_event_count\t" + to_string(s[3]))
+            println("ext_event_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_kernel32_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_kernel32_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pkernel()
+            println("cleaned: " + pkernel_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pkernel_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_kernel32_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

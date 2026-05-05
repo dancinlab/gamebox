@@ -1,0 +1,448 @@
+// lib/loader/pe_signal_to_seh_bridge.hexa — Apple Mach signal → Win32 EXCEPTION_RECORD raise
+//
+// sigaction(SIGSEGV, handler) — handler 내에서 setjmp 없이 ucontext_t →
+// CONTEXT struct 합성 후 KiUserExceptionDispatcher 호출. Mach signal 이
+// frame 위에 올라온 시점에 SEH chain (FS:[0] / TEB->NtTib.ExceptionList) 로
+// 직접 진입한다. arm64 host 일 때 context = pc / sp / x0..x30 / lr / fp 를
+// x86_64 CONTEXT 의 Rip / Rsp / Rax..R15 등으로 mapping 하여 PE binary
+// 입장에서 정상적인 x86_64 exception frame 을 보게 한다.
+//
+// own 1 enforcement: Wine / CrossOver / GPTK / Whisky / community 코드 0 줄.
+//   본 module 은 sigaction → SEH bridge tracker — 실제 KiUserExceptionDispatcher
+//   호출 / chain walk 는 stage6 native helper. 본 hexa 는 bridge 등록 정합성
+//   (signal_kind × win32_code × context_arch) 만 record / count.
+//   own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// signal_kind (Apple sigaction):
+//    4 = SIGILL
+//    5 = SIGTRAP
+//    6 = SIGABRT
+//    8 = SIGFPE
+//   10 = SIGBUS  (Mach EXC_BAD_ACCESS — alignment / unmapped page)
+//   11 = SIGSEGV
+//
+// win32_code (NTSTATUS — MS x64 CONTEXT spec):
+//   0xC0000005 = EXCEPTION_ACCESS_VIOLATION       (SIGSEGV / SIGBUS)
+//   0xC000008D = EXCEPTION_FLT_DIVIDE_BY_ZERO     (SIGFPE — div0)
+//   0xC000001D = EXCEPTION_ILLEGAL_INSTRUCTION    (SIGILL)
+//   0x80000003 = EXCEPTION_BREAKPOINT             (SIGTRAP)
+//   0xC0000409 = EXCEPTION_STACK_BUFFER_OVERRUN   (SIGABRT / __fastfail)
+//
+// context_arch:
+//    1 = x86_64  (host == guest, 직접 mapping)
+//    2 = arm64   (host arm64 → guest x86_64 CONTEXT 합성: pc→Rip, sp→Rsp,
+//                 x0..x30 → Rax..R15 + Rbx/Rcx/Rdx 등, fp→Rbp, lr→복귀 stub)
+//
+// persist schema (TSV — bridges.tsv):
+//   bridge_id<int> \t signal_kind<int> \t win32_code<int> \t context_arch<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pssb_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_signal_to_seh_bridge"
+}
+
+fn pssb_bridges_path() -> str {
+    return pssb_dir() + "/bridges.tsv"
+}
+
+fn pssb_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pssb_dir() + "'")
+}
+
+fn cleanup_pssb() -> void {
+    pssb_ensure_dir()
+    let _ = exec("rm -f '" + pssb_bridges_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pssb_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pssb_append_row(path: str, row: str) -> void {
+    pssb_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_bridge: sigaction → SEH chain bridge 1 건 기록 ───
+fn record_bridge(bridge_id: int, signal_kind: int, win32_code: int, context_arch: int) -> void {
+    if bridge_id <= 0 {
+        panic("pe_signal_to_seh_bridge FAIL [record_bridge] expected=bridge_id>0 got=" + to_string(bridge_id))
+    }
+    if signal_kind < 1 {
+        panic("pe_signal_to_seh_bridge FAIL [record_bridge] expected=signal_kind>=1 got=" + to_string(signal_kind))
+    }
+    if signal_kind > 64 {
+        panic("pe_signal_to_seh_bridge FAIL [record_bridge] expected=signal_kind<=64 got=" + to_string(signal_kind))
+    }
+    if win32_code < 0 {
+        panic("pe_signal_to_seh_bridge FAIL [record_bridge] expected=win32_code>=0 got=" + to_string(win32_code))
+    }
+    if context_arch != 1 {
+        if context_arch != 2 {
+            panic("pe_signal_to_seh_bridge FAIL [record_bridge] expected=context_arch in {1,2} got=" + to_string(context_arch))
+        }
+    }
+    let row = to_string(bridge_id) + "\t" + to_string(signal_kind)
+        + "\t" + to_string(win32_code) + "\t" + to_string(context_arch) + "\n"
+    pssb_append_row(pssb_bridges_path(), row)
+}
+
+// ─── bridge_count: total bridge 수 ───
+fn bridge_count() -> int {
+    let t = pssb_read_table(pssb_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_signal_kind: 특정 signal_kind 의 bridge 수 ───
+fn count_by_signal_kind(signal_kind: int) -> int {
+    let t = pssb_read_table(pssb_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == signal_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_win32_code: 특정 win32_code 의 bridge 수 ───
+fn count_by_win32_code(win32_code: int) -> int {
+    let t = pssb_read_table(pssb_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == win32_code {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_context_arch: 특정 context_arch (1=x86_64/2=arm64) 의 bridge 수 ───
+fn count_by_context_arch(context_arch: int) -> int {
+    let t = pssb_read_table(pssb_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == context_arch {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── segv_count: SIGSEGV (signal_kind=11) bridge 수 ───
+fn segv_count() -> int {
+    return count_by_signal_kind(11)
+}
+
+// ─── bridge_win32_code: 특정 bridge_id 의 win32_code (없으면 0) ───
+fn bridge_win32_code(bridge_id: int) -> int {
+    let t = pssb_read_table(pssb_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == bridge_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pssb_stats: [bridge_count, segv_count, count_by_context_arch(1), count_by_context_arch(2)] ───
+fn pssb_stats() -> array {
+    let mut out = []
+    out.push(bridge_count())
+    out.push(segv_count())
+    out.push(count_by_context_arch(1))
+    out.push(count_by_context_arch(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pssb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pssb()
+
+    // 2. record 6 bridges covering ≥3 signal_kinds (11/8/4/5/10/6) + both context_archs (1,2)
+    //    SIGSEGV → EXCEPTION_ACCESS_VIOLATION on arm64 host
+    record_bridge(810001, 11, 3221225477, 2)
+    r0_emit("pe_signal_to_seh_bridge_record",
+        "\"bridge_id\":810001,\"signal_kind\":11,\"win32_code\":3221225477,\"context_arch\":2,\"target\":\"SIGSEGV_arm64\"")
+
+    //    SIGFPE → EXCEPTION_FLT_DIVIDE_BY_ZERO on x86_64 host
+    record_bridge(810002, 8, 3221225613, 1)
+    r0_emit("pe_signal_to_seh_bridge_record",
+        "\"bridge_id\":810002,\"signal_kind\":8,\"win32_code\":3221225613,\"context_arch\":1,\"target\":\"SIGFPE_DIV0_x86_64\"")
+
+    //    SIGILL → EXCEPTION_ILLEGAL_INSTRUCTION on arm64 host
+    record_bridge(810003, 4, 3221225501, 2)
+    r0_emit("pe_signal_to_seh_bridge_record",
+        "\"bridge_id\":810003,\"signal_kind\":4,\"win32_code\":3221225501,\"context_arch\":2,\"target\":\"SIGILL_arm64\"")
+
+    //    SIGSEGV (dup signal_kind) → EXCEPTION_ACCESS_VIOLATION on x86_64 host
+    record_bridge(810004, 11, 3221225477, 1)
+    r0_emit("pe_signal_to_seh_bridge_record",
+        "\"bridge_id\":810004,\"signal_kind\":11,\"win32_code\":3221225477,\"context_arch\":1,\"target\":\"SIGSEGV_x86_64\"")
+
+    //    SIGTRAP → EXCEPTION_BREAKPOINT on arm64 host
+    record_bridge(810005, 5, 2147483651, 2)
+    r0_emit("pe_signal_to_seh_bridge_record",
+        "\"bridge_id\":810005,\"signal_kind\":5,\"win32_code\":2147483651,\"context_arch\":2,\"target\":\"SIGTRAP_arm64\"")
+
+    //    SIGBUS → EXCEPTION_ACCESS_VIOLATION on arm64 host (Mach EXC_BAD_ACCESS alignment)
+    record_bridge(810006, 10, 3221225477, 2)
+    r0_emit("pe_signal_to_seh_bridge_record",
+        "\"bridge_id\":810006,\"signal_kind\":10,\"win32_code\":3221225477,\"context_arch\":2,\"target\":\"SIGBUS_arm64\"")
+
+    // 3. bridge_count = 6
+    let c = bridge_count()
+    if c != 6 {
+        panic("pe_signal_to_seh_bridge FAIL [bridge_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_signal_kind sanity (≥3 distinct kinds)
+    let s11 = count_by_signal_kind(11)
+    if s11 != 2 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_signal_kind(11)] expected=2 got=" + to_string(s11))
+    }
+    let s8 = count_by_signal_kind(8)
+    if s8 != 1 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_signal_kind(8)] expected=1 got=" + to_string(s8))
+    }
+    let s4 = count_by_signal_kind(4)
+    if s4 != 1 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_signal_kind(4)] expected=1 got=" + to_string(s4))
+    }
+    let s5 = count_by_signal_kind(5)
+    if s5 != 1 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_signal_kind(5)] expected=1 got=" + to_string(s5))
+    }
+    let s10 = count_by_signal_kind(10)
+    if s10 != 1 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_signal_kind(10)] expected=1 got=" + to_string(s10))
+    }
+    let s_miss = count_by_signal_kind(6)
+    if s_miss != 0 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_signal_kind(6)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 5. segv_count = 2
+    let segv = segv_count()
+    if segv != 2 {
+        panic("pe_signal_to_seh_bridge FAIL [segv_count] expected=2 got=" + to_string(segv))
+    }
+
+    // 6. count_by_win32_code sanity
+    let w_av = count_by_win32_code(3221225477)
+    if w_av != 3 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_win32_code(AV)] expected=3 got=" + to_string(w_av))
+    }
+    let w_div = count_by_win32_code(3221225613)
+    if w_div != 1 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_win32_code(DIV0)] expected=1 got=" + to_string(w_div))
+    }
+    let w_bp = count_by_win32_code(2147483651)
+    if w_bp != 1 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_win32_code(BREAKPOINT)] expected=1 got=" + to_string(w_bp))
+    }
+    let w_miss = count_by_win32_code(0)
+    if w_miss != 0 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_win32_code(0)] expected=0 got=" + to_string(w_miss))
+    }
+
+    // 7. count_by_context_arch sanity (both archs covered)
+    let a1 = count_by_context_arch(1)
+    if a1 != 2 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_context_arch(1)] expected=2 got=" + to_string(a1))
+    }
+    let a2 = count_by_context_arch(2)
+    if a2 != 4 {
+        panic("pe_signal_to_seh_bridge FAIL [count_by_context_arch(2)] expected=4 got=" + to_string(a2))
+    }
+
+    // 8. bridge_win32_code sanity
+    let b2 = bridge_win32_code(810002)
+    if b2 != 3221225613 {
+        panic("pe_signal_to_seh_bridge FAIL [bridge_win32_code(810002)] expected=3221225613 got=" + to_string(b2))
+    }
+    let b5 = bridge_win32_code(810005)
+    if b5 != 2147483651 {
+        panic("pe_signal_to_seh_bridge FAIL [bridge_win32_code(810005)] expected=2147483651 got=" + to_string(b5))
+    }
+    let b_miss = bridge_win32_code(9999)
+    if b_miss != 0 {
+        panic("pe_signal_to_seh_bridge FAIL [bridge_win32_code(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 9. pssb_stats() = [6, 2, 2, 4]
+    let s = pssb_stats()
+    if len(s) != 4 {
+        panic("pe_signal_to_seh_bridge FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_signal_to_seh_bridge FAIL [stats bridge_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_signal_to_seh_bridge FAIL [stats segv_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_signal_to_seh_bridge FAIL [stats arch(x86_64)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_signal_to_seh_bridge FAIL [stats arch(arm64)] expected=4 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_signal_to_seh_bridge_stats",
+        "\"bridge_count\":" + to_string(s[0])
+        + ",\"segv_count\":" + to_string(s[1])
+        + ",\"arch_x86_64\":" + to_string(s[2])
+        + ",\"arch_arm64\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_signal_to_seh_bridge FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pssb()
+    let s2 = pssb_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_signal_to_seh_bridge FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_signal_to_seh_bridge self_test PASS (bridges=" + to_string(s[0])
+        + ", segv=" + to_string(s[1]) + ", x86_64=" + to_string(s[2])
+        + ", arm64=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pssb_stats()
+            println("bridge_count\t" + to_string(s[0]))
+            println("segv_count\t" + to_string(s[1]))
+            println("arch_x86_64\t" + to_string(s[2]))
+            println("arch_arm64\t" + to_string(s[3]))
+            return
+        }
+        if sub == "code" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                println("bridge_win32_code\t" + to_string(bridge_win32_code(bid)))
+                return
+            }
+            println("usage: hexa run pe_signal_to_seh_bridge.hexa code <bridge_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let sk = to_int(a[3])
+                println("count_by_signal_kind\t" + to_string(count_by_signal_kind(sk)))
+                return
+            }
+            println("usage: hexa run pe_signal_to_seh_bridge.hexa count <signal_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pssb()
+            println("cleaned: " + pssb_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pssb_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_signal_to_seh_bridge.hexa { self-test | stats | code <bridge_id> | count <signal_kind> | cleanup | dir }")
+}

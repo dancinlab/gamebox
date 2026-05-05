@@ -1,0 +1,518 @@
+// lib/loader/pe_i386_segment_override_real.hexa — i386 segment override prefix tracker
+//
+// Phase 후속 interpreter 가 사용할 i386 segment override prefix (0x26/2E/36/3E/64/65)
+// 의 instruction-level 추적기. flat memory model 에서 CS/DS/SS/ES base = 0 이므로
+// override 무의미하나 (ignored), FS/GS 만 의미를 가진다:
+//   - Win32 i386 FS:[0x00] = SEH chain head, FS:[0x18] = TEB self_ptr,
+//                FS:[0x24] = TID, FS:[0x30] = PEB ptr
+//   - Win64 GS:[0x00] = PEB, GS:[0x18] = TEB self_ptr  (i386 의 FS 와 swap)
+//
+// 본 module 은 Apple SDK / Wine / CrossOver / Box86 / community 코드 0줄.
+// Intel SDM (Vol.1 §3.4 Segments, §3.5 Memory Mode) 만 참조한다.
+//
+// own 1: Wine winecrt0 / Box86 / community 0 줄. SDM spec 자체 구현.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — 5 separate tables):
+//   prefix.tsv     : prefix_id<int>  \t prefix_byte<int> \t seg_idx<int>
+//   access.tsv     : access_id<int>  \t prefix_id<int>   \t op_kind<int>
+//                    \t offset_hex<int> \t size_bytes<int>
+//   teb.tsv        : teb_id<int>     \t offset_hex<int>  \t field_name<str>
+//   peb.tsv        : peb_id<int>     \t offset_hex<int>  \t field_name<str>
+//   ignored.tsv    : ignored_id<int> \t prefix_byte<int> \t reason<str>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piso_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_segment_override_real"
+}
+
+fn piso_overrides_path() -> str {
+    return piso_dir() + "/overrides.tsv"
+}
+
+fn piso_prefix_path() -> str {
+    return piso_dir() + "/prefix.tsv"
+}
+
+fn piso_access_path() -> str {
+    return piso_dir() + "/access.tsv"
+}
+
+fn piso_teb_path() -> str {
+    return piso_dir() + "/teb.tsv"
+}
+
+fn piso_peb_path() -> str {
+    return piso_dir() + "/peb.tsv"
+}
+
+fn piso_ignored_path() -> str {
+    return piso_dir() + "/ignored.tsv"
+}
+
+fn piso_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piso_dir() + "'")
+}
+
+fn cleanup_piso() -> void {
+    piso_ensure_dir()
+    let _ = exec("rm -f '" + piso_prefix_path() + "' '" + piso_access_path()
+        + "' '" + piso_teb_path() + "' '" + piso_peb_path()
+        + "' '" + piso_ignored_path() + "' '" + piso_overrides_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piso_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piso_append_row(path: str, row: str) -> void {
+    piso_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn piso_count_rows(path: str, min_cols: int) -> int {
+    let t = piso_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+// seg_idx: 0=ES 1=CS 2=SS 3=DS 4=FS 5=GS
+fn seg_name(idx: int) -> str {
+    if idx == 0 { return "ES" }
+    if idx == 1 { return "CS" }
+    if idx == 2 { return "SS" }
+    if idx == 3 { return "DS" }
+    if idx == 4 { return "FS" }
+    if idx == 5 { return "GS" }
+    return "?"
+}
+
+// prefix_byte → seg_idx
+fn prefix_byte_to_seg(b: int) -> int {
+    if b == 38  { return 0 }   // 0x26 ES
+    if b == 46  { return 1 }   // 0x2E CS
+    if b == 54  { return 2 }   // 0x36 SS
+    if b == 62  { return 3 }   // 0x3E DS
+    if b == 100 { return 4 }   // 0x64 FS
+    if b == 101 { return 5 }   // 0x65 GS
+    return -1
+}
+
+// ─── record_prefix: segment override prefix byte 등장 1 회 기록 ───
+//   prefix_id    > 0
+//   prefix_byte  ∈ {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65}
+//   seg_idx      ∈ 0..5  (prefix_byte_to_seg() 결과와 일치해야 함)
+fn record_prefix(prefix_id: int, prefix_byte: int, seg_idx: int) -> void {
+    if prefix_id <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] expected=prefix_id>0 got=" + to_string(prefix_id))
+    }
+    if prefix_byte < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] expected=prefix_byte>=0 got=" + to_string(prefix_byte))
+    }
+    if prefix_byte > 255 {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] expected=prefix_byte<=255 got=" + to_string(prefix_byte))
+    }
+    let mapped = prefix_byte_to_seg(prefix_byte)
+    if mapped < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] expected=prefix_byte∈{0x26,0x2E,0x36,0x3E,0x64,0x65} got=" + to_string(prefix_byte))
+    }
+    if seg_idx < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] expected=seg_idx>=0 got=" + to_string(seg_idx))
+    }
+    if seg_idx > 5 {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] expected=seg_idx<=5 got=" + to_string(seg_idx))
+    }
+    if mapped != seg_idx {
+        panic("pe_i386_segment_override_real FAIL [record_prefix] mismatch prefix_byte=" + to_string(prefix_byte) + " expected_seg=" + to_string(mapped) + " got_seg=" + to_string(seg_idx))
+    }
+    let row = to_string(prefix_id) + "\t" + to_string(prefix_byte) + "\t" + to_string(seg_idx) + "\n"
+    piso_append_row(piso_prefix_path(), row)
+}
+
+// ─── record_access: segment override 가 적용된 memory access 1 건 기록 ───
+//   op_kind: 0=read, 1=write
+fn record_access(access_id: int, prefix_id: int, op_kind: int, offset_hex: int, size_bytes: int) -> void {
+    if access_id <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=access_id>0 got=" + to_string(access_id))
+    }
+    if prefix_id <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=prefix_id>0 got=" + to_string(prefix_id))
+    }
+    if op_kind < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=op_kind>=0 got=" + to_string(op_kind))
+    }
+    if op_kind > 1 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=op_kind<=1 got=" + to_string(op_kind))
+    }
+    if offset_hex < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=offset_hex>=0 got=" + to_string(offset_hex))
+    }
+    if size_bytes <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=size_bytes>0 got=" + to_string(size_bytes))
+    }
+    if size_bytes > 8 {
+        panic("pe_i386_segment_override_real FAIL [record_access] expected=size_bytes<=8 got=" + to_string(size_bytes))
+    }
+    let row = to_string(access_id) + "\t" + to_string(prefix_id)
+        + "\t" + to_string(op_kind) + "\t" + to_string(offset_hex)
+        + "\t" + to_string(size_bytes) + "\n"
+    piso_append_row(piso_access_path(), row)
+}
+
+// ─── record_teb_field_access: FS:[off] (Win32) TEB field 접근 기록 ───
+//   대표 offset: 0x00=SEH, 0x18=self_ptr, 0x20=pid, 0x24=tid, 0x30=PEB
+fn record_teb_field_access(teb_id: int, offset_hex: int, field_name: str) -> void {
+    if teb_id <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_teb_field_access] expected=teb_id>0 got=" + to_string(teb_id))
+    }
+    if offset_hex < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_teb_field_access] expected=offset_hex>=0 got=" + to_string(offset_hex))
+    }
+    if field_name == "" {
+        panic("pe_i386_segment_override_real FAIL [record_teb_field_access] expected=field_name!=\"\" got=empty")
+    }
+    let row = to_string(teb_id) + "\t" + to_string(offset_hex) + "\t" + field_name + "\n"
+    piso_append_row(piso_teb_path(), row)
+}
+
+// ─── record_peb_field_access: PEB struct field 접근 기록 ───
+//   대표 offset: 0x00=BeingDebugged, 0x0C=Ldr, 0x10=ProcessParameters
+fn record_peb_field_access(peb_id: int, offset_hex: int, field_name: str) -> void {
+    if peb_id <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_peb_field_access] expected=peb_id>0 got=" + to_string(peb_id))
+    }
+    if offset_hex < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_peb_field_access] expected=offset_hex>=0 got=" + to_string(offset_hex))
+    }
+    if field_name == "" {
+        panic("pe_i386_segment_override_real FAIL [record_peb_field_access] expected=field_name!=\"\" got=empty")
+    }
+    let row = to_string(peb_id) + "\t" + to_string(offset_hex) + "\t" + field_name + "\n"
+    piso_append_row(piso_peb_path(), row)
+}
+
+// ─── record_ignored: flat-mode 에서 무의미한 CS/DS/SS/ES override 기록 ───
+fn record_ignored(ignored_id: int, prefix_byte: int, reason: str) -> void {
+    if ignored_id <= 0 {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] expected=ignored_id>0 got=" + to_string(ignored_id))
+    }
+    if prefix_byte < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] expected=prefix_byte>=0 got=" + to_string(prefix_byte))
+    }
+    if prefix_byte > 255 {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] expected=prefix_byte<=255 got=" + to_string(prefix_byte))
+    }
+    let mapped = prefix_byte_to_seg(prefix_byte)
+    if mapped < 0 {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] expected=prefix_byte∈{0x26,0x2E,0x36,0x3E,0x64,0x65} got=" + to_string(prefix_byte))
+    }
+    // FS(4) / GS(5) 는 ignored 대상이 아님 — flat 에서도 의미 보존
+    if mapped == 4 {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] FS not ignorable in flat mode")
+    }
+    if mapped == 5 {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] GS not ignorable in flat mode")
+    }
+    if reason == "" {
+        panic("pe_i386_segment_override_real FAIL [record_ignored] expected=reason!=\"\" got=empty")
+    }
+    let row = to_string(ignored_id) + "\t" + to_string(prefix_byte) + "\t" + reason + "\n"
+    piso_append_row(piso_ignored_path(), row)
+}
+
+// ─── statistics ───
+fn prefix_count() -> int {
+    return piso_count_rows(piso_prefix_path(), 3)
+}
+
+fn access_count() -> int {
+    return piso_count_rows(piso_access_path(), 5)
+}
+
+fn teb_access_count() -> int {
+    return piso_count_rows(piso_teb_path(), 3)
+}
+
+fn peb_access_count() -> int {
+    return piso_count_rows(piso_peb_path(), 3)
+}
+
+fn ignored_count() -> int {
+    return piso_count_rows(piso_ignored_path(), 3)
+}
+
+fn piso_stats() -> array {
+    let mut out = []
+    out.push(prefix_count())
+    out.push(access_count())
+    out.push(teb_access_count())
+    out.push(peb_access_count())
+    out.push(ignored_count())
+    return out
+}
+
+// ─── self_test ≥ 14 record + assertions ───
+fn self_test() -> void {
+    let sid = "piso-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_piso()
+
+    // 1. prefix 4 record (FS, GS, CS, DS)
+    record_prefix(1, 100, 4)                  // 0x64 FS
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"prefix\",\"prefix_id\":1,\"prefix_byte\":100,\"prefix_hex\":\"0x64\",\"seg_idx\":4,\"seg\":\"FS\"")
+
+    record_prefix(2, 101, 5)                  // 0x65 GS
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"prefix\",\"prefix_id\":2,\"prefix_byte\":101,\"prefix_hex\":\"0x65\",\"seg_idx\":5,\"seg\":\"GS\"")
+
+    record_prefix(3, 46, 1)                   // 0x2E CS
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"prefix\",\"prefix_id\":3,\"prefix_byte\":46,\"prefix_hex\":\"0x2E\",\"seg_idx\":1,\"seg\":\"CS\"")
+
+    record_prefix(4, 62, 3)                   // 0x3E DS
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"prefix\",\"prefix_id\":4,\"prefix_byte\":62,\"prefix_hex\":\"0x3E\",\"seg_idx\":3,\"seg\":\"DS\"")
+
+    // 2. access 6 record
+    record_access(1, 1, 0, 0, 4)              // FS:[0x00] read 4 bytes (SEH chain head)
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"access\",\"access_id\":1,\"prefix_id\":1,\"op\":\"read\",\"offset_hex\":0,\"offset\":\"0x00\",\"size_bytes\":4")
+
+    record_access(2, 1, 0, 24, 4)             // FS:[0x18] read 4 bytes (TEB self_ptr)
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"access\",\"access_id\":2,\"prefix_id\":1,\"op\":\"read\",\"offset_hex\":24,\"offset\":\"0x18\",\"size_bytes\":4")
+
+    record_access(3, 1, 0, 48, 4)             // FS:[0x30] read 4 bytes (PEB ptr)
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"access\",\"access_id\":3,\"prefix_id\":1,\"op\":\"read\",\"offset_hex\":48,\"offset\":\"0x30\",\"size_bytes\":4")
+
+    record_access(4, 2, 0, 0, 8)              // GS:[0x00] read 8 bytes (Win64 PEB)
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"access\",\"access_id\":4,\"prefix_id\":2,\"op\":\"read\",\"offset_hex\":0,\"offset\":\"0x00\",\"size_bytes\":8")
+
+    record_access(5, 1, 1, 0, 4)              // FS:[0x00] write 4 bytes (push SEH frame)
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"access\",\"access_id\":5,\"prefix_id\":1,\"op\":\"write\",\"offset_hex\":0,\"offset\":\"0x00\",\"size_bytes\":4")
+
+    record_access(6, 1, 0, 36, 4)             // FS:[0x24] read 4 bytes (TID)
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"access\",\"access_id\":6,\"prefix_id\":1,\"op\":\"read\",\"offset_hex\":36,\"offset\":\"0x24\",\"size_bytes\":4")
+
+    // 3. teb_access 4 record
+    record_teb_field_access(1, 0, "ExceptionList")        // 0x00 SEH chain head
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"teb_access\",\"teb_id\":1,\"offset_hex\":0,\"offset\":\"0x00\",\"field_name\":\"ExceptionList\"")
+
+    record_teb_field_access(2, 24, "TebSelfPtr")          // 0x18 self_ptr
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"teb_access\",\"teb_id\":2,\"offset_hex\":24,\"offset\":\"0x18\",\"field_name\":\"TebSelfPtr\"")
+
+    record_teb_field_access(3, 36, "ClientIdThread")      // 0x24 TID
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"teb_access\",\"teb_id\":3,\"offset_hex\":36,\"offset\":\"0x24\",\"field_name\":\"ClientIdThread\"")
+
+    record_teb_field_access(4, 48, "ProcessEnvironmentBlock")  // 0x30 PEB
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"teb_access\",\"teb_id\":4,\"offset_hex\":48,\"offset\":\"0x30\",\"field_name\":\"ProcessEnvironmentBlock\"")
+
+    // 4. peb_access 1 record
+    record_peb_field_access(1, 12, "Ldr")                 // 0x0C Ldr
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"peb_access\",\"peb_id\":1,\"offset_hex\":12,\"offset\":\"0x0C\",\"field_name\":\"Ldr\"")
+
+    // 5. ignored 2 record (CS, DS — flat mode base=0)
+    record_ignored(1, 46, "flat_mode_cs_base_zero")        // 0x2E CS ignored
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"ignored\",\"ignored_id\":1,\"prefix_byte\":46,\"prefix_hex\":\"0x2E\",\"seg\":\"CS\",\"reason\":\"flat_mode_cs_base_zero\"")
+
+    record_ignored(2, 62, "flat_mode_ds_base_zero")        // 0x3E DS ignored
+    r0_emit("pe_i386_segment_override_real_record",
+        "\"kind\":\"ignored\",\"ignored_id\":2,\"prefix_byte\":62,\"prefix_hex\":\"0x3E\",\"seg\":\"DS\",\"reason\":\"flat_mode_ds_base_zero\"")
+
+    // ─── assertions ───
+    let p = prefix_count()
+    if p != 4 {
+        panic("pe_i386_segment_override_real FAIL [prefix_count] expected=4 got=" + to_string(p))
+    }
+    let a = access_count()
+    if a != 6 {
+        panic("pe_i386_segment_override_real FAIL [access_count] expected=6 got=" + to_string(a))
+    }
+    let t = teb_access_count()
+    if t != 4 {
+        panic("pe_i386_segment_override_real FAIL [teb_access_count] expected=4 got=" + to_string(t))
+    }
+    let pe = peb_access_count()
+    if pe != 1 {
+        panic("pe_i386_segment_override_real FAIL [peb_access_count] expected=1 got=" + to_string(pe))
+    }
+    let ig = ignored_count()
+    if ig != 2 {
+        panic("pe_i386_segment_override_real FAIL [ignored_count] expected=2 got=" + to_string(ig))
+    }
+
+    // ─── name lookup assertions ───
+    let n_es = seg_name(0)
+    if n_es != "ES" {
+        panic("pe_i386_segment_override_real FAIL [seg_name(0)] expected=ES got=" + n_es)
+    }
+    let n_cs = seg_name(1)
+    if n_cs != "CS" {
+        panic("pe_i386_segment_override_real FAIL [seg_name(1)] expected=CS got=" + n_cs)
+    }
+    let n_ss = seg_name(2)
+    if n_ss != "SS" {
+        panic("pe_i386_segment_override_real FAIL [seg_name(2)] expected=SS got=" + n_ss)
+    }
+    let n_ds = seg_name(3)
+    if n_ds != "DS" {
+        panic("pe_i386_segment_override_real FAIL [seg_name(3)] expected=DS got=" + n_ds)
+    }
+    let n_fs = seg_name(4)
+    if n_fs != "FS" {
+        panic("pe_i386_segment_override_real FAIL [seg_name(4)] expected=FS got=" + n_fs)
+    }
+    let n_gs = seg_name(5)
+    if n_gs != "GS" {
+        panic("pe_i386_segment_override_real FAIL [seg_name(5)] expected=GS got=" + n_gs)
+    }
+
+    // prefix_byte → seg_idx 매핑 확인
+    let m_es = prefix_byte_to_seg(38)
+    if m_es != 0 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x26)] expected=0 got=" + to_string(m_es))
+    }
+    let m_cs = prefix_byte_to_seg(46)
+    if m_cs != 1 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x2E)] expected=1 got=" + to_string(m_cs))
+    }
+    let m_ss = prefix_byte_to_seg(54)
+    if m_ss != 2 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x36)] expected=2 got=" + to_string(m_ss))
+    }
+    let m_ds = prefix_byte_to_seg(62)
+    if m_ds != 3 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x3E)] expected=3 got=" + to_string(m_ds))
+    }
+    let m_fs = prefix_byte_to_seg(100)
+    if m_fs != 4 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x64)] expected=4 got=" + to_string(m_fs))
+    }
+    let m_gs = prefix_byte_to_seg(101)
+    if m_gs != 5 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x65)] expected=5 got=" + to_string(m_gs))
+    }
+    let m_inv = prefix_byte_to_seg(144)        // 0x90 NOP — not a seg override
+    if m_inv != -1 {
+        panic("pe_i386_segment_override_real FAIL [prefix_byte_to_seg(0x90)] expected=-1 got=" + to_string(m_inv))
+    }
+
+    // ─── stats sanity ───
+    let s = piso_stats()
+    if len(s) != 5 {
+        panic("pe_i386_segment_override_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_i386_segment_override_real FAIL [stats prefix] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 6 {
+        panic("pe_i386_segment_override_real FAIL [stats access] expected=6 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_i386_segment_override_real FAIL [stats teb] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_segment_override_real FAIL [stats peb] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_segment_override_real FAIL [stats ignored] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (record 17 + this 1 = 18 ≥ 14 보장) ───
+    r0_emit("pe_i386_segment_override_real_stats",
+        "\"prefix_count\":" + to_string(s[0])
+        + ",\"access_count\":" + to_string(s[1])
+        + ",\"teb_access_count\":" + to_string(s[2])
+        + ",\"peb_access_count\":" + to_string(s[3])
+        + ",\"ignored_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_segment_override_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_piso()
+    let s2 = piso_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_segment_override_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_segment_override_real self_test PASS (prefix=" + to_string(s[0])
+        + ", access=" + to_string(s[1]) + ", teb=" + to_string(s[2])
+        + ", peb=" + to_string(s[3]) + ", ignored=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piso_stats()
+            println("prefix_count\t" + to_string(s[0]))
+            println("access_count\t" + to_string(s[1]))
+            println("teb_access_count\t" + to_string(s[2]))
+            println("peb_access_count\t" + to_string(s[3]))
+            println("ignored_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piso()
+            println("cleaned: " + piso_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piso_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_segment_override_real.hexa { self-test | stats | cleanup | dir }")
+}

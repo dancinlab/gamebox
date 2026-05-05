@@ -1,0 +1,227 @@
+// lib/perf/c_metal_fence_track.hexa — CN-134 skeleton manjeom 15/15
+//
+// Metal fence (MTLFence) 사용 추적 — DX12 fence → MTLFence 매핑 + signal/wait 페어 검증.
+// D4 DX12 ID3D12Fence 의 signal(value) / wait(value) 를 MTLFence 로 1:1 매핑,
+// orphan signal / orphan wait 을 잡아 GPU stall 또는 race 위험 진단.
+//
+// 무기: queue × fence × value 3-key columnar log + pair counting.
+// 효과: cross-queue sync 누락 즉시 노출 → D4 hang/glitch 예방.
+
+use "./r0_common"
+
+let MFT_DIR = GAMEBOX_HOME + "/persist/metal_fence_track"
+let SIGNAL_LOG = MFT_DIR + "/signals.tsv"
+let WAIT_LOG = MFT_DIR + "/waits.tsv"
+let PAIR_HISTORY = MFT_DIR + "/pairs.jsonl"
+
+fn mft_dir() -> str { return MFT_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + MFT_DIR + "'")
+}
+
+// ─── signal 등록 ───
+//   queue_id (graphics/compute/blit), fence_id (DX12 fence id → MTLFence 매핑), value
+fn record_signal(queue_id: str, fence_id: int, value: int) -> void {
+    ensure_dir()
+    let line = queue_id + "\t" + to_string(fence_id) + "\t" + to_string(value)
+    let tmp = SIGNAL_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SIGNAL_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── wait 등록 ───
+fn record_wait(queue_id: str, fence_id: int, value: int) -> void {
+    ensure_dir()
+    let line = queue_id + "\t" + to_string(fence_id) + "\t" + to_string(value)
+    let tmp = WAIT_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + WAIT_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── pair_complete — 같은 fence_id 에 signal + wait 모두 있으면 true ───
+fn pair_complete(fence_id: int) -> bool {
+    let exists_s = exec("test -f '" + SIGNAL_LOG + "' && echo ok").trim()
+    let exists_w = exec("test -f '" + WAIT_LOG + "' && echo ok").trim()
+    if exists_s != "ok" || exists_w != "ok" { return false }
+    let s_cnt = to_int(exec("awk -F'\\t' -v f=" + to_string(fence_id) + " '$2==f' '" + SIGNAL_LOG + "' | wc -l | tr -d ' '").trim())
+    let w_cnt = to_int(exec("awk -F'\\t' -v f=" + to_string(fence_id) + " '$2==f' '" + WAIT_LOG + "' | wc -l | tr -d ' '").trim())
+    if s_cnt > 0 && w_cnt > 0 { return true }
+    return false
+}
+
+// ─── orphan_signals — wait 없는 signal fence 수 ───
+fn orphan_signals() -> int {
+    let exists_s = exec("test -f '" + SIGNAL_LOG + "' && echo ok").trim()
+    if exists_s != "ok" { return 0 }
+    let exists_w = exec("test -f '" + WAIT_LOG + "' && echo ok").trim()
+    if exists_w != "ok" {
+        // wait log 없음 → 모든 signal fence 가 orphan (unique fence_id 수)
+        let cnt_str = exec("awk -F'\\t' '{print $2}' '" + SIGNAL_LOG + "' | sort -u | wc -l | tr -d ' '").trim()
+        return to_int(cnt_str)
+    }
+    // sh-compatible: signal fence_id 중 wait 에 없는 것 카운트 (awk NR==FNR 트릭)
+    let cmd = "awk -F'\\t' 'NR==FNR{w[$2]=1; next} !($2 in w){s[$2]=1} END{n=0; for(k in s) n++; print n}' '" + WAIT_LOG + "' '" + SIGNAL_LOG + "' | tr -d ' '"
+    let out = exec(cmd).trim()
+    if out == "" { return 0 }
+    return to_int(out)
+}
+
+// ─── orphan_waits — signal 없는 wait fence 수 ───
+fn orphan_waits() -> int {
+    let exists_w = exec("test -f '" + WAIT_LOG + "' && echo ok").trim()
+    if exists_w != "ok" { return 0 }
+    let exists_s = exec("test -f '" + SIGNAL_LOG + "' && echo ok").trim()
+    if exists_s != "ok" {
+        let cnt_str = exec("awk -F'\\t' '{print $2}' '" + WAIT_LOG + "' | sort -u | wc -l | tr -d ' '").trim()
+        return to_int(cnt_str)
+    }
+    // sh-compatible: wait fence_id 중 signal 에 없는 것 카운트
+    let cmd = "awk -F'\\t' 'NR==FNR{s[$2]=1; next} !($2 in s){w[$2]=1} END{n=0; for(k in w) n++; print n}' '" + SIGNAL_LOG + "' '" + WAIT_LOG + "' | tr -d ' '"
+    let out = exec(cmd).trim()
+    if out == "" { return 0 }
+    return to_int(out)
+}
+
+// ─── pair 검증 결과 기록 ───
+fn record_pair(fence_id: int, complete: bool) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let cstr = "false"
+    if complete { cstr = "true" }
+    let line = "{\"ts\":" + ts + ",\"fence\":" + to_string(fence_id) + ",\"complete\":" + cstr + "}"
+    let tmp = PAIR_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PAIR_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("metal_fence_pair", "\"fence\":" + to_string(fence_id) + ",\"complete\":" + cstr)
+}
+
+fn mft_stats() -> array {
+    let exists_s = exec("test -f '" + SIGNAL_LOG + "' && echo ok").trim()
+    let signals = 0
+    if exists_s == "ok" {
+        signals = to_int(exec("wc -l < '" + SIGNAL_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_w = exec("test -f '" + WAIT_LOG + "' && echo ok").trim()
+    let waits = 0
+    if exists_w == "ok" {
+        waits = to_int(exec("wc -l < '" + WAIT_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_p = exec("test -f '" + PAIR_HISTORY + "' && echo ok").trim()
+    let pairs = 0
+    if exists_p == "ok" {
+        pairs = to_int(exec("wc -l < '" + PAIR_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [signals, waits, pairs]
+}
+
+fn cleanup_mft() -> void {
+    let _ = exec("rm -rf '" + MFT_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "mft-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_mft()
+
+    // 합성 5 pair: 4 complete (fence 100-103) + 1 orphan signal (fence 104)
+    // fence 100: graphics signal(1) → compute wait(1)
+    record_signal("graphics", 100, 1)
+    record_wait("compute", 100, 1)
+    // fence 101: compute signal(2) → blit wait(2)
+    record_signal("compute", 101, 2)
+    record_wait("blit", 101, 2)
+    // fence 102: graphics signal(3) → blit wait(3)
+    record_signal("graphics", 102, 3)
+    record_wait("blit", 102, 3)
+    // fence 103: blit signal(4) → graphics wait(4)
+    record_signal("blit", 103, 4)
+    record_wait("graphics", 103, 4)
+    // fence 104: graphics signal(5) — wait 누락 (orphan)
+    record_signal("graphics", 104, 5)
+
+    // 4 complete pair 검증
+    if !pair_complete(100) { panic("c_metal_fence_track FAIL [pair 100] expected=true") }
+    if !pair_complete(101) { panic("c_metal_fence_track FAIL [pair 101] expected=true") }
+    if !pair_complete(102) { panic("c_metal_fence_track FAIL [pair 102] expected=true") }
+    if !pair_complete(103) { panic("c_metal_fence_track FAIL [pair 103] expected=true") }
+    // 104 는 orphan signal → pair_complete false
+    if pair_complete(104) { panic("c_metal_fence_track FAIL [pair 104] expected=false") }
+
+    record_pair(100, true)
+    record_pair(101, true)
+    record_pair(102, true)
+    record_pair(103, true)
+    record_pair(104, false)
+
+    // orphan 카운트
+    let os = orphan_signals()
+    if os != 1 { panic("c_metal_fence_track FAIL [orphan signals] expected=1 got=" + to_string(os)) }
+    let ow = orphan_waits()
+    if ow != 0 { panic("c_metal_fence_track FAIL [orphan waits] expected=0 got=" + to_string(ow)) }
+
+    // stats: 5 signals, 4 waits, 5 pair records
+    let stats = mft_stats()
+    if stats[0] != 5 { panic("c_metal_fence_track FAIL [stats signals] expected=5 got=" + to_string(stats[0])) }
+    if stats[1] != 4 { panic("c_metal_fence_track FAIL [stats waits] expected=4 got=" + to_string(stats[1])) }
+    if stats[2] != 5 { panic("c_metal_fence_track FAIL [stats pairs] expected=5 got=" + to_string(stats[2])) }
+
+    r0_emit("metal_fence_summary", "\"signals\":" + to_string(stats[0]) + ",\"waits\":" + to_string(stats[1]) + ",\"pairs\":" + to_string(stats[2]) + ",\"orphan_sig\":" + to_string(os) + ",\"orphan_wait\":" + to_string(ow))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 6 { panic("c_metal_fence_track FAIL [emit count] expected>=6 got=" + to_string(cnt)) }
+
+    // ─── synthetic MTLFence state machine round-trip (cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track AP mission: D2R/D4 cond.3 (Apple Metal layer) 측 evidence augment.
+    // cond.3 측 status `partial` 영구 유지 — D3DMetal binary licence transitive
+    // (loader_dx blk.1) 측 영구 외부 의존, met 승격 X. Apple-native scaffold.
+    //
+    // (a) synthetic MTLFence 4-phase signal/wait lifecycle —
+    //     create → signal → wait → release state machine:
+    //     phase_count               4                   (create/signal/wait/release)
+    //     fence_obj_off             0x180012000         (synthetic MTLFence RVA)
+    //     fence_kind                "synthetic_inline"  (실 MTLFence 호출 X)
+    //
+    // (b) synthetic queue × value 12-slot pair matrix —
+    //     3 queue (graphics/compute/blit) × 4 value step = 12 slot walk:
+    //     slot_total                12                  (3 queue × 4 value)
+    //     completed_slot_count      4                   (4 complete pair fence 100-103)
+    //     matrix_kind               "synthetic_inline"  (실 GPU sync wait X)
+    //
+    // round-trip = synthesize_fence_phase(scaffold) → walk_queue_value_matrix(scaffold).
+    //              hexa-native loop only — 실 MTLFence.signal/waitUntilCompleted() 0,
+    //              real cross-queue GPU sync 0.
+    //
+    // synthetic fence phase emit
+    r0_emit("c_metal_fence_track_synthetic_phase",
+        "\"stage\":\"fence_phase\",\"phase_count\":4,\"fence_obj_off\":\"0x180012000\",\"fence_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"d3dmetal_gap\":\"permanent — D3DMetal binary licence transitive (loader_dx blk.1)\"")
+    println("__METAL_FENCE__ PARTIAL fence_phase")
+
+    // synthetic queue × value pair matrix emit
+    r0_emit("c_metal_fence_track_synthetic_matrix",
+        "\"stage\":\"queue_value_matrix\",\"slot_total\":12,\"completed_slot_count\":4,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"d3dmetal_gap\":\"permanent — D3DMetal binary licence transitive (loader_dx blk.1)\"")
+    println("__METAL_FENCE__ PARTIAL queue_value_matrix")
+
+    cleanup_mft()
+
+    println("  ✅ c_metal_fence_track self_test PASS (5 signals / 4 waits, 4 complete + 1 orphan signal, orphan_wait=0, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = mft_stats()
+            let os = orphan_signals()
+            let ow = orphan_waits()
+            println("signals=" + to_string(s[0]) + " waits=" + to_string(s[1]) + " pairs=" + to_string(s[2]) + " orphan_sig=" + to_string(os) + " orphan_wait=" + to_string(ow))
+            return
+        }
+        if sub == "cleanup" { cleanup_mft(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_metal_fence_track.hexa { self-test | stats | cleanup }")
+}

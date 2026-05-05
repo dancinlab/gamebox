@@ -1,0 +1,399 @@
+// lib/loader/pe_call_conv_fastcall.hexa — cycle68 i386 fastcall adapter telemetry skeleton
+//
+// i386 fastcall ABI: 첫 2 개 정수/포인터 인자는 ECX/EDX register 로 전달,
+// 나머지는 stack 으로 전달 (right-to-left, callee cleans). arm64 adapter 는
+// reg_params 를 x0/x1 로 매핑하고 stack_params 를 stack frame 으로 spill.
+// 본 module 은 call site adapter telemetry tracker — 실제 register read /
+// stack walk 호출 X (cycle69+).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   reg/stack 분류 logic 은 fastcall ABI spec (Microsoft __fastcall, Borland
+//   register) 기반 자체 구현.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// reg_params 범위: 0 (모두 stack) ~ 2 (ECX + EDX 모두 사용)
+// stack_params = param_count - reg_params
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t param_count<int> \t reg_params<int> \t stack_params<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pccf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_call_conv_fastcall"
+}
+
+fn pccf_calls_path() -> str {
+    return pccf_dir() + "/calls.tsv"
+}
+
+fn pccf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pccf_dir() + "'")
+}
+
+fn cleanup_pccf() -> void {
+    pccf_ensure_dir()
+    let _ = exec("rm -f '" + pccf_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pccf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pccf_append_row(path: str, row: str) -> void {
+    pccf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: fastcall site 1 건 기록 ───
+fn record_call(call_id: int, param_count: int, reg_params: int, stack_params: int) -> void {
+    if call_id <= 0 {
+        panic("pe_call_conv_fastcall FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if param_count < 0 {
+        panic("pe_call_conv_fastcall FAIL [record_call] expected=param_count>=0 got=" + to_string(param_count))
+    }
+    if reg_params < 0 {
+        panic("pe_call_conv_fastcall FAIL [record_call] expected=reg_params>=0 got=" + to_string(reg_params))
+    }
+    if reg_params > 2 {
+        panic("pe_call_conv_fastcall FAIL [record_call] expected=reg_params<=2 got=" + to_string(reg_params))
+    }
+    if stack_params < 0 {
+        panic("pe_call_conv_fastcall FAIL [record_call] expected=stack_params>=0 got=" + to_string(stack_params))
+    }
+    if reg_params + stack_params != param_count {
+        panic("pe_call_conv_fastcall FAIL [record_call] expected=reg+stack==param_count got="
+            + to_string(reg_params) + "+" + to_string(stack_params) + "!=" + to_string(param_count))
+    }
+    let row = to_string(call_id) + "\t" + to_string(param_count)
+        + "\t" + to_string(reg_params) + "\t" + to_string(stack_params) + "\n"
+    pccf_append_row(pccf_calls_path(), row)
+}
+
+// ─── call_count: total call site 수 ───
+fn call_count() -> int {
+    let t = pccf_read_table(pccf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_reg_params: 모든 call 의 reg_params 합 ───
+fn total_reg_params() -> int {
+    let t = pccf_read_table(pccf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_stack_params: 모든 call 의 stack_params 합 ───
+fn total_stack_params() -> int {
+    let t = pccf_read_table(pccf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_param_count: 특정 param_count 의 call 수 ───
+fn count_by_param_count(pc: int) -> int {
+    let t = pccf_read_table(pccf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == pc {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── call_reg_params: 특정 call_id 의 reg_params (없으면 0) ───
+fn call_reg_params(call_id: int) -> int {
+    let t = pccf_read_table(pccf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pccf_stats: [call_count, total_reg_params, total_stack_params, count_by_param_count(2)] ───
+fn pccf_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(total_reg_params())
+    out.push(total_stack_params())
+    out.push(count_by_param_count(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pccf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pccf()
+
+    // 2. record 5 fastcall sites — reg_params 0/1/2 모두 포함, param_count 다양
+    //   call 680001: 0 params (reg=0 stack=0)  — void()
+    //   call 680002: 1 param  (reg=1 stack=0)  — ECX only
+    //   call 680003: 2 params (reg=2 stack=0)  — ECX+EDX only
+    //   call 680004: 4 params (reg=2 stack=2)  — ECX+EDX + 2 stack
+    //   call 680005: 3 params (reg=2 stack=1)  — ECX+EDX + 1 stack
+    record_call(680001, 0, 0, 0)
+    r0_emit("pe_call_conv_fastcall_record",
+        "\"call_id\":680001,\"param_count\":0,\"reg_params\":0,\"stack_params\":0,\"target\":\"void\"")
+
+    record_call(680002, 1, 1, 0)
+    r0_emit("pe_call_conv_fastcall_record",
+        "\"call_id\":680002,\"param_count\":1,\"reg_params\":1,\"stack_params\":0,\"target\":\"ecx\"")
+
+    record_call(680003, 2, 2, 0)
+    r0_emit("pe_call_conv_fastcall_record",
+        "\"call_id\":680003,\"param_count\":2,\"reg_params\":2,\"stack_params\":0,\"target\":\"ecx_edx\"")
+
+    record_call(680004, 4, 2, 2)
+    r0_emit("pe_call_conv_fastcall_record",
+        "\"call_id\":680004,\"param_count\":4,\"reg_params\":2,\"stack_params\":2,\"target\":\"ecx_edx_stk2\"")
+
+    record_call(680005, 3, 2, 1)
+    r0_emit("pe_call_conv_fastcall_record",
+        "\"call_id\":680005,\"param_count\":3,\"reg_params\":2,\"stack_params\":1,\"target\":\"ecx_edx_stk1\"")
+
+    // 3. call_count = 5
+    let c = call_count()
+    if c != 5 {
+        panic("pe_call_conv_fastcall FAIL [call_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_reg_params = 0+1+2+2+2 = 7
+    let trp = total_reg_params()
+    if trp != 7 {
+        panic("pe_call_conv_fastcall FAIL [total_reg_params] expected=7 got=" + to_string(trp))
+    }
+
+    // 5. total_stack_params = 0+0+0+2+1 = 3
+    let tsp = total_stack_params()
+    if tsp != 3 {
+        panic("pe_call_conv_fastcall FAIL [total_stack_params] expected=3 got=" + to_string(tsp))
+    }
+
+    // 6. count_by_param_count sanity
+    let pc0 = count_by_param_count(0)
+    if pc0 != 1 {
+        panic("pe_call_conv_fastcall FAIL [count_by_param_count(0)] expected=1 got=" + to_string(pc0))
+    }
+    let pc1 = count_by_param_count(1)
+    if pc1 != 1 {
+        panic("pe_call_conv_fastcall FAIL [count_by_param_count(1)] expected=1 got=" + to_string(pc1))
+    }
+    let pc2 = count_by_param_count(2)
+    if pc2 != 1 {
+        panic("pe_call_conv_fastcall FAIL [count_by_param_count(2)] expected=1 got=" + to_string(pc2))
+    }
+    let pc3 = count_by_param_count(3)
+    if pc3 != 1 {
+        panic("pe_call_conv_fastcall FAIL [count_by_param_count(3)] expected=1 got=" + to_string(pc3))
+    }
+    let pc4 = count_by_param_count(4)
+    if pc4 != 1 {
+        panic("pe_call_conv_fastcall FAIL [count_by_param_count(4)] expected=1 got=" + to_string(pc4))
+    }
+    let pc99 = count_by_param_count(99)
+    if pc99 != 0 {
+        panic("pe_call_conv_fastcall FAIL [count_by_param_count(99)] expected=0 got=" + to_string(pc99))
+    }
+
+    // 7. call_reg_params sanity
+    let r2 = call_reg_params(680002)
+    if r2 != 1 {
+        panic("pe_call_conv_fastcall FAIL [call_reg_params(680002)] expected=1 got=" + to_string(r2))
+    }
+    let r4 = call_reg_params(680004)
+    if r4 != 2 {
+        panic("pe_call_conv_fastcall FAIL [call_reg_params(680004)] expected=2 got=" + to_string(r4))
+    }
+    let r1 = call_reg_params(680001)
+    if r1 != 0 {
+        panic("pe_call_conv_fastcall FAIL [call_reg_params(680001)] expected=0 got=" + to_string(r1))
+    }
+    let r_miss = call_reg_params(9999)
+    if r_miss != 0 {
+        panic("pe_call_conv_fastcall FAIL [call_reg_params(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 8. pccf_stats() = [5, 7, 3, 1]
+    let s = pccf_stats()
+    if len(s) != 4 {
+        panic("pe_call_conv_fastcall FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_call_conv_fastcall FAIL [stats call_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 7 {
+        panic("pe_call_conv_fastcall FAIL [stats total_reg_params] expected=7 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_call_conv_fastcall FAIL [stats total_stack_params] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_call_conv_fastcall FAIL [stats count_param_count(2)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_call_conv_fastcall_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"total_reg_params\":" + to_string(s[1])
+        + ",\"total_stack_params\":" + to_string(s[2])
+        + ",\"count_pc2\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_call_conv_fastcall FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pccf()
+    let s2 = pccf_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_call_conv_fastcall FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_call_conv_fastcall self_test PASS (calls=" + to_string(s[0])
+        + ", reg=" + to_string(s[1]) + ", stack=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pccf_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("total_reg_params\t" + to_string(s[1]))
+            println("total_stack_params\t" + to_string(s[2]))
+            println("count_param_count_2\t" + to_string(s[3]))
+            return
+        }
+        if sub == "reg" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_reg_params\t" + to_string(call_reg_params(cid)))
+                return
+            }
+            println("usage: hexa run pe_call_conv_fastcall.hexa reg <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pc = to_int(a[3])
+                println("count_by_param_count\t" + to_string(count_by_param_count(pc)))
+                return
+            }
+            println("usage: hexa run pe_call_conv_fastcall.hexa count <param_count>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pccf()
+            println("cleaned: " + pccf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pccf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_call_conv_fastcall.hexa { self-test | stats | reg <call_id> | count <param_count> | cleanup | dir }")
+}

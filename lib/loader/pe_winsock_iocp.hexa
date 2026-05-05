@@ -1,0 +1,383 @@
+// lib/loader/pe_winsock_iocp.hexa — cycle 75 Winsock + IOCP integration telemetry skeleton
+//
+// Windows Winsock2 + I/O Completion Port (IOCP) high-perf server pattern:
+//   CreateIoCompletionPort + WSARecv + GetQueuedCompletionStatus.
+//   각 socket 을 IOCP 에 associate → completion 이 worker thread pool 로 dispatch.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 Winsock/IOCP association tracker — 실 WSAStartup() / WSARecv() /
+//   CreateIoCompletionPort() 호출 X (stage6 native bridge 영역).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// socket_kind code:
+//   1 = tcp
+//   2 = udp
+//   3 = raw
+//   4 = ipx
+//
+// persist schema (TSV — assocs.tsv):
+//   assoc_id<int> \t socket_kind<int> \t bytes_per_op<int> \t completion_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwi_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_winsock_iocp"
+}
+
+fn pwi_assocs_path() -> str {
+    return pwi_dir() + "/assocs.tsv"
+}
+
+fn pwi_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwi_dir() + "'")
+}
+
+fn cleanup_pwi() -> void {
+    pwi_ensure_dir()
+    let _ = exec("rm -f '" + pwi_assocs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwi_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwi_append_row(path: str, row: str) -> void {
+    pwi_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_assoc: IOCP association 1 건 기록 ───
+fn record_assoc(assoc_id: int, socket_kind: int, bytes_per_op: int, completion_count: int) -> void {
+    if assoc_id <= 0 {
+        panic("pe_winsock_iocp FAIL [record_assoc] expected=assoc_id>0 got=" + to_string(assoc_id))
+    }
+    if socket_kind < 1 {
+        panic("pe_winsock_iocp FAIL [record_assoc] expected=socket_kind>=1 got=" + to_string(socket_kind))
+    }
+    if socket_kind > 4 {
+        panic("pe_winsock_iocp FAIL [record_assoc] expected=socket_kind<=4 got=" + to_string(socket_kind))
+    }
+    if bytes_per_op < 0 {
+        panic("pe_winsock_iocp FAIL [record_assoc] expected=bytes_per_op>=0 got=" + to_string(bytes_per_op))
+    }
+    if completion_count < 0 {
+        panic("pe_winsock_iocp FAIL [record_assoc] expected=completion_count>=0 got=" + to_string(completion_count))
+    }
+    let row = to_string(assoc_id) + "\t" + to_string(socket_kind)
+        + "\t" + to_string(bytes_per_op) + "\t" + to_string(completion_count) + "\n"
+    pwi_append_row(pwi_assocs_path(), row)
+}
+
+// ─── assoc_count: total association 수 ───
+fn assoc_count() -> int {
+    let t = pwi_read_table(pwi_assocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes_per_op: 모든 association bytes_per_op 합 ───
+fn total_bytes_per_op() -> int {
+    let t = pwi_read_table(pwi_assocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_completions: 모든 association completion_count 합 ───
+fn total_completions() -> int {
+    let t = pwi_read_table(pwi_assocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_socket_kind: 특정 socket_kind 의 association 수 ───
+fn count_by_socket_kind(kind: int) -> int {
+    let t = pwi_read_table(pwi_assocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── assoc_completions: 특정 assoc_id 의 completion_count (없으면 0) ───
+fn assoc_completions(assoc_id: int) -> int {
+    let t = pwi_read_table(pwi_assocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == assoc_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pwi_stats: [assoc_count, total_bytes_per_op, total_completions, count_by_socket_kind(1)] ───
+fn pwi_stats() -> array {
+    let mut out = []
+    out.push(assoc_count())
+    out.push(total_bytes_per_op())
+    out.push(total_completions())
+    out.push(count_by_socket_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pwi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pwi()
+
+    // 2. record 5 assocs across ≥3 socket_kinds (1=tcp, 2=udp, 3=raw)
+    record_assoc(750001, 1, 4096, 128)
+    r0_emit("pe_winsock_iocp_record",
+        "\"assoc_id\":750001,\"socket_kind\":1,\"bytes_per_op\":4096,\"completion_count\":128,\"target\":\"tcp\"")
+
+    record_assoc(750002, 1, 8192, 256)
+    r0_emit("pe_winsock_iocp_record",
+        "\"assoc_id\":750002,\"socket_kind\":1,\"bytes_per_op\":8192,\"completion_count\":256,\"target\":\"tcp\"")
+
+    record_assoc(750003, 2, 1500, 64)
+    r0_emit("pe_winsock_iocp_record",
+        "\"assoc_id\":750003,\"socket_kind\":2,\"bytes_per_op\":1500,\"completion_count\":64,\"target\":\"udp\"")
+
+    record_assoc(750004, 3, 2048, 32)
+    r0_emit("pe_winsock_iocp_record",
+        "\"assoc_id\":750004,\"socket_kind\":3,\"bytes_per_op\":2048,\"completion_count\":32,\"target\":\"raw\"")
+
+    record_assoc(750005, 2, 1024, 96)
+    r0_emit("pe_winsock_iocp_record",
+        "\"assoc_id\":750005,\"socket_kind\":2,\"bytes_per_op\":1024,\"completion_count\":96,\"target\":\"udp\"")
+
+    // 3. assoc_count = 5
+    let c = assoc_count()
+    if c != 5 {
+        panic("pe_winsock_iocp FAIL [assoc_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_bytes_per_op = 4096+8192+1500+2048+1024 = 16860
+    let tb = total_bytes_per_op()
+    if tb != 16860 {
+        panic("pe_winsock_iocp FAIL [total_bytes_per_op] expected=16860 got=" + to_string(tb))
+    }
+
+    // 5. total_completions = 128+256+64+32+96 = 576
+    let tc = total_completions()
+    if tc != 576 {
+        panic("pe_winsock_iocp FAIL [total_completions] expected=576 got=" + to_string(tc))
+    }
+
+    // 6. count_by_socket_kind sanity
+    let k1 = count_by_socket_kind(1)
+    if k1 != 2 {
+        panic("pe_winsock_iocp FAIL [count_by_socket_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_socket_kind(2)
+    if k2 != 2 {
+        panic("pe_winsock_iocp FAIL [count_by_socket_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_socket_kind(3)
+    if k3 != 1 {
+        panic("pe_winsock_iocp FAIL [count_by_socket_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_socket_kind(4)
+    if k4 != 0 {
+        panic("pe_winsock_iocp FAIL [count_by_socket_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k99 = count_by_socket_kind(99)
+    if k99 != 0 {
+        panic("pe_winsock_iocp FAIL [count_by_socket_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. assoc_completions sanity
+    let ac2 = assoc_completions(750002)
+    if ac2 != 256 {
+        panic("pe_winsock_iocp FAIL [assoc_completions(750002)] expected=256 got=" + to_string(ac2))
+    }
+    let ac4 = assoc_completions(750004)
+    if ac4 != 32 {
+        panic("pe_winsock_iocp FAIL [assoc_completions(750004)] expected=32 got=" + to_string(ac4))
+    }
+    let ac_miss = assoc_completions(9999)
+    if ac_miss != 0 {
+        panic("pe_winsock_iocp FAIL [assoc_completions(9999)] expected=0 got=" + to_string(ac_miss))
+    }
+
+    // 8. pwi_stats() = [5, 16860, 576, 2]
+    let s = pwi_stats()
+    if len(s) != 4 {
+        panic("pe_winsock_iocp FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_winsock_iocp FAIL [stats assoc_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 16860 {
+        panic("pe_winsock_iocp FAIL [stats total_bytes_per_op] expected=16860 got=" + to_string(s[1]))
+    }
+    if s[2] != 576 {
+        panic("pe_winsock_iocp FAIL [stats total_completions] expected=576 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_winsock_iocp FAIL [stats count_kind(tcp)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_winsock_iocp_stats",
+        "\"assoc_count\":" + to_string(s[0])
+        + ",\"total_bytes_per_op\":" + to_string(s[1])
+        + ",\"total_completions\":" + to_string(s[2])
+        + ",\"kind_tcp\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_winsock_iocp FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pwi()
+    let s2 = pwi_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_winsock_iocp FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_winsock_iocp self_test PASS (assocs=" + to_string(s[0])
+        + ", bytes_per_op=" + to_string(s[1]) + ", completions=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwi_stats()
+            println("assoc_count\t" + to_string(s[0]))
+            println("total_bytes_per_op\t" + to_string(s[1]))
+            println("total_completions\t" + to_string(s[2]))
+            println("count_kind_tcp\t" + to_string(s[3]))
+            return
+        }
+        if sub == "completions" {
+            if len(a) >= 4 {
+                let aid = to_int(a[3])
+                println("assoc_completions\t" + to_string(assoc_completions(aid)))
+                return
+            }
+            println("usage: hexa run pe_winsock_iocp.hexa completions <assoc_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_socket_kind\t" + to_string(count_by_socket_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_winsock_iocp.hexa count <socket_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwi()
+            println("cleaned: " + pwi_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwi_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_winsock_iocp.hexa { self-test | stats | completions <assoc_id> | count <socket_kind> | cleanup | dir }")
+}

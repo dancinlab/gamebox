@@ -1,0 +1,584 @@
+// lib/loader/pe_msvc_scrt_common_main_seh_real.hexa — MSVC __scrt_common_main_seh 11-step path tracker
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / Bochs / community wrapper 0 줄.
+//        Microsoft Docs (Welcome to vcruntime / _initterm, _initterm_e / __security_init_cookie /
+//        IMAGE_LOAD_CONFIG_DIRECTORY) public ABI 관찰만 — 본 module 은 path traversal 의
+//        instrumentation telemetry 만 기록.
+// own 2: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   `__scrt_common_main_seh` 의 11-step entry path (docs/MSVC_CRT_INIT_BYPASS.md sequence).
+//     1  __scrt_initialize_crt(NORMAL=1)               → step_kind 0
+//     2  __security_init_cookie() — /GS canary seed    → step_kind 1
+//     3  __scrt_acquire_startup_lock()                 → step_kind 2
+//     4  _initterm_e(__xi_a, __xi_z) — C init array    → step_kind 3
+//     5  _initterm(__xc_a, __xc_z)   — C++ ctor table  → step_kind 4
+//     6  _set_app_type(GUI=1)                          → step_kind 5
+//     7  _get_initial_narrow_environment()             → step_kind 6
+//     8  _get_narrow_winmain_command_line()            → step_kind 7
+//     9  __scrt_translate_winmain() — shim wrapper     → step_kind 8
+//    10  WinMain(hInst, NULL, lpCmdLine, nShowCmd)     → step_kind 9
+//    11  __scrt_release_startup_lock + _cexit + Exit   → step_kind 10
+//   각 step 의 timestamp(ns) + ok(1=success / 0=fail) 를 기록.
+//
+//   추가로 SEH frame chain (FS:[0] EXCEPTION_REGISTRATION_RECORD: prev / handler) capture,
+//   path branch (success / fallback / abort) decision log,
+//   WinMain invoke 의 4-arg + return value 단발 capture,
+//   step 별 metric (latency, init array 길이, env var count 등) capture.
+//
+// step_kind code: 0=initialize_crt 1=security_init_cookie 2=acquire_lock
+//                 3=initterm_e 4=initterm 5=set_app_type 6=get_env
+//                 7=get_cmdline 8=translate_winmain 9=invoke_winmain 10=release_lock
+// branch_kind code: 0=success_path 1=fallback 2=abort
+//
+// persist schema (TSV — 5 separate tables):
+//   step.tsv:
+//     step_id<int> \t step_kind<int> \t ts_ns<int> \t ok<int>
+//   seh_frame.tsv:
+//     frame_id<int> \t prev_frame_va_hex<str> \t handler_va_hex<str> \t depth<int>
+//   path_branch.tsv:
+//     branch_id<int> \t step_id<int> \t branch_kind<int> \t taken<int>
+//   winmain_invoke.tsv:
+//     invoke_id<int> \t hinst_hex<str> \t lp_cmdline_hex<str> \t n_show<int> \t ret_value_hex<str>
+//   step_metric.tsv:
+//     metric_id<int> \t step_id<int> \t metric_name<str> \t value<int>
+//
+// 식별자 주의: type / mod / handle / resume 단독 identifier 금지 (hexa 예약어).
+// 사용 식별자: step_id / step_kind / ts_ns / ok / frame_id / prev_frame_va_hex /
+// handler_va_hex / depth / branch_id / branch_kind / taken / invoke_id / hinst_hex /
+// lp_cmdline_hex / n_show / ret_value_hex / metric_id / metric_name / value.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmsh_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_scrt_common_main_seh_real"
+}
+
+fn pmsh_step_path() -> str {
+    return pmsh_dir() + "/step.tsv"
+}
+
+fn pmsh_seh_frame_path() -> str {
+    return pmsh_dir() + "/seh_frame.tsv"
+}
+
+fn pmsh_path_branch_path() -> str {
+    return pmsh_dir() + "/path_branch.tsv"
+}
+
+fn pmsh_winmain_invoke_path() -> str {
+    return pmsh_dir() + "/winmain_invoke.tsv"
+}
+
+fn pmsh_step_metric_path() -> str {
+    return pmsh_dir() + "/step_metric.tsv"
+}
+
+fn pmsh_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmsh_dir() + "'")
+}
+
+fn cleanup_pmsh() -> void {
+    pmsh_ensure_dir()
+    let _ = exec("rm -f '" + pmsh_step_path() + "' '" + pmsh_seh_frame_path()
+        + "' '" + pmsh_path_branch_path() + "' '" + pmsh_winmain_invoke_path()
+        + "' '" + pmsh_step_metric_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmsh_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmsh_append_row(path: str, row: str) -> void {
+    pmsh_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmsh_count_rows(path: str, min_cols: int) -> int {
+    let t = pmsh_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_step: 11-step path 1 건 ───
+//    step_kind 0..10 — __scrt_common_main_seh sequence index
+fn record_step(step_id: int, step_kind: int, ts_ns: int, ok: int) -> void {
+    if step_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if step_kind < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step] expected=step_kind>=0 got=" + to_string(step_kind))
+    }
+    if step_kind > 10 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step] expected=step_kind<=10 got=" + to_string(step_kind))
+    }
+    if ts_ns < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    if ok < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step] expected=ok>=0 got=" + to_string(ok))
+    }
+    if ok > 1 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step] expected=ok<=1 got=" + to_string(ok))
+    }
+    let row = to_string(step_id) + "\t" + to_string(step_kind) + "\t" + to_string(ts_ns) + "\t" + to_string(ok) + "\n"
+    pmsh_append_row(pmsh_step_path(), row)
+}
+
+// ─── record_seh_frame: FS:[0] EXCEPTION_REGISTRATION_RECORD chain capture ───
+fn record_seh_frame(frame_id: int, prev_frame_va_hex: str, handler_va_hex: str, depth: int) -> void {
+    if frame_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_seh_frame] expected=frame_id>0 got=" + to_string(frame_id))
+    }
+    if prev_frame_va_hex == "" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_seh_frame] expected=prev_frame_va_hex!=empty got=empty")
+    }
+    if handler_va_hex == "" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_seh_frame] expected=handler_va_hex!=empty got=empty")
+    }
+    if depth < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_seh_frame] expected=depth>=0 got=" + to_string(depth))
+    }
+    let row = to_string(frame_id) + "\t" + prev_frame_va_hex + "\t" + handler_va_hex + "\t" + to_string(depth) + "\n"
+    pmsh_append_row(pmsh_seh_frame_path(), row)
+}
+
+// ─── record_path_branch: success / fallback / abort decision 1 건 ───
+//    branch_kind 0=success_path 1=fallback 2=abort
+fn record_path_branch(branch_id: int, step_id: int, branch_kind: int, taken: int) -> void {
+    if branch_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_path_branch] expected=branch_id>0 got=" + to_string(branch_id))
+    }
+    if step_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_path_branch] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if branch_kind < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_path_branch] expected=branch_kind>=0 got=" + to_string(branch_kind))
+    }
+    if branch_kind > 2 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_path_branch] expected=branch_kind<=2 got=" + to_string(branch_kind))
+    }
+    if taken < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_path_branch] expected=taken>=0 got=" + to_string(taken))
+    }
+    if taken > 1 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_path_branch] expected=taken<=1 got=" + to_string(taken))
+    }
+    let row = to_string(branch_id) + "\t" + to_string(step_id) + "\t" + to_string(branch_kind) + "\t" + to_string(taken) + "\n"
+    pmsh_append_row(pmsh_path_branch_path(), row)
+}
+
+// ─── record_winmain_invoke: WinMain(hInst, NULL, lpCmdLine, nShow) → ret 단발 capture ───
+fn record_winmain_invoke(invoke_id: int, hinst_hex: str, lp_cmdline_hex: str, n_show: int, ret_value_hex: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_winmain_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if hinst_hex == "" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_winmain_invoke] expected=hinst_hex!=empty got=empty")
+    }
+    if lp_cmdline_hex == "" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_winmain_invoke] expected=lp_cmdline_hex!=empty got=empty")
+    }
+    if n_show < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_winmain_invoke] expected=n_show>=0 got=" + to_string(n_show))
+    }
+    if ret_value_hex == "" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_winmain_invoke] expected=ret_value_hex!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + hinst_hex + "\t" + lp_cmdline_hex + "\t" + to_string(n_show) + "\t" + ret_value_hex + "\n"
+    pmsh_append_row(pmsh_winmain_invoke_path(), row)
+}
+
+// ─── record_step_metric: step 별 metric (latency/array_len/env_var_count …) ───
+fn record_step_metric(metric_id: int, step_id: int, metric_name: str, value: int) -> void {
+    if metric_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step_metric] expected=metric_id>0 got=" + to_string(metric_id))
+    }
+    if step_id <= 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step_metric] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if metric_name == "" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step_metric] expected=metric_name!=empty got=empty")
+    }
+    if value < 0 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [record_step_metric] expected=value>=0 got=" + to_string(value))
+    }
+    let row = to_string(metric_id) + "\t" + to_string(step_id) + "\t" + metric_name + "\t" + to_string(value) + "\n"
+    pmsh_append_row(pmsh_step_metric_path(), row)
+}
+
+// ─── 5종 통계 ───
+fn step_count() -> int {
+    return pmsh_count_rows(pmsh_step_path(), 4)
+}
+
+fn seh_frame_count() -> int {
+    return pmsh_count_rows(pmsh_seh_frame_path(), 4)
+}
+
+fn path_branch_count() -> int {
+    return pmsh_count_rows(pmsh_path_branch_path(), 4)
+}
+
+fn winmain_invoke_count() -> int {
+    return pmsh_count_rows(pmsh_winmain_invoke_path(), 5)
+}
+
+fn step_metric_count() -> int {
+    return pmsh_count_rows(pmsh_step_metric_path(), 4)
+}
+
+// ─── step_kind_name: 0..10 → name ───
+fn step_kind_name(k: int) -> str {
+    if k == 0 {
+        return "initialize_crt"
+    }
+    if k == 1 {
+        return "security_init_cookie"
+    }
+    if k == 2 {
+        return "acquire_lock"
+    }
+    if k == 3 {
+        return "initterm_e"
+    }
+    if k == 4 {
+        return "initterm"
+    }
+    if k == 5 {
+        return "set_app_type"
+    }
+    if k == 6 {
+        return "get_env"
+    }
+    if k == 7 {
+        return "get_cmdline"
+    }
+    if k == 8 {
+        return "translate_winmain"
+    }
+    if k == 9 {
+        return "invoke_winmain"
+    }
+    if k == 10 {
+        return "release_lock"
+    }
+    panic("pe_msvc_scrt_common_main_seh_real FAIL [step_kind_name] expected=0..10 got=" + to_string(k))
+}
+
+// ─── branch_kind_name: 0..2 → name ───
+fn branch_kind_name(b: int) -> str {
+    if b == 0 {
+        return "success_path"
+    }
+    if b == 1 {
+        return "fallback"
+    }
+    if b == 2 {
+        return "abort"
+    }
+    panic("pe_msvc_scrt_common_main_seh_real FAIL [branch_kind_name] expected=0..2 got=" + to_string(b))
+}
+
+// ─── pmsh_stats: [step, seh_frame, path_branch, winmain_invoke, step_metric] ───
+fn pmsh_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(seh_frame_count())
+    out.push(path_branch_count())
+    out.push(winmain_invoke_count())
+    out.push(step_metric_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmsh-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmsh()
+
+    // 2. record_step x11 — 11-step __scrt_common_main_seh path (step_kind 0~10, ok=1 all)
+    record_step(1, 0, 1000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":1,\"step_kind\":0,\"ts_ns\":1000,\"ok\":1,\"name\":\"" + step_kind_name(0) + "\"")
+
+    record_step(2, 1, 2000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":2,\"step_kind\":1,\"ts_ns\":2000,\"ok\":1,\"name\":\"" + step_kind_name(1) + "\"")
+
+    record_step(3, 2, 3000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":3,\"step_kind\":2,\"ts_ns\":3000,\"ok\":1,\"name\":\"" + step_kind_name(2) + "\"")
+
+    record_step(4, 3, 4000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":4,\"step_kind\":3,\"ts_ns\":4000,\"ok\":1,\"name\":\"" + step_kind_name(3) + "\"")
+
+    record_step(5, 4, 5000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":5,\"step_kind\":4,\"ts_ns\":5000,\"ok\":1,\"name\":\"" + step_kind_name(4) + "\"")
+
+    record_step(6, 5, 6000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":6,\"step_kind\":5,\"ts_ns\":6000,\"ok\":1,\"name\":\"" + step_kind_name(5) + "\"")
+
+    record_step(7, 6, 7000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":7,\"step_kind\":6,\"ts_ns\":7000,\"ok\":1,\"name\":\"" + step_kind_name(6) + "\"")
+
+    record_step(8, 7, 8000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":8,\"step_kind\":7,\"ts_ns\":8000,\"ok\":1,\"name\":\"" + step_kind_name(7) + "\"")
+
+    record_step(9, 8, 9000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":9,\"step_kind\":8,\"ts_ns\":9000,\"ok\":1,\"name\":\"" + step_kind_name(8) + "\"")
+
+    record_step(10, 9, 10000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":10,\"step_kind\":9,\"ts_ns\":10000,\"ok\":1,\"name\":\"" + step_kind_name(9) + "\"")
+
+    record_step(11, 10, 11000, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step",
+        "\"step_id\":11,\"step_kind\":10,\"ts_ns\":11000,\"ok\":1,\"name\":\"" + step_kind_name(10) + "\"")
+
+    // 3. record_seh_frame x2 — depth 1 (outer __scrt frame) + depth 2 (WinMain inner frame)
+    record_seh_frame(1, "0xffffffff", "0x00401500", 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_seh_frame",
+        "\"frame_id\":1,\"prev_frame_va_hex\":\"0xffffffff\",\"handler_va_hex\":\"0x00401500\",\"depth\":1")
+
+    record_seh_frame(2, "0x0019ff7c", "0x00402a00", 2)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_seh_frame",
+        "\"frame_id\":2,\"prev_frame_va_hex\":\"0x0019ff7c\",\"handler_va_hex\":\"0x00402a00\",\"depth\":2")
+
+    // 4. record_path_branch x5 — 4 success_path + 1 fallback (security_init_cookie weak cookie)
+    record_path_branch(1, 1, 0, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_path_branch",
+        "\"branch_id\":1,\"step_id\":1,\"branch_kind\":0,\"taken\":1,\"name\":\"" + branch_kind_name(0) + "\"")
+
+    record_path_branch(2, 2, 1, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_path_branch",
+        "\"branch_id\":2,\"step_id\":2,\"branch_kind\":1,\"taken\":1,\"name\":\"" + branch_kind_name(1) + "\",\"reason\":\"weak_cookie_default_sentinel\"")
+
+    record_path_branch(3, 4, 0, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_path_branch",
+        "\"branch_id\":3,\"step_id\":4,\"branch_kind\":0,\"taken\":1,\"name\":\"" + branch_kind_name(0) + "\"")
+
+    record_path_branch(4, 5, 0, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_path_branch",
+        "\"branch_id\":4,\"step_id\":5,\"branch_kind\":0,\"taken\":1,\"name\":\"" + branch_kind_name(0) + "\"")
+
+    record_path_branch(5, 10, 0, 1)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_path_branch",
+        "\"branch_id\":5,\"step_id\":10,\"branch_kind\":0,\"taken\":1,\"name\":\"" + branch_kind_name(0) + "\"")
+
+    // 5. record_winmain_invoke x1 — WinMain(0x10000000, NULL, 0x80000800, SW_SHOWDEFAULT=10) → 0
+    record_winmain_invoke(1, "0x10000000", "0x80000800", 10, "0x0")
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_winmain_invoke",
+        "\"invoke_id\":1,\"hinst_hex\":\"0x10000000\",\"lp_cmdline_hex\":\"0x80000800\",\"n_show\":10,\"ret_value_hex\":\"0x0\"")
+
+    // 6. record_step_metric x4 — initterm_e array_len + initterm array_len + env var_count + winmain latency_ns
+    record_step_metric(1, 4, "initterm_e_array_len", 8)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step_metric",
+        "\"metric_id\":1,\"step_id\":4,\"metric_name\":\"initterm_e_array_len\",\"value\":8")
+
+    record_step_metric(2, 5, "initterm_array_len", 4)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step_metric",
+        "\"metric_id\":2,\"step_id\":5,\"metric_name\":\"initterm_array_len\",\"value\":4")
+
+    record_step_metric(3, 7, "env_var_count", 20)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step_metric",
+        "\"metric_id\":3,\"step_id\":7,\"metric_name\":\"env_var_count\",\"value\":20")
+
+    record_step_metric(4, 10, "winmain_latency_ns", 1000)
+    r0_emit("pe_msvc_scrt_common_main_seh_real_record_step_metric",
+        "\"metric_id\":4,\"step_id\":10,\"metric_name\":\"winmain_latency_ns\",\"value\":1000")
+
+    // 7. assertion: step == 11
+    let sc = step_count()
+    if sc != 11 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [step_count] expected=11 got=" + to_string(sc))
+    }
+
+    // 8. assertion: seh_frame == 2
+    let fc = seh_frame_count()
+    if fc != 2 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [seh_frame_count] expected=2 got=" + to_string(fc))
+    }
+
+    // 9. assertion: path_branch == 5
+    let pb = path_branch_count()
+    if pb != 5 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [path_branch_count] expected=5 got=" + to_string(pb))
+    }
+
+    // 10. assertion: winmain_invoke == 1
+    let wi = winmain_invoke_count()
+    if wi != 1 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [winmain_invoke_count] expected=1 got=" + to_string(wi))
+    }
+
+    // 11. assertion: step_metric == 4
+    let sm = step_metric_count()
+    if sm != 4 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [step_metric_count] expected=4 got=" + to_string(sm))
+    }
+
+    // 12. step_kind_name sanity 11 종
+    let n0 = step_kind_name(0)
+    if n0 != "initialize_crt" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [step_kind_name(0)] expected=initialize_crt got=" + n0)
+    }
+    let n1 = step_kind_name(1)
+    if n1 != "security_init_cookie" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [step_kind_name(1)] expected=security_init_cookie got=" + n1)
+    }
+    let n9 = step_kind_name(9)
+    if n9 != "invoke_winmain" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [step_kind_name(9)] expected=invoke_winmain got=" + n9)
+    }
+    let n10 = step_kind_name(10)
+    if n10 != "release_lock" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [step_kind_name(10)] expected=release_lock got=" + n10)
+    }
+
+    // 13. branch_kind_name sanity 3 종
+    let b0 = branch_kind_name(0)
+    if b0 != "success_path" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [branch_kind_name(0)] expected=success_path got=" + b0)
+    }
+    let b1 = branch_kind_name(1)
+    if b1 != "fallback" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [branch_kind_name(1)] expected=fallback got=" + b1)
+    }
+    let b2 = branch_kind_name(2)
+    if b2 != "abort" {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [branch_kind_name(2)] expected=abort got=" + b2)
+    }
+
+    // 14. pmsh_stats() == [11, 2, 5, 1, 4]
+    let s = pmsh_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 11 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [stats step] expected=11 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [stats seh_frame] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [stats path_branch] expected=5 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [stats winmain_invoke] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [stats step_metric] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_msvc_scrt_common_main_seh_real_stats",
+        "\"step\":" + to_string(s[0])
+        + ",\"seh_frame\":" + to_string(s[1])
+        + ",\"path_branch\":" + to_string(s[2])
+        + ",\"winmain_invoke\":" + to_string(s[3])
+        + ",\"step_metric\":" + to_string(s[4]))
+
+    // 16. emit count >= 12 (own2 mandate)
+    //     11 step + 2 seh_frame + 5 path_branch + 1 winmain_invoke + 4 step_metric + 1 stats = 24
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_msvc_scrt_common_main_seh_real FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pmsh()
+    let s2 = pmsh_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_scrt_common_main_seh_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_scrt_common_main_seh_real self_test PASS (step="
+        + to_string(s[0]) + ", seh_frame=" + to_string(s[1])
+        + ", path_branch=" + to_string(s[2]) + ", winmain_invoke=" + to_string(s[3])
+        + ", step_metric=" + to_string(s[4]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmsh_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("seh_frame_count\t" + to_string(s[1]))
+            println("path_branch_count\t" + to_string(s[2]))
+            println("winmain_invoke_count\t" + to_string(s[3]))
+            println("step_metric_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "step-kind-name" {
+            if len(a) >= 4 {
+                println(step_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_scrt_common_main_seh_real.hexa step-kind-name <int>")
+            return
+        }
+        if sub == "branch-kind-name" {
+            if len(a) >= 4 {
+                println(branch_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_scrt_common_main_seh_real.hexa branch-kind-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmsh()
+            println("cleaned: " + pmsh_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmsh_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_scrt_common_main_seh_real.hexa { self-test | stats | step-kind-name <k> | branch-kind-name <b> | cleanup | dir }")
+}

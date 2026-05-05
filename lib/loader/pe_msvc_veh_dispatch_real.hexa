@@ -1,0 +1,518 @@
+// lib/loader/pe_msvc_veh_dispatch_real.hexa — Vectored Exception Handler list + dispatch flow tracker (R3 Tier).
+//
+// Windows VEH (Vectored Exception Handlers) — process-wide chain that runs
+// BEFORE SEH frame walker. AddVectoredExceptionHandler 의 두 번째 arg
+// (FirstHandler != 0) 으로 head 삽입 / tail append 결정. Anti-debug code +
+// __try/__except 우회 path 가 자주 사용. Wine 의 call_vectored_handlers
+// (algorithm direction reference only — Wine source 0 줄 lift).
+//
+// own1 enforcement: Wine / CrossOver / Whisky / GPTk source 0 줄 lift.
+//   본 module 은 register / remove / dispatch / disposition / handoff
+//   record API — 실 RtlAddVectoredExceptionHandler / KiUserExceptionDispatcher
+//   호출 X. TSV persist + r0_emit 기반 추적기.
+//
+// own2 mandate:
+//   - r0_emit ≥ 14 (16 record + 5 stats emit = 21)
+//   - self_test() + main() dispatch + headless safe + panic 형식 검증.
+//
+// first_or_last code (record_veh_register, AddVectoredExceptionHandler 의 첫 arg):
+//   0 = first  (insert at head — runs before previously registered)
+//   1 = last   (append at tail — runs after previously registered)
+//
+// disposition_value code (record_veh_disposition, VEH 반환값):
+//   0 = ContinueExecution  (EXCEPTION_CONTINUE_EXECUTION  — fix up + resume, SEH skip)
+//   1 = ContinueSearch     (EXCEPTION_CONTINUE_SEARCH     — pass to next VEH or SEH)
+//
+// reason_kind code (record_veh_to_seh_handoff):
+//   0 = continue_search  (모든 VEH 가 ContinueSearch 반환 → SEH 진입)
+//   1 = no_veh           (등록된 VEH 0 개 → 즉시 SEH 진입)
+//   2 = all_search       (VEH walk 완료, ContinueExecution 없음 → SEH dispatch)
+//
+// persist schema (TSV — 5 tables):
+//   veh_registers.tsv   : reg_id<int> \t handler_va_hex<str> \t first_or_last<int>
+//   veh_removes.tsv     : remove_id<int> \t reg_id<int>
+//   veh_dispatches.tsv  : dispatch_id<int> \t exception_code_hex<str> \t fault_va_hex<str> \t walked_count<int>
+//   veh_dispositions.tsv: disp_id<int> \t dispatch_id<int> \t reg_id<int> \t disposition_value<int>
+//   veh_handoffs.tsv    : handoff_id<int> \t dispatch_id<int> \t reason_kind<int>
+//
+// Hexa 예약어 회피: type / mod / handle / class / kind 단독 식별자 금지 →
+// first_or_last / disposition_value / reason_kind / walked_count.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmvd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_veh_dispatch_real"
+}
+
+fn pmvd_registers_path() -> str {
+    return pmvd_dir() + "/veh_registers.tsv"
+}
+
+fn pmvd_removes_path() -> str {
+    return pmvd_dir() + "/veh_removes.tsv"
+}
+
+fn pmvd_dispatches_path() -> str {
+    return pmvd_dir() + "/veh_dispatches.tsv"
+}
+
+fn pmvd_dispositions_path() -> str {
+    return pmvd_dir() + "/veh_dispositions.tsv"
+}
+
+fn pmvd_handoffs_path() -> str {
+    return pmvd_dir() + "/veh_handoffs.tsv"
+}
+
+fn pmvd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmvd_dir() + "'")
+}
+
+fn cleanup_pmvd() -> void {
+    pmvd_ensure_dir()
+    let _ = exec("rm -f '" + pmvd_registers_path()
+        + "' '" + pmvd_removes_path()
+        + "' '" + pmvd_dispatches_path()
+        + "' '" + pmvd_dispositions_path()
+        + "' '" + pmvd_handoffs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmvd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmvd_append_row(path: str, row: str) -> void {
+    pmvd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmvd_count_rows(path: str, min_cols: int) -> int {
+    let t = pmvd_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_veh_register: AddVectoredExceptionHandler 등록 1 건 ───
+fn record_veh_register(reg_id: int, handler_va_hex: str, first_or_last: int) -> void {
+    if reg_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_register] expected=reg_id>0 got=" + to_string(reg_id))
+    }
+    if handler_va_hex == "" {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_register] expected=handler_va_hex!=empty got=empty")
+    }
+    if first_or_last < 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_register] expected=first_or_last>=0 got=" + to_string(first_or_last))
+    }
+    if first_or_last > 1 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_register] expected=first_or_last<=1 got=" + to_string(first_or_last))
+    }
+    let row = to_string(reg_id) + "\t" + handler_va_hex
+        + "\t" + to_string(first_or_last) + "\n"
+    pmvd_append_row(pmvd_registers_path(), row)
+}
+
+// ─── record_veh_remove: RemoveVectoredExceptionHandler 1 건 ───
+fn record_veh_remove(remove_id: int, reg_id: int) -> void {
+    if remove_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_remove] expected=remove_id>0 got=" + to_string(remove_id))
+    }
+    if reg_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_remove] expected=reg_id>0 got=" + to_string(reg_id))
+    }
+    let row = to_string(remove_id) + "\t" + to_string(reg_id) + "\n"
+    pmvd_append_row(pmvd_removes_path(), row)
+}
+
+// ─── record_veh_dispatch: VEH chain walk 1 건 (exception 발생) ───
+fn record_veh_dispatch(dispatch_id: int, exception_code_hex: str, fault_va_hex: str, walked_count: int) -> void {
+    if dispatch_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_dispatch] expected=dispatch_id>0 got=" + to_string(dispatch_id))
+    }
+    if exception_code_hex == "" {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_dispatch] expected=exception_code_hex!=empty got=empty")
+    }
+    if fault_va_hex == "" {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_dispatch] expected=fault_va_hex!=empty got=empty")
+    }
+    if walked_count < 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_dispatch] expected=walked_count>=0 got=" + to_string(walked_count))
+    }
+    let row = to_string(dispatch_id) + "\t" + exception_code_hex
+        + "\t" + fault_va_hex + "\t" + to_string(walked_count) + "\n"
+    pmvd_append_row(pmvd_dispatches_path(), row)
+}
+
+// ─── record_veh_disposition: VEH 반환 disposition 1 건 ───
+fn record_veh_disposition(disp_id: int, dispatch_id: int, reg_id: int, disposition_value: int) -> void {
+    if disp_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_disposition] expected=disp_id>0 got=" + to_string(disp_id))
+    }
+    if dispatch_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_disposition] expected=dispatch_id>0 got=" + to_string(dispatch_id))
+    }
+    if reg_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_disposition] expected=reg_id>0 got=" + to_string(reg_id))
+    }
+    if disposition_value < 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_disposition] expected=disposition_value>=0 got=" + to_string(disposition_value))
+    }
+    if disposition_value > 1 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_disposition] expected=disposition_value<=1 got=" + to_string(disposition_value))
+    }
+    let row = to_string(disp_id) + "\t" + to_string(dispatch_id)
+        + "\t" + to_string(reg_id) + "\t" + to_string(disposition_value) + "\n"
+    pmvd_append_row(pmvd_dispositions_path(), row)
+}
+
+// ─── record_veh_to_seh_handoff: VEH chain → SEH dispatch handoff 1 건 ───
+fn record_veh_to_seh_handoff(handoff_id: int, dispatch_id: int, reason_kind: int) -> void {
+    if handoff_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_to_seh_handoff] expected=handoff_id>0 got=" + to_string(handoff_id))
+    }
+    if dispatch_id <= 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_to_seh_handoff] expected=dispatch_id>0 got=" + to_string(dispatch_id))
+    }
+    if reason_kind < 0 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_to_seh_handoff] expected=reason_kind>=0 got=" + to_string(reason_kind))
+    }
+    if reason_kind > 2 {
+        panic("pe_msvc_veh_dispatch_real FAIL [record_veh_to_seh_handoff] expected=reason_kind<=2 got=" + to_string(reason_kind))
+    }
+    let row = to_string(handoff_id) + "\t" + to_string(dispatch_id)
+        + "\t" + to_string(reason_kind) + "\n"
+    pmvd_append_row(pmvd_handoffs_path(), row)
+}
+
+// ─── 5 종 통계 ───
+fn veh_register_count() -> int {
+    return pmvd_count_rows(pmvd_registers_path(), 3)
+}
+
+fn veh_remove_count() -> int {
+    return pmvd_count_rows(pmvd_removes_path(), 2)
+}
+
+fn veh_dispatch_count() -> int {
+    return pmvd_count_rows(pmvd_dispatches_path(), 4)
+}
+
+fn veh_disposition_count() -> int {
+    return pmvd_count_rows(pmvd_dispositions_path(), 4)
+}
+
+fn veh_to_seh_handoff_count() -> int {
+    return pmvd_count_rows(pmvd_handoffs_path(), 3)
+}
+
+// ─── helper: code → name ───
+fn first_or_last_name(first_or_last: int) -> str {
+    if first_or_last == 0 { return "first" }
+    if first_or_last == 1 { return "last" }
+    return "unknown"
+}
+
+fn disposition_value_name(disposition_value: int) -> str {
+    if disposition_value == 0 { return "ContinueExecution" }
+    if disposition_value == 1 { return "ContinueSearch" }
+    return "unknown"
+}
+
+fn reason_kind_name(reason_kind: int) -> str {
+    if reason_kind == 0 { return "continue_search" }
+    if reason_kind == 1 { return "no_veh" }
+    if reason_kind == 2 { return "all_search" }
+    return "unknown"
+}
+
+// ─── pmvd_stats: [register, remove, dispatch, disposition, handoff] ───
+fn pmvd_stats() -> array {
+    let mut out = []
+    out.push(veh_register_count())
+    out.push(veh_remove_count())
+    out.push(veh_dispatch_count())
+    out.push(veh_disposition_count())
+    out.push(veh_to_seh_handoff_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmvd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmvd()
+
+    // 2. helper sanity (이름 매핑) — 호출 자체는 emit 미발생, panic 만 검증.
+    if first_or_last_name(0) != "first" {
+        panic("pe_msvc_veh_dispatch_real FAIL [first_or_last_name(0)] expected=first got=" + first_or_last_name(0))
+    }
+    if first_or_last_name(1) != "last" {
+        panic("pe_msvc_veh_dispatch_real FAIL [first_or_last_name(1)] expected=last got=" + first_or_last_name(1))
+    }
+    if first_or_last_name(99) != "unknown" {
+        panic("pe_msvc_veh_dispatch_real FAIL [first_or_last_name(99)] expected=unknown got=" + first_or_last_name(99))
+    }
+    if disposition_value_name(0) != "ContinueExecution" {
+        panic("pe_msvc_veh_dispatch_real FAIL [disposition_value_name(0)] expected=ContinueExecution got=" + disposition_value_name(0))
+    }
+    if disposition_value_name(1) != "ContinueSearch" {
+        panic("pe_msvc_veh_dispatch_real FAIL [disposition_value_name(1)] expected=ContinueSearch got=" + disposition_value_name(1))
+    }
+    if disposition_value_name(99) != "unknown" {
+        panic("pe_msvc_veh_dispatch_real FAIL [disposition_value_name(99)] expected=unknown got=" + disposition_value_name(99))
+    }
+    if reason_kind_name(0) != "continue_search" {
+        panic("pe_msvc_veh_dispatch_real FAIL [reason_kind_name(0)] expected=continue_search got=" + reason_kind_name(0))
+    }
+    if reason_kind_name(1) != "no_veh" {
+        panic("pe_msvc_veh_dispatch_real FAIL [reason_kind_name(1)] expected=no_veh got=" + reason_kind_name(1))
+    }
+    if reason_kind_name(2) != "all_search" {
+        panic("pe_msvc_veh_dispatch_real FAIL [reason_kind_name(2)] expected=all_search got=" + reason_kind_name(2))
+    }
+    if reason_kind_name(99) != "unknown" {
+        panic("pe_msvc_veh_dispatch_real FAIL [reason_kind_name(99)] expected=unknown got=" + reason_kind_name(99))
+    }
+
+    // 3. record 4 veh_register (2 first + 2 last)
+    //    reg 9001 = handler @ 00407100, first  (anti-debug head 삽입)
+    //    reg 9002 = handler @ 00407200, last   (logger tail append)
+    //    reg 9003 = handler @ 00407300, first  (CFG fast-fail head)
+    //    reg 9004 = handler @ 00407400, last   (default fallback tail)
+    record_veh_register(9001, "00407100", 0)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_register",
+        "\"reg_id\":9001,\"handler_va_hex\":\"00407100\",\"first_or_last\":0,\"target\":\"first\"")
+
+    record_veh_register(9002, "00407200", 1)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_register",
+        "\"reg_id\":9002,\"handler_va_hex\":\"00407200\",\"first_or_last\":1,\"target\":\"last\"")
+
+    record_veh_register(9003, "00407300", 0)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_register",
+        "\"reg_id\":9003,\"handler_va_hex\":\"00407300\",\"first_or_last\":0,\"target\":\"first\"")
+
+    record_veh_register(9004, "00407400", 1)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_register",
+        "\"reg_id\":9004,\"handler_va_hex\":\"00407400\",\"first_or_last\":1,\"target\":\"last\"")
+
+    // 4. record 2 veh_remove
+    //    remove 9501 → reg 9002 (logger 제거)
+    //    remove 9502 → reg 9004 (default fallback 제거)
+    record_veh_remove(9501, 9002)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_remove",
+        "\"remove_id\":9501,\"reg_id\":9002")
+
+    record_veh_remove(9502, 9004)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_remove",
+        "\"remove_id\":9502,\"reg_id\":9004")
+
+    // 5. record 3 veh_dispatch (3 다른 exception_code)
+    //    dispatch 10001 = 0xC0000005 access violation @ 00407A12, walked 3
+    //    dispatch 10002 = 0x80000003 breakpoint        @ 00408C31, walked 2
+    //    dispatch 10003 = 0xC0000094 int_divide_by_0   @ 0040AB55, walked 2
+    record_veh_dispatch(10001, "C0000005", "00407A12", 3)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_dispatch",
+        "\"dispatch_id\":10001,\"exception_code_hex\":\"C0000005\",\"fault_va_hex\":\"00407A12\",\"walked_count\":3")
+
+    record_veh_dispatch(10002, "80000003", "00408C31", 2)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_dispatch",
+        "\"dispatch_id\":10002,\"exception_code_hex\":\"80000003\",\"fault_va_hex\":\"00408C31\",\"walked_count\":2")
+
+    record_veh_dispatch(10003, "C0000094", "0040AB55", 2)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_dispatch",
+        "\"dispatch_id\":10003,\"exception_code_hex\":\"C0000094\",\"fault_va_hex\":\"0040AB55\",\"walked_count\":2")
+
+    // 6. record 4 veh_disposition (3 ContinueSearch + 1 ContinueExecution)
+    //    disp 11001 → dispatch 10001, reg 9001, ContinueSearch
+    //    disp 11002 → dispatch 10001, reg 9003, ContinueSearch
+    //    disp 11003 → dispatch 10002, reg 9001, ContinueExecution (debug fixup)
+    //    disp 11004 → dispatch 10003, reg 9003, ContinueSearch
+    record_veh_disposition(11001, 10001, 9001, 1)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_disposition",
+        "\"disp_id\":11001,\"dispatch_id\":10001,\"reg_id\":9001,\"disposition_value\":1,\"target\":\"ContinueSearch\"")
+
+    record_veh_disposition(11002, 10001, 9003, 1)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_disposition",
+        "\"disp_id\":11002,\"dispatch_id\":10001,\"reg_id\":9003,\"disposition_value\":1,\"target\":\"ContinueSearch\"")
+
+    record_veh_disposition(11003, 10002, 9001, 0)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_disposition",
+        "\"disp_id\":11003,\"dispatch_id\":10002,\"reg_id\":9001,\"disposition_value\":0,\"target\":\"ContinueExecution\"")
+
+    record_veh_disposition(11004, 10003, 9003, 1)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_disposition",
+        "\"disp_id\":11004,\"dispatch_id\":10003,\"reg_id\":9003,\"disposition_value\":1,\"target\":\"ContinueSearch\"")
+
+    // 7. record 3 veh_to_seh_handoff (각 reason_kind)
+    //    handoff 12001 → dispatch 10001, reason continue_search (모두 search)
+    //    handoff 12002 → dispatch 10003, reason no_veh         (이미 제거된 chain)
+    //    handoff 12003 → dispatch 10003, reason all_search     (walk 완료, ContinueExecution 없음)
+    record_veh_to_seh_handoff(12001, 10001, 0)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_to_seh_handoff",
+        "\"handoff_id\":12001,\"dispatch_id\":10001,\"reason_kind\":0,\"target\":\"continue_search\"")
+
+    record_veh_to_seh_handoff(12002, 10003, 1)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_to_seh_handoff",
+        "\"handoff_id\":12002,\"dispatch_id\":10003,\"reason_kind\":1,\"target\":\"no_veh\"")
+
+    record_veh_to_seh_handoff(12003, 10003, 2)
+    r0_emit("pe_msvc_veh_dispatch_real_record_veh_to_seh_handoff",
+        "\"handoff_id\":12003,\"dispatch_id\":10003,\"reason_kind\":2,\"target\":\"all_search\"")
+
+    // 8. row count 검증 — 4 register / 2 remove / 3 dispatch / 4 disposition / 3 handoff
+    let rc = veh_register_count()
+    if rc != 4 {
+        panic("pe_msvc_veh_dispatch_real FAIL [veh_register_count] expected=4 got=" + to_string(rc))
+    }
+    let mc = veh_remove_count()
+    if mc != 2 {
+        panic("pe_msvc_veh_dispatch_real FAIL [veh_remove_count] expected=2 got=" + to_string(mc))
+    }
+    let dc = veh_dispatch_count()
+    if dc != 3 {
+        panic("pe_msvc_veh_dispatch_real FAIL [veh_dispatch_count] expected=3 got=" + to_string(dc))
+    }
+    let ic = veh_disposition_count()
+    if ic != 4 {
+        panic("pe_msvc_veh_dispatch_real FAIL [veh_disposition_count] expected=4 got=" + to_string(ic))
+    }
+    let hc = veh_to_seh_handoff_count()
+    if hc != 3 {
+        panic("pe_msvc_veh_dispatch_real FAIL [veh_to_seh_handoff_count] expected=3 got=" + to_string(hc))
+    }
+
+    // 9. pmvd_stats() = [4, 2, 3, 4, 3]
+    let s = pmvd_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_veh_dispatch_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_veh_dispatch_real FAIL [stats veh_register_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvc_veh_dispatch_real FAIL [stats veh_remove_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_msvc_veh_dispatch_real FAIL [stats veh_dispatch_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_veh_dispatch_real FAIL [stats veh_disposition_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_veh_dispatch_real FAIL [stats veh_to_seh_handoff_count] expected=3 got=" + to_string(s[4]))
+    }
+
+    // 10. emit 5 종 stats line — 분리하여 r0_emit ≥ 14 보장 (16 record + 5 stats = 21)
+    r0_emit("pe_msvc_veh_dispatch_real_stats_register",
+        "\"veh_register_count\":" + to_string(s[0]))
+    r0_emit("pe_msvc_veh_dispatch_real_stats_remove",
+        "\"veh_remove_count\":" + to_string(s[1]))
+    r0_emit("pe_msvc_veh_dispatch_real_stats_dispatch",
+        "\"veh_dispatch_count\":" + to_string(s[2]))
+    r0_emit("pe_msvc_veh_dispatch_real_stats_disposition",
+        "\"veh_disposition_count\":" + to_string(s[3]))
+    r0_emit("pe_msvc_veh_dispatch_real_stats_handoff",
+        "\"veh_to_seh_handoff_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 14 (16 record + 5 stats = 21)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_veh_dispatch_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → 5 stats 모두 0
+    cleanup_pmvd()
+    let s2 = pmvd_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_veh_dispatch_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_veh_dispatch_real self_test PASS (register=" + to_string(s[0])
+        + ", remove=" + to_string(s[1]) + ", dispatch=" + to_string(s[2])
+        + ", disposition=" + to_string(s[3]) + ", handoff=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmvd_stats()
+            println("veh_register_count\t" + to_string(s[0]))
+            println("veh_remove_count\t" + to_string(s[1]))
+            println("veh_dispatch_count\t" + to_string(s[2]))
+            println("veh_disposition_count\t" + to_string(s[3]))
+            println("veh_to_seh_handoff_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "first-or-last-name" {
+            if len(a) >= 4 {
+                println(first_or_last_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_veh_dispatch_real.hexa first-or-last-name <n>")
+            return
+        }
+        if sub == "disposition-value-name" {
+            if len(a) >= 4 {
+                println(disposition_value_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_veh_dispatch_real.hexa disposition-value-name <n>")
+            return
+        }
+        if sub == "reason-kind-name" {
+            if len(a) >= 4 {
+                println(reason_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_veh_dispatch_real.hexa reason-kind-name <n>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmvd()
+            println("cleaned: " + pmvd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmvd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_veh_dispatch_real.hexa { self-test | stats | first-or-last-name <n> | disposition-value-name <n> | reason-kind-name <n> | cleanup | dir }")
+}

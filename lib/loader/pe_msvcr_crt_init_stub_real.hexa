@@ -1,0 +1,489 @@
+// lib/loader/pe_msvcr_crt_init_stub_real.hexa — MSVCR/UCRT C runtime init path stub 호출 추적기
+//
+// shim cpp wave5 가 CRT init 함수 (`_initterm`, `__scrt_acquire_startup_lock`,
+// `_get_initial_narrow_environment`, `__scrt_initialize_crt`, etc.) 를 의미 있는
+// fake return 으로 stub 처리. 본 hexa 는 그 stub 호출 path 의 instrumentation +
+// coverage 추적 layer — Apple SDK 호출 X (own1 정합).
+//
+// CRT init typical sequence (MSVC __scrt_common_main_seh, MSDN UCRT 공개 doc 기준):
+//   1. __scrt_initialize_crt(NORMAL=1)
+//   2. __scrt_acquire_startup_lock()
+//   3. _initterm_e (CRT C init array — 실패 가능 ctor)
+//   4. _initterm   (CRT C++ init array — void ctor table)
+//   5. _is_managed_app
+//   6. _set_app_type(1)              // GUI
+//   7. _get_initial_narrow_environment
+//   8. _get_narrow_winmain_command_line
+//   9. WinMain(hInst, NULL, lpCmdLine, nShowCmd)  ← entry
+//  10. __scrt_release_startup_lock
+//  11. exit(WinMain return value)
+//
+// own 1 enforcement: Wine msvcrt source / Microsoft msvcrt source / CrossOver / Box86 /
+//                    community 코드 0 줄. Microsoft UCRT API doc 참조 OK.
+//   - Wine dlls/msvcrt 인용 X
+//   - Microsoft msvcrt source 인용 X
+//   - 우회 금지
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   crt_calls.tsv     : call_id<int>      \t fn_name<str>       \t ret_value_hex<str> \t arg_count<int>
+//   init_arrays.tsv   : init_id<int>      \t start_va_hex<str>  \t end_va_hex<str>    \t walked_count<int>
+//   app_types.tsv     : at_id<int>        \t app_type<int>
+//   env_blocks.tsv    : eb_id<int>        \t env_block_va_hex<str> \t var_count<int>  \t total_size<int>
+//   winmain_args.tsv  : arg_id<int>       \t arg_idx<int>       \t value_hex<str>     \t kind<int>
+//
+// app_type code: 0=console 1=gui 2=dll
+// kind code (winmain): 0=hInstance 1=hPrevInstance 2=lpCmdLine 3=nShowCmd
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → app_type / kind / arg_idx.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmcr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvcr_crt_init_stub_real"
+}
+
+fn pmcr_calls_path() -> str {
+    return pmcr_dir() + "/crt_calls.tsv"
+}
+
+fn pmcr_init_arrays_path() -> str {
+    return pmcr_dir() + "/init_arrays.tsv"
+}
+
+fn pmcr_app_types_path() -> str {
+    return pmcr_dir() + "/app_types.tsv"
+}
+
+fn pmcr_env_blocks_path() -> str {
+    return pmcr_dir() + "/env_blocks.tsv"
+}
+
+fn pmcr_winmain_args_path() -> str {
+    return pmcr_dir() + "/winmain_args.tsv"
+}
+
+fn pmcr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmcr_dir() + "'")
+}
+
+fn cleanup_pmcr() -> void {
+    pmcr_ensure_dir()
+    let _ = exec("rm -f '" + pmcr_calls_path() + "' '" + pmcr_init_arrays_path()
+        + "' '" + pmcr_app_types_path() + "' '" + pmcr_env_blocks_path()
+        + "' '" + pmcr_winmain_args_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmcr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmcr_append_row(path: str, row: str) -> void {
+    pmcr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_crt_call: CRT init stub 함수 호출 1 건 기록 ───
+fn record_crt_call(call_id: int, fn_name: str, ret_value_hex: str, arg_count: int) -> void {
+    if call_id <= 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_crt_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if fn_name == "" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_crt_call] expected=fn_name!=empty got=empty")
+    }
+    if ret_value_hex == "" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_crt_call] expected=ret_value_hex!=empty got=empty")
+    }
+    if arg_count < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_crt_call] expected=arg_count>=0 got=" + to_string(arg_count))
+    }
+    let row = to_string(call_id) + "\t" + fn_name + "\t" + ret_value_hex + "\t" + to_string(arg_count) + "\n"
+    pmcr_append_row(pmcr_calls_path(), row)
+}
+
+// ─── record_init_array: CRT init array (start..end) walk 1 건 ───
+//    walked_count = (end - start) / 4  (i386 PE — 4-byte fn ptr table)
+fn record_init_array(init_id: int, start_va_hex: str, end_va_hex: str, walked_count: int) -> void {
+    if init_id <= 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_init_array] expected=init_id>0 got=" + to_string(init_id))
+    }
+    if start_va_hex == "" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_init_array] expected=start_va_hex!=empty got=empty")
+    }
+    if end_va_hex == "" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_init_array] expected=end_va_hex!=empty got=empty")
+    }
+    if walked_count < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_init_array] expected=walked_count>=0 got=" + to_string(walked_count))
+    }
+    let row = to_string(init_id) + "\t" + start_va_hex + "\t" + end_va_hex + "\t" + to_string(walked_count) + "\n"
+    pmcr_append_row(pmcr_init_arrays_path(), row)
+}
+
+// ─── record_app_type: _set_app_type(0/1/2) 호출 1 건 ───
+fn record_app_type(at_id: int, app_type: int) -> void {
+    if at_id <= 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_app_type] expected=at_id>0 got=" + to_string(at_id))
+    }
+    if app_type < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_app_type] expected=app_type>=0 got=" + to_string(app_type))
+    }
+    if app_type > 2 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_app_type] expected=app_type<=2 got=" + to_string(app_type))
+    }
+    let row = to_string(at_id) + "\t" + to_string(app_type) + "\n"
+    pmcr_append_row(pmcr_app_types_path(), row)
+}
+
+// ─── record_environment_block: _get_initial_narrow_environment 결과 1 건 ───
+fn record_environment_block(eb_id: int, env_block_va_hex: str, var_count: int, total_size: int) -> void {
+    if eb_id <= 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_environment_block] expected=eb_id>0 got=" + to_string(eb_id))
+    }
+    if env_block_va_hex == "" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_environment_block] expected=env_block_va_hex!=empty got=empty")
+    }
+    if var_count < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_environment_block] expected=var_count>=0 got=" + to_string(var_count))
+    }
+    if total_size < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_environment_block] expected=total_size>=0 got=" + to_string(total_size))
+    }
+    let row = to_string(eb_id) + "\t" + env_block_va_hex + "\t" + to_string(var_count) + "\t" + to_string(total_size) + "\n"
+    pmcr_append_row(pmcr_env_blocks_path(), row)
+}
+
+// ─── record_winmain_arg: WinMain 4-arg marshal 1 건 ───
+//    kind: 0=hInstance 1=hPrevInstance 2=lpCmdLine 3=nShowCmd
+fn record_winmain_arg(arg_id: int, arg_idx: int, value_hex: str, kind: int) -> void {
+    if arg_id <= 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_winmain_arg] expected=arg_id>0 got=" + to_string(arg_id))
+    }
+    if arg_idx < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_winmain_arg] expected=arg_idx>=0 got=" + to_string(arg_idx))
+    }
+    if arg_idx > 3 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_winmain_arg] expected=arg_idx<=3 got=" + to_string(arg_idx))
+    }
+    if value_hex == "" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_winmain_arg] expected=value_hex!=empty got=empty")
+    }
+    if kind < 0 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_winmain_arg] expected=kind>=0 got=" + to_string(kind))
+    }
+    if kind > 3 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [record_winmain_arg] expected=kind<=3 got=" + to_string(kind))
+    }
+    let row = to_string(arg_id) + "\t" + to_string(arg_idx) + "\t" + value_hex + "\t" + to_string(kind) + "\n"
+    pmcr_append_row(pmcr_winmain_args_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmcr_count_rows(path: str, min_fields: int) -> int {
+    let t = pmcr_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn crt_call_count() -> int {
+    return pmcr_count_rows(pmcr_calls_path(), 4)
+}
+
+fn init_array_count() -> int {
+    return pmcr_count_rows(pmcr_init_arrays_path(), 4)
+}
+
+fn app_type_count() -> int {
+    return pmcr_count_rows(pmcr_app_types_path(), 2)
+}
+
+fn env_block_count() -> int {
+    return pmcr_count_rows(pmcr_env_blocks_path(), 4)
+}
+
+fn winmain_arg_count() -> int {
+    return pmcr_count_rows(pmcr_winmain_args_path(), 4)
+}
+
+// ─── app_type_name: 0/1/2 → console/gui/dll ───
+fn app_type_name(t: int) -> str {
+    if t == 0 {
+        return "console"
+    }
+    if t == 1 {
+        return "gui"
+    }
+    if t == 2 {
+        return "dll"
+    }
+    panic("pe_msvcr_crt_init_stub_real FAIL [app_type_name] expected=0..2 got=" + to_string(t))
+}
+
+// ─── winmain_arg_name: 0/1/2/3 → hInstance/hPrevInstance/lpCmdLine/nShowCmd ───
+fn winmain_arg_name(k: int) -> str {
+    if k == 0 {
+        return "hInstance"
+    }
+    if k == 1 {
+        return "hPrevInstance"
+    }
+    if k == 2 {
+        return "lpCmdLine"
+    }
+    if k == 3 {
+        return "nShowCmd"
+    }
+    panic("pe_msvcr_crt_init_stub_real FAIL [winmain_arg_name] expected=0..3 got=" + to_string(k))
+}
+
+// ─── pmcr_stats: [crt_call, init_array, app_type, env_block, winmain_arg] ───
+fn pmcr_stats() -> array {
+    let mut out = []
+    out.push(crt_call_count())
+    out.push(init_array_count())
+    out.push(app_type_count())
+    out.push(env_block_count())
+    out.push(winmain_arg_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmcr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmcr()
+
+    // 2. record_crt_call x6 — typical __scrt_common_main_seh path
+    record_crt_call(1, "__scrt_initialize_crt", "0x1", 1)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_crt_call",
+        "\"call_id\":1,\"fn_name\":\"__scrt_initialize_crt\",\"ret_value_hex\":\"0x1\",\"arg_count\":1")
+
+    record_crt_call(2, "__scrt_acquire_startup_lock", "0x0", 0)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_crt_call",
+        "\"call_id\":2,\"fn_name\":\"__scrt_acquire_startup_lock\",\"ret_value_hex\":\"0x0\",\"arg_count\":0")
+
+    record_crt_call(3, "_initterm_e", "0x0", 2)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_crt_call",
+        "\"call_id\":3,\"fn_name\":\"_initterm_e\",\"ret_value_hex\":\"0x0\",\"arg_count\":2")
+
+    record_crt_call(4, "_initterm", "0x0", 2)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_crt_call",
+        "\"call_id\":4,\"fn_name\":\"_initterm\",\"ret_value_hex\":\"0x0\",\"arg_count\":2")
+
+    record_crt_call(5, "_set_app_type", "0x0", 1)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_crt_call",
+        "\"call_id\":5,\"fn_name\":\"_set_app_type\",\"ret_value_hex\":\"0x0\",\"arg_count\":1")
+
+    record_crt_call(6, "_get_narrow_winmain_command_line", "0x80000800", 0)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_crt_call",
+        "\"call_id\":6,\"fn_name\":\"_get_narrow_winmain_command_line\",\"ret_value_hex\":\"0x80000800\",\"arg_count\":0")
+
+    // 3. record_init_array x2 — CRT C (8 entries) / CRT C++ (4 entries)
+    //    walked_count = (end - start) / 4
+    //    C  : 0x401000..0x401020 → 0x20/4 = 8
+    //    C++: 0x401020..0x401030 → 0x10/4 = 4
+    record_init_array(1, "0x401000", "0x401020", 8)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_init_array",
+        "\"init_id\":1,\"start_va_hex\":\"0x401000\",\"end_va_hex\":\"0x401020\",\"walked_count\":8,\"target\":\"CRT_C\"")
+
+    record_init_array(2, "0x401020", "0x401030", 4)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_init_array",
+        "\"init_id\":2,\"start_va_hex\":\"0x401020\",\"end_va_hex\":\"0x401030\",\"walked_count\":4,\"target\":\"CRT_CPP\"")
+
+    // 4. record_app_type x1 — _set_app_type(1) GUI
+    record_app_type(1, 1)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_app_type",
+        "\"at_id\":1,\"app_type\":1,\"name\":\"" + app_type_name(1) + "\"")
+
+    // 5. record_environment_block x1 — _get_initial_narrow_environment
+    record_environment_block(1, "0x80000000", 20, 512)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_env_block",
+        "\"eb_id\":1,\"env_block_va_hex\":\"0x80000000\",\"var_count\":20,\"total_size\":512")
+
+    // 6. record_winmain_arg x4 — WinMain(hInst, NULL, lpCmdLine, SW_SHOW)
+    record_winmain_arg(1, 0, "0x10000000", 0)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_winmain_arg",
+        "\"arg_id\":1,\"arg_idx\":0,\"value_hex\":\"0x10000000\",\"kind\":0,\"name\":\"" + winmain_arg_name(0) + "\"")
+
+    record_winmain_arg(2, 1, "0x0", 1)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_winmain_arg",
+        "\"arg_id\":2,\"arg_idx\":1,\"value_hex\":\"0x0\",\"kind\":1,\"name\":\"" + winmain_arg_name(1) + "\"")
+
+    record_winmain_arg(3, 2, "0x80000800", 2)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_winmain_arg",
+        "\"arg_id\":3,\"arg_idx\":2,\"value_hex\":\"0x80000800\",\"kind\":2,\"name\":\"" + winmain_arg_name(2) + "\"")
+
+    record_winmain_arg(4, 3, "0xa", 3)
+    r0_emit("pe_msvcr_crt_init_stub_real_record_winmain_arg",
+        "\"arg_id\":4,\"arg_idx\":3,\"value_hex\":\"0xa\",\"kind\":3,\"name\":\"" + winmain_arg_name(3) + "\",\"target\":\"SW_SHOW\"")
+
+    // 7. assertion: crt_call == 6
+    let cc = crt_call_count()
+    if cc != 6 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [crt_call_count] expected=6 got=" + to_string(cc))
+    }
+
+    // 8. assertion: init_array == 2
+    let ia = init_array_count()
+    if ia != 2 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [init_array_count] expected=2 got=" + to_string(ia))
+    }
+
+    // 9. assertion: app_type == 1
+    let at = app_type_count()
+    if at != 1 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [app_type_count] expected=1 got=" + to_string(at))
+    }
+
+    // 10. assertion: env_block == 1
+    let eb = env_block_count()
+    if eb != 1 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [env_block_count] expected=1 got=" + to_string(eb))
+    }
+
+    // 11. assertion: winmain_arg == 4
+    let wa = winmain_arg_count()
+    if wa != 4 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [winmain_arg_count] expected=4 got=" + to_string(wa))
+    }
+
+    // 12. app_type_name sanity
+    let n0 = app_type_name(0)
+    if n0 != "console" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [app_type_name(0)] expected=console got=" + n0)
+    }
+    let n1 = app_type_name(1)
+    if n1 != "gui" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [app_type_name(1)] expected=gui got=" + n1)
+    }
+    let n2 = app_type_name(2)
+    if n2 != "dll" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [app_type_name(2)] expected=dll got=" + n2)
+    }
+
+    // 13. winmain_arg_name sanity
+    let w0 = winmain_arg_name(0)
+    if w0 != "hInstance" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [winmain_arg_name(0)] expected=hInstance got=" + w0)
+    }
+    let w1 = winmain_arg_name(1)
+    if w1 != "hPrevInstance" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [winmain_arg_name(1)] expected=hPrevInstance got=" + w1)
+    }
+    let w2 = winmain_arg_name(2)
+    if w2 != "lpCmdLine" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [winmain_arg_name(2)] expected=lpCmdLine got=" + w2)
+    }
+    let w3 = winmain_arg_name(3)
+    if w3 != "nShowCmd" {
+        panic("pe_msvcr_crt_init_stub_real FAIL [winmain_arg_name(3)] expected=nShowCmd got=" + w3)
+    }
+
+    // 14. pmcr_stats() == [6, 2, 1, 1, 4]
+    let s = pmcr_stats()
+    if len(s) != 5 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [stats crt_call] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [stats init_array] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [stats app_type] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [stats env_block] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [stats winmain_arg] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_msvcr_crt_init_stub_real_stats",
+        "\"crt_call\":" + to_string(s[0])
+        + ",\"init_array\":" + to_string(s[1])
+        + ",\"app_type\":" + to_string(s[2])
+        + ",\"env_block\":" + to_string(s[3])
+        + ",\"winmain_arg\":" + to_string(s[4]))
+
+    // 16. emit count >= 14 (6 crt_call + 2 init_array + 1 app_type + 1 env + 4 winmain + 1 stats = 15)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvcr_crt_init_stub_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pmcr()
+    let s2 = pmcr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvcr_crt_init_stub_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvcr_crt_init_stub_real self_test PASS (crt_call=" + to_string(s[0])
+        + ", init_array=" + to_string(s[1]) + ", app_type=" + to_string(s[2])
+        + ", env_block=" + to_string(s[3]) + ", winmain_arg=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmcr_stats()
+            println("crt_call_count\t" + to_string(s[0]))
+            println("init_array_count\t" + to_string(s[1]))
+            println("app_type_count\t" + to_string(s[2]))
+            println("env_block_count\t" + to_string(s[3]))
+            println("winmain_arg_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmcr()
+            println("cleaned: " + pmcr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmcr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvcr_crt_init_stub_real.hexa { self-test | stats | cleanup | dir }")
+}

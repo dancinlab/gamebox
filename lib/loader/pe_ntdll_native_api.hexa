@@ -1,0 +1,392 @@
+// lib/loader/pe_ntdll_native_api.hexa — cycle 69 NTDLL native API call telemetry
+//
+// Win32 PE 가 ntdll!Nt*/Zw* 직호출 (system call thunk) 한 횟수와 NTSTATUS
+// 결과를 추적. NTAPI surface area 측정 + error pattern detection.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 native API call tracker — 실 syscall thunk emit X (stage6+).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// api_kind code:
+//   1 = Nt_handle   (NtClose, NtDuplicateObject, NtWaitForSingleObject ...)
+//   2 = Nt_file     (NtCreateFile, NtReadFile, NtWriteFile ...)
+//   3 = Nt_process  (NtOpenProcess, NtTerminateProcess, NtQueryInformationProcess ...)
+//   4 = Nt_memory   (NtAllocateVirtualMemory, NtFreeVirtualMemory, NtProtectVirtualMemory ...)
+//
+// nt_status:
+//   0          = STATUS_SUCCESS
+//   non-zero   = NTSTATUS error (e.g. 0xC0000022 STATUS_ACCESS_DENIED)
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t api_kind<int> \t nt_status<int> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnna_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_native_api"
+}
+
+fn pnna_calls_path() -> str {
+    return pnna_dir() + "/calls.tsv"
+}
+
+fn pnna_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnna_dir() + "'")
+}
+
+fn cleanup_pnna() -> void {
+    pnna_ensure_dir()
+    let _ = exec("rm -f '" + pnna_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnna_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnna_append_row(path: str, row: str) -> void {
+    pnna_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: native API call 1 건 기록 ───
+fn record_call(call_id: int, api_kind: int, nt_status: int, elapsed_us: int) -> void {
+    if call_id <= 0 {
+        panic("pe_ntdll_native_api FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if api_kind < 1 {
+        panic("pe_ntdll_native_api FAIL [record_call] expected=api_kind>=1 got=" + to_string(api_kind))
+    }
+    if api_kind > 4 {
+        panic("pe_ntdll_native_api FAIL [record_call] expected=api_kind<=4 got=" + to_string(api_kind))
+    }
+    if nt_status < 0 {
+        panic("pe_ntdll_native_api FAIL [record_call] expected=nt_status>=0 got=" + to_string(nt_status))
+    }
+    if elapsed_us < 0 {
+        panic("pe_ntdll_native_api FAIL [record_call] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(call_id) + "\t" + to_string(api_kind)
+        + "\t" + to_string(nt_status) + "\t" + to_string(elapsed_us) + "\n"
+    pnna_append_row(pnna_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = pnna_read_table(pnna_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: nt_status == 0 인 call 수 ───
+fn success_count() -> int {
+    let t = pnna_read_table(pnna_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_elapsed_us: 모든 call elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let t = pnna_read_table(pnna_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_api_kind: 특정 api_kind 의 call 수 ───
+fn count_by_api_kind(api_kind: int) -> int {
+    let t = pnna_read_table(pnna_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == api_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── call_status: 특정 call_id 의 nt_status (없으면 -1) ───
+fn call_status(call_id: int) -> int {
+    let t = pnna_read_table(pnna_calls_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnna_stats: [call_count, success_count, total_elapsed_us, count_by_api_kind(2)] ───
+fn pnna_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(success_count())
+    out.push(total_elapsed_us())
+    out.push(count_by_api_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnna-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnna()
+
+    // 2. record 5 native API calls (3 success + 2 fail, 4 distinct api_kinds)
+    //    690001 NtClose                   (handle)  STATUS_SUCCESS
+    //    690002 NtCreateFile              (file)    STATUS_SUCCESS
+    //    690003 NtOpenProcess             (process) STATUS_ACCESS_DENIED 0xC0000022
+    //    690004 NtAllocateVirtualMemory   (memory)  STATUS_SUCCESS
+    //    690005 NtReadFile                (file)    STATUS_END_OF_FILE  0xC0000011
+    record_call(690001, 1, 0, 12)
+    r0_emit("pe_ntdll_native_api_record",
+        "\"call_id\":690001,\"api_kind\":1,\"nt_status\":0,\"elapsed_us\":12,\"target\":\"NtClose\"")
+
+    record_call(690002, 2, 0, 84)
+    r0_emit("pe_ntdll_native_api_record",
+        "\"call_id\":690002,\"api_kind\":2,\"nt_status\":0,\"elapsed_us\":84,\"target\":\"NtCreateFile\"")
+
+    record_call(690003, 3, 3221225506, 41)
+    r0_emit("pe_ntdll_native_api_record",
+        "\"call_id\":690003,\"api_kind\":3,\"nt_status\":3221225506,\"elapsed_us\":41,\"target\":\"NtOpenProcess\"")
+
+    record_call(690004, 4, 0, 156)
+    r0_emit("pe_ntdll_native_api_record",
+        "\"call_id\":690004,\"api_kind\":4,\"nt_status\":0,\"elapsed_us\":156,\"target\":\"NtAllocateVirtualMemory\"")
+
+    record_call(690005, 2, 3221225489, 23)
+    r0_emit("pe_ntdll_native_api_record",
+        "\"call_id\":690005,\"api_kind\":2,\"nt_status\":3221225489,\"elapsed_us\":23,\"target\":\"NtReadFile\"")
+
+    // 3. call_count = 5
+    let c = call_count()
+    if c != 5 {
+        panic("pe_ntdll_native_api FAIL [call_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. success_count = 3 (690001, 690002, 690004)
+    let sc = success_count()
+    if sc != 3 {
+        panic("pe_ntdll_native_api FAIL [success_count] expected=3 got=" + to_string(sc))
+    }
+
+    // 5. total_elapsed_us = 12+84+41+156+23 = 316
+    let te = total_elapsed_us()
+    if te != 316 {
+        panic("pe_ntdll_native_api FAIL [total_elapsed_us] expected=316 got=" + to_string(te))
+    }
+
+    // 6. count_by_api_kind sanity (4 distinct kinds, kind=2 has 2)
+    let k1 = count_by_api_kind(1)
+    if k1 != 1 {
+        panic("pe_ntdll_native_api FAIL [count_by_api_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_api_kind(2)
+    if k2 != 2 {
+        panic("pe_ntdll_native_api FAIL [count_by_api_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_api_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_native_api FAIL [count_by_api_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_api_kind(4)
+    if k4 != 1 {
+        panic("pe_ntdll_native_api FAIL [count_by_api_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_api_kind(99)
+    if k99 != 0 {
+        panic("pe_ntdll_native_api FAIL [count_by_api_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. call_status sanity
+    let st1 = call_status(690001)
+    if st1 != 0 {
+        panic("pe_ntdll_native_api FAIL [call_status(690001)] expected=0 got=" + to_string(st1))
+    }
+    let st3 = call_status(690003)
+    if st3 != 3221225506 {
+        panic("pe_ntdll_native_api FAIL [call_status(690003)] expected=3221225506 got=" + to_string(st3))
+    }
+    let st_miss = call_status(9999)
+    if st_miss != -1 {
+        panic("pe_ntdll_native_api FAIL [call_status(9999)] expected=-1 got=" + to_string(st_miss))
+    }
+
+    // 8. pnna_stats() = [5, 3, 316, 2]
+    let s = pnna_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_native_api FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ntdll_native_api FAIL [stats call_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_ntdll_native_api FAIL [stats success_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 316 {
+        panic("pe_ntdll_native_api FAIL [stats total_elapsed_us] expected=316 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ntdll_native_api FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ntdll_native_api_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"success_count\":" + to_string(s[1])
+        + ",\"total_elapsed_us\":" + to_string(s[2])
+        + ",\"kind_file\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ntdll_native_api FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pnna()
+    let s2 = pnna_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_native_api FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_native_api self_test PASS (calls=" + to_string(s[0])
+        + ", success=" + to_string(s[1]) + ", elapsed_us=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnna_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("success_count\t" + to_string(s[1]))
+            println("total_elapsed_us\t" + to_string(s[2]))
+            println("count_kind_file\t" + to_string(s[3]))
+            return
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_status\t" + to_string(call_status(cid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_native_api.hexa status <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let ak = to_int(a[3])
+                println("count_by_api_kind\t" + to_string(count_by_api_kind(ak)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_native_api.hexa count <api_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnna()
+            println("cleaned: " + pnna_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnna_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_native_api.hexa { self-test | stats | status <call_id> | count <api_kind> | cleanup | dir }")
+}

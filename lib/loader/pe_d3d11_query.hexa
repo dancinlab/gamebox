@@ -1,0 +1,383 @@
+// lib/loader/pe_d3d11_query.hexa — D3D11 ID3D11Query GPU telemetry skeleton
+//
+// D3D11 query object tracker — timestamp / disjoint / occlusion / predicate /
+// pipeline_stats. CreateQuery + GetData lifecycle 의 결과 추적용 in-memory
+// 모델. 본 module 은 query 결과 record/aggregate 만 — 실 ID3D11Device::CreateQuery
+// 호출은 stage2 native helper 에서 처리.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// query_kind code (D3D11_QUERY enum 의 sentinel mapping):
+//   1 = event
+//   2 = occlusion
+//   3 = timestamp
+//   4 = timestamp_disjoint
+//   5 = pipeline_stats
+//
+// persist schema (TSV — queries.tsv):
+//   query_id<int> \t query_kind<int> \t result_us<int> \t data_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdq11_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_query"
+}
+
+fn pdq11_queries_path() -> str {
+    return pdq11_dir() + "/queries.tsv"
+}
+
+fn pdq11_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdq11_dir() + "'")
+}
+
+fn cleanup_pdq11() -> void {
+    pdq11_ensure_dir()
+    let _ = exec("rm -f '" + pdq11_queries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdq11_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdq11_append_row(path: str, row: str) -> void {
+    pdq11_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_query: GPU query 1 건 기록 ───
+fn record_query(query_id: int, query_kind: int, result_us: int, data_size_bytes: int) -> void {
+    if query_id <= 0 {
+        panic("pe_d3d11_query FAIL [record_query] expected=query_id>0 got=" + to_string(query_id))
+    }
+    if query_kind < 1 {
+        panic("pe_d3d11_query FAIL [record_query] expected=query_kind>=1 got=" + to_string(query_kind))
+    }
+    if query_kind > 5 {
+        panic("pe_d3d11_query FAIL [record_query] expected=query_kind<=5 got=" + to_string(query_kind))
+    }
+    if result_us < 0 {
+        panic("pe_d3d11_query FAIL [record_query] expected=result_us>=0 got=" + to_string(result_us))
+    }
+    if data_size_bytes < 0 {
+        panic("pe_d3d11_query FAIL [record_query] expected=data_size_bytes>=0 got=" + to_string(data_size_bytes))
+    }
+    let row = to_string(query_id) + "\t" + to_string(query_kind)
+        + "\t" + to_string(result_us) + "\t" + to_string(data_size_bytes) + "\n"
+    pdq11_append_row(pdq11_queries_path(), row)
+}
+
+// ─── query_count: total query 수 ───
+fn query_count() -> int {
+    let t = pdq11_read_table(pdq11_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_result_us: 모든 query result_us 합 ───
+fn total_result_us() -> int {
+    let t = pdq11_read_table(pdq11_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_data_bytes: 모든 query data_size_bytes 합 ───
+fn total_data_bytes() -> int {
+    let t = pdq11_read_table(pdq11_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_query_kind: 특정 query_kind 의 query 수 ───
+fn count_by_query_kind(kind: int) -> int {
+    let t = pdq11_read_table(pdq11_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── query_result_us: 특정 query_id 의 result_us (없으면 0) ───
+fn query_result_us(query_id: int) -> int {
+    let t = pdq11_read_table(pdq11_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == query_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdq11_stats: [query_count, total_result_us, total_data_bytes, count_by_query_kind(3)] ───
+fn pdq11_stats() -> array {
+    let mut out = []
+    out.push(query_count())
+    out.push(total_result_us())
+    out.push(total_data_bytes())
+    out.push(count_by_query_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdq11-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdq11()
+
+    // 2. record 5 queries across ≥3 query_kinds (deterministic synthetic)
+    record_query(220001, 3, 1200, 8)
+    r0_emit("pe_d3d11_query_record",
+        "\"query_id\":220001,\"query_kind\":3,\"result_us\":1200,\"data_size_bytes\":8,\"target\":\"timestamp\"")
+
+    record_query(220002, 4, 800, 24)
+    r0_emit("pe_d3d11_query_record",
+        "\"query_id\":220002,\"query_kind\":4,\"result_us\":800,\"data_size_bytes\":24,\"target\":\"timestamp_disjoint\"")
+
+    record_query(220003, 2, 4500, 8)
+    r0_emit("pe_d3d11_query_record",
+        "\"query_id\":220003,\"query_kind\":2,\"result_us\":4500,\"data_size_bytes\":8,\"target\":\"occlusion\"")
+
+    record_query(220004, 3, 2300, 8)
+    r0_emit("pe_d3d11_query_record",
+        "\"query_id\":220004,\"query_kind\":3,\"result_us\":2300,\"data_size_bytes\":8,\"target\":\"timestamp\"")
+
+    record_query(220005, 5, 600, 88)
+    r0_emit("pe_d3d11_query_record",
+        "\"query_id\":220005,\"query_kind\":5,\"result_us\":600,\"data_size_bytes\":88,\"target\":\"pipeline_stats\"")
+
+    // 3. query_count = 5
+    let c = query_count()
+    if c != 5 {
+        panic("pe_d3d11_query FAIL [query_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_result_us = 9400
+    let tr = total_result_us()
+    if tr != 9400 {
+        panic("pe_d3d11_query FAIL [total_result_us] expected=9400 got=" + to_string(tr))
+    }
+
+    // 5. total_data_bytes = 136
+    let tb = total_data_bytes()
+    if tb != 136 {
+        panic("pe_d3d11_query FAIL [total_data_bytes] expected=136 got=" + to_string(tb))
+    }
+
+    // 6. count_by_query_kind sanity
+    let k2 = count_by_query_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d11_query FAIL [count_by_query_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_query_kind(3)
+    if k3 != 2 {
+        panic("pe_d3d11_query FAIL [count_by_query_kind(3)] expected=2 got=" + to_string(k3))
+    }
+    let k4 = count_by_query_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d11_query FAIL [count_by_query_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_query_kind(5)
+    if k5 != 1 {
+        panic("pe_d3d11_query FAIL [count_by_query_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k1 = count_by_query_kind(1)
+    if k1 != 0 {
+        panic("pe_d3d11_query FAIL [count_by_query_kind(1)] expected=0 got=" + to_string(k1))
+    }
+
+    // 7. query_result_us sanity
+    let r3 = query_result_us(220003)
+    if r3 != 4500 {
+        panic("pe_d3d11_query FAIL [query_result_us(220003)] expected=4500 got=" + to_string(r3))
+    }
+    let r5 = query_result_us(220005)
+    if r5 != 600 {
+        panic("pe_d3d11_query FAIL [query_result_us(220005)] expected=600 got=" + to_string(r5))
+    }
+    let r_miss = query_result_us(9999)
+    if r_miss != 0 {
+        panic("pe_d3d11_query FAIL [query_result_us(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 8. pdq11_stats() = [5, 9400, 136, 2]
+    let s = pdq11_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_query FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d11_query FAIL [stats query_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 9400 {
+        panic("pe_d3d11_query FAIL [stats total_result_us] expected=9400 got=" + to_string(s[1]))
+    }
+    if s[2] != 136 {
+        panic("pe_d3d11_query FAIL [stats total_data_bytes] expected=136 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d11_query FAIL [stats count_kind(3)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_d3d11_query_stats",
+        "\"query_count\":" + to_string(s[0])
+        + ",\"total_result_us\":" + to_string(s[1])
+        + ",\"total_data_bytes\":" + to_string(s[2])
+        + ",\"kind_timestamp\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d11_query FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pdq11()
+    let s2 = pdq11_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_query FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_query self_test PASS (queries=" + to_string(s[0])
+        + ", result_us=" + to_string(s[1]) + ", data_bytes=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdq11_stats()
+            println("query_count\t" + to_string(s[0]))
+            println("total_result_us\t" + to_string(s[1]))
+            println("total_data_bytes\t" + to_string(s[2]))
+            println("count_kind_timestamp\t" + to_string(s[3]))
+            return
+        }
+        if sub == "result" {
+            if len(a) >= 4 {
+                let qid = to_int(a[3])
+                println("query_result_us\t" + to_string(query_result_us(qid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_query.hexa result <query_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_query_kind\t" + to_string(count_by_query_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_query.hexa count <query_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdq11()
+            println("cleaned: " + pdq11_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdq11_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_query.hexa { self-test | stats | result <query_id> | count <query_kind> | cleanup | dir }")
+}

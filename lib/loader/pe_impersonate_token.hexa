@@ -1,0 +1,415 @@
+// lib/loader/pe_impersonate_token.hexa — cycle 74 ImpersonateLoggedOnUser
+// telemetry skeleton
+//
+// Win32 ImpersonateLoggedOnUser / DuplicateTokenEx / RevertToSelf —
+// per-thread security context manipulation tracker. native helper 가 토큰
+// 복제 / 임퍼소네이션 / 복구 op 를 issue 할 때 hexa 측에서 op 단위로
+// 기록 후 aggregate.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 op tracker — 실제 ImpersonateLoggedOnUser() / DuplicateTokenEx()
+//   / RevertToSelf() / OpenThreadToken() 호출 X (native helper stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = duplicate     (DuplicateTokenEx)
+//   2 = impersonate   (ImpersonateLoggedOnUser)
+//   3 = revert        (RevertToSelf)
+//   4 = open_thread_token (OpenThreadToken)
+//
+// impersonation_level code (SECURITY_IMPERSONATION_LEVEL):
+//   1 = anonymous       (SecurityAnonymous)
+//   2 = identification  (SecurityIdentification)
+//   3 = impersonation   (SecurityImpersonation)
+//   4 = delegation      (SecurityDelegation)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t impersonation_level<int> \t thread_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pit_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_impersonate_token"
+}
+
+fn pit_ops_path() -> str {
+    return pit_dir() + "/ops.tsv"
+}
+
+fn pit_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pit_dir() + "'")
+}
+
+fn cleanup_pit() -> void {
+    pit_ensure_dir()
+    let _ = exec("rm -f '" + pit_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pit_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pit_append_row(path: str, row: str) -> void {
+    pit_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: token op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, impersonation_level: int, thread_id: int) -> void {
+    if op_id <= 0 {
+        panic("pe_impersonate_token FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_impersonate_token FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_impersonate_token FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if impersonation_level < 1 {
+        panic("pe_impersonate_token FAIL [record_op] expected=impersonation_level>=1 got=" + to_string(impersonation_level))
+    }
+    if impersonation_level > 4 {
+        panic("pe_impersonate_token FAIL [record_op] expected=impersonation_level<=4 got=" + to_string(impersonation_level))
+    }
+    if thread_id <= 0 {
+        panic("pe_impersonate_token FAIL [record_op] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(impersonation_level) + "\t" + to_string(thread_id) + "\n"
+    pit_append_row(pit_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pit_read_table(pit_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pit_read_table(pit_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_level: 특정 impersonation_level 의 op 수 ───
+fn count_by_level(level: int) -> int {
+    let t = pit_read_table(pit_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == level {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 등장한 thread_id 의 distinct count ───
+fn distinct_threads() -> int {
+    let t = pit_read_table(pit_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[3])
+                let mut found = false
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == tid {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── op_impersonation_level: 특정 op_id 의 impersonation_level (없으면 0) ───
+fn op_impersonation_level(op_id: int) -> int {
+    let t = pit_read_table(pit_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pit_stats: [op_count, count_by_op_kind(2), count_by_level(3), distinct_threads] ───
+fn pit_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(count_by_op_kind(2))
+    out.push(count_by_level(3))
+    out.push(distinct_threads())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pit-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pit()
+
+    // 2. record 5 ops — op_kinds {1,2,3,4} (≥3), levels {2,3} (≥2)
+    record_op(740001, 4, 3, 4801)
+    r0_emit("pe_impersonate_token_record",
+        "\"op_id\":740001,\"op_kind\":4,\"impersonation_level\":3,\"thread_id\":4801,\"target\":\"open_thread_token\"")
+
+    record_op(740002, 1, 3, 4801)
+    r0_emit("pe_impersonate_token_record",
+        "\"op_id\":740002,\"op_kind\":1,\"impersonation_level\":3,\"thread_id\":4801,\"target\":\"duplicate\"")
+
+    record_op(740003, 2, 3, 4802)
+    r0_emit("pe_impersonate_token_record",
+        "\"op_id\":740003,\"op_kind\":2,\"impersonation_level\":3,\"thread_id\":4802,\"target\":\"impersonate\"")
+
+    record_op(740004, 2, 2, 4802)
+    r0_emit("pe_impersonate_token_record",
+        "\"op_id\":740004,\"op_kind\":2,\"impersonation_level\":2,\"thread_id\":4802,\"target\":\"impersonate\"")
+
+    record_op(740005, 3, 3, 4802)
+    r0_emit("pe_impersonate_token_record",
+        "\"op_id\":740005,\"op_kind\":3,\"impersonation_level\":3,\"thread_id\":4802,\"target\":\"revert\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_impersonate_token FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_impersonate_token FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_impersonate_token FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_impersonate_token FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_impersonate_token FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_impersonate_token FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. count_by_level sanity — level 3 = 4, level 2 = 1
+    let l3 = count_by_level(3)
+    if l3 != 4 {
+        panic("pe_impersonate_token FAIL [count_by_level(3)] expected=4 got=" + to_string(l3))
+    }
+    let l2 = count_by_level(2)
+    if l2 != 1 {
+        panic("pe_impersonate_token FAIL [count_by_level(2)] expected=1 got=" + to_string(l2))
+    }
+    let l1 = count_by_level(1)
+    if l1 != 0 {
+        panic("pe_impersonate_token FAIL [count_by_level(1)] expected=0 got=" + to_string(l1))
+    }
+
+    // 6. distinct_threads = 2 (4801, 4802)
+    let dt = distinct_threads()
+    if dt != 2 {
+        panic("pe_impersonate_token FAIL [distinct_threads] expected=2 got=" + to_string(dt))
+    }
+
+    // 7. op_impersonation_level sanity
+    let lv2 = op_impersonation_level(740004)
+    if lv2 != 2 {
+        panic("pe_impersonate_token FAIL [op_impersonation_level(740004)] expected=2 got=" + to_string(lv2))
+    }
+    let lv3 = op_impersonation_level(740003)
+    if lv3 != 3 {
+        panic("pe_impersonate_token FAIL [op_impersonation_level(740003)] expected=3 got=" + to_string(lv3))
+    }
+    let lv_miss = op_impersonation_level(9999)
+    if lv_miss != 0 {
+        panic("pe_impersonate_token FAIL [op_impersonation_level(9999)] expected=0 got=" + to_string(lv_miss))
+    }
+
+    // 8. pit_stats() = [5, 2, 4, 2]
+    let s = pit_stats()
+    if len(s) != 4 {
+        panic("pe_impersonate_token FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_impersonate_token FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_impersonate_token FAIL [stats kind_impersonate] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_impersonate_token FAIL [stats level_impersonation] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_impersonate_token FAIL [stats distinct_threads] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_impersonate_token_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"kind_impersonate\":" + to_string(s[1])
+        + ",\"level_impersonation\":" + to_string(s[2])
+        + ",\"distinct_threads\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_impersonate_token FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pit()
+    let s2 = pit_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_impersonate_token FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_impersonate_token self_test PASS (ops=" + to_string(s[0])
+        + ", kind_impersonate=" + to_string(s[1]) + ", level_impersonation=" + to_string(s[2])
+        + ", threads=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pit_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("kind_impersonate\t" + to_string(s[1]))
+            println("level_impersonation\t" + to_string(s[2]))
+            println("distinct_threads\t" + to_string(s[3]))
+            return
+        }
+        if sub == "level" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_impersonation_level\t" + to_string(op_impersonation_level(oid)))
+                return
+            }
+            println("usage: hexa run pe_impersonate_token.hexa level <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_impersonate_token.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pit()
+            println("cleaned: " + pit_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pit_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_impersonate_token.hexa { self-test | stats | level <op_id> | count <op_kind> | cleanup | dir }")
+}

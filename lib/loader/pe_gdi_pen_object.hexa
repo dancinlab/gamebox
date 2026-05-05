@@ -1,0 +1,397 @@
+// lib/loader/pe_gdi_pen_object.hexa — Win32 GDI pen → CGContext stroke style bridge skeleton
+//
+// Win32 GDI CreatePen / ExtCreatePen 의 HPEN 객체를 CoreGraphics CGContext
+// stroke style 로 매핑하는 dispatch tracker. PE binary 가 SelectObject/StrokePath
+// 호출 시 docker hexa loader 가 본 module 에 pen 객체 1 건씩 record_pen 으로
+// 적재 → host native helper 가 CGContextSetStrokeColorWithColor +
+// CGContextSetLineWidth + CGContextSetLineDash 로 변환.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 pen object tracker — 실제 GDI / CG 호출 X (stage6 native bridge).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// pen_style code (Win32 PS_*):
+//   0 = PS_SOLID
+//   1 = PS_DASH
+//   2 = PS_DOT
+//   3 = PS_DASHDOT
+//   5 = PS_NULL
+//
+// persist schema (TSV — pens.tsv):
+//   pen_id<int> \t pen_style<int> \t width_px<int> \t color_rgba<str>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pgpo_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_gdi_pen_object"
+}
+
+fn pgpo_pens_path() -> str {
+    return pgpo_dir() + "/pens.tsv"
+}
+
+fn pgpo_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pgpo_dir() + "'")
+}
+
+fn cleanup_pgpo() -> void {
+    pgpo_ensure_dir()
+    let _ = exec("rm -f '" + pgpo_pens_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pgpo_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pgpo_append_row(path: str, row: str) -> void {
+    pgpo_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_pen: pen 객체 1 건 기록 ───
+fn record_pen(pen_id: int, pen_style: int, width_px: int, color_rgba: str) -> void {
+    if pen_id <= 0 {
+        panic("pe_gdi_pen_object FAIL [record_pen] expected=pen_id>0 got=" + to_string(pen_id))
+    }
+    if pen_style < 0 {
+        panic("pe_gdi_pen_object FAIL [record_pen] expected=pen_style>=0 got=" + to_string(pen_style))
+    }
+    if pen_style > 5 {
+        panic("pe_gdi_pen_object FAIL [record_pen] expected=pen_style<=5 got=" + to_string(pen_style))
+    }
+    if pen_style == 4 {
+        panic("pe_gdi_pen_object FAIL [record_pen] expected=pen_style!=4 got=4")
+    }
+    if width_px < 0 {
+        panic("pe_gdi_pen_object FAIL [record_pen] expected=width_px>=0 got=" + to_string(width_px))
+    }
+    if color_rgba == "" {
+        panic("pe_gdi_pen_object FAIL [record_pen] expected=color_rgba!=empty got=empty")
+    }
+    let row = to_string(pen_id) + "\t" + to_string(pen_style)
+        + "\t" + to_string(width_px) + "\t" + color_rgba + "\n"
+    pgpo_append_row(pgpo_pens_path(), row)
+}
+
+// ─── pen_count: total pen 수 ───
+fn pen_count() -> int {
+    let t = pgpo_read_table(pgpo_pens_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_width_px: 모든 pen width_px 합 ───
+fn total_width_px() -> int {
+    let t = pgpo_read_table(pgpo_pens_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_pen_style: 특정 pen_style 의 pen 수 ───
+fn count_by_pen_style(pen_style: int) -> int {
+    let t = pgpo_read_table(pgpo_pens_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == pen_style {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_colors: distinct color_rgba 수 ───
+fn distinct_colors() -> int {
+    let t = pgpo_read_table(pgpo_pens_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = ""
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let key = "|" + parts[3] + "|"
+                if seen.index_of(key) < 0 {
+                    seen = seen + key
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pen_width_px: 특정 pen_id 의 width_px (없으면 0) ───
+fn pen_width_px(pen_id: int) -> int {
+    let t = pgpo_read_table(pgpo_pens_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == pen_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pgpo_stats: [pen_count, total_width_px, distinct_colors, count_by_pen_style(1)] ───
+fn pgpo_stats() -> array {
+    let mut out = []
+    out.push(pen_count())
+    out.push(total_width_px())
+    out.push(distinct_colors())
+    out.push(count_by_pen_style(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pgpo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pgpo()
+
+    // 2. record 5 pens across ≥3 pen_styles (0/1/2/3/5)
+    record_pen(220001, 0, 1, "#000000FF")
+    r0_emit("pe_gdi_pen_object_record",
+        "\"pen_id\":220001,\"pen_style\":0,\"width_px\":1,\"color_rgba\":\"#000000FF\",\"target\":\"solid\"")
+
+    record_pen(220002, 1, 2, "#FF0000FF")
+    r0_emit("pe_gdi_pen_object_record",
+        "\"pen_id\":220002,\"pen_style\":1,\"width_px\":2,\"color_rgba\":\"#FF0000FF\",\"target\":\"dash\"")
+
+    record_pen(220003, 2, 3, "#00FF00FF")
+    r0_emit("pe_gdi_pen_object_record",
+        "\"pen_id\":220003,\"pen_style\":2,\"width_px\":3,\"color_rgba\":\"#00FF00FF\",\"target\":\"dot\"")
+
+    record_pen(220004, 3, 4, "#0000FFFF")
+    r0_emit("pe_gdi_pen_object_record",
+        "\"pen_id\":220004,\"pen_style\":3,\"width_px\":4,\"color_rgba\":\"#0000FFFF\",\"target\":\"dashdot\"")
+
+    record_pen(220005, 5, 0, "#00000000")
+    r0_emit("pe_gdi_pen_object_record",
+        "\"pen_id\":220005,\"pen_style\":5,\"width_px\":0,\"color_rgba\":\"#00000000\",\"target\":\"null\"")
+
+    // 3. pen_count = 5
+    let c = pen_count()
+    if c != 5 {
+        panic("pe_gdi_pen_object FAIL [pen_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_width_px = 10
+    let tw = total_width_px()
+    if tw != 10 {
+        panic("pe_gdi_pen_object FAIL [total_width_px] expected=10 got=" + to_string(tw))
+    }
+
+    // 5. count_by_pen_style sanity (5 distinct styles)
+    let s0 = count_by_pen_style(0)
+    if s0 != 1 {
+        panic("pe_gdi_pen_object FAIL [count_by_pen_style(0)] expected=1 got=" + to_string(s0))
+    }
+    let s1 = count_by_pen_style(1)
+    if s1 != 1 {
+        panic("pe_gdi_pen_object FAIL [count_by_pen_style(1)] expected=1 got=" + to_string(s1))
+    }
+    let s2 = count_by_pen_style(2)
+    if s2 != 1 {
+        panic("pe_gdi_pen_object FAIL [count_by_pen_style(2)] expected=1 got=" + to_string(s2))
+    }
+    let s3 = count_by_pen_style(3)
+    if s3 != 1 {
+        panic("pe_gdi_pen_object FAIL [count_by_pen_style(3)] expected=1 got=" + to_string(s3))
+    }
+    let s5 = count_by_pen_style(5)
+    if s5 != 1 {
+        panic("pe_gdi_pen_object FAIL [count_by_pen_style(5)] expected=1 got=" + to_string(s5))
+    }
+    let s99 = count_by_pen_style(99)
+    if s99 != 0 {
+        panic("pe_gdi_pen_object FAIL [count_by_pen_style(99)] expected=0 got=" + to_string(s99))
+    }
+
+    // 6. distinct_colors = 5
+    let dc = distinct_colors()
+    if dc != 5 {
+        panic("pe_gdi_pen_object FAIL [distinct_colors] expected=5 got=" + to_string(dc))
+    }
+
+    // 7. pen_width_px sanity
+    let w2 = pen_width_px(220002)
+    if w2 != 2 {
+        panic("pe_gdi_pen_object FAIL [pen_width_px(220002)] expected=2 got=" + to_string(w2))
+    }
+    let w4 = pen_width_px(220004)
+    if w4 != 4 {
+        panic("pe_gdi_pen_object FAIL [pen_width_px(220004)] expected=4 got=" + to_string(w4))
+    }
+    let w_miss = pen_width_px(9999)
+    if w_miss != 0 {
+        panic("pe_gdi_pen_object FAIL [pen_width_px(9999)] expected=0 got=" + to_string(w_miss))
+    }
+
+    // 8. pgpo_stats() = [5, 10, 5, 1]
+    let s = pgpo_stats()
+    if len(s) != 4 {
+        panic("pe_gdi_pen_object FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_gdi_pen_object FAIL [stats pen_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 10 {
+        panic("pe_gdi_pen_object FAIL [stats total_width_px] expected=10 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_gdi_pen_object FAIL [stats distinct_colors] expected=5 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_gdi_pen_object FAIL [stats count_style(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_gdi_pen_object_stats",
+        "\"pen_count\":" + to_string(s[0])
+        + ",\"total_width_px\":" + to_string(s[1])
+        + ",\"distinct_colors\":" + to_string(s[2])
+        + ",\"style_dash\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_gdi_pen_object FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pgpo()
+    let s2 = pgpo_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_gdi_pen_object FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_gdi_pen_object self_test PASS (pens=" + to_string(s[0])
+        + ", width=" + to_string(s[1]) + ", colors=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pgpo_stats()
+            println("pen_count\t" + to_string(s[0]))
+            println("total_width_px\t" + to_string(s[1]))
+            println("distinct_colors\t" + to_string(s[2]))
+            println("count_style_dash\t" + to_string(s[3]))
+            return
+        }
+        if sub == "width" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("pen_width_px\t" + to_string(pen_width_px(pid)))
+                return
+            }
+            println("usage: hexa run pe_gdi_pen_object.hexa width <pen_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let style = to_int(a[3])
+                println("count_by_pen_style\t" + to_string(count_by_pen_style(style)))
+                return
+            }
+            println("usage: hexa run pe_gdi_pen_object.hexa count <pen_style>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pgpo()
+            println("cleaned: " + pgpo_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pgpo_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_gdi_pen_object.hexa { self-test | stats | width <pen_id> | count <pen_style> | cleanup | dir }")
+}

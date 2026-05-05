@@ -1,0 +1,487 @@
+// lib/loader/pe_native_dlopen_real.hexa — stage7 native bridge real dlopen invoke tracker
+//
+// cycle 80 R1 phase 1 — wrapper(stage4) 의 다음 단계. wrapper 는 PE→framework
+// translation + history 만 추적; 본 모듈은 helper.mm IPC frame 호출 path 의
+// invoke 추적 + handle_kind / elapsed_us aggregation. 실 dlopen() 호출은
+// helper.mm 가 dispatch_async 안에서 수행 — hexa side 는 frame send/recv 후
+// 결과를 record_invoke 로 적재.
+//
+// stage7 helper.mm IPC frame:
+//   request:  {kind: "dlopen", path: <utf8>, flags: <int32>}
+//   response: {handle_kind: <int>, native_handle: <opaque uintptr>, errno: <int>}
+// 실 호출 path: hexa → unix_socket frame → helper.mm dispatch_async → real dlopen() → response
+// own1 enforcement: helper.mm 자체 구현 — Wine/CrossOver/community 의 loader 코드 인용 금지
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Apple dlopen(3) man page + Apple GCD dispatch_async 만 참조.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// dlopen_flags (조합 비트마스크):
+//   1 = RTLD_LAZY
+//   2 = RTLD_NOW       (RTLD_LAZY 와 ORed 중 하나)
+//   4 = RTLD_LOCAL
+//   8 = RTLD_GLOBAL    (RTLD_LOCAL 과 ORed 중 하나)
+//
+// handle_kind:
+//   1 = valid_handle      (helper.mm 가 non-null void* 반환)
+//   2 = null_main_image   (path="" → main image 핸들 — null 가능)
+//   3 = error             (dlerror() set, native_handle == 0)
+//   4 = already_loaded    (RTLD_NOLOAD 의도 또는 캐시 hit)
+//
+// persist schema (TSV — invokes.tsv):
+//   invoke_id<int> \t dlopen_flags<int> \t handle_kind<int> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pndr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_dlopen_real"
+}
+
+fn pndr_invokes_path() -> str {
+    return pndr_dir() + "/invokes.tsv"
+}
+
+fn pndr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pndr_dir() + "'")
+}
+
+fn cleanup_pndr() -> void {
+    pndr_ensure_dir()
+    let _ = exec("rm -f '" + pndr_invokes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pndr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pndr_append_row(path: str, row: str) -> void {
+    pndr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_invoke: helper.mm IPC frame 호출 1건 기록 ───
+//   stage7 에서 hexa → unix_socket → helper.mm dispatch_async → real dlopen()
+//   → response 가 도착한 직후 호출. handle_kind 는 helper.mm 응답에서 분류.
+fn record_invoke(invoke_id: int, dlopen_flags: int, handle_kind: int, elapsed_us: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_native_dlopen_real FAIL [record_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if dlopen_flags < 1 {
+        panic("pe_native_dlopen_real FAIL [record_invoke] expected=dlopen_flags>=1 got=" + to_string(dlopen_flags))
+    }
+    if dlopen_flags > 15 {
+        panic("pe_native_dlopen_real FAIL [record_invoke] expected=dlopen_flags<=15 got=" + to_string(dlopen_flags))
+    }
+    if handle_kind < 1 {
+        panic("pe_native_dlopen_real FAIL [record_invoke] expected=handle_kind>=1 got=" + to_string(handle_kind))
+    }
+    if handle_kind > 4 {
+        panic("pe_native_dlopen_real FAIL [record_invoke] expected=handle_kind<=4 got=" + to_string(handle_kind))
+    }
+    if elapsed_us < 0 {
+        panic("pe_native_dlopen_real FAIL [record_invoke] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(dlopen_flags)
+        + "\t" + to_string(handle_kind) + "\t" + to_string(elapsed_us) + "\n"
+    pndr_append_row(pndr_invokes_path(), row)
+}
+
+// ─── invoke_count: 총 invoke 수 ───
+fn invoke_count() -> int {
+    let t = pndr_read_table(pndr_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_elapsed_us: 모든 invoke elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let t = pndr_read_table(pndr_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_handle_kind: 특정 handle_kind 의 invoke 수 ───
+fn count_by_handle_kind(handle_kind: int) -> int {
+    let t = pndr_read_table(pndr_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == handle_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pndr_bit_and: pure hexa bit AND (flags 4비트 0..15 범위) ───
+//   awk and() 는 gawk extension — BSD awk 호환 위해 산술로 구현.
+fn pndr_bit_and(a: int, b: int) -> int {
+    let mut out = 0
+    let mut div = 1
+    let mut k = 0
+    while k < 16 {
+        let abit = (a / div) % 2
+        let bbit = (b / div) % 2
+        if abit == 1 {
+            if bbit == 1 {
+                out = out + div
+            }
+        }
+        div = div * 2
+        k = k + 1
+    }
+    return out
+}
+
+// ─── count_by_flag_bit: (dlopen_flags AND bit_mask) != 0 인 row 의 개수 ───
+//   pndw 의 count_by_flag 는 == flag (모든 bit 일치) 였지만,
+//   본 모듈은 spec 상 != 0 (어느 bit 라도 set 되어 있으면 카운트).
+fn count_by_flag_bit(bit_mask: int) -> int {
+    if bit_mask <= 0 {
+        return 0
+    }
+    let t = pndr_read_table(pndr_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let f = to_int(parts[1])
+                if pndr_bit_and(f, bit_mask) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: handle_kind != 3 (error 가 아닌) 의 개수 ───
+fn success_count() -> int {
+    let t = pndr_read_table(pndr_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) != 3 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── invoke_elapsed_us: 특정 invoke_id 의 elapsed_us (없으면 0) ───
+fn invoke_elapsed_us(invoke_id: int) -> int {
+    let t = pndr_read_table(pndr_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == invoke_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pndr_stats: [invoke_count, total_elapsed_us, success_count, count_by_flag_bit(2)] ───
+fn pndr_stats() -> array {
+    let mut out = []
+    out.push(invoke_count())
+    out.push(total_elapsed_us())
+    out.push(success_count())
+    out.push(count_by_flag_bit(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pndr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pndr()
+
+    // 2. record 5 invokes — handle_kinds {1,2,3,4} 모두 + flag combos {10,6,9}
+    //    invoke 1: RTLD_NOW|RTLD_GLOBAL=10, valid_handle=1
+    record_invoke(200001, 10, 1, 120)
+    r0_emit("pe_native_dlopen_real_invoke",
+        "\"invoke_id\":200001,\"dlopen_flags\":10,\"handle_kind\":1,\"elapsed_us\":120,\"flag_str\":\"RTLD_NOW|RTLD_GLOBAL\",\"kind_str\":\"valid_handle\"")
+
+    //    invoke 2: RTLD_NOW|RTLD_GLOBAL=10, already_loaded=4 (cache hit fast path)
+    record_invoke(200002, 10, 4, 15)
+    r0_emit("pe_native_dlopen_real_invoke",
+        "\"invoke_id\":200002,\"dlopen_flags\":10,\"handle_kind\":4,\"elapsed_us\":15,\"flag_str\":\"RTLD_NOW|RTLD_GLOBAL\",\"kind_str\":\"already_loaded\"")
+
+    //    invoke 3: RTLD_NOW|RTLD_LOCAL=6, null_main_image=2 (path="")
+    record_invoke(200003, 6, 2, 80)
+    r0_emit("pe_native_dlopen_real_invoke",
+        "\"invoke_id\":200003,\"dlopen_flags\":6,\"handle_kind\":2,\"elapsed_us\":80,\"flag_str\":\"RTLD_NOW|RTLD_LOCAL\",\"kind_str\":\"null_main_image\"")
+
+    //    invoke 4: RTLD_LAZY|RTLD_GLOBAL=9, error=3
+    record_invoke(200004, 9, 3, 200)
+    r0_emit("pe_native_dlopen_real_invoke",
+        "\"invoke_id\":200004,\"dlopen_flags\":9,\"handle_kind\":3,\"elapsed_us\":200,\"flag_str\":\"RTLD_LAZY|RTLD_GLOBAL\",\"kind_str\":\"error\"")
+
+    //    invoke 5: RTLD_NOW|RTLD_GLOBAL=10, valid_handle=1
+    record_invoke(200005, 10, 1, 95)
+    r0_emit("pe_native_dlopen_real_invoke",
+        "\"invoke_id\":200005,\"dlopen_flags\":10,\"handle_kind\":1,\"elapsed_us\":95,\"flag_str\":\"RTLD_NOW|RTLD_GLOBAL\",\"kind_str\":\"valid_handle\"")
+
+    // 3. invoke_count = 5
+    let ic = invoke_count()
+    if ic != 5 {
+        panic("pe_native_dlopen_real FAIL [invoke_count] expected=5 got=" + to_string(ic))
+    }
+
+    // 4. total_elapsed_us = 120+15+80+200+95 = 510
+    let te = total_elapsed_us()
+    if te != 510 {
+        panic("pe_native_dlopen_real FAIL [total_elapsed_us] expected=510 got=" + to_string(te))
+    }
+
+    // 5. count_by_handle_kind: 1→2, 2→1, 3→1, 4→1, 99→0
+    let h1 = count_by_handle_kind(1)
+    if h1 != 2 {
+        panic("pe_native_dlopen_real FAIL [count_by_handle_kind(1)] expected=2 got=" + to_string(h1))
+    }
+    let h2 = count_by_handle_kind(2)
+    if h2 != 1 {
+        panic("pe_native_dlopen_real FAIL [count_by_handle_kind(2)] expected=1 got=" + to_string(h2))
+    }
+    let h3 = count_by_handle_kind(3)
+    if h3 != 1 {
+        panic("pe_native_dlopen_real FAIL [count_by_handle_kind(3)] expected=1 got=" + to_string(h3))
+    }
+    let h4 = count_by_handle_kind(4)
+    if h4 != 1 {
+        panic("pe_native_dlopen_real FAIL [count_by_handle_kind(4)] expected=1 got=" + to_string(h4))
+    }
+    let h99 = count_by_handle_kind(99)
+    if h99 != 0 {
+        panic("pe_native_dlopen_real FAIL [count_by_handle_kind(99)] expected=0 got=" + to_string(h99))
+    }
+
+    // 6. count_by_flag_bit:
+    //   bit 2 (RTLD_NOW): rows with flags={10,10,6,_,10} → 4
+    //   bit 1 (RTLD_LAZY): rows with flags={_,_,_,9,_} → 1
+    //   bit 8 (RTLD_GLOBAL): rows with flags={10,10,_,9,10} → 4
+    //   bit 4 (RTLD_LOCAL): rows with flags={_,_,6,_,_} → 1
+    //   bit 0: → 0 (guard)
+    let b_now = count_by_flag_bit(2)
+    if b_now != 4 {
+        panic("pe_native_dlopen_real FAIL [count_by_flag_bit(2)] expected=4 got=" + to_string(b_now))
+    }
+    let b_lazy = count_by_flag_bit(1)
+    if b_lazy != 1 {
+        panic("pe_native_dlopen_real FAIL [count_by_flag_bit(1)] expected=1 got=" + to_string(b_lazy))
+    }
+    let b_global = count_by_flag_bit(8)
+    if b_global != 4 {
+        panic("pe_native_dlopen_real FAIL [count_by_flag_bit(8)] expected=4 got=" + to_string(b_global))
+    }
+    let b_local = count_by_flag_bit(4)
+    if b_local != 1 {
+        panic("pe_native_dlopen_real FAIL [count_by_flag_bit(4)] expected=1 got=" + to_string(b_local))
+    }
+    let b_zero = count_by_flag_bit(0)
+    if b_zero != 0 {
+        panic("pe_native_dlopen_real FAIL [count_by_flag_bit(0)] expected=0 got=" + to_string(b_zero))
+    }
+
+    // 7. success_count = handle_kind != 3 → 4
+    let sc = success_count()
+    if sc != 4 {
+        panic("pe_native_dlopen_real FAIL [success_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 8. invoke_elapsed_us sanity
+    let e1 = invoke_elapsed_us(200001)
+    if e1 != 120 {
+        panic("pe_native_dlopen_real FAIL [invoke_elapsed_us(200001)] expected=120 got=" + to_string(e1))
+    }
+    let e4 = invoke_elapsed_us(200004)
+    if e4 != 200 {
+        panic("pe_native_dlopen_real FAIL [invoke_elapsed_us(200004)] expected=200 got=" + to_string(e4))
+    }
+    let e_miss = invoke_elapsed_us(9999)
+    if e_miss != 0 {
+        panic("pe_native_dlopen_real FAIL [invoke_elapsed_us(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 9. pndr_stats() = [5, 510, 4, 4]
+    let s = pndr_stats()
+    if len(s) != 4 {
+        panic("pe_native_dlopen_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_native_dlopen_real FAIL [stats invoke_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 510 {
+        panic("pe_native_dlopen_real FAIL [stats total_elapsed_us] expected=510 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_native_dlopen_real FAIL [stats success_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_native_dlopen_real FAIL [stats count_by_flag_bit(2)] expected=4 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_native_dlopen_real_stats",
+        "\"invoke_count\":" + to_string(s[0])
+        + ",\"total_elapsed_us\":" + to_string(s[1])
+        + ",\"success_count\":" + to_string(s[2])
+        + ",\"rtld_now_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (실제: 5 invokes + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_native_dlopen_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pndr()
+    let s2 = pndr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_native_dlopen_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_dlopen_real self_test PASS (invokes=" + to_string(s[0])
+        + ", elapsed_us=" + to_string(s[1]) + ", success=" + to_string(s[2])
+        + ", rtld_now=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pndr_stats()
+            println("invoke_count\t" + to_string(s[0]))
+            println("total_elapsed_us\t" + to_string(s[1]))
+            println("success_count\t" + to_string(s[2]))
+            println("count_by_flag_bit(2)\t" + to_string(s[3]))
+            return
+        }
+        if sub == "elapsed" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("invoke_elapsed_us\t" + to_string(invoke_elapsed_us(iid)))
+                return
+            }
+            println("usage: hexa run pe_native_dlopen_real.hexa elapsed <invoke_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let hk = to_int(a[3])
+                println("count_by_handle_kind(" + to_string(hk) + ")\t" + to_string(count_by_handle_kind(hk)))
+                return
+            }
+            println("usage: hexa run pe_native_dlopen_real.hexa count <handle_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pndr()
+            println("cleaned: " + pndr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pndr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_dlopen_real.hexa { self-test | stats | elapsed <invoke_id> | count <handle_kind> | cleanup | dir }")
+}

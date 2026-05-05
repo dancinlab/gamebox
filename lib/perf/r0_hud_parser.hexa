@@ -1,0 +1,121 @@
+// lib/perf/r0_hud_parser.hexa — MTL_HUD 출력 → JSONL events
+//
+// MTL_HUD_ENABLED=1 이 활성화된 게임 stderr 의 line stream 을 JSONL 로 변환.
+// 입력 채널: 파일 (--file <path>) 또는 합성 (--self-test).
+// stdin 루프는 hexa stage1 에서 신뢰 어려움 → file 모드 우선 (upstream candidate: stdin loop).
+//
+// 처리 패턴 (sed/grep regex 우회 — hexa-lang stage1 native regex 없음):
+//   "FPS: 60.4 GPU: 8.3 ms CPU: 2.1 ms  Heap: 1234 MB" → frame_tick
+//   "Pipeline state created (vertex_hash=0x.., fragment_hash=0x.., compile_ms=12)" → pso_compiled
+//   "Texture evicted: 32 MB" → tex_evicted
+//   "Heap fragmentation: 18%" → heap_frag
+
+use "./r0_common"
+
+// 단일 line 처리 — 0 개 이상 emit
+fn parse_line(line: str) -> int {
+    if line.contains("FPS:") {
+        if line.contains("GPU:") {
+            if line.contains("CPU:") {
+                let fps = exec("printf '%s' '" + line + "' | sed -nE 's/.*FPS:[[:space:]]*([0-9.]+).*/\\1/p'").trim()
+                let gpu = exec("printf '%s' '" + line + "' | sed -nE 's/.*GPU:[[:space:]]*([0-9.]+).*/\\1/p'").trim()
+                let cpu = exec("printf '%s' '" + line + "' | sed -nE 's/.*CPU:[[:space:]]*([0-9.]+).*/\\1/p'").trim()
+                let heap = exec("printf '%s' '" + line + "' | sed -nE 's/.*Heap:[[:space:]]*([0-9]+).*/\\1/p'").trim()
+                if fps != "" {
+                    let payload = "\"fps\":" + fps + ",\"gpu_ms\":" + gpu + ",\"cpu_ms\":" + cpu
+                    if heap != "" {
+                        payload = payload + ",\"heap_mb\":" + heap
+                    }
+                    r0_emit("frame_tick", payload)
+                    return 1
+                }
+            }
+        }
+    }
+    if line.contains("Pipeline state created") {
+        let vh = exec("printf '%s' '" + line + "' | sed -nE 's/.*vertex_hash=(0x[0-9a-fA-F]+).*/\\1/p'").trim()
+        let fh = exec("printf '%s' '" + line + "' | sed -nE 's/.*fragment_hash=(0x[0-9a-fA-F]+).*/\\1/p'").trim()
+        let cms = exec("printf '%s' '" + line + "' | sed -nE 's/.*compile_ms=([0-9]+).*/\\1/p'").trim()
+        if vh == "" { vh = "0x0" }
+        if fh == "" { fh = "0x0" }
+        if cms == "" { cms = "0" }
+        let payload = "\"vertex_hash\":\"" + vh + "\",\"fragment_hash\":\"" + fh + "\",\"compile_ms\":" + cms
+        r0_emit("pso_compiled", payload)
+        return 1
+    }
+    if line.contains("Texture evicted") {
+        let mb = exec("printf '%s' '" + line + "' | sed -nE 's/.*evicted:[[:space:]]*([0-9]+).*/\\1/p'").trim()
+        if mb != "" {
+            r0_emit("tex_evicted", "\"size_mb\":" + mb)
+            return 1
+        }
+    }
+    if line.contains("Heap fragmentation") {
+        let pct = exec("printf '%s' '" + line + "' | sed -nE 's/.*fragmentation:[[:space:]]*([0-9]+).*/\\1/p'").trim()
+        if pct != "" {
+            r0_emit("heap_frag", "\"frag_pct\":" + pct)
+            return 1
+        }
+    }
+    return 0
+}
+
+// 파일 처리: line 단위 → parse_line
+fn run_file(path: str) -> int {
+    let _check = exec("test -f '" + path + "' && echo ok").trim()
+    if _check != "ok" {
+        panic("hud_parser file not found: " + path)
+    }
+    // line count 로 loop bound
+    let n_str = exec("wc -l < '" + path + "' | tr -d ' '").trim()
+    let n = to_int(n_str)
+    let i = 1
+    let emitted = 0
+    while i <= n {
+        let line = exec("sed -n '" + to_string(i) + "p' '" + path + "'")
+        emitted = emitted + parse_line(line)
+        i = i + 1
+    }
+    return emitted
+}
+
+fn self_test() -> void {
+    let sid = "r0hud-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 합성 입력 — temp 파일에 작성
+    let tmp = "/tmp/r0_hud_test." + exec("date +%s").trim() + ".log"
+    let synth = "FPS: 60.4 GPU: 8.3 ms CPU: 2.1 ms  Heap: 1234 MB\nPipeline state created (vertex_hash=0xabcd, fragment_hash=0x1234, compile_ms=12)\nTexture evicted: 32 MB\nHeap fragmentation: 18%\nrandom unrelated line\nFPS: 30.0 GPU: 30.5 ms CPU: 4.0 ms  Heap: 1500 MB\n"
+    write_file(tmp, synth)
+
+    let emitted = run_file(tmp)
+    let _rm = exec("rm -f '" + tmp + "'")
+
+    if emitted != 5 {
+        panic("r0_hud_parser FAIL [emitted count] expected=5 got=" + to_string(emitted))
+    }
+    let cnt = r0_session_count(sid)
+    if cnt != 5 {
+        panic("r0_hud_parser FAIL [session count] expected=5 got=" + to_string(cnt))
+    }
+    println("  ✅ r0_hud_parser self_test PASS (5/5 events, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "file" {
+            if len(a) >= 4 {
+                let n = run_file(a[3])
+                println("emitted: " + to_string(n))
+                return
+            }
+        }
+    }
+    println("usage: hexa run r0_hud_parser.hexa { self-test | file <path> }")
+}

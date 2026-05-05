@@ -1,0 +1,498 @@
+// lib/perf/c_win32_call_profile.hexa — CN-3 C-WIN32-CALL-PROFILE (15/15)
+//
+// 무엇:
+//   own1-driven Win32 shim (lib/loader/win32_*.hexa, Phase 2-4) 의 모든 stub 호출
+//   path 를 columnar profiler 로 측정 → hot path 식별 → Phase 3-4 implementation
+//   우선순위 결정.
+//
+//   각 call = 1 record (name / ts_us / duration_us). aggregate per function.
+//   Holt 이중 지수평활로 다음 second 호출 빈도 forecast (capacity planning + cache
+//   warm-up 우선순위 — 자주 불릴 함수 일수록 hot stub 합치).
+//
+// columnar schema (calls.jsonl row, 3 + meta):
+//   name / ts_us / duration_us / inserted_ts
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X.
+// args() = [hexa, file, ...userargs]. a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. 본 모듈은 profile 만 —
+// 의존 없이 synthetic call data 로 round-trip 검증. 실 path 는 Phase 2-4 에서
+// win32_stubs 와 합류 (record_call 호출).
+//
+// own 2 mandate: r0_emit ≥ 2 (call_recorded × N + hotpath_summary),
+// fn self_test() + main() dispatch, headless (no GUI/dialog), panic 형식
+// "c_win32_call_profile FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/win32_profile/
+//     calls.jsonl   — per-call records (columnar)
+//     hotpath.txt   — top-N hot functions (sorted desc by total_us)
+
+fn profile_dir() -> str {
+    return GAMEBOX_HOME + "/persist/win32_profile"
+}
+
+fn calls_path() -> str {
+    return profile_dir() + "/calls.jsonl"
+}
+
+fn hotpath_path() -> str {
+    return profile_dir() + "/hotpath.txt"
+}
+
+fn profile_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + profile_dir() + "'")
+}
+
+// ─── current monotonic micro-second ts ───
+//   stage1 float X. GNU coreutils: `date +%s%6N` 가 us 단위. BSD (macOS) 는
+//   %N 미지원 — `%6N` 가 그대로 literal 출력 → fallback 으로 sec*1e6.
+//   Docker hexa runner = Linux/GNU. 본 함수는 cross-platform safe.
+fn now_us() -> int {
+    let s = exec("date +%s%6N 2>/dev/null").trim()
+    if s == "" {
+        let s2 = exec("date +%s").trim()
+        if s2 == "" { return 0 }
+        return to_int(s2) * 1000000
+    }
+    // BSD date 는 %N 그대로 출력 (e.g. "1700000000%6N") — 숫자 외 문자 검출 시 fallback.
+    let digits_only = exec("printf '%s' '" + s + "' | tr -dc '0-9'").trim()
+    if digits_only == "" {
+        let s2 = exec("date +%s").trim()
+        if s2 == "" { return 0 }
+        return to_int(s2) * 1000000
+    }
+    if digits_only != s {
+        // 비-digit 문자 존재 → BSD literal %N 케이스 → sec 만 사용.
+        let s2 = exec("date +%s").trim()
+        if s2 == "" { return 0 }
+        return to_int(s2) * 1000000
+    }
+    return to_int(s)
+}
+
+// ─── record_call ───
+//   single call = 1 columnar row + 1 emit.
+fn record_call(name: str, duration_us: int) -> void {
+    profile_ensure_dir()
+    let f = calls_path()
+    let ts = now_us()
+    let line = "{\"name\":\"" + name + "\""
+        + ",\"ts_us\":" + to_string(ts)
+        + ",\"duration_us\":" + to_string(duration_us)
+        + ",\"inserted_ts\":" + to_string(ts)
+        + "}"
+    r0_append_line(f, line)
+    r0_emit("win32_call_recorded", "\"name\":\"" + name + "\",\"duration_us\":" + to_string(duration_us))
+}
+
+// ─── extract per-row field (sed) ───
+fn extract_str_field(line: str, field: str) -> str {
+    let cmd = "echo '" + line + "' | sed -E 's/.*\"" + field + "\":\"([^\"]+)\".*/\\1/'"
+    let v = exec(cmd).trim()
+    if v == "" { return "" }
+    if v == line { return "" }
+    return v
+}
+
+fn extract_int_field(line: str, field: str) -> int {
+    let cmd = "echo '" + line + "' | sed -E 's/.*\"" + field + "\":([0-9]+).*/\\1/'"
+    let v = exec(cmd).trim()
+    if v == "" { return 0 }
+    if v == line { return 0 }
+    return to_int(v)
+}
+
+// ─── aggregate_calls ───
+//   calls.jsonl 전체를 읽어 per-name (count, total_us, avg_us) 집계.
+//   결과: [[name, count, total_us, avg_us], ...]  (insertion order, hexa stage1
+//   에 sort/dict 없음 — 선형 fold 로 unique name list 유지).
+fn aggregate_calls() -> array {
+    profile_ensure_dir()
+    let f = calls_path()
+    let exists = exec("test -f '" + f + "' && echo ok").trim()
+    if exists != "ok" {
+        return []
+    }
+    // file 행 단위 처리. wc -l + sed -n로 한 줄씩.
+    let n_str = exec("wc -l < '" + f + "' 2>/dev/null | tr -d ' '").trim()
+    if n_str == "" { return [] }
+    let n = to_int(n_str)
+    let names = []
+    let counts = []
+    let totals = []
+    let i = 1
+    while i <= n {
+        let line = exec("sed -n '" + to_string(i) + "p' '" + f + "' 2>/dev/null").trim()
+        if line != "" {
+            let nm = extract_str_field(line, "name")
+            let du = extract_int_field(line, "duration_us")
+            // unique name 검색
+            let found = -1
+            let j = 0
+            while j < len(names) {
+                if names[j] == nm {
+                    found = j
+                }
+                j = j + 1
+            }
+            if found < 0 {
+                names = names + [nm]
+                counts = counts + [1]
+                totals = totals + [du]
+            } else {
+                counts[found] = counts[found] + 1
+                totals[found] = totals[found] + du
+            }
+        }
+        i = i + 1
+    }
+    // assemble rows
+    let rows = []
+    let k = 0
+    while k < len(names) {
+        let avg = 0
+        if counts[k] > 0 {
+            avg = totals[k] / counts[k]
+        }
+        rows = rows + [[names[k], counts[k], totals[k], avg]]
+        k = k + 1
+    }
+    return rows
+}
+
+// ─── top_hot ───
+//   aggregate_calls() 에서 total_us desc 로 정렬한 첫 N rows.
+//   stage1 sort 없음 — selection sort 로 in-place desc 정렬.
+fn top_hot(n: int) -> array {
+    let rows = aggregate_calls()
+    let m = len(rows)
+    if m == 0 { return [] }
+    // selection sort by total_us desc
+    let i = 0
+    while i < m {
+        let max_idx = i
+        let j = i + 1
+        while j < m {
+            let a_row = rows[max_idx]
+            let b_row = rows[j]
+            let a_total = a_row[2]
+            let b_total = b_row[2]
+            if b_total > a_total {
+                max_idx = j
+            }
+            j = j + 1
+        }
+        if max_idx != i {
+            let tmp = rows[i]
+            rows[i] = rows[max_idx]
+            rows[max_idx] = tmp
+        }
+        i = i + 1
+    }
+    // first n
+    let out = []
+    let limit = n
+    if m < limit { limit = m }
+    let k = 0
+    while k < limit {
+        out = out + [rows[k]]
+        k = k + 1
+    }
+    return out
+}
+
+// ─── Holt 이중 지수평활 (int math) ───
+//   level_t   = (alpha * value + (100-alpha) * (level_{t-1} + trend_{t-1})) / 100
+//   trend_t   = (beta * (level_t - level_{t-1}) + (100-beta) * trend_{t-1}) / 100
+//   forecast  = level + trend
+fn holt_step(value: int, prev_level: int, prev_trend: int, alpha: int, beta: int) -> array {
+    let one_step = prev_level + prev_trend
+    let level_t = (alpha * value + (100 - alpha) * one_step) / 100
+    let trend_t = (beta * (level_t - prev_level) + (100 - beta) * prev_trend) / 100
+    return [level_t, trend_t]
+}
+
+// ─── forecast_next_second ───
+//   history: [[ts_sec, count], ...]  → ts_sec 무시, count 시리즈만 forecast.
+//   alpha/beta percent (0..100). 1-step ahead.
+fn forecast_next_second(history: array, alpha: int, beta: int) -> int {
+    let m = len(history)
+    if m == 0 { return 0 }
+    if m == 1 {
+        let row0 = history[0]
+        return row0[1]
+    }
+    let r0 = history[0]
+    let r1 = history[1]
+    let level = r0[1]
+    let trend = r1[1] - r0[1]
+    let i = 1
+    while i < m {
+        let row = history[i]
+        let v = row[1]
+        let r = holt_step(v, level, trend, alpha, beta)
+        level = r[0]
+        trend = r[1]
+        i = i + 1
+    }
+    return level + trend
+}
+
+// ─── write_hotpath ───
+//   top 20 hot functions 을 hotpath.txt 에 줄 단위 쓰기 (sorted desc total_us).
+//   line 형식: "name<TAB>count<TAB>total_us<TAB>avg_us"
+//   반환값: 쓴 line 수.
+fn write_hotpath() -> int {
+    profile_ensure_dir()
+    let rows = top_hot(20)
+    let m = len(rows)
+    let body = ""
+    let i = 0
+    while i < m {
+        let row = rows[i]
+        let nm = row[0]
+        let cnt = row[1]
+        let total = row[2]
+        let avg = row[3]
+        body = body + nm + "\t" + to_string(cnt) + "\t" + to_string(total) + "\t" + to_string(avg) + "\n"
+        i = i + 1
+    }
+    write_file(hotpath_path(), body)
+    return m
+}
+
+// ─── cache_stats ───
+//   [total_calls, unique_funcs, total_duration_us]
+fn cache_stats() -> array {
+    profile_ensure_dir()
+    let f = calls_path()
+    let exists = exec("test -f '" + f + "' && echo ok").trim()
+    let total_calls = 0
+    if exists == "ok" {
+        let c = exec("wc -l < '" + f + "' 2>/dev/null | tr -d ' '").trim()
+        if c != "" { total_calls = to_int(c) }
+    }
+    let rows = aggregate_calls()
+    let unique = len(rows)
+    let total_dur = 0
+    let i = 0
+    while i < unique {
+        let row = rows[i]
+        total_dur = total_dur + row[2]
+        i = i + 1
+    }
+    return [total_calls, unique, total_dur]
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "win32prof-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cache reset.
+    let _rm1 = exec("rm -f '" + calls_path() + "'")
+    let _rm2 = exec("rm -f '" + hotpath_path() + "'")
+
+    // 2. record_call 합성 데이터 (다양한 빈도/duration).
+    //    expected totals:
+    //      ReadFile     100 × 50  = 5000us
+    //      CreateFileW   50 × 200 = 10000us
+    //      WriteFile     30 × 80  = 2400us
+    //      CloseHandle   50 × 5   = 250us
+    //      MessageBoxW    1 × 1000 = 1000us
+    //    desc order by total_us: CreateFileW (10000), ReadFile (5000), WriteFile (2400), MessageBoxW (1000), CloseHandle (250)
+    let i = 0
+    while i < 50 {
+        record_call("CreateFileW", 200)
+        i = i + 1
+    }
+    let j = 0
+    while j < 100 {
+        record_call("ReadFile", 50)
+        j = j + 1
+    }
+    let k = 0
+    while k < 30 {
+        record_call("WriteFile", 80)
+        k = k + 1
+    }
+    let l = 0
+    while l < 50 {
+        record_call("CloseHandle", 5)
+        l = l + 1
+    }
+    record_call("MessageBoxW", 1000)
+
+    let total_records = 50 + 100 + 30 + 50 + 1   // 231
+
+    // 3. r0_emit "win32_call_recorded" emit 검증 — 매 record 마다 1 emit.
+    //    아직 hotpath_summary 추가 emit 전이므로 = total_records.
+    let emit_after_records = r0_session_count(sid)
+    if emit_after_records < total_records {
+        panic("c_win32_call_profile FAIL [emit count after records] expected>=" + to_string(total_records) + " got=" + to_string(emit_after_records))
+    }
+
+    // 4. aggregate_calls() → 5 unique funcs.
+    let agg = aggregate_calls()
+    if len(agg) != 5 {
+        panic("c_win32_call_profile FAIL [aggregate unique count] expected=5 got=" + to_string(len(agg)))
+    }
+
+    // 5. top_hot(3) 순서 검증 — CreateFileW (10000), ReadFile (5000), WriteFile (2400).
+    //    NOTE: 사양은 "ReadFile, CreateFileW, WriteFile" 순 이라 적었으나 total_us 기준
+    //    desc 정렬 시 CreateFileW(10000) > ReadFile(5000) > WriteFile(2400) 이 정확.
+    //    검증은 top 3 가 이 3 함수를 모두 포함 + WriteFile 이 3 등 (가장 작은 total)
+    //    + 1 등 total 이 ≥ 2 등 total ≥ 3 등 total 인지 확인.
+    let top3 = top_hot(3)
+    if len(top3) != 3 {
+        panic("c_win32_call_profile FAIL [top3 length] expected=3 got=" + to_string(len(top3)))
+    }
+    let r0 = top3[0]
+    let r1 = top3[1]
+    let r2 = top3[2]
+    let t0 = r0[2]
+    let t1 = r1[2]
+    let t2 = r2[2]
+    if t0 < t1 {
+        panic("c_win32_call_profile FAIL [top3 desc 0>=1] expected=" + to_string(t0) + ">=" + to_string(t1) + " got mismatch")
+    }
+    if t1 < t2 {
+        panic("c_win32_call_profile FAIL [top3 desc 1>=2] expected=" + to_string(t1) + ">=" + to_string(t2) + " got mismatch")
+    }
+    // 1 등 = CreateFileW (total 10000)
+    if r0[0] != "CreateFileW" {
+        panic("c_win32_call_profile FAIL [top1 name] expected=CreateFileW got=" + r0[0])
+    }
+    if r0[2] != 10000 {
+        panic("c_win32_call_profile FAIL [top1 total_us] expected=10000 got=" + to_string(r0[2]))
+    }
+    // 2 등 = ReadFile (total 5000)
+    if r1[0] != "ReadFile" {
+        panic("c_win32_call_profile FAIL [top2 name] expected=ReadFile got=" + r1[0])
+    }
+    if r1[2] != 5000 {
+        panic("c_win32_call_profile FAIL [top2 total_us] expected=5000 got=" + to_string(r1[2]))
+    }
+    // 3 등 = WriteFile (total 2400)
+    if r2[0] != "WriteFile" {
+        panic("c_win32_call_profile FAIL [top3 name] expected=WriteFile got=" + r2[0])
+    }
+    if r2[2] != 2400 {
+        panic("c_win32_call_profile FAIL [top3 total_us] expected=2400 got=" + to_string(r2[2]))
+    }
+
+    // 6. forecast_next_second([[1,10],[2,15],[3,20],[4,25]], 60, 30) > 25 (trending up).
+    let hist = [[1, 10], [2, 15], [3, 20], [4, 25]]
+    let f = forecast_next_second(hist, 60, 30)
+    if f <= 25 {
+        panic("c_win32_call_profile FAIL [forecast trending up] expected>25 got=" + to_string(f))
+    }
+
+    // 7. write_hotpath() → 5 (5 unique funcs, top 20 limit 미적용).
+    let written = write_hotpath()
+    if written != 5 {
+        panic("c_win32_call_profile FAIL [write_hotpath count] expected=5 got=" + to_string(written))
+    }
+    let hp_exists = exec("test -f '" + hotpath_path() + "' && echo ok").trim()
+    if hp_exists != "ok" {
+        panic("c_win32_call_profile FAIL [hotpath file exists] expected=ok got=" + hp_exists)
+    }
+
+    // 8. cache_stats → [231, 5, total_dur].
+    //    total_dur = 10000 + 5000 + 2400 + 250 + 1000 = 18650
+    let stats = cache_stats()
+    let stats_total_calls = stats[0]
+    let stats_unique = stats[1]
+    let stats_total_dur = stats[2]
+    if stats_total_calls != total_records {
+        panic("c_win32_call_profile FAIL [stats total_calls] expected=" + to_string(total_records) + " got=" + to_string(stats_total_calls))
+    }
+    if stats_unique != 5 {
+        panic("c_win32_call_profile FAIL [stats unique] expected=5 got=" + to_string(stats_unique))
+    }
+    if stats_total_dur != 18650 {
+        panic("c_win32_call_profile FAIL [stats total_dur] expected=18650 got=" + to_string(stats_total_dur))
+    }
+
+    // 9. r0_emit "hotpath_summary" {top, count}.
+    let top_name = r0[0]
+    r0_emit("hotpath_summary", "\"top\":\"" + top_name + "\",\"count\":" + to_string(stats_unique))
+
+    // emit ≥ 2 (mandate). 실제 ≥ total_records + 1.
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 2 {
+        panic("c_win32_call_profile FAIL [emit count final] expected>=2 got=" + to_string(evt_cnt))
+    }
+
+    // 10. cleanup (테스트 누적 방지).
+    let _rmf = exec("rm -f '" + calls_path() + "'")
+    let _rmh = exec("rm -f '" + hotpath_path() + "'")
+
+    println("  ✅ c_win32_call_profile self_test PASS (sid=" + sid + ", calls=" + to_string(stats_total_calls) + ", unique=" + to_string(stats_unique) + ", total_us=" + to_string(stats_total_dur) + ", top=" + top_name + ", forecast=" + to_string(f) + ", emits=" + to_string(evt_cnt) + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "record" {
+            if len(a) >= 5 {
+                record_call(a[3], to_int(a[4]))
+                println("recorded: " + a[3] + " duration_us=" + a[4])
+                return
+            }
+        }
+        if sub == "aggregate" {
+            let rows = aggregate_calls()
+            let i = 0
+            while i < len(rows) {
+                let row = rows[i]
+                println(row[0] + "\t" + to_string(row[1]) + "\t" + to_string(row[2]) + "\t" + to_string(row[3]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "top" {
+            let n = 10
+            if len(a) >= 4 { n = to_int(a[3]) }
+            let rows = top_hot(n)
+            let i = 0
+            while i < len(rows) {
+                let row = rows[i]
+                println(row[0] + "\t" + to_string(row[1]) + "\t" + to_string(row[2]) + "\t" + to_string(row[3]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "write-hotpath" {
+            let n = write_hotpath()
+            println("written=" + to_string(n) + " path=" + hotpath_path())
+            return
+        }
+        if sub == "stats" {
+            let s = cache_stats()
+            println("total_calls=" + to_string(s[0]) + " unique_funcs=" + to_string(s[1]) + " total_us=" + to_string(s[2]))
+            return
+        }
+        if sub == "profile-dir" {
+            println(profile_dir())
+            return
+        }
+        if sub == "calls-path" {
+            println(calls_path())
+            return
+        }
+        if sub == "hotpath-path" {
+            println(hotpath_path())
+            return
+        }
+    }
+    println("usage: hexa run c_win32_call_profile.hexa { self-test | record <name> <duration_us> | aggregate | top [N] | write-hotpath | stats | profile-dir | calls-path | hotpath-path }")
+}

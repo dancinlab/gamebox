@@ -1,0 +1,430 @@
+// lib/loader/pe_to_macho_shim_track.hexa — Phase 1 Rosetta 2 위임 시나리오 B path tracker
+//
+// PE → Mach-O thin shim header 변환 + Rosetta 2 위임 추적. R4 만점 검토
+// (docs/BINARY_TRANSLATION_MANJEOM_REVIEW.md, B path 21/25) 권장 cycle 80 R4.
+//
+// Rosetta 2 위임 시나리오 B:
+//   1. PE_header_parse: COFF + Optional Header (PE32+) 파싱
+//   2. Mach-O_header_synthesize: mh_magic=MH_MAGIC_64, cputype=CPU_TYPE_X86_64, filetype=MH_EXECUTE
+//   3. section_remap: PE section → __TEXT/__text, __DATA/__data, __DATA_CONST/__rodata
+//   4. lc_segment_emit: LC_SEGMENT_64 + sections + LC_DYLD_INFO + LC_MAIN
+//   5. rosetta_invoke: thin Mach-O 파일 fd → posix_spawn(MH_EXECUTE) → Rosetta 2 자동 변환
+//
+// Apple Silicon Rosetta 2:
+//   - x86_64 → arm64 binary translation (Apple in-house, own1 § A 명시 허용)
+//   - dylib 의존: macOS dylib 만 (Win32 import 은 IAT layer 에서 별도 routing — R3 결과)
+//   - SEH (PE .pdata) → DWARF (.eh_frame) 변환은 R4-B 후속 cycle 별도
+// own1: Apple Mach-O spec + Rosetta 2 (Apple binary) only
+//   - Wine PE-to-ELF 변환, MoltenVM, NTDLL.so 등 community 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 shim phase tracker — 실 Mach-O emit / posix_spawn 호출 X (후속 stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = pe_header_parse
+//   2 = macho_header_synthesize
+//   3 = section_remap
+//   4 = lc_segment_emit
+//   5 = rosetta_invoke
+//
+// persist schema (TSV — shims.tsv):
+//   shim_id<int> \t phase_kind<int> \t input_kb<int> \t output_kb<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ptmst_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_to_macho_shim_track"
+}
+
+fn ptmst_shims_path() -> str {
+    return ptmst_dir() + "/shims.tsv"
+}
+
+fn ptmst_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ptmst_dir() + "'")
+}
+
+fn cleanup_ptmst() -> void {
+    ptmst_ensure_dir()
+    let _ = exec("rm -f '" + ptmst_shims_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ptmst_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ptmst_append_row(path: str, row: str) -> void {
+    ptmst_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_shim: shim phase 1 건 기록 ───
+fn record_shim(shim_id: int, phase_kind: int, input_kb: int, output_kb: int) -> void {
+    if shim_id <= 0 {
+        panic("pe_to_macho_shim_track FAIL [record_shim] expected=shim_id>0 got=" + to_string(shim_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_to_macho_shim_track FAIL [record_shim] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 5 {
+        panic("pe_to_macho_shim_track FAIL [record_shim] expected=phase_kind<=5 got=" + to_string(phase_kind))
+    }
+    if input_kb < 0 {
+        panic("pe_to_macho_shim_track FAIL [record_shim] expected=input_kb>=0 got=" + to_string(input_kb))
+    }
+    if output_kb < 0 {
+        panic("pe_to_macho_shim_track FAIL [record_shim] expected=output_kb>=0 got=" + to_string(output_kb))
+    }
+    let row = to_string(shim_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(input_kb) + "\t" + to_string(output_kb) + "\n"
+    ptmst_append_row(ptmst_shims_path(), row)
+}
+
+// ─── shim_count: total shim 수 ───
+fn shim_count() -> int {
+    let t = ptmst_read_table(ptmst_shims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_input_kb: 모든 shim input_kb 합 ───
+fn total_input_kb() -> int {
+    let t = ptmst_read_table(ptmst_shims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_output_kb: 모든 shim output_kb 합 ───
+fn total_output_kb() -> int {
+    let t = ptmst_read_table(ptmst_shims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 shim 수 ───
+fn count_by_phase_kind(kind: int) -> int {
+    let t = ptmst_read_table(ptmst_shims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── expansion_pct: (total_output_kb * 100) / total_input_kb (0-guard) ───
+fn expansion_pct() -> int {
+    let i_kb = total_input_kb()
+    if i_kb <= 0 {
+        return 0
+    }
+    let o_kb = total_output_kb()
+    return (o_kb * 100) / i_kb
+}
+
+// ─── shim_output_kb: 특정 shim_id 의 output_kb (없으면 0) ───
+fn shim_output_kb(shim_id: int) -> int {
+    let t = ptmst_read_table(ptmst_shims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == shim_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ptmst_stats: [shim_count, total_input_kb, total_output_kb, expansion_pct, count_by_phase_kind(5)] ───
+fn ptmst_stats() -> array {
+    let mut out = []
+    out.push(shim_count())
+    out.push(total_input_kb())
+    out.push(total_output_kb())
+    out.push(expansion_pct())
+    out.push(count_by_phase_kind(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ptmst-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ptmst()
+
+    // 2. record 5 shims covering all 5 phase_kinds (realistic sizes)
+    //    PE input 1024 KB → Mach-O thin output ~ 1140 KB (≈111% expansion)
+    //    phase 1 pe_header_parse:        in=1024 out=2     (header 추출만)
+    //    phase 2 macho_header_synthesize:in=2    out=4     (mh_header_64 + cmds)
+    //    phase 3 section_remap:          in=900  out=900   (section 그대로)
+    //    phase 4 lc_segment_emit:        in=4    out=128   (LC_SEGMENT_64 expand)
+    //    phase 5 rosetta_invoke:         in=1024 out=1024  (thin Mach-O 그대로)
+    //    sums: input=2954, output=2058 → expansion = (2058*100)/2954 = 69
+    record_shim(710001, 1, 1024, 2)
+    r0_emit("pe_to_macho_shim_track_record",
+        "\"shim_id\":710001,\"phase_kind\":1,\"input_kb\":1024,\"output_kb\":2,\"target\":\"pe_header_parse\"")
+
+    record_shim(710002, 2, 2, 4)
+    r0_emit("pe_to_macho_shim_track_record",
+        "\"shim_id\":710002,\"phase_kind\":2,\"input_kb\":2,\"output_kb\":4,\"target\":\"macho_header_synthesize\"")
+
+    record_shim(710003, 3, 900, 900)
+    r0_emit("pe_to_macho_shim_track_record",
+        "\"shim_id\":710003,\"phase_kind\":3,\"input_kb\":900,\"output_kb\":900,\"target\":\"section_remap\"")
+
+    record_shim(710004, 4, 4, 128)
+    r0_emit("pe_to_macho_shim_track_record",
+        "\"shim_id\":710004,\"phase_kind\":4,\"input_kb\":4,\"output_kb\":128,\"target\":\"lc_segment_emit\"")
+
+    record_shim(710005, 5, 1024, 1024)
+    r0_emit("pe_to_macho_shim_track_record",
+        "\"shim_id\":710005,\"phase_kind\":5,\"input_kb\":1024,\"output_kb\":1024,\"target\":\"rosetta_invoke\"")
+
+    // 3. shim_count = 5
+    let c = shim_count()
+    if c != 5 {
+        panic("pe_to_macho_shim_track FAIL [shim_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_input_kb = 2954
+    let ti = total_input_kb()
+    if ti != 2954 {
+        panic("pe_to_macho_shim_track FAIL [total_input_kb] expected=2954 got=" + to_string(ti))
+    }
+
+    // 5. total_output_kb = 2058
+    let to_kb = total_output_kb()
+    if to_kb != 2058 {
+        panic("pe_to_macho_shim_track FAIL [total_output_kb] expected=2058 got=" + to_string(to_kb))
+    }
+
+    // 6. count_by_phase_kind sanity (모든 5 종 1 건씩)
+    let k1 = count_by_phase_kind(1)
+    if k1 != 1 {
+        panic("pe_to_macho_shim_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_phase_kind(2)
+    if k2 != 1 {
+        panic("pe_to_macho_shim_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_phase_kind(3)
+    if k3 != 1 {
+        panic("pe_to_macho_shim_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_phase_kind(4)
+    if k4 != 1 {
+        panic("pe_to_macho_shim_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_phase_kind(5)
+    if k5 != 1 {
+        panic("pe_to_macho_shim_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_phase_kind(99)
+    if k99 != 0 {
+        panic("pe_to_macho_shim_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. expansion_pct = (2058*100)/2954 = 69
+    let ep = expansion_pct()
+    if ep != 69 {
+        panic("pe_to_macho_shim_track FAIL [expansion_pct] expected=69 got=" + to_string(ep))
+    }
+
+    // 8. shim_output_kb sanity
+    let o3 = shim_output_kb(710003)
+    if o3 != 900 {
+        panic("pe_to_macho_shim_track FAIL [shim_output_kb(710003)] expected=900 got=" + to_string(o3))
+    }
+    let o4 = shim_output_kb(710004)
+    if o4 != 128 {
+        panic("pe_to_macho_shim_track FAIL [shim_output_kb(710004)] expected=128 got=" + to_string(o4))
+    }
+    let o_miss = shim_output_kb(9999)
+    if o_miss != 0 {
+        panic("pe_to_macho_shim_track FAIL [shim_output_kb(9999)] expected=0 got=" + to_string(o_miss))
+    }
+
+    // 9. ptmst_stats() = [5, 2954, 2058, 69, 1]
+    let s = ptmst_stats()
+    if len(s) != 5 {
+        panic("pe_to_macho_shim_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_to_macho_shim_track FAIL [stats shim_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2954 {
+        panic("pe_to_macho_shim_track FAIL [stats total_input_kb] expected=2954 got=" + to_string(s[1]))
+    }
+    if s[2] != 2058 {
+        panic("pe_to_macho_shim_track FAIL [stats total_output_kb] expected=2058 got=" + to_string(s[2]))
+    }
+    if s[3] != 69 {
+        panic("pe_to_macho_shim_track FAIL [stats expansion_pct] expected=69 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_to_macho_shim_track FAIL [stats count_kind(5)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_to_macho_shim_track_stats",
+        "\"shim_count\":" + to_string(s[0])
+        + ",\"total_input_kb\":" + to_string(s[1])
+        + ",\"total_output_kb\":" + to_string(s[2])
+        + ",\"expansion_pct\":" + to_string(s[3])
+        + ",\"kind_rosetta_invoke\":" + to_string(s[4]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_to_macho_shim_track FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_ptmst()
+    let s2 = ptmst_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_to_macho_shim_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_to_macho_shim_track self_test PASS (shims=" + to_string(s[0])
+        + ", input_kb=" + to_string(s[1]) + ", output_kb=" + to_string(s[2])
+        + ", expansion_pct=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ptmst_stats()
+            println("shim_count\t" + to_string(s[0]))
+            println("total_input_kb\t" + to_string(s[1]))
+            println("total_output_kb\t" + to_string(s[2]))
+            println("expansion_pct\t" + to_string(s[3]))
+            println("count_kind_rosetta_invoke\t" + to_string(s[4]))
+            return
+        }
+        if sub == "output" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("shim_output_kb\t" + to_string(shim_output_kb(sid)))
+                return
+            }
+            println("usage: hexa run pe_to_macho_shim_track.hexa output <shim_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_to_macho_shim_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ptmst()
+            println("cleaned: " + ptmst_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ptmst_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_to_macho_shim_track.hexa { self-test | stats | output <shim_id> | count <phase_kind> | cleanup | dir }")
+}

@@ -1,0 +1,586 @@
+// lib/loader/pe_i386_userland_first_dialog_e2e_real.hexa — R3-12 closure target
+// end-to-end timeline tracker.
+//
+// own 1: Wine / CrossOver / Whisky / Box86 / community 0 줄. Apple SDK 직접 호출 X.
+//        Microsoft Win32 spec + Apple AppKit doc 의 contract 만 reference 하여
+//        timeline event 를 hexa-side 에서 기록한다 (instrumentation only).
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// R3-12 closure 정의:
+//   "Battle.net Setup 의 first NSWindow 가 macOS 화면에 실제로 표시되는 시점"
+//   PE entry → SEH register → IAT thunk 실행 → USER32 RegisterClass / CreateWindowEx
+//   → ShowWindow → AppKit NSWindow makeKeyAndOrderFront — 의 timeline 을 추적.
+//
+// Timeline 단계 (milestone 16 종 spec):
+//   pe_validate / helper_handshake / section_mmap / iat_routing / teb_alloc /
+//   interp_start / seh_register / iat_thunk_first / user32_register_class /
+//   user32_create_window / user32_show_window / user32_get_message /
+//   first_paint / user_click / window_close / app_exit
+//
+// Win32 reference (구현 X — telemetry only):
+//   - GetSystemTimeAsFileTime  (KERNEL32) : iat_thunk_first 검증 시 첫 호출 후보
+//   - RegisterClassExA/W       (USER32)   : window class 등록
+//   - CreateWindowExA/W        (USER32)   : HWND 생성 (WM_NCCREATE/WM_CREATE 발생)
+//   - ShowWindow / UpdateWindow(USER32)   : WM_PAINT 발생
+//   - GetMessage / DispatchMessage        : message pump (WndProc 호출)
+//   - WM_LBUTTONDOWN (0x0201)             : 사용자 클릭 후 dispatch
+//
+// AppKit reference (구현 X — telemetry only):
+//   - NSWindow makeKeyAndOrderFront / orderOut
+//   - NSEvent translation : AppKit_translated source_kind 로 기록
+//
+// persist schema (TSV — 5 separate tables):
+//   milestone.tsv   : milestone_id<int>  \t milestone_name<str> \t ts_ns<int>            \t success<int>
+//   transition.tsv  : transition_id<int> \t from_phase<int>     \t to_phase<int>         \t elapsed_ns<int>
+//   window.tsv      : event_id<int>      \t hwnd_hex<str>       \t event_kind<int>       \t ts_ns<int>
+//   message.tsv     : msg_id<int>        \t hwnd_hex<str>       \t message_code_hex<str> \t source_kind<int>
+//   metric.tsv      : metric_id<int>     \t metric_name<str>    \t value<int>
+//
+// 식별자 주의: type/mod/resume/handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: milestone_id / milestone_name / ts_ns / transition_id / from_phase /
+// to_phase / elapsed_ns / event_id / hwnd_hex / event_kind / msg_id /
+// message_code_hex / source_kind / metric_id / metric_name.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pufd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_userland_first_dialog_e2e_real"
+}
+
+fn pufd_milestone_path() -> str {
+    return pufd_dir() + "/milestone.tsv"
+}
+
+fn pufd_transition_path() -> str {
+    return pufd_dir() + "/transition.tsv"
+}
+
+fn pufd_window_path() -> str {
+    return pufd_dir() + "/window.tsv"
+}
+
+fn pufd_message_path() -> str {
+    return pufd_dir() + "/message.tsv"
+}
+
+fn pufd_metric_path() -> str {
+    return pufd_dir() + "/metric.tsv"
+}
+
+fn pufd_timeline_path() -> str {
+    return pufd_dir() + "/timeline.tsv"
+}
+
+fn pufd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pufd_dir() + "'")
+}
+
+fn cleanup_pufd() -> void {
+    pufd_ensure_dir()
+    let _ = exec("rm -f '" + pufd_milestone_path() + "' '" + pufd_transition_path()
+        + "' '" + pufd_window_path() + "' '" + pufd_message_path()
+        + "' '" + pufd_metric_path() + "' '" + pufd_timeline_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pufd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pufd_append_row(path: str, row: str) -> void {
+    pufd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pufd_count_rows(path: str, min_cols: int) -> int {
+    let t = pufd_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+fn source_name(s: int) -> str {
+    if s == 0 { return "PostMessage" }
+    if s == 1 { return "SendMessage" }
+    if s == 2 { return "AppKit_translated" }
+    if s == 3 { return "Synthetic" }
+    return "?"
+}
+
+fn event_kind_name(k: int) -> str {
+    if k == 0 { return "create" }
+    if k == 1 { return "show" }
+    if k == 2 { return "paint" }
+    if k == 3 { return "move" }
+    if k == 4 { return "close" }
+    return "?"
+}
+
+// ─── record_milestone: timeline milestone (PE → window 표시 → click → exit) ───
+fn record_milestone(milestone_id: int, milestone_name: str, ts_ns: int, success: int) -> void {
+    if milestone_id <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_milestone] expected=milestone_id>0 got=" + to_string(milestone_id))
+    }
+    if milestone_name == "" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_milestone] expected=milestone_name!=empty got=empty")
+    }
+    if ts_ns < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_milestone] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    if success < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_milestone] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_milestone] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(milestone_id) + "\t" + milestone_name + "\t"
+        + to_string(ts_ns) + "\t" + to_string(success) + "\n"
+    pufd_append_row(pufd_milestone_path(), row)
+}
+
+// ─── record_phase_transition: phase i → phase j elapsed ns ───
+fn record_phase_transition(transition_id: int, from_phase: int, to_phase: int, elapsed_ns: int) -> void {
+    if transition_id <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_phase_transition] expected=transition_id>0 got=" + to_string(transition_id))
+    }
+    if from_phase <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_phase_transition] expected=from_phase>0 got=" + to_string(from_phase))
+    }
+    if to_phase <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_phase_transition] expected=to_phase>0 got=" + to_string(to_phase))
+    }
+    if elapsed_ns < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_phase_transition] expected=elapsed_ns>=0 got=" + to_string(elapsed_ns))
+    }
+    let row = to_string(transition_id) + "\t" + to_string(from_phase) + "\t"
+        + to_string(to_phase) + "\t" + to_string(elapsed_ns) + "\n"
+    pufd_append_row(pufd_transition_path(), row)
+}
+
+// ─── record_window_event: NSWindow / HWND lifecycle event ───
+// event_kind: 0=create 1=show 2=paint 3=move 4=close
+fn record_window_event(event_id: int, hwnd_hex: str, event_kind: int, ts_ns: int) -> void {
+    if event_id <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_window_event] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_window_event] expected=hwnd_hex!=empty got=empty")
+    }
+    if event_kind < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_window_event] expected=event_kind>=0 got=" + to_string(event_kind))
+    }
+    if event_kind > 4 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_window_event] expected=event_kind<=4 got=" + to_string(event_kind))
+    }
+    if ts_ns < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_window_event] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    let row = to_string(event_id) + "\t" + hwnd_hex + "\t"
+        + to_string(event_kind) + "\t" + to_string(ts_ns) + "\n"
+    pufd_append_row(pufd_window_path(), row)
+}
+
+// ─── record_message_traffic: WM_* dispatch traffic 기록 ───
+// source_kind: 0=PostMessage 1=SendMessage 2=AppKit_translated 3=Synthetic
+fn record_message_traffic(msg_id: int, hwnd_hex: str, message_code_hex: str, source_kind: int) -> void {
+    if msg_id <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_message_traffic] expected=msg_id>0 got=" + to_string(msg_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_message_traffic] expected=hwnd_hex!=empty got=empty")
+    }
+    if message_code_hex == "" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_message_traffic] expected=message_code_hex!=empty got=empty")
+    }
+    if source_kind < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_message_traffic] expected=source_kind>=0 got=" + to_string(source_kind))
+    }
+    if source_kind > 3 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_message_traffic] expected=source_kind<=3 got=" + to_string(source_kind))
+    }
+    let row = to_string(msg_id) + "\t" + hwnd_hex + "\t" + message_code_hex
+        + "\t" + to_string(source_kind) + "\n"
+    pufd_append_row(pufd_message_path(), row)
+}
+
+// ─── record_metric: 명명된 counter metric 기록 ───
+fn record_metric(metric_id: int, metric_name: str, value: int) -> void {
+    if metric_id <= 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_metric] expected=metric_id>0 got=" + to_string(metric_id))
+    }
+    if metric_name == "" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_metric] expected=metric_name!=empty got=empty")
+    }
+    if value < 0 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [record_metric] expected=value>=0 got=" + to_string(value))
+    }
+    let row = to_string(metric_id) + "\t" + metric_name + "\t" + to_string(value) + "\n"
+    pufd_append_row(pufd_metric_path(), row)
+}
+
+// ─── statistics ───
+fn milestone_count() -> int {
+    return pufd_count_rows(pufd_milestone_path(), 4)
+}
+
+fn transition_count() -> int {
+    return pufd_count_rows(pufd_transition_path(), 4)
+}
+
+fn window_event_count() -> int {
+    return pufd_count_rows(pufd_window_path(), 4)
+}
+
+fn message_traffic_count() -> int {
+    return pufd_count_rows(pufd_message_path(), 4)
+}
+
+fn metric_count() -> int {
+    return pufd_count_rows(pufd_metric_path(), 3)
+}
+
+fn milestone_success_count() -> int {
+    let t = pufd_read_table(pufd_milestone_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn has_milestone(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let t = pufd_read_table(pufd_milestone_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[1] == name {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn pufd_stats() -> array {
+    let mut out = []
+    out.push(milestone_count())
+    out.push(transition_count())
+    out.push(window_event_count())
+    out.push(message_traffic_count())
+    out.push(metric_count())
+    out.push(milestone_success_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record (8 milestone + 4 transition + 3 window +
+// 4 message + 5 metric = 24 record) + assertions + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pufd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pufd()
+
+    // ─── 1. milestone × 8 (PE entry → seh → iat thunk → user32 register) ───
+    record_milestone(1, "pe_validate", 100, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":1,\"milestone_name\":\"pe_validate\",\"ts_ns\":100,\"success\":1")
+
+    record_milestone(2, "helper_handshake", 200, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":2,\"milestone_name\":\"helper_handshake\",\"ts_ns\":200,\"success\":1")
+
+    record_milestone(3, "section_mmap", 350, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":3,\"milestone_name\":\"section_mmap\",\"ts_ns\":350,\"success\":1")
+
+    record_milestone(4, "iat_routing", 500, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":4,\"milestone_name\":\"iat_routing\",\"ts_ns\":500,\"success\":1")
+
+    record_milestone(5, "interp_start", 700, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":5,\"milestone_name\":\"interp_start\",\"ts_ns\":700,\"success\":1")
+
+    record_milestone(6, "seh_register", 900, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":6,\"milestone_name\":\"seh_register\",\"ts_ns\":900,\"success\":1")
+
+    // KERNEL32!GetSystemTimeAsFileTime — 일반적으로 PE 의 첫 IAT thunk 호출
+    record_milestone(7, "iat_thunk_first", 1100, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":7,\"milestone_name\":\"iat_thunk_first\",\"ts_ns\":1100,\"success\":1,\"thunk_target\":\"KERNEL32!GetSystemTimeAsFileTime\"")
+
+    record_milestone(8, "user32_register_class", 1500, 1)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":8,\"milestone_name\":\"user32_register_class\",\"ts_ns\":1500,\"success\":1")
+
+    // ─── 2. phase_transition × 4 (1→2, 2→3, 3→4, 4→8) ───
+    record_phase_transition(1, 1, 2, 100)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"transition\",\"transition_id\":1,\"from\":1,\"to\":2,\"elapsed_ns\":100")
+
+    record_phase_transition(2, 2, 3, 150)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"transition\",\"transition_id\":2,\"from\":2,\"to\":3,\"elapsed_ns\":150")
+
+    record_phase_transition(3, 3, 4, 150)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"transition\",\"transition_id\":3,\"from\":3,\"to\":4,\"elapsed_ns\":150")
+
+    record_phase_transition(4, 4, 8, 1000)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"transition\",\"transition_id\":4,\"from\":4,\"to\":8,\"elapsed_ns\":1000")
+
+    // ─── 3. window_event × 3 (create / show / paint) ───
+    record_window_event(1, "0x10001", 0, 1600)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"window\",\"event_id\":1,\"hwnd\":\"0x10001\",\"event_kind\":0,\"event\":\"create\",\"ts_ns\":1600")
+
+    record_window_event(2, "0x10001", 1, 1700)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"window\",\"event_id\":2,\"hwnd\":\"0x10001\",\"event_kind\":1,\"event\":\"show\",\"ts_ns\":1700")
+
+    record_window_event(3, "0x10001", 2, 1850)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"window\",\"event_id\":3,\"hwnd\":\"0x10001\",\"event_kind\":2,\"event\":\"paint\",\"ts_ns\":1850")
+
+    // ─── 4. message_traffic × 4 (WM_NCCREATE / WM_CREATE / WM_PAINT / WM_LBUTTONDOWN) ───
+    record_message_traffic(1, "0x10001", "0x0081", 1)  // WM_NCCREATE — SendMessage
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"message\",\"msg_id\":1,\"hwnd\":\"0x10001\",\"message_code\":\"0x0081\",\"source_kind\":1,\"source\":\"SendMessage\",\"wm\":\"WM_NCCREATE\"")
+
+    record_message_traffic(2, "0x10001", "0x0001", 1)  // WM_CREATE — SendMessage
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"message\",\"msg_id\":2,\"hwnd\":\"0x10001\",\"message_code\":\"0x0001\",\"source_kind\":1,\"source\":\"SendMessage\",\"wm\":\"WM_CREATE\"")
+
+    record_message_traffic(3, "0x10001", "0x000F", 0)  // WM_PAINT — PostMessage
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"message\",\"msg_id\":3,\"hwnd\":\"0x10001\",\"message_code\":\"0x000F\",\"source_kind\":0,\"source\":\"PostMessage\",\"wm\":\"WM_PAINT\"")
+
+    record_message_traffic(4, "0x10001", "0x0201", 2)  // WM_LBUTTONDOWN — AppKit translated
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"message\",\"msg_id\":4,\"hwnd\":\"0x10001\",\"message_code\":\"0x0201\",\"source_kind\":2,\"source\":\"AppKit_translated\",\"wm\":\"WM_LBUTTONDOWN\"")
+
+    // ─── 5. metric × 5 (interp inst / iat / helper / nsevent / wndproc) ───
+    record_metric(1, "inst_interpreted", 277)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"metric\",\"metric_id\":1,\"metric_name\":\"inst_interpreted\",\"value\":277")
+
+    record_metric(2, "iat_thunks_called", 4)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"metric\",\"metric_id\":2,\"metric_name\":\"iat_thunks_called\",\"value\":4")
+
+    record_metric(3, "helper_calls", 3)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"metric\",\"metric_id\":3,\"metric_name\":\"helper_calls\",\"value\":3")
+
+    record_metric(4, "nsevent_dispatched", 2)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"metric\",\"metric_id\":4,\"metric_name\":\"nsevent_dispatched\",\"value\":2")
+
+    record_metric(5, "wndproc_invocations", 2)
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_record",
+        "\"kind\":\"metric\",\"metric_id\":5,\"metric_name\":\"wndproc_invocations\",\"value\":2")
+
+    // ─── assertions: count ───
+    let mc = milestone_count()
+    if mc != 8 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [milestone_count] expected=8 got=" + to_string(mc))
+    }
+    let tc = transition_count()
+    if tc != 4 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [transition_count] expected=4 got=" + to_string(tc))
+    }
+    let wc = window_event_count()
+    if wc != 3 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [window_event_count] expected=3 got=" + to_string(wc))
+    }
+    let mtc = message_traffic_count()
+    if mtc != 4 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [message_traffic_count] expected=4 got=" + to_string(mtc))
+    }
+    let metc = metric_count()
+    if metc != 5 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [metric_count] expected=5 got=" + to_string(metc))
+    }
+
+    // ─── assertions: success / has_milestone ───
+    let sc = milestone_success_count()
+    if sc != 8 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [milestone_success_count] expected=8 got=" + to_string(sc))
+    }
+    let h_user32 = has_milestone("user32_register_class")
+    if h_user32 != true {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [has_milestone(user32_register_class)] expected=true got=false")
+    }
+    let h_pe = has_milestone("pe_validate")
+    if h_pe != true {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [has_milestone(pe_validate)] expected=true got=false")
+    }
+    let h_first_paint = has_milestone("first_paint")
+    if h_first_paint != false {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [has_milestone(first_paint)] expected=false got=true")
+    }
+    let h_empty = has_milestone("")
+    if h_empty != false {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [has_milestone(\"\")] expected=false got=true")
+    }
+
+    // ─── name lookup assertions ───
+    if source_name(0) != "PostMessage" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [source_name(0)] expected=PostMessage got=" + source_name(0))
+    }
+    if source_name(2) != "AppKit_translated" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [source_name(2)] expected=AppKit_translated got=" + source_name(2))
+    }
+    if source_name(3) != "Synthetic" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [source_name(3)] expected=Synthetic got=" + source_name(3))
+    }
+    if event_kind_name(0) != "create" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [event_kind_name(0)] expected=create got=" + event_kind_name(0))
+    }
+    if event_kind_name(2) != "paint" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [event_kind_name(2)] expected=paint got=" + event_kind_name(2))
+    }
+    if event_kind_name(4) != "close" {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [event_kind_name(4)] expected=close got=" + event_kind_name(4))
+    }
+
+    // ─── stats sanity ───
+    let s = pufd_stats()
+    if len(s) != 6 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats len] expected=6 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats milestone] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats transition] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats window] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats message] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 5 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats metric] expected=5 got=" + to_string(s[4]))
+    }
+    if s[5] != 8 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [stats success] expected=8 got=" + to_string(s[5]))
+    }
+
+    // ─── stats r0_emit (24 record + this 1 = 25 ≥ 14) ───
+    r0_emit("pe_i386_userland_first_dialog_e2e_real_stats",
+        "\"milestone_count\":" + to_string(s[0])
+        + ",\"transition_count\":" + to_string(s[1])
+        + ",\"window_event_count\":" + to_string(s[2])
+        + ",\"message_traffic_count\":" + to_string(s[3])
+        + ",\"metric_count\":" + to_string(s[4])
+        + ",\"milestone_success_count\":" + to_string(s[5]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_userland_first_dialog_e2e_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pufd()
+    let s2 = pufd_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_userland_first_dialog_e2e_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_userland_first_dialog_e2e_real self_test PASS (milestone="
+        + to_string(s[0]) + ", transition=" + to_string(s[1])
+        + ", window=" + to_string(s[2]) + ", message=" + to_string(s[3])
+        + ", metric=" + to_string(s[4]) + ", success=" + to_string(s[5])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pufd_stats()
+            println("milestone_count\t" + to_string(s[0]))
+            println("transition_count\t" + to_string(s[1]))
+            println("window_event_count\t" + to_string(s[2]))
+            println("message_traffic_count\t" + to_string(s[3]))
+            println("metric_count\t" + to_string(s[4]))
+            println("milestone_success_count\t" + to_string(s[5]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pufd()
+            println("cleaned: " + pufd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pufd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_userland_first_dialog_e2e_real.hexa { self-test | stats | cleanup | dir }")
+}

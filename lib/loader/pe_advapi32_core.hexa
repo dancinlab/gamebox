@@ -1,0 +1,502 @@
+// lib/loader/pe_advapi32_core.hexa — ADVAPI32.dll core syscall surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine advapi32 source 인용 0.
+//       Keychain/SecKeychainItem/Service Management/launchd 직접 binding 0. windows.h/winreg.h/
+//       winsvc.h/wincrypt.h reference shape 만 (HKEY/SC_HANDLE/HCRYPTPROV/SECURITY_DESCRIPTOR
+//       /TOKEN_*). 실 RegOpenKeyExW / 실 OpenSCManagerW / 실 OpenProcessToken / 실
+//       CryptAcquireContextW = 미수행.
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + panic 형식. PARTIAL emit
+//       명시 — full coverage 측 multi-cycle long-horizon, production smoke pending.
+// online_expansion_lockin: L1+L2+L3+L4+L5 ALL OK (사용자 lock-in 2026-05-03).
+//
+// Track Q3 — ADVAPI32 (advapi32.dll) core registry/security/service/token/crypto surface
+// coverage 18 fn skeleton row. Track O (KERNEL32 18 fn) + Track Q1 (USER32 20 fn) + Track Q2
+// (GDI32 15 fn) 후 본 Track Q3 는 ADVAPI32 5 group baseline land. cycle 30 측 61/435 (~14.02%)
+// → cycle 31 측 79/435 (~18.16%) coverage progression (+18 fn 신규).
+//
+// 대상 fn (18 fn — 5 group, fn_kind 0..17):
+//   Registry (5):  RegOpenKeyExW/RegCloseKey/RegQueryValueExW/RegSetValueExW/RegEnumKeyExW
+//   Security (5):  InitializeSecurityDescriptor/SetSecurityDescriptorDacl/GetSecurityInfo/
+//                  SetSecurityInfo/ConvertStringSecurityDescriptorToSecurityDescriptorW
+//   Service (3):   OpenSCManagerW/OpenServiceW/CloseServiceHandle
+//   Token (3):     OpenProcessToken/GetTokenInformation/AdjustTokenPrivileges
+//   Crypto (2):    CryptAcquireContextW/CryptReleaseContext
+//
+// synthetic HKEY "0x80000002" (HKEY_LOCAL_MACHINE) + sub_hkey "0x000A0500". SC_HANDLE
+// "0x000B0600" (manager) + svc "0x000B0700". token_handle "0x000C0800". HCRYPTPROV
+// "0x000D0900". SECURITY_DESCRIPTOR (20 byte: Revision 0x01 + Sbz1 + Control 0x8004 LE +
+// Owner/Group/Sacl/Dacl offsets). SID (12 byte). persist (TSV 4 table): syscall_invoke /
+// registry_op / service_op / sec_token_event.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn padv_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_advapi32_core"
+}
+
+fn padv_syscall_invoke_path() -> str {
+    return padv_dir() + "/syscall_invoke.tsv"
+}
+
+fn padv_registry_op_path() -> str {
+    return padv_dir() + "/registry_op.tsv"
+}
+
+fn padv_service_op_path() -> str {
+    return padv_dir() + "/service_op.tsv"
+}
+
+fn padv_sec_token_event_path() -> str {
+    return padv_dir() + "/sec_token_event.tsv"
+}
+
+fn padv_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + padv_dir() + "'")
+}
+
+fn cleanup_padv() -> void {
+    padv_ensure_dir()
+    let _ = exec("rm -f '" + padv_syscall_invoke_path() + "' '" + padv_registry_op_path()
+        + "' '" + padv_service_op_path() + "' '" + padv_sec_token_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn padv_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn padv_append_row(path: str, row: str) -> void {
+    padv_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn padv_count_rows(path: str, min_cols: int) -> int {
+    let t = padv_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (18 fn coverage, fn_kind 0..17) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "RegOpenKeyExW" }
+    if k == 1 { return "RegCloseKey" }
+    if k == 2 { return "RegQueryValueExW" }
+    if k == 3 { return "RegSetValueExW" }
+    if k == 4 { return "RegEnumKeyExW" }
+    if k == 5 { return "InitializeSecurityDescriptor" }
+    if k == 6 { return "SetSecurityDescriptorDacl" }
+    if k == 7 { return "GetSecurityInfo" }
+    if k == 8 { return "SetSecurityInfo" }
+    if k == 9 { return "ConvertStringSecurityDescriptorToSecurityDescriptorW" }
+    if k == 10 { return "OpenSCManagerW" }
+    if k == 11 { return "OpenServiceW" }
+    if k == 12 { return "CloseServiceHandle" }
+    if k == 13 { return "OpenProcessToken" }
+    if k == 14 { return "GetTokenInformation" }
+    if k == 15 { return "AdjustTokenPrivileges" }
+    if k == 16 { return "CryptAcquireContextW" }
+    if k == 17 { return "CryptReleaseContext" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (5 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 4 {
+            return "registry"
+        }
+    }
+    if k >= 5 {
+        if k <= 9 {
+            return "security"
+        }
+    }
+    if k >= 10 {
+        if k <= 12 {
+            return "service"
+        }
+    }
+    if k >= 13 {
+        if k <= 15 {
+            return "token"
+        }
+    }
+    if k >= 16 {
+        if k <= 17 {
+            return "crypto"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: ADVAPI32 fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_advapi32_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_advapi32_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 17 {
+        panic("pe_advapi32_core FAIL [record_syscall_invoke] expected=fn_kind<=17 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_advapi32_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_advapi32_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    padv_append_row(padv_syscall_invoke_path(), row)
+}
+
+// ─── record_registry_op: RegOpenKeyExW / RegQueryValueExW / RegSetValueExW / RegCloseKey row ───
+fn record_registry_op(reg_id: int, op_id: str, hkey_hex: str, sub_path_w: str, status: str) -> void {
+    if reg_id <= 0 {
+        panic("pe_advapi32_core FAIL [record_registry_op] expected=reg_id>0 got=" + to_string(reg_id))
+    }
+    if op_id == "" {
+        panic("pe_advapi32_core FAIL [record_registry_op] expected=op_id!=empty got=empty")
+    }
+    if hkey_hex == "" {
+        panic("pe_advapi32_core FAIL [record_registry_op] expected=hkey_hex!=empty got=empty")
+    }
+    if sub_path_w == "" {
+        panic("pe_advapi32_core FAIL [record_registry_op] expected=sub_path_w!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_advapi32_core FAIL [record_registry_op] expected=status!=empty got=empty")
+    }
+    let row = to_string(reg_id) + "\t" + op_id + "\t" + hkey_hex + "\t"
+        + sub_path_w + "\t" + status + "\n"
+    padv_append_row(padv_registry_op_path(), row)
+}
+
+// ─── record_service_op: OpenSCManagerW / OpenServiceW / CloseServiceHandle row ───
+fn record_service_op(svc_id: int, op_id: str, sc_handle_hex: str, svc_name_w: str, status: str) -> void {
+    if svc_id <= 0 {
+        panic("pe_advapi32_core FAIL [record_service_op] expected=svc_id>0 got=" + to_string(svc_id))
+    }
+    if op_id == "" {
+        panic("pe_advapi32_core FAIL [record_service_op] expected=op_id!=empty got=empty")
+    }
+    if sc_handle_hex == "" {
+        panic("pe_advapi32_core FAIL [record_service_op] expected=sc_handle_hex!=empty got=empty")
+    }
+    if svc_name_w == "" {
+        panic("pe_advapi32_core FAIL [record_service_op] expected=svc_name_w!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_advapi32_core FAIL [record_service_op] expected=status!=empty got=empty")
+    }
+    let row = to_string(svc_id) + "\t" + op_id + "\t" + sc_handle_hex + "\t"
+        + svc_name_w + "\t" + status + "\n"
+    padv_append_row(padv_service_op_path(), row)
+}
+
+// ─── record_sec_token_event: SECURITY_DESCRIPTOR / token / crypto fn event row ───
+fn record_sec_token_event(evt_id: int, sec_kind: str, fn_name: str, payload_hex: str, status: str) -> void {
+    if evt_id <= 0 {
+        panic("pe_advapi32_core FAIL [record_sec_token_event] expected=evt_id>0 got=" + to_string(evt_id))
+    }
+    if sec_kind == "" {
+        panic("pe_advapi32_core FAIL [record_sec_token_event] expected=sec_kind!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_advapi32_core FAIL [record_sec_token_event] expected=fn_name!=empty got=empty")
+    }
+    if payload_hex == "" {
+        panic("pe_advapi32_core FAIL [record_sec_token_event] expected=payload_hex!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_advapi32_core FAIL [record_sec_token_event] expected=status!=empty got=empty")
+    }
+    let row = to_string(evt_id) + "\t" + sec_kind + "\t" + fn_name + "\t"
+        + payload_hex + "\t" + status + "\n"
+    padv_append_row(padv_sec_token_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return padv_count_rows(padv_syscall_invoke_path(), 4)
+}
+
+fn registry_op_count() -> int {
+    return padv_count_rows(padv_registry_op_path(), 5)
+}
+
+fn service_op_count() -> int {
+    return padv_count_rows(padv_service_op_path(), 5)
+}
+
+fn sec_token_event_count() -> int {
+    return padv_count_rows(padv_sec_token_event_path(), 5)
+}
+
+fn padv_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(registry_op_count())
+    out.push(service_op_count())
+    out.push(sec_token_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "padv-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_padv()
+
+    // ─── 1. syscall_invoke × 18 (one per fn, 5 group coverage) ───
+    //   Registry group (5)
+    record_syscall_invoke(1, 0, "RegOpenKeyExW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL RegOpenKeyExW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"RegOpenKeyExW\",\"fn_group\":\"registry\",\"status\":\"PARTIAL\",\"hkey_hex\":\"0x80000002\",\"sub_path_w_synth\":\"SOFTWARE\\\\Blizzard Entertainment\\\\Diablo II Resurrected\",\"out_hkey_hex\":\"0x000A0500\"")
+    record_syscall_invoke(2, 1, "RegCloseKey", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL RegCloseKey")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"RegCloseKey\",\"fn_group\":\"registry\",\"status\":\"PARTIAL\",\"hkey_hex\":\"0x000A0500\",\"return_synth\":\"0x00000000\"")
+    record_syscall_invoke(3, 2, "RegQueryValueExW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL RegQueryValueExW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"RegQueryValueExW\",\"fn_group\":\"registry\",\"status\":\"PARTIAL\",\"hkey_hex\":\"0x000A0500\",\"value_name_w_synth\":\"InstallPath\",\"value_kind\":\"REG_SZ\",\"value_data_w_synth\":\"C:\\\\Battle.net\\\\D2R\"")
+    record_syscall_invoke(4, 3, "RegSetValueExW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL RegSetValueExW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"RegSetValueExW\",\"fn_group\":\"registry\",\"status\":\"PARTIAL\",\"hkey_hex\":\"0x000A0500\",\"value_name_w_synth\":\"LastRunVersion\",\"value_kind\":\"REG_SZ\",\"data_size\":24")
+    record_syscall_invoke(5, 4, "RegEnumKeyExW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL RegEnumKeyExW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"RegEnumKeyExW\",\"fn_group\":\"registry\",\"status\":\"PARTIAL\",\"hkey_hex\":\"0x000A0500\",\"index\":0,\"sub_key_w_synth\":\"DefaultLocale\"")
+
+    //   Security group (5)
+    record_syscall_invoke(6, 5, "InitializeSecurityDescriptor", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL InitializeSecurityDescriptor")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"InitializeSecurityDescriptor\",\"fn_group\":\"security\",\"status\":\"PARTIAL\",\"sd_synth_hex\":\"01000480000000000000000000000000\",\"revision\":1")
+    record_syscall_invoke(7, 6, "SetSecurityDescriptorDacl", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL SetSecurityDescriptorDacl")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"SetSecurityDescriptorDacl\",\"fn_group\":\"security\",\"status\":\"PARTIAL\",\"sd_synth_hex\":\"01000480000000000000000010100000\",\"dacl_present\":true,\"defaulted\":false")
+    record_syscall_invoke(8, 7, "GetSecurityInfo", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL GetSecurityInfo")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"GetSecurityInfo\",\"fn_group\":\"security\",\"status\":\"PARTIAL\",\"object_handle\":\"0x000A0500\",\"object_kind\":\"SE_REGISTRY_KEY\",\"info_kind\":\"DACL_SECURITY_INFORMATION\"")
+    record_syscall_invoke(9, 8, "SetSecurityInfo", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL SetSecurityInfo")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"SetSecurityInfo\",\"fn_group\":\"security\",\"status\":\"PARTIAL\",\"object_handle\":\"0x000A0500\",\"object_kind\":\"SE_REGISTRY_KEY\",\"info_kind\":\"DACL_SECURITY_INFORMATION\"")
+    record_syscall_invoke(10, 9, "ConvertStringSecurityDescriptorToSecurityDescriptorW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL ConvertStringSecurityDescriptorToSecurityDescriptorW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"ConvertStringSecurityDescriptorToSecurityDescriptorW\",\"fn_group\":\"security\",\"status\":\"PARTIAL\",\"sddl_synth\":\"D:(A;;GA;;;BA)(A;;GR;;;BU)\",\"sd_revision\":1")
+
+    //   Service group (3)
+    record_syscall_invoke(11, 10, "OpenSCManagerW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL OpenSCManagerW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"OpenSCManagerW\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"machine_name_w_synth\":\"\",\"database_w_synth\":\"ServicesActive\",\"access\":\"0x000F003F\",\"sc_handle_hex\":\"0x000B0600\"")
+    record_syscall_invoke(12, 11, "OpenServiceW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL OpenServiceW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"OpenServiceW\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"sc_manager\":\"0x000B0600\",\"svc_name_w_synth\":\"Battle.net Update Agent\",\"access\":\"0x000F01FF\",\"svc_handle_hex\":\"0x000B0700\"")
+    record_syscall_invoke(13, 12, "CloseServiceHandle", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL CloseServiceHandle")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":13,\"fn_kind\":12,\"fn_name\":\"CloseServiceHandle\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"sc_handle_hex\":\"0x000B0700\",\"return_synth\":1")
+
+    //   Token group (3)
+    record_syscall_invoke(14, 13, "OpenProcessToken", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL OpenProcessToken")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":14,\"fn_kind\":13,\"fn_name\":\"OpenProcessToken\",\"fn_group\":\"token\",\"status\":\"PARTIAL\",\"process_handle\":\"0xFFFFFFFF\",\"desired_access\":\"0x00000020\",\"token_handle_hex\":\"0x000C0800\"")
+    record_syscall_invoke(15, 14, "GetTokenInformation", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL GetTokenInformation")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":15,\"fn_kind\":14,\"fn_name\":\"GetTokenInformation\",\"fn_group\":\"token\",\"status\":\"PARTIAL\",\"token_handle_hex\":\"0x000C0800\",\"info_class\":\"TokenUser\",\"sid_synth_hex\":\"010100000000000512000000\",\"sid_bytes\":12")
+    record_syscall_invoke(16, 15, "AdjustTokenPrivileges", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL AdjustTokenPrivileges")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":16,\"fn_kind\":15,\"fn_name\":\"AdjustTokenPrivileges\",\"fn_group\":\"token\",\"status\":\"PARTIAL\",\"token_handle_hex\":\"0x000C0800\",\"disable_all\":false,\"new_state_priv_count\":1,\"priv_name_w_synth\":\"SeShutdownPrivilege\"")
+
+    //   Crypto group (2)
+    record_syscall_invoke(17, 16, "CryptAcquireContextW", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL CryptAcquireContextW")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":17,\"fn_kind\":16,\"fn_name\":\"CryptAcquireContextW\",\"fn_group\":\"crypto\",\"status\":\"PARTIAL\",\"container_w_synth\":\"D2R-CryptoContainer\",\"provider_w_synth\":\"Microsoft Enhanced Cryptographic Provider v1.0\",\"prov_kind\":1,\"prov_handle_hex\":\"0x000D0900\"")
+    record_syscall_invoke(18, 17, "CryptReleaseContext", "PARTIAL")
+    println("__ADVAPI32__ PARTIAL CryptReleaseContext")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":18,\"fn_kind\":17,\"fn_name\":\"CryptReleaseContext\",\"fn_group\":\"crypto\",\"status\":\"PARTIAL\",\"prov_handle_hex\":\"0x000D0900\",\"return_synth\":1")
+
+    // ─── 2. registry_op × 4 (open / query / set / close) ───
+    record_registry_op(1, "open", "0x80000002", "SOFTWARE\\Blizzard Entertainment\\Diablo II Resurrected", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"registry_op\",\"reg_id\":1,\"op_id\":\"open\",\"hkey_hex\":\"0x80000002\",\"sub_path_w_synth\":\"SOFTWARE\\\\Blizzard Entertainment\\\\Diablo II Resurrected\",\"out_hkey_hex\":\"0x000A0500\",\"sam_desired\":\"0x00020019\",\"status\":\"PARTIAL\"")
+    record_registry_op(2, "query", "0x000A0500", "InstallPath", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"registry_op\",\"reg_id\":2,\"op_id\":\"query\",\"hkey_hex\":\"0x000A0500\",\"value_name_w_synth\":\"InstallPath\",\"value_kind\":\"REG_SZ\",\"value_data_w_synth\":\"C:\\\\Battle.net\\\\D2R\",\"status\":\"PARTIAL\"")
+    record_registry_op(3, "set", "0x000A0500", "LastRunVersion", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"registry_op\",\"reg_id\":3,\"op_id\":\"set\",\"hkey_hex\":\"0x000A0500\",\"value_name_w_synth\":\"LastRunVersion\",\"value_kind\":\"REG_SZ\",\"data_size\":24,\"value_data_w_synth\":\"1.6.81475\",\"status\":\"PARTIAL\"")
+    record_registry_op(4, "close", "0x000A0500", "(closed)", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"registry_op\",\"reg_id\":4,\"op_id\":\"close\",\"hkey_hex\":\"0x000A0500\",\"return_synth\":\"0x00000000\",\"status\":\"PARTIAL\"")
+
+    // ─── 3. service_op × 3 (open_manager / open_service / close) ───
+    record_service_op(1, "open_manager", "0x000B0600", "ServicesActive", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"service_op\",\"svc_id\":1,\"op_id\":\"open_manager\",\"sc_handle_hex\":\"0x000B0600\",\"database_w_synth\":\"ServicesActive\",\"access\":\"0x000F003F\",\"status\":\"PARTIAL\"")
+    record_service_op(2, "open_service", "0x000B0700", "Battle.net Update Agent", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"service_op\",\"svc_id\":2,\"op_id\":\"open_service\",\"sc_handle_hex\":\"0x000B0700\",\"sc_manager\":\"0x000B0600\",\"svc_name_w_synth\":\"Battle.net Update Agent\",\"access\":\"0x000F01FF\",\"status\":\"PARTIAL\"")
+    record_service_op(3, "close", "0x000B0700", "(closed)", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"service_op\",\"svc_id\":3,\"op_id\":\"close\",\"sc_handle_hex\":\"0x000B0700\",\"return_synth\":1,\"status\":\"PARTIAL\"")
+
+    // ─── 4. sec_token_event × 5 (sd_init / token_open / token_query / token_adjust / crypto_acquire) ───
+    record_sec_token_event(1, "security_descriptor", "InitializeSecurityDescriptor", "01000480000000000000000000000000", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"sec_token_event\",\"evt_id\":1,\"sec_kind\":\"security_descriptor\",\"fn_name\":\"InitializeSecurityDescriptor\",\"sd_synth_hex\":\"01000480000000000000000000000000\",\"revision\":1,\"control\":\"0x8004\",\"status\":\"PARTIAL\"")
+    record_sec_token_event(2, "token", "OpenProcessToken", "00080C00", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"sec_token_event\",\"evt_id\":2,\"sec_kind\":\"token\",\"fn_name\":\"OpenProcessToken\",\"token_handle_hex\":\"0x000C0800\",\"desired_access\":\"0x00000020\",\"status\":\"PARTIAL\"")
+    record_sec_token_event(3, "token", "GetTokenInformation", "010100000000000512000000", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"sec_token_event\",\"evt_id\":3,\"sec_kind\":\"token\",\"fn_name\":\"GetTokenInformation\",\"token_handle_hex\":\"0x000C0800\",\"info_class\":\"TokenUser\",\"sid_synth_hex\":\"010100000000000512000000\",\"sid_revision\":1,\"sub_authority_count\":1,\"status\":\"PARTIAL\"")
+    record_sec_token_event(4, "token", "AdjustTokenPrivileges", "00080C00", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"sec_token_event\",\"evt_id\":4,\"sec_kind\":\"token\",\"fn_name\":\"AdjustTokenPrivileges\",\"token_handle_hex\":\"0x000C0800\",\"disable_all\":false,\"priv_name_w_synth\":\"SeShutdownPrivilege\",\"status\":\"PARTIAL\"")
+    record_sec_token_event(5, "crypto", "CryptAcquireContextW", "00090D00", "PARTIAL")
+    r0_emit("pe_advapi32_core_record", "\"kind\":\"sec_token_event\",\"evt_id\":5,\"sec_kind\":\"crypto\",\"fn_name\":\"CryptAcquireContextW\",\"prov_handle_hex\":\"0x000D0900\",\"prov_kind\":1,\"container_w_synth\":\"D2R-CryptoContainer\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 18 {
+        panic("pe_advapi32_core FAIL [syscall_invoke_count] expected=18 got=" + to_string(si))
+    }
+    let ro = registry_op_count()
+    if ro != 4 {
+        panic("pe_advapi32_core FAIL [registry_op_count] expected=4 got=" + to_string(ro))
+    }
+    let so = service_op_count()
+    if so != 3 {
+        panic("pe_advapi32_core FAIL [service_op_count] expected=3 got=" + to_string(so))
+    }
+    let st = sec_token_event_count()
+    if st != 5 {
+        panic("pe_advapi32_core FAIL [sec_token_event_count] expected=5 got=" + to_string(st))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "RegOpenKeyExW" { panic("pe_advapi32_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(5) != "InitializeSecurityDescriptor" { panic("pe_advapi32_core FAIL [fn_kind_name(5)]") }
+    if fn_kind_name(10) != "OpenSCManagerW" { panic("pe_advapi32_core FAIL [fn_kind_name(10)]") }
+    if fn_kind_name(13) != "OpenProcessToken" { panic("pe_advapi32_core FAIL [fn_kind_name(13)]") }
+    if fn_kind_name(17) != "CryptReleaseContext" { panic("pe_advapi32_core FAIL [fn_kind_name(17)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_advapi32_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "registry" { panic("pe_advapi32_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(5) != "security" { panic("pe_advapi32_core FAIL [fn_group_name(5)]") }
+    if fn_group_name(10) != "service" { panic("pe_advapi32_core FAIL [fn_group_name(10)]") }
+    if fn_group_name(13) != "token" { panic("pe_advapi32_core FAIL [fn_group_name(13)]") }
+    if fn_group_name(16) != "crypto" { panic("pe_advapi32_core FAIL [fn_group_name(16)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_advapi32_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = padv_stats()
+    if len(s) != 4 { panic("pe_advapi32_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 18 { panic("pe_advapi32_core FAIL [stats syscall_invoke_count] expected=18 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_advapi32_core FAIL [stats registry_op_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 3 { panic("pe_advapi32_core FAIL [stats service_op_count] expected=3 got=" + to_string(s[2])) }
+    if s[3] != 5 { panic("pe_advapi32_core FAIL [stats sec_token_event_count] expected=5 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_advapi32_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"registry_op_count\":" + to_string(s[1])
+        + ",\"service_op_count\":" + to_string(s[2])
+        + ",\"sec_token_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_advapi32_core_summary",
+        "\"target\":\"ADVAPI32.dll\",\"fn_total\":18,\"fn_emit_partial\":18,\"groups\":[\"registry\",\"security\",\"service\",\"token\",\"crypto\"],\"hkey_synth\":\"0x000A0500\",\"sc_handle_synth\":\"0x000B0600\",\"token_handle_synth\":\"0x000C0800\",\"prov_handle_synth\":\"0x000D0900\",\"security_descriptor_synth_bytes\":20,\"sid_synth_bytes\":12,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_advapi32_core_kpi",
+        "\"registry_emits\":5,\"security_emits\":5,\"service_emits\":3,\"token_emits\":3,\"crypto_emits\":2,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true")
+
+    // ─── cycle 30 → 31 ADVAPI32 coverage progression evidence emit ───
+    r0_emit("pe_advapi32_core_coverage_progression",
+        "\"surface\":\"ADVAPI32_full_~25_fn_estimated\",\"cycle_30_count\":61,\"cycle_31_count\":79,\"delta\":18,\"cycle_30_percent\":14.02,\"cycle_31_percent\":18.16,\"cycle_31_module\":\"pe_advapi32_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\"")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_advapi32_core_round_trip_matrix",
+        "\"surface\":\"ADVAPI32_core_18_fn\",\"fn_partial\":18,\"fn_groups\":5,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real RegOpenKeyExW + OpenSCManagerW + OpenProcessToken + CryptAcquireContextW pending separate cycle\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\",\"track_q_cumulative_to_track_o\":\"ADVAPI32 + USER32_20 + GDI32_15 + KERNEL32_18 = 71 fn cumulative skeleton-tier (Track Q bundled cycle 29-31 = 53 fn delta)\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_advapi32_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_padv()
+    let s2 = padv_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_advapi32_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_advapi32_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", registry_op=" + to_string(s[1])
+        + ", service_op=" + to_string(s[2]) + ", sec_token_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = padv_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("registry_op_count\t" + to_string(s[1]))
+            println("service_op_count\t" + to_string(s[2]))
+            println("sec_token_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_advapi32_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_advapi32_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_padv()
+            println("cleaned: " + padv_dir())
+            return
+        }
+        if sub == "dir" {
+            println(padv_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_advapi32_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

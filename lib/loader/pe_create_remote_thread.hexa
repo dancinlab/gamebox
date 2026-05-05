@@ -1,0 +1,408 @@
+// lib/loader/pe_create_remote_thread.hexa — cycle74 Win32 cross-process
+// thread creation telemetry (CreateRemoteThread / NtCreateThreadEx).
+//
+// CreateRemoteThread / NtCreateThreadEx 는 호출자 프로세스 외부의 target
+// 프로세스에 새 thread 를 시작시킨다. DLL injection 의 고전 경로 (LoadLibrary
+// 를 entry point 로 한 thread 생성) 외에도 임의 shellcode 진입, 기존
+// thread reuse, APC 큐잉 등 다양한 시작 형태가 있고 anti-cheat 가 정확히
+// 추적해야 하는 표면이다.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 inject 추적기 — 실 CreateRemoteThread / NtCreateThreadEx
+//   호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe
+//   + panic 형식.
+//
+// start_kind code:
+//   1 = loadlibrary     (entry = LoadLibraryA/W, lpParameter = DLL path)
+//   2 = arbitrary_code  (entry = injected shellcode / APC stub)
+//   3 = existing_proc   (entry = target proc 이미 매핑된 export)
+//   4 = apc             (NtQueueApcThread 후 alertable wait 트리거)
+//
+// suspended:
+//   0 = 즉시 실행 (CREATE_SUSPENDED 미지정)
+//   1 = CREATE_SUSPENDED — caller 가 ResumeThread 까지 보류
+//
+// persist schema (TSV — injects.tsv):
+//   inject_id<int> \t target_process_id<int> \t start_kind<int> \t suspended<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcrt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_create_remote_thread"
+}
+
+fn pcrt_injects_path() -> str {
+    return pcrt_dir() + "/injects.tsv"
+}
+
+fn pcrt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcrt_dir() + "'")
+}
+
+fn cleanup_pcrt() -> void {
+    pcrt_ensure_dir()
+    let _ = exec("rm -f '" + pcrt_injects_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcrt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcrt_append_row(path: str, row: str) -> void {
+    pcrt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_inject: 단일 inject 1 건 기록 ───
+fn record_inject(inject_id: int, target_process_id: int, start_kind: int, suspended: int) -> void {
+    if inject_id <= 0 {
+        panic("pe_create_remote_thread FAIL [record_inject] expected=inject_id>0 got=" + to_string(inject_id))
+    }
+    if target_process_id <= 0 {
+        panic("pe_create_remote_thread FAIL [record_inject] expected=target_process_id>0 got=" + to_string(target_process_id))
+    }
+    if start_kind < 1 {
+        panic("pe_create_remote_thread FAIL [record_inject] expected=start_kind>=1 got=" + to_string(start_kind))
+    }
+    if start_kind > 4 {
+        panic("pe_create_remote_thread FAIL [record_inject] expected=start_kind<=4 got=" + to_string(start_kind))
+    }
+    if suspended < 0 {
+        panic("pe_create_remote_thread FAIL [record_inject] expected=suspended>=0 got=" + to_string(suspended))
+    }
+    if suspended > 1 {
+        panic("pe_create_remote_thread FAIL [record_inject] expected=suspended<=1 got=" + to_string(suspended))
+    }
+    let row = to_string(inject_id) + "\t" + to_string(target_process_id)
+        + "\t" + to_string(start_kind) + "\t" + to_string(suspended) + "\n"
+    pcrt_append_row(pcrt_injects_path(), row)
+}
+
+// ─── inject_count: total inject 수 ───
+fn inject_count() -> int {
+    let t = pcrt_read_table(pcrt_injects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_start_kind: 특정 start_kind 의 inject 수 ───
+fn count_by_start_kind(start_kind: int) -> int {
+    let t = pcrt_read_table(pcrt_injects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == start_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── suspended_count: suspended=1 inject 수 ───
+fn suspended_count() -> int {
+    let t = pcrt_read_table(pcrt_injects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_targets: 고유 target_process_id 수 ───
+fn distinct_targets() -> int {
+    let t = pcrt_read_table(pcrt_injects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let pid = to_int(parts[1])
+                let m = len(seen)
+                let j = 0
+                let mut found = 0
+                while j < m {
+                    if seen[j] == pid {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(pid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── inject_target_pid: 특정 inject_id 의 target_process_id (없으면 0) ───
+fn inject_target_pid(inject_id: int) -> int {
+    let t = pcrt_read_table(pcrt_injects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == inject_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pcrt_stats: [inject_count, distinct_targets, suspended_count, count_by_start_kind(1)] ───
+fn pcrt_stats() -> array {
+    let mut out = []
+    out.push(inject_count())
+    out.push(distinct_targets())
+    out.push(suspended_count())
+    out.push(count_by_start_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcrt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcrt()
+
+    // 2. record 5 injects across 4 start_kinds with 2 suspended
+    record_inject(120001, 4001, 1, 0)
+    r0_emit("pe_create_remote_thread_record",
+        "\"inject_id\":120001,\"target_process_id\":4001,\"start_kind\":1,\"suspended\":0,\"target\":\"loadlibrary\"")
+
+    record_inject(120002, 4001, 2, 1)
+    r0_emit("pe_create_remote_thread_record",
+        "\"inject_id\":120002,\"target_process_id\":4001,\"start_kind\":2,\"suspended\":1,\"target\":\"arbitrary_code\"")
+
+    record_inject(120003, 4002, 3, 0)
+    r0_emit("pe_create_remote_thread_record",
+        "\"inject_id\":120003,\"target_process_id\":4002,\"start_kind\":3,\"suspended\":0,\"target\":\"existing_proc\"")
+
+    record_inject(120004, 4003, 4, 1)
+    r0_emit("pe_create_remote_thread_record",
+        "\"inject_id\":120004,\"target_process_id\":4003,\"start_kind\":4,\"suspended\":1,\"target\":\"apc\"")
+
+    record_inject(120005, 4002, 1, 0)
+    r0_emit("pe_create_remote_thread_record",
+        "\"inject_id\":120005,\"target_process_id\":4002,\"start_kind\":1,\"suspended\":0,\"target\":\"loadlibrary\"")
+
+    // 3. inject_count = 5
+    let c = inject_count()
+    if c != 5 {
+        panic("pe_create_remote_thread FAIL [inject_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_start_kind sanity
+    let k1 = count_by_start_kind(1)
+    if k1 != 2 {
+        panic("pe_create_remote_thread FAIL [count_by_start_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_start_kind(2)
+    if k2 != 1 {
+        panic("pe_create_remote_thread FAIL [count_by_start_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_start_kind(3)
+    if k3 != 1 {
+        panic("pe_create_remote_thread FAIL [count_by_start_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_start_kind(4)
+    if k4 != 1 {
+        panic("pe_create_remote_thread FAIL [count_by_start_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_start_kind(99)
+    if k99 != 0 {
+        panic("pe_create_remote_thread FAIL [count_by_start_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. suspended_count = 2
+    let sc = suspended_count()
+    if sc != 2 {
+        panic("pe_create_remote_thread FAIL [suspended_count] expected=2 got=" + to_string(sc))
+    }
+
+    // 6. distinct_targets = 3 (4001, 4002, 4003)
+    let dt = distinct_targets()
+    if dt != 3 {
+        panic("pe_create_remote_thread FAIL [distinct_targets] expected=3 got=" + to_string(dt))
+    }
+
+    // 7. inject_target_pid sanity
+    let p3 = inject_target_pid(120003)
+    if p3 != 4002 {
+        panic("pe_create_remote_thread FAIL [inject_target_pid(120003)] expected=4002 got=" + to_string(p3))
+    }
+    let p5 = inject_target_pid(120005)
+    if p5 != 4002 {
+        panic("pe_create_remote_thread FAIL [inject_target_pid(120005)] expected=4002 got=" + to_string(p5))
+    }
+    let p_miss = inject_target_pid(9999)
+    if p_miss != 0 {
+        panic("pe_create_remote_thread FAIL [inject_target_pid(9999)] expected=0 got=" + to_string(p_miss))
+    }
+
+    // 8. pcrt_stats() = [5, 3, 2, 2]
+    let s = pcrt_stats()
+    if len(s) != 4 {
+        panic("pe_create_remote_thread FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_create_remote_thread FAIL [stats inject_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_create_remote_thread FAIL [stats distinct_targets] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_create_remote_thread FAIL [stats suspended_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_create_remote_thread FAIL [stats count_kind(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_create_remote_thread_stats",
+        "\"inject_count\":" + to_string(s[0])
+        + ",\"distinct_targets\":" + to_string(s[1])
+        + ",\"suspended_count\":" + to_string(s[2])
+        + ",\"kind_loadlibrary\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_create_remote_thread FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pcrt()
+    let s2 = pcrt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_create_remote_thread FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_create_remote_thread self_test PASS (injects=" + to_string(s[0])
+        + ", targets=" + to_string(s[1]) + ", suspended=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcrt_stats()
+            println("inject_count\t" + to_string(s[0]))
+            println("distinct_targets\t" + to_string(s[1]))
+            println("suspended_count\t" + to_string(s[2]))
+            println("count_kind_loadlibrary\t" + to_string(s[3]))
+            return
+        }
+        if sub == "target" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("inject_target_pid\t" + to_string(inject_target_pid(iid)))
+                return
+            }
+            println("usage: hexa run pe_create_remote_thread.hexa target <inject_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let sk = to_int(a[3])
+                println("count_by_start_kind\t" + to_string(count_by_start_kind(sk)))
+                return
+            }
+            println("usage: hexa run pe_create_remote_thread.hexa count <start_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcrt()
+            println("cleaned: " + pcrt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcrt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_create_remote_thread.hexa { self-test | stats | target <inject_id> | count <start_kind> | cleanup | dir }")
+}

@@ -1,0 +1,369 @@
+// lib/loader/pe_ipc_named_pipe.hexa — stage6 POSIX FIFO IPC skeleton
+//
+// mkfifo + open(O_RDONLY/WRONLY). file-system path 기반 unidirectional
+// byte stream. blocking I/O. simple but limited.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 fifo op tracker — 실 mkfifo() / open() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// direction code:
+//   1 = read   (O_RDONLY)
+//   2 = write  (O_WRONLY)
+//
+// persist schema (TSV — fifo_ops.tsv):
+//   fifo_id<int> \t direction<int> \t bytes_transferred<int> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pinp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_named_pipe"
+}
+
+fn pinp_ops_path() -> str {
+    return pinp_dir() + "/fifo_ops.tsv"
+}
+
+fn pinp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pinp_dir() + "'")
+}
+
+fn cleanup_pinp() -> void {
+    pinp_ensure_dir()
+    let _ = exec("rm -f '" + pinp_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pinp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pinp_append_row(path: str, row: str) -> void {
+    pinp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_fifo_op: fifo op 1 건 기록 ───
+fn record_fifo_op(fifo_id: int, direction: int, bytes_transferred: int, elapsed_us: int) -> void {
+    if fifo_id <= 0 {
+        panic("pe_ipc_named_pipe FAIL [record_fifo_op] expected=fifo_id>0 got=" + to_string(fifo_id))
+    }
+    if direction < 1 {
+        panic("pe_ipc_named_pipe FAIL [record_fifo_op] expected=direction>=1 got=" + to_string(direction))
+    }
+    if direction > 2 {
+        panic("pe_ipc_named_pipe FAIL [record_fifo_op] expected=direction<=2 got=" + to_string(direction))
+    }
+    if bytes_transferred < 0 {
+        panic("pe_ipc_named_pipe FAIL [record_fifo_op] expected=bytes_transferred>=0 got=" + to_string(bytes_transferred))
+    }
+    if elapsed_us < 0 {
+        panic("pe_ipc_named_pipe FAIL [record_fifo_op] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(fifo_id) + "\t" + to_string(direction)
+        + "\t" + to_string(bytes_transferred) + "\t" + to_string(elapsed_us) + "\n"
+    pinp_append_row(pinp_ops_path(), row)
+}
+
+// ─── fifo_count: total op 수 ───
+fn fifo_count() -> int {
+    let t = pinp_read_table(pinp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes: 모든 op bytes_transferred 합 ───
+fn total_bytes() -> int {
+    let t = pinp_read_table(pinp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_direction: 특정 direction 의 op 수 ───
+fn count_by_direction(direction: int) -> int {
+    let t = pinp_read_table(pinp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == direction {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_elapsed_us: 모든 op elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let t = pinp_read_table(pinp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── fifo_bytes: 특정 fifo_id 의 bytes_transferred (없으면 0) ───
+fn fifo_bytes(fifo_id: int) -> int {
+    let t = pinp_read_table(pinp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == fifo_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pinp_stats: [fifo_count, total_bytes, count_by_direction(1), count_by_direction(2)] ───
+fn pinp_stats() -> array {
+    let mut out = []
+    out.push(fifo_count())
+    out.push(total_bytes())
+    out.push(count_by_direction(1))
+    out.push(count_by_direction(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pinp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pinp()
+
+    // 2. record 4 fifo ops (deterministic synthetic)
+    record_fifo_op(123001, 2, 1024, 80)
+    r0_emit("pe_ipc_named_pipe_record",
+        "\"fifo_id\":123001,\"direction\":2,\"bytes_transferred\":1024,\"elapsed_us\":80,\"target\":\"write\"")
+
+    record_fifo_op(123002, 1, 1024, 120)
+    r0_emit("pe_ipc_named_pipe_record",
+        "\"fifo_id\":123002,\"direction\":1,\"bytes_transferred\":1024,\"elapsed_us\":120,\"target\":\"read\"")
+
+    record_fifo_op(123003, 2, 2048, 120)
+    r0_emit("pe_ipc_named_pipe_record",
+        "\"fifo_id\":123003,\"direction\":2,\"bytes_transferred\":2048,\"elapsed_us\":120,\"target\":\"write\"")
+
+    record_fifo_op(123004, 1, 2048, 180)
+    r0_emit("pe_ipc_named_pipe_record",
+        "\"fifo_id\":123004,\"direction\":1,\"bytes_transferred\":2048,\"elapsed_us\":180,\"target\":\"read\"")
+
+    // 3. fifo_count = 4
+    let c = fifo_count()
+    if c != 4 {
+        panic("pe_ipc_named_pipe FAIL [fifo_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_bytes = 6144
+    let tb = total_bytes()
+    if tb != 6144 {
+        panic("pe_ipc_named_pipe FAIL [total_bytes] expected=6144 got=" + to_string(tb))
+    }
+
+    // 5. count_by_direction sanity
+    let d1 = count_by_direction(1)
+    if d1 != 2 {
+        panic("pe_ipc_named_pipe FAIL [count_by_direction(1)] expected=2 got=" + to_string(d1))
+    }
+    let d2 = count_by_direction(2)
+    if d2 != 2 {
+        panic("pe_ipc_named_pipe FAIL [count_by_direction(2)] expected=2 got=" + to_string(d2))
+    }
+    let d99 = count_by_direction(99)
+    if d99 != 0 {
+        panic("pe_ipc_named_pipe FAIL [count_by_direction(99)] expected=0 got=" + to_string(d99))
+    }
+
+    // 6. total_elapsed_us = 500
+    let te = total_elapsed_us()
+    if te != 500 {
+        panic("pe_ipc_named_pipe FAIL [total_elapsed_us] expected=500 got=" + to_string(te))
+    }
+
+    // 7. fifo_bytes sanity
+    let b1 = fifo_bytes(123001)
+    if b1 != 1024 {
+        panic("pe_ipc_named_pipe FAIL [fifo_bytes(123001)] expected=1024 got=" + to_string(b1))
+    }
+    let b3 = fifo_bytes(123003)
+    if b3 != 2048 {
+        panic("pe_ipc_named_pipe FAIL [fifo_bytes(123003)] expected=2048 got=" + to_string(b3))
+    }
+    let b_miss = fifo_bytes(9999)
+    if b_miss != 0 {
+        panic("pe_ipc_named_pipe FAIL [fifo_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 8. pinp_stats() = [4, 6144, 2, 2]
+    let s = pinp_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_named_pipe FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_ipc_named_pipe FAIL [stats fifo_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 6144 {
+        panic("pe_ipc_named_pipe FAIL [stats total_bytes] expected=6144 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_ipc_named_pipe FAIL [stats count_dir(1)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ipc_named_pipe FAIL [stats count_dir(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_named_pipe_stats",
+        "\"fifo_count\":" + to_string(s[0])
+        + ",\"total_bytes\":" + to_string(s[1])
+        + ",\"dir_read\":" + to_string(s[2])
+        + ",\"dir_write\":" + to_string(s[3])
+        + ",\"total_elapsed_us\":" + to_string(te))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_ipc_named_pipe FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pinp()
+    let s2 = pinp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_named_pipe FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_named_pipe self_test PASS (fifos=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", elapsed_us=" + to_string(te)
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pinp_stats()
+            println("fifo_count\t" + to_string(s[0]))
+            println("total_bytes\t" + to_string(s[1]))
+            println("count_dir_read\t" + to_string(s[2]))
+            println("count_dir_write\t" + to_string(s[3]))
+            println("total_elapsed_us\t" + to_string(total_elapsed_us()))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let fid = to_int(a[3])
+                println("fifo_bytes\t" + to_string(fifo_bytes(fid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_named_pipe.hexa bytes <fifo_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let dir = to_int(a[3])
+                println("count_by_direction\t" + to_string(count_by_direction(dir)))
+                return
+            }
+            println("usage: hexa run pe_ipc_named_pipe.hexa count <direction>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pinp()
+            println("cleaned: " + pinp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pinp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_named_pipe.hexa { self-test | stats | bytes <fifo_id> | count <direction> | cleanup | dir }")
+}

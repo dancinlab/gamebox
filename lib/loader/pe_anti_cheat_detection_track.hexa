@@ -1,0 +1,454 @@
+// lib/loader/pe_anti_cheat_detection_track.hexa — anti-cheat module detection 추적기 (own2 자체 구현)
+//
+// Anti-cheat module 추적기 (own2 자체 구현):
+//   EAC (Easy Anti-Cheat) — kernel driver, Apple Silicon 차단 (Apex Legends/Fortnite)
+//   BattlEye                — kernel driver, Apple Silicon 차단 (PUBG)
+//   nProtect GameGuard      — kernel driver, Lineage 시리즈, Apple 차단
+//   VIOLET (NCSOFT)         — Lineage W 자체 AC, Apple 차단
+//   XIGNCODE3 (Wellbia)     — kernel driver, MMORPG 다수
+//   VAC (Valve Anti-Cheat)  — user-mode (CS2/Dota2), 일부 path 가능
+//   Hyperion (Fortnite)     — kernel + user, 차단
+//
+//   본 모듈은 PE binary 의 import 표/loaded module list 에서 AC 모듈 detect 만 추적
+//   실 AC 우회는 closure path B 정책상 거부 (kernel-mode AC = 차단 수용)
+// own1: PE binary fingerprint 만 — AC bypass 코드 0 줄, 우회 가이드 0 줄
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 AC fingerprint tracker — 실 bypass / hook / patch 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// ac_kind code:
+//   1 = eac (Easy Anti-Cheat)
+//   2 = battleye
+//   3 = nprotect_gameguard
+//   4 = violet (NCSOFT)
+//   5 = xigncode3 (Wellbia)
+//   6 = vac (Valve Anti-Cheat)
+//   7 = hyperion_fortnite
+//
+// vector_kind code:
+//   1 = kernel_driver
+//   2 = user_mode_dll
+//   3 = integrity_check
+//   4 = process_scan
+//   5 = memory_scan
+//
+// persist schema (TSV — detections.tsv):
+//   detection_id<int> \t ac_kind<int> \t vector_kind<int> \t blocked<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pacd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_anti_cheat_detection_track"
+}
+
+fn pacd_detections_path() -> str {
+    return pacd_dir() + "/detections.tsv"
+}
+
+fn pacd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pacd_dir() + "'")
+}
+
+fn cleanup_pacd() -> void {
+    pacd_ensure_dir()
+    let _ = exec("rm -f '" + pacd_detections_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pacd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pacd_append_row(path: str, row: str) -> void {
+    pacd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_detection: AC detection 1 건 기록 ───
+fn record_detection(detection_id: int, ac_kind: int, vector_kind: int, blocked: int) -> void {
+    if detection_id <= 0 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=detection_id>0 got=" + to_string(detection_id))
+    }
+    if ac_kind < 1 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=ac_kind>=1 got=" + to_string(ac_kind))
+    }
+    if ac_kind > 7 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=ac_kind<=7 got=" + to_string(ac_kind))
+    }
+    if vector_kind < 1 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=vector_kind>=1 got=" + to_string(vector_kind))
+    }
+    if vector_kind > 5 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=vector_kind<=5 got=" + to_string(vector_kind))
+    }
+    if blocked < 0 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=blocked>=0 got=" + to_string(blocked))
+    }
+    if blocked > 1 {
+        panic("pe_anti_cheat_detection_track FAIL [record_detection] expected=blocked<=1 got=" + to_string(blocked))
+    }
+    let row = to_string(detection_id) + "\t" + to_string(ac_kind)
+        + "\t" + to_string(vector_kind) + "\t" + to_string(blocked) + "\n"
+    pacd_append_row(pacd_detections_path(), row)
+}
+
+// ─── detection_count: total detection 수 ───
+fn detection_count() -> int {
+    let t = pacd_read_table(pacd_detections_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_ac_kind: 특정 ac_kind 의 detection 수 ───
+fn count_by_ac_kind(ac_kind: int) -> int {
+    let t = pacd_read_table(pacd_detections_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == ac_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_vector_kind: 특정 vector_kind 의 detection 수 ───
+fn count_by_vector_kind(vector_kind: int) -> int {
+    let t = pacd_read_table(pacd_detections_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == vector_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── blocked_count: blocked=1 인 detection 수 ───
+fn blocked_count() -> int {
+    let t = pacd_read_table(pacd_detections_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── kernel_driver_count: vector_kind=1 인 detection 수 ───
+fn kernel_driver_count() -> int {
+    return count_by_vector_kind(1)
+}
+
+// ─── detection_blocked: 특정 detection_id 의 blocked 값 (없으면 0) ───
+fn detection_blocked(detection_id: int) -> int {
+    let t = pacd_read_table(pacd_detections_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == detection_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pacd_stats: [detection_count, blocked_count, kernel_driver_count, count_by_ac_kind(1)] ───
+fn pacd_stats() -> array {
+    let mut out = []
+    out.push(detection_count())
+    out.push(blocked_count())
+    out.push(kernel_driver_count())
+    out.push(count_by_ac_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pacd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pacd()
+
+    // 2. record 6 detections — ≥4 ac_kinds, ≥3 vector_kinds, ≥3 blocked
+    //    ac_kinds 사용: 1=eac, 2=battleye, 3=nprotect, 5=xigncode3, 6=vac (5 종)
+    //    vector_kinds 사용: 1=kernel_driver, 2=user_mode_dll, 4=process_scan (3 종)
+    //    blocked=1: 4 건 (eac kernel, battleye kernel, nprotect kernel, xigncode3 kernel)
+    record_detection(120001, 1, 1, 1) // eac kernel driver — blocked
+    r0_emit("pe_anti_cheat_detection_track_record",
+        "\"detection_id\":120001,\"ac_kind\":1,\"vector_kind\":1,\"blocked\":1,\"target\":\"eac_kernel\"")
+
+    record_detection(120002, 2, 1, 1) // battleye kernel driver — blocked
+    r0_emit("pe_anti_cheat_detection_track_record",
+        "\"detection_id\":120002,\"ac_kind\":2,\"vector_kind\":1,\"blocked\":1,\"target\":\"battleye_kernel\"")
+
+    record_detection(120003, 3, 1, 1) // nprotect_gameguard kernel — blocked
+    r0_emit("pe_anti_cheat_detection_track_record",
+        "\"detection_id\":120003,\"ac_kind\":3,\"vector_kind\":1,\"blocked\":1,\"target\":\"nprotect_kernel\"")
+
+    record_detection(120004, 5, 1, 1) // xigncode3 kernel — blocked
+    r0_emit("pe_anti_cheat_detection_track_record",
+        "\"detection_id\":120004,\"ac_kind\":5,\"vector_kind\":1,\"blocked\":1,\"target\":\"xigncode3_kernel\"")
+
+    record_detection(120005, 6, 2, 0) // vac user-mode dll — not blocked
+    r0_emit("pe_anti_cheat_detection_track_record",
+        "\"detection_id\":120005,\"ac_kind\":6,\"vector_kind\":2,\"blocked\":0,\"target\":\"vac_user\"")
+
+    record_detection(120006, 6, 4, 0) // vac process scan — not blocked
+    r0_emit("pe_anti_cheat_detection_track_record",
+        "\"detection_id\":120006,\"ac_kind\":6,\"vector_kind\":4,\"blocked\":0,\"target\":\"vac_proc_scan\"")
+
+    // 3. detection_count = 6
+    let c = detection_count()
+    if c != 6 {
+        panic("pe_anti_cheat_detection_track FAIL [detection_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_ac_kind sanity
+    let a1 = count_by_ac_kind(1)
+    if a1 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_ac_kind(1)] expected=1 got=" + to_string(a1))
+    }
+    let a2 = count_by_ac_kind(2)
+    if a2 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_ac_kind(2)] expected=1 got=" + to_string(a2))
+    }
+    let a3 = count_by_ac_kind(3)
+    if a3 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_ac_kind(3)] expected=1 got=" + to_string(a3))
+    }
+    let a5 = count_by_ac_kind(5)
+    if a5 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_ac_kind(5)] expected=1 got=" + to_string(a5))
+    }
+    let a6 = count_by_ac_kind(6)
+    if a6 != 2 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_ac_kind(6)] expected=2 got=" + to_string(a6))
+    }
+    let a7 = count_by_ac_kind(7)
+    if a7 != 0 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_ac_kind(7)] expected=0 got=" + to_string(a7))
+    }
+
+    // 5. count_by_vector_kind sanity
+    let v1 = count_by_vector_kind(1)
+    if v1 != 4 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_vector_kind(1)] expected=4 got=" + to_string(v1))
+    }
+    let v2 = count_by_vector_kind(2)
+    if v2 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_vector_kind(2)] expected=1 got=" + to_string(v2))
+    }
+    let v4 = count_by_vector_kind(4)
+    if v4 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_vector_kind(4)] expected=1 got=" + to_string(v4))
+    }
+    let v3 = count_by_vector_kind(3)
+    if v3 != 0 {
+        panic("pe_anti_cheat_detection_track FAIL [count_by_vector_kind(3)] expected=0 got=" + to_string(v3))
+    }
+
+    // 6. blocked_count = 4
+    let bc = blocked_count()
+    if bc != 4 {
+        panic("pe_anti_cheat_detection_track FAIL [blocked_count] expected=4 got=" + to_string(bc))
+    }
+
+    // 7. kernel_driver_count = 4
+    let kdc = kernel_driver_count()
+    if kdc != 4 {
+        panic("pe_anti_cheat_detection_track FAIL [kernel_driver_count] expected=4 got=" + to_string(kdc))
+    }
+
+    // 8. detection_blocked sanity
+    let db1 = detection_blocked(120001)
+    if db1 != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [detection_blocked(120001)] expected=1 got=" + to_string(db1))
+    }
+    let db5 = detection_blocked(120005)
+    if db5 != 0 {
+        panic("pe_anti_cheat_detection_track FAIL [detection_blocked(120005)] expected=0 got=" + to_string(db5))
+    }
+    let db_miss = detection_blocked(9999)
+    if db_miss != 0 {
+        panic("pe_anti_cheat_detection_track FAIL [detection_blocked(9999)] expected=0 got=" + to_string(db_miss))
+    }
+
+    // 9. pacd_stats() = [6, 4, 4, 1]
+    let s = pacd_stats()
+    if len(s) != 4 {
+        panic("pe_anti_cheat_detection_track FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_anti_cheat_detection_track FAIL [stats detection_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_anti_cheat_detection_track FAIL [stats blocked_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_anti_cheat_detection_track FAIL [stats kernel_driver_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_anti_cheat_detection_track FAIL [stats count_ac(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_anti_cheat_detection_track_stats",
+        "\"detection_count\":" + to_string(s[0])
+        + ",\"blocked_count\":" + to_string(s[1])
+        + ",\"kernel_driver_count\":" + to_string(s[2])
+        + ",\"ac_eac\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_anti_cheat_detection_track FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pacd()
+    let s2 = pacd_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_anti_cheat_detection_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_anti_cheat_detection_track self_test PASS (detections=" + to_string(s[0])
+        + ", blocked=" + to_string(s[1]) + ", kernel=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pacd_stats()
+            println("detection_count\t" + to_string(s[0]))
+            println("blocked_count\t" + to_string(s[1]))
+            println("kernel_driver_count\t" + to_string(s[2]))
+            println("count_ac_eac\t" + to_string(s[3]))
+            return
+        }
+        if sub == "blocked" {
+            if len(a) >= 4 {
+                let did = to_int(a[3])
+                println("detection_blocked\t" + to_string(detection_blocked(did)))
+                return
+            }
+            println("usage: hexa run pe_anti_cheat_detection_track.hexa blocked <detection_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let val = to_int(a[4])
+                if dim == "ac" {
+                    println("count_by_ac_kind\t" + to_string(count_by_ac_kind(val)))
+                    return
+                }
+                if dim == "vector" {
+                    println("count_by_vector_kind\t" + to_string(count_by_vector_kind(val)))
+                    return
+                }
+                println("usage: hexa run pe_anti_cheat_detection_track.hexa count { ac <ac_kind> | vector <vector_kind> }")
+                return
+            }
+            println("usage: hexa run pe_anti_cheat_detection_track.hexa count { ac <ac_kind> | vector <vector_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pacd()
+            println("cleaned: " + pacd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pacd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_anti_cheat_detection_track.hexa { self-test | stats | blocked <detection_id> | count ac <ac_kind> | count vector <vector_kind> | cleanup | dir }")
+}

@@ -1,0 +1,394 @@
+// lib/loader/pe_glyph_metrics.hexa — Win32 GetGlyphOutline / GetTextMetrics → CoreText CTFont metrics bridge telemetry
+//
+// Win32 font / glyph API → macOS CoreText 매핑. Win32 측 GetGlyphOutlineW /
+// GetTextMetricsW / ABC width 호출이 들어오면 CoreText CTFontGetGlyphsForCharacters
+// + CTFontGetAdvancesForGlyphs 로 변환되며, 본 module 은 그 query 1 건마다
+// (glyph_id, query_kind, glyph_index, advance_x) 행을 persist 한다.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 metric query tracker — 실 GetGlyphOutline / CTFont 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// query_kind code:
+//   1 = outline      (GGO_NATIVE / GGO_BEZIER)
+//   2 = metrics_only (GGO_METRICS)
+//   3 = bitmap       (GGO_GRAY*_BITMAP)
+//   4 = tt_outline   (GGO_NATIVE | GGO_GLYPH_INDEX)
+//
+// persist schema (TSV — glyphs.tsv):
+//   glyph_id<int> \t query_kind<int> \t glyph_index<int> \t advance_x<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pgm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_glyph_metrics"
+}
+
+fn pgm_glyphs_path() -> str {
+    return pgm_dir() + "/glyphs.tsv"
+}
+
+fn pgm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pgm_dir() + "'")
+}
+
+fn cleanup_pgm() -> void {
+    pgm_ensure_dir()
+    let _ = exec("rm -f '" + pgm_glyphs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pgm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pgm_append_row(path: str, row: str) -> void {
+    pgm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_glyph: glyph metric query 1 건 기록 ───
+fn record_glyph(glyph_id: int, query_kind: int, glyph_index: int, advance_x: int) -> void {
+    if glyph_id <= 0 {
+        panic("pe_glyph_metrics FAIL [record_glyph] expected=glyph_id>0 got=" + to_string(glyph_id))
+    }
+    if query_kind < 1 {
+        panic("pe_glyph_metrics FAIL [record_glyph] expected=query_kind>=1 got=" + to_string(query_kind))
+    }
+    if query_kind > 4 {
+        panic("pe_glyph_metrics FAIL [record_glyph] expected=query_kind<=4 got=" + to_string(query_kind))
+    }
+    if glyph_index < 0 {
+        panic("pe_glyph_metrics FAIL [record_glyph] expected=glyph_index>=0 got=" + to_string(glyph_index))
+    }
+    if advance_x < 0 {
+        panic("pe_glyph_metrics FAIL [record_glyph] expected=advance_x>=0 got=" + to_string(advance_x))
+    }
+    let row = to_string(glyph_id) + "\t" + to_string(query_kind)
+        + "\t" + to_string(glyph_index) + "\t" + to_string(advance_x) + "\n"
+    pgm_append_row(pgm_glyphs_path(), row)
+}
+
+// ─── glyph_count: total glyph query 수 ───
+fn glyph_count() -> int {
+    let t = pgm_read_table(pgm_glyphs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_advance_x: 모든 glyph advance_x 합 ───
+fn total_advance_x() -> int {
+    let t = pgm_read_table(pgm_glyphs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_query_kind: 특정 query_kind 의 glyph 수 ───
+fn count_by_query_kind(kind: int) -> int {
+    let t = pgm_read_table(pgm_glyphs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_indices: 중복 제거된 glyph_index 수 ───
+fn distinct_indices() -> int {
+    let t = pgm_read_table(pgm_glyphs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let idx = to_int(parts[2])
+                let mut found = 0
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == idx {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(idx)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── glyph_advance_x: 특정 glyph_id 의 advance_x (없으면 0) ───
+fn glyph_advance_x(glyph_id: int) -> int {
+    let t = pgm_read_table(pgm_glyphs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == glyph_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pgm_stats: [glyph_count, total_advance_x, distinct_indices, count_by_query_kind(2)] ───
+fn pgm_stats() -> array {
+    let mut out = []
+    out.push(glyph_count())
+    out.push(total_advance_x())
+    out.push(distinct_indices())
+    out.push(count_by_query_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pgm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pgm()
+
+    // 2. record 5 glyph queries across ≥3 query_kinds (deterministic synthetic)
+    record_glyph(120001, 1, 36, 612)
+    r0_emit("pe_glyph_metrics_record",
+        "\"glyph_id\":120001,\"query_kind\":1,\"glyph_index\":36,\"advance_x\":612,\"target\":\"outline\"")
+
+    record_glyph(120002, 2, 36, 612)
+    r0_emit("pe_glyph_metrics_record",
+        "\"glyph_id\":120002,\"query_kind\":2,\"glyph_index\":36,\"advance_x\":612,\"target\":\"metrics_only\"")
+
+    record_glyph(120003, 2, 72, 488)
+    r0_emit("pe_glyph_metrics_record",
+        "\"glyph_id\":120003,\"query_kind\":2,\"glyph_index\":72,\"advance_x\":488,\"target\":\"metrics_only\"")
+
+    record_glyph(120004, 3, 109, 720)
+    r0_emit("pe_glyph_metrics_record",
+        "\"glyph_id\":120004,\"query_kind\":3,\"glyph_index\":109,\"advance_x\":720,\"target\":\"bitmap\"")
+
+    record_glyph(120005, 4, 109, 720)
+    r0_emit("pe_glyph_metrics_record",
+        "\"glyph_id\":120005,\"query_kind\":4,\"glyph_index\":109,\"advance_x\":720,\"target\":\"tt_outline\"")
+
+    // 3. glyph_count = 5
+    let c = glyph_count()
+    if c != 5 {
+        panic("pe_glyph_metrics FAIL [glyph_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_advance_x = 612 + 612 + 488 + 720 + 720 = 3152
+    let ta = total_advance_x()
+    if ta != 3152 {
+        panic("pe_glyph_metrics FAIL [total_advance_x] expected=3152 got=" + to_string(ta))
+    }
+
+    // 5. count_by_query_kind sanity (≥3 kinds: 1, 2, 3, 4)
+    let k1 = count_by_query_kind(1)
+    if k1 != 1 {
+        panic("pe_glyph_metrics FAIL [count_by_query_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_query_kind(2)
+    if k2 != 2 {
+        panic("pe_glyph_metrics FAIL [count_by_query_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_query_kind(3)
+    if k3 != 1 {
+        panic("pe_glyph_metrics FAIL [count_by_query_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_query_kind(4)
+    if k4 != 1 {
+        panic("pe_glyph_metrics FAIL [count_by_query_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_query_kind(99)
+    if k99 != 0 {
+        panic("pe_glyph_metrics FAIL [count_by_query_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_indices = {36, 72, 109} = 3
+    let di = distinct_indices()
+    if di != 3 {
+        panic("pe_glyph_metrics FAIL [distinct_indices] expected=3 got=" + to_string(di))
+    }
+
+    // 7. glyph_advance_x sanity
+    let ax3 = glyph_advance_x(120003)
+    if ax3 != 488 {
+        panic("pe_glyph_metrics FAIL [glyph_advance_x(120003)] expected=488 got=" + to_string(ax3))
+    }
+    let ax5 = glyph_advance_x(120005)
+    if ax5 != 720 {
+        panic("pe_glyph_metrics FAIL [glyph_advance_x(120005)] expected=720 got=" + to_string(ax5))
+    }
+    let ax_miss = glyph_advance_x(9999)
+    if ax_miss != 0 {
+        panic("pe_glyph_metrics FAIL [glyph_advance_x(9999)] expected=0 got=" + to_string(ax_miss))
+    }
+
+    // 8. pgm_stats() = [5, 3152, 3, 2]
+    let s = pgm_stats()
+    if len(s) != 4 {
+        panic("pe_glyph_metrics FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_glyph_metrics FAIL [stats glyph_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3152 {
+        panic("pe_glyph_metrics FAIL [stats total_advance_x] expected=3152 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_glyph_metrics FAIL [stats distinct_indices] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_glyph_metrics FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_glyph_metrics_stats",
+        "\"glyph_count\":" + to_string(s[0])
+        + ",\"total_advance_x\":" + to_string(s[1])
+        + ",\"distinct_indices\":" + to_string(s[2])
+        + ",\"kind_metrics_only\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_glyph_metrics FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pgm()
+    let s2 = pgm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_glyph_metrics FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_glyph_metrics self_test PASS (glyphs=" + to_string(s[0])
+        + ", advance_x=" + to_string(s[1]) + ", distinct=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pgm_stats()
+            println("glyph_count\t" + to_string(s[0]))
+            println("total_advance_x\t" + to_string(s[1]))
+            println("distinct_indices\t" + to_string(s[2]))
+            println("count_kind_metrics_only\t" + to_string(s[3]))
+            return
+        }
+        if sub == "advance" {
+            if len(a) >= 4 {
+                let gid = to_int(a[3])
+                println("glyph_advance_x\t" + to_string(glyph_advance_x(gid)))
+                return
+            }
+            println("usage: hexa run pe_glyph_metrics.hexa advance <glyph_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_query_kind\t" + to_string(count_by_query_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_glyph_metrics.hexa count <query_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pgm()
+            println("cleaned: " + pgm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pgm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_glyph_metrics.hexa { self-test | stats | advance <glyph_id> | count <query_kind> | cleanup | dir }")
+}

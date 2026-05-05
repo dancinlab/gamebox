@@ -1,0 +1,509 @@
+// lib/loader/pe_i386_misc_inst.hexa — i386 misc instruction tracker
+// (BCD adjust / sign extend / PUSHA-POPA-PUSHF-POPF / INC-DEC single-byte / flag-manip).
+//
+// Battle.net-Setup.exe / D2R / D4 의 32-bit shim 에서 등장하는 "기타" 명령어 군을
+// hexa side 에서 분류·기록하기 위한 5종 record API + stats + self-test.
+//
+// 추적 대상 (Intel SDM Vol 2 reference):
+//   - BCD adjust   : 0x27 DAA, 0x2F DAS, 0x37 AAA, 0x3F AAS, 0xD4 AAM, 0xD5 AAD
+//                    operates_on = "al" (DAA/DAS/AAA/AAS) / "ax" (AAM/AAD)
+//   - sign extend  : 0x98 CBW (al→ax 1→2), 0x99 CWD (ax→dx:ax 2→4),
+//                    0x99 CDQ in 32-bit (eax→edx:eax 4→8)
+//   - stack misc   : 0x60 PUSHA/PUSHAD (8 reg), 0x61 POPA/POPAD,
+//                    0x9C PUSHF/PUSHFD (1 reg=eflags), 0x9D POPF/POPFD
+//   - INC/DEC      : 0x40-0x47 INC r32, 0x48-0x4F DEC r32 (single-byte form)
+//   - flag manip   : 0xF8 CLC, 0xF9 STC (CF), 0xFA CLI, 0xFB STI (IF),
+//                    0xFC CLD, 0xFD STD (DF), 0xF5 CMC (CF)
+//
+// own 1 enforcement: Wine/Box86/QEMU/Bochs/community 0줄. Apple SDK 호출 X.
+//   - Intel SDM Vol 2 reference OK. 우회 금지.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   bcd.tsv          : bcd_id<str>     \t opcode_byte<int> \t mnemonic<str> \t operates_on<str>
+//   sign_extend.tsv  : se_id<str>      \t opcode_byte<int> \t src_size<int> \t dst_size<int>
+//   stack_misc.tsv   : stk_id<str>     \t opcode_byte<int> \t mnemonic<str> \t regs_count<int>
+//   inc_dec.tsv      : id_id<str>      \t opcode_byte<int> \t reg_idx<int>  \t op_kind<int>
+//   flag_manip.tsv   : fm_id<str>      \t opcode_byte<int> \t mnemonic<str> \t flag_target<str>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지.
+//   식별자: opcode_byte / operates_on / se_id / src_size / dst_size /
+//           stk_id / regs_count / id_id / reg_idx / op_kind / fm_id /
+//           flag_target / bcd_id.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pimi_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_misc_inst"
+}
+
+fn pimi_inst_path() -> str {
+    return pimi_dir()
+}
+
+fn pimi_bcd_path() -> str {
+    return pimi_dir() + "/bcd.tsv"
+}
+
+fn pimi_sign_extend_path() -> str {
+    return pimi_dir() + "/sign_extend.tsv"
+}
+
+fn pimi_stack_misc_path() -> str {
+    return pimi_dir() + "/stack_misc.tsv"
+}
+
+fn pimi_inc_dec_path() -> str {
+    return pimi_dir() + "/inc_dec.tsv"
+}
+
+fn pimi_flag_manip_path() -> str {
+    return pimi_dir() + "/flag_manip.tsv"
+}
+
+fn pimi_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pimi_dir() + "'")
+}
+
+fn cleanup_pimi() -> void {
+    pimi_ensure_dir()
+    let _ = exec("rm -f '" + pimi_bcd_path()
+        + "' '" + pimi_sign_extend_path()
+        + "' '" + pimi_stack_misc_path()
+        + "' '" + pimi_inc_dec_path()
+        + "' '" + pimi_flag_manip_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pimi_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pimi_append_row(path: str, row: str) -> void {
+    pimi_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pimi_count_rows(path: str, min_cols: int) -> int {
+    let t = pimi_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── reg32_name: 0..7 → eax/ecx/edx/ebx/esp/ebp/esi/edi (Intel SDM Vol 2 §3 Table 2-2) ───
+fn reg32_name(idx: int) -> str {
+    if idx == 0 { return "eax" }
+    if idx == 1 { return "ecx" }
+    if idx == 2 { return "edx" }
+    if idx == 3 { return "ebx" }
+    if idx == 4 { return "esp" }
+    if idx == 5 { return "ebp" }
+    if idx == 6 { return "esi" }
+    if idx == 7 { return "edi" }
+    panic("pe_i386_misc_inst FAIL [reg32_name] expected=0..7 got=" + to_string(idx))
+}
+
+// ─── record_bcd: BCD adjust (DAA/DAS/AAA/AAS/AAM/AAD) ───
+fn record_bcd(bcd_id: str, opcode_byte: int, mnemonic: str, operates_on: str) -> void {
+    if bcd_id == "" {
+        panic("pe_i386_misc_inst FAIL [record_bcd] expected=bcd_id!=empty got=empty")
+    }
+    if opcode_byte < 0 {
+        panic("pe_i386_misc_inst FAIL [record_bcd] expected=opcode_byte>=0 got=" + to_string(opcode_byte))
+    }
+    if opcode_byte > 255 {
+        panic("pe_i386_misc_inst FAIL [record_bcd] expected=opcode_byte<=255 got=" + to_string(opcode_byte))
+    }
+    if mnemonic == "" {
+        panic("pe_i386_misc_inst FAIL [record_bcd] expected=mnemonic!=empty got=empty")
+    }
+    if operates_on != "al" {
+        if operates_on != "ax" {
+            panic("pe_i386_misc_inst FAIL [record_bcd] expected=operates_on={al|ax} got=" + operates_on)
+        }
+    }
+    let row = bcd_id + "\t" + to_string(opcode_byte) + "\t" + mnemonic + "\t" + operates_on + "\n"
+    pimi_append_row(pimi_bcd_path(), row)
+}
+
+// ─── record_sign_extend: CBW/CWD/CDQ ───
+fn record_sign_extend(se_id: str, opcode_byte: int, src_size: int, dst_size: int) -> void {
+    if se_id == "" {
+        panic("pe_i386_misc_inst FAIL [record_sign_extend] expected=se_id!=empty got=empty")
+    }
+    if opcode_byte < 0 {
+        panic("pe_i386_misc_inst FAIL [record_sign_extend] expected=opcode_byte>=0 got=" + to_string(opcode_byte))
+    }
+    if opcode_byte > 255 {
+        panic("pe_i386_misc_inst FAIL [record_sign_extend] expected=opcode_byte<=255 got=" + to_string(opcode_byte))
+    }
+    if src_size <= 0 {
+        panic("pe_i386_misc_inst FAIL [record_sign_extend] expected=src_size>0 got=" + to_string(src_size))
+    }
+    if dst_size <= src_size {
+        panic("pe_i386_misc_inst FAIL [record_sign_extend] expected=dst_size>src_size got src_size="
+            + to_string(src_size) + " dst_size=" + to_string(dst_size))
+    }
+    if dst_size > 8 {
+        panic("pe_i386_misc_inst FAIL [record_sign_extend] expected=dst_size<=8 got=" + to_string(dst_size))
+    }
+    let row = se_id + "\t" + to_string(opcode_byte) + "\t" + to_string(src_size) + "\t" + to_string(dst_size) + "\n"
+    pimi_append_row(pimi_sign_extend_path(), row)
+}
+
+// ─── record_stack_misc: PUSHA/POPA/PUSHF/POPF ───
+fn record_stack_misc(stk_id: str, opcode_byte: int, mnemonic: str, regs_count: int) -> void {
+    if stk_id == "" {
+        panic("pe_i386_misc_inst FAIL [record_stack_misc] expected=stk_id!=empty got=empty")
+    }
+    if opcode_byte < 0 {
+        panic("pe_i386_misc_inst FAIL [record_stack_misc] expected=opcode_byte>=0 got=" + to_string(opcode_byte))
+    }
+    if opcode_byte > 255 {
+        panic("pe_i386_misc_inst FAIL [record_stack_misc] expected=opcode_byte<=255 got=" + to_string(opcode_byte))
+    }
+    if mnemonic == "" {
+        panic("pe_i386_misc_inst FAIL [record_stack_misc] expected=mnemonic!=empty got=empty")
+    }
+    if regs_count <= 0 {
+        panic("pe_i386_misc_inst FAIL [record_stack_misc] expected=regs_count>0 got=" + to_string(regs_count))
+    }
+    if regs_count > 8 {
+        panic("pe_i386_misc_inst FAIL [record_stack_misc] expected=regs_count<=8 got=" + to_string(regs_count))
+    }
+    let row = stk_id + "\t" + to_string(opcode_byte) + "\t" + mnemonic + "\t" + to_string(regs_count) + "\n"
+    pimi_append_row(pimi_stack_misc_path(), row)
+}
+
+// ─── record_inc_dec: 0x40-0x47 INC r32 / 0x48-0x4F DEC r32 ───
+fn record_inc_dec(id_id: str, opcode_byte: int, reg_idx: int, op_kind: int) -> void {
+    if id_id == "" {
+        panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=id_id!=empty got=empty")
+    }
+    if opcode_byte < 64 {
+        panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=opcode_byte>=0x40 got=" + to_string(opcode_byte))
+    }
+    if opcode_byte > 79 {
+        panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=opcode_byte<=0x4F got=" + to_string(opcode_byte))
+    }
+    if reg_idx < 0 {
+        panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=reg_idx>=0 got=" + to_string(reg_idx))
+    }
+    if reg_idx > 7 {
+        panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=reg_idx<=7 got=" + to_string(reg_idx))
+    }
+    if op_kind != 0 {
+        if op_kind != 1 {
+            panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=op_kind={0|1} got=" + to_string(op_kind))
+        }
+    }
+    // Cross check: 0x40+reg_idx for inc, 0x48+reg_idx for dec
+    let expected_byte = 64 + (op_kind * 8) + reg_idx
+    if opcode_byte != expected_byte {
+        panic("pe_i386_misc_inst FAIL [record_inc_dec] expected=opcode_byte="
+            + to_string(expected_byte) + " (op_kind=" + to_string(op_kind)
+            + " reg_idx=" + to_string(reg_idx) + ") got=" + to_string(opcode_byte))
+    }
+    let row = id_id + "\t" + to_string(opcode_byte) + "\t" + to_string(reg_idx) + "\t" + to_string(op_kind) + "\n"
+    pimi_append_row(pimi_inc_dec_path(), row)
+}
+
+// ─── record_flag_manip: CLC/STC/CLI/STI/CLD/STD/CMC ───
+fn record_flag_manip(fm_id: str, opcode_byte: int, mnemonic: str, flag_target: str) -> void {
+    if fm_id == "" {
+        panic("pe_i386_misc_inst FAIL [record_flag_manip] expected=fm_id!=empty got=empty")
+    }
+    if opcode_byte < 0 {
+        panic("pe_i386_misc_inst FAIL [record_flag_manip] expected=opcode_byte>=0 got=" + to_string(opcode_byte))
+    }
+    if opcode_byte > 255 {
+        panic("pe_i386_misc_inst FAIL [record_flag_manip] expected=opcode_byte<=255 got=" + to_string(opcode_byte))
+    }
+    if mnemonic == "" {
+        panic("pe_i386_misc_inst FAIL [record_flag_manip] expected=mnemonic!=empty got=empty")
+    }
+    if flag_target != "CF" {
+        if flag_target != "DF" {
+            if flag_target != "IF" {
+                panic("pe_i386_misc_inst FAIL [record_flag_manip] expected=flag_target={CF|DF|IF} got=" + flag_target)
+            }
+        }
+    }
+    let row = fm_id + "\t" + to_string(opcode_byte) + "\t" + mnemonic + "\t" + flag_target + "\n"
+    pimi_append_row(pimi_flag_manip_path(), row)
+}
+
+// ─── stats ───
+fn bcd_count() -> int {
+    return pimi_count_rows(pimi_bcd_path(), 4)
+}
+
+fn sign_extend_count() -> int {
+    return pimi_count_rows(pimi_sign_extend_path(), 4)
+}
+
+fn stack_misc_count() -> int {
+    return pimi_count_rows(pimi_stack_misc_path(), 4)
+}
+
+fn inc_dec_count() -> int {
+    return pimi_count_rows(pimi_inc_dec_path(), 4)
+}
+
+fn flag_manip_count() -> int {
+    return pimi_count_rows(pimi_flag_manip_path(), 4)
+}
+
+fn pimi_stats() -> array {
+    let mut out = []
+    out.push(bcd_count())
+    out.push(sign_extend_count())
+    out.push(stack_misc_count())
+    out.push(inc_dec_count())
+    out.push(flag_manip_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pimi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pimi()
+
+    // 2. record_bcd 3종 (0x27 DAA / 0x2F DAS / 0x37 AAA — operates_on="al")
+    record_bcd("bcd-daa", 39, "daa", "al")
+    r0_emit("pe_i386_misc_inst_record_bcd",
+        "\"bcd_id\":\"bcd-daa\",\"opcode_byte\":39,\"mnemonic\":\"daa\",\"operates_on\":\"al\"")
+
+    record_bcd("bcd-das", 47, "das", "al")
+    r0_emit("pe_i386_misc_inst_record_bcd",
+        "\"bcd_id\":\"bcd-das\",\"opcode_byte\":47,\"mnemonic\":\"das\",\"operates_on\":\"al\"")
+
+    record_bcd("bcd-aaa", 55, "aaa", "al")
+    r0_emit("pe_i386_misc_inst_record_bcd",
+        "\"bcd_id\":\"bcd-aaa\",\"opcode_byte\":55,\"mnemonic\":\"aaa\",\"operates_on\":\"al\"")
+
+    // 3. record_sign_extend 3종 (0x98 CBW 1→2 / 0x99 CWD 2→4 / 0x99 CDQ 4→8)
+    record_sign_extend("se-cbw", 152, 1, 2)
+    r0_emit("pe_i386_misc_inst_record_sign_extend",
+        "\"se_id\":\"se-cbw\",\"opcode_byte\":152,\"src_size\":1,\"dst_size\":2,\"target\":\"al-to-ax\"")
+
+    record_sign_extend("se-cwd", 153, 2, 4)
+    r0_emit("pe_i386_misc_inst_record_sign_extend",
+        "\"se_id\":\"se-cwd\",\"opcode_byte\":153,\"src_size\":2,\"dst_size\":4,\"target\":\"ax-to-dxax\"")
+
+    record_sign_extend("se-cdq", 153, 4, 8)
+    r0_emit("pe_i386_misc_inst_record_sign_extend",
+        "\"se_id\":\"se-cdq\",\"opcode_byte\":153,\"src_size\":4,\"dst_size\":8,\"target\":\"eax-to-edxeax\"")
+
+    // 4. record_stack_misc 4종 (0x60 PUSHAD=8 / 0x61 POPAD=8 / 0x9C PUSHFD=1 / 0x9D POPFD=1)
+    record_stack_misc("stk-pushad", 96, "pushad", 8)
+    r0_emit("pe_i386_misc_inst_record_stack_misc",
+        "\"stk_id\":\"stk-pushad\",\"opcode_byte\":96,\"mnemonic\":\"pushad\",\"regs_count\":8")
+
+    record_stack_misc("stk-popad", 97, "popad", 8)
+    r0_emit("pe_i386_misc_inst_record_stack_misc",
+        "\"stk_id\":\"stk-popad\",\"opcode_byte\":97,\"mnemonic\":\"popad\",\"regs_count\":8")
+
+    record_stack_misc("stk-pushfd", 156, "pushfd", 1)
+    r0_emit("pe_i386_misc_inst_record_stack_misc",
+        "\"stk_id\":\"stk-pushfd\",\"opcode_byte\":156,\"mnemonic\":\"pushfd\",\"regs_count\":1")
+
+    record_stack_misc("stk-popfd", 157, "popfd", 1)
+    r0_emit("pe_i386_misc_inst_record_stack_misc",
+        "\"stk_id\":\"stk-popfd\",\"opcode_byte\":157,\"mnemonic\":\"popfd\",\"regs_count\":1")
+
+    // 5. record_inc_dec 8종 (4 INC + 4 DEC)
+    //    INC: 0x40 eax / 0x41 ecx / 0x43 ebx / 0x47 edi
+    record_inc_dec("id-inc-eax", 64, 0, 0)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-inc-eax\",\"opcode_byte\":64,\"reg_idx\":0,\"op_kind\":0,\"reg_name\":\"" + reg32_name(0) + "\"")
+
+    record_inc_dec("id-inc-ecx", 65, 1, 0)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-inc-ecx\",\"opcode_byte\":65,\"reg_idx\":1,\"op_kind\":0,\"reg_name\":\"" + reg32_name(1) + "\"")
+
+    record_inc_dec("id-inc-ebx", 67, 3, 0)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-inc-ebx\",\"opcode_byte\":67,\"reg_idx\":3,\"op_kind\":0,\"reg_name\":\"" + reg32_name(3) + "\"")
+
+    record_inc_dec("id-inc-edi", 71, 7, 0)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-inc-edi\",\"opcode_byte\":71,\"reg_idx\":7,\"op_kind\":0,\"reg_name\":\"" + reg32_name(7) + "\"")
+
+    //    DEC: 0x48 eax / 0x49 ecx / 0x4D ebp / 0x4F edi
+    record_inc_dec("id-dec-eax", 72, 0, 1)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-dec-eax\",\"opcode_byte\":72,\"reg_idx\":0,\"op_kind\":1,\"reg_name\":\"" + reg32_name(0) + "\"")
+
+    record_inc_dec("id-dec-ecx", 73, 1, 1)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-dec-ecx\",\"opcode_byte\":73,\"reg_idx\":1,\"op_kind\":1,\"reg_name\":\"" + reg32_name(1) + "\"")
+
+    record_inc_dec("id-dec-ebp", 77, 5, 1)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-dec-ebp\",\"opcode_byte\":77,\"reg_idx\":5,\"op_kind\":1,\"reg_name\":\"" + reg32_name(5) + "\"")
+
+    record_inc_dec("id-dec-edi", 79, 7, 1)
+    r0_emit("pe_i386_misc_inst_record_inc_dec",
+        "\"id_id\":\"id-dec-edi\",\"opcode_byte\":79,\"reg_idx\":7,\"op_kind\":1,\"reg_name\":\"" + reg32_name(7) + "\"")
+
+    // 6. record_flag_manip 4종 (0xF8 CLC CF / 0xF9 STC CF / 0xFC CLD DF / 0xFD STD DF)
+    record_flag_manip("fm-clc", 248, "clc", "CF")
+    r0_emit("pe_i386_misc_inst_record_flag_manip",
+        "\"fm_id\":\"fm-clc\",\"opcode_byte\":248,\"mnemonic\":\"clc\",\"flag_target\":\"CF\"")
+
+    record_flag_manip("fm-stc", 249, "stc", "CF")
+    r0_emit("pe_i386_misc_inst_record_flag_manip",
+        "\"fm_id\":\"fm-stc\",\"opcode_byte\":249,\"mnemonic\":\"stc\",\"flag_target\":\"CF\"")
+
+    record_flag_manip("fm-cld", 252, "cld", "DF")
+    r0_emit("pe_i386_misc_inst_record_flag_manip",
+        "\"fm_id\":\"fm-cld\",\"opcode_byte\":252,\"mnemonic\":\"cld\",\"flag_target\":\"DF\"")
+
+    record_flag_manip("fm-std", 253, "std", "DF")
+    r0_emit("pe_i386_misc_inst_record_flag_manip",
+        "\"fm_id\":\"fm-std\",\"opcode_byte\":253,\"mnemonic\":\"std\",\"flag_target\":\"DF\"")
+
+    // 7. assertions
+    let bc = bcd_count()
+    if bc != 3 {
+        panic("pe_i386_misc_inst FAIL [bcd_count] expected=3 got=" + to_string(bc))
+    }
+    let sc = sign_extend_count()
+    if sc != 3 {
+        panic("pe_i386_misc_inst FAIL [sign_extend_count] expected=3 got=" + to_string(sc))
+    }
+    let mc = stack_misc_count()
+    if mc != 4 {
+        panic("pe_i386_misc_inst FAIL [stack_misc_count] expected=4 got=" + to_string(mc))
+    }
+    let ic = inc_dec_count()
+    if ic != 8 {
+        panic("pe_i386_misc_inst FAIL [inc_dec_count] expected=8 got=" + to_string(ic))
+    }
+    let fc = flag_manip_count()
+    if fc != 4 {
+        panic("pe_i386_misc_inst FAIL [flag_manip_count] expected=4 got=" + to_string(fc))
+    }
+
+    // 8. reg32_name spot check
+    if reg32_name(0) != "eax" {
+        panic("pe_i386_misc_inst FAIL [reg32_name(0)] expected=eax got=" + reg32_name(0))
+    }
+    if reg32_name(7) != "edi" {
+        panic("pe_i386_misc_inst FAIL [reg32_name(7)] expected=edi got=" + reg32_name(7))
+    }
+    if reg32_name(4) != "esp" {
+        panic("pe_i386_misc_inst FAIL [reg32_name(4)] expected=esp got=" + reg32_name(4))
+    }
+
+    // 9. pimi_stats() = [3, 3, 4, 8, 4]
+    let s = pimi_stats()
+    if len(s) != 5 {
+        panic("pe_i386_misc_inst FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_i386_misc_inst FAIL [stats bcd] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_i386_misc_inst FAIL [stats sign_extend] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_i386_misc_inst FAIL [stats stack_misc] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 8 {
+        panic("pe_i386_misc_inst FAIL [stats inc_dec] expected=8 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_i386_misc_inst FAIL [stats flag_manip] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_i386_misc_inst_stats",
+        "\"bcd_count\":" + to_string(s[0])
+        + ",\"sign_extend_count\":" + to_string(s[1])
+        + ",\"stack_misc_count\":" + to_string(s[2])
+        + ",\"inc_dec_count\":" + to_string(s[3])
+        + ",\"flag_manip_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 14 (3 bcd + 3 se + 4 stk + 8 id + 4 fm + 1 stats = 23)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_misc_inst FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pimi()
+    let s2 = pimi_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_misc_inst FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_misc_inst self_test PASS (bcd=" + to_string(s[0])
+        + ", sign_extend=" + to_string(s[1])
+        + ", stack_misc=" + to_string(s[2])
+        + ", inc_dec=" + to_string(s[3])
+        + ", flag_manip=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pimi_stats()
+            println("bcd_count\t" + to_string(s[0]))
+            println("sign_extend_count\t" + to_string(s[1]))
+            println("stack_misc_count\t" + to_string(s[2]))
+            println("inc_dec_count\t" + to_string(s[3]))
+            println("flag_manip_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pimi()
+            println("cleaned: " + pimi_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pimi_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_misc_inst.hexa { self-test | stats | cleanup | dir }")
+}

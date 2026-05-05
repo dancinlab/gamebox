@@ -1,0 +1,255 @@
+// lib/perf/c_pso.hexa — C-PSO (M4)
+//
+// 8-axis PSO state cache. D3DMetal 가 매번 set 하는 PSO (pipeline state object) 의
+// 상태 정체 capture. 컴파일 hitch 제거 + redundant set dedup.
+//
+// 8 hash fields (16-bit each): vertex_hash, fragment_hash, compute_hash, depth_stencil,
+// blend, raster, primitive, resource_sig.
+// 3 meta: ts_ms (32), hit_count (16), compile_ms (16).
+// = 24 byte/record. JSONL events under ring file forge/genomes-gptk-pso.ring.
+//
+// SHBF (sharded bloom filter):
+//   spec 가 1024-bit bitmap 32-element int array (각 int 32 bits) 를 권장하나
+//   hexa-lang stage1 에 bit ops (& | ^ << >>) 부재 — `arr[i/32] = arr[i/32] - ...`
+//   pow(2, k) 사칙연산 우회는 가능하나 idempotent set 에 정확도 risk.
+//   따라서 spec 의 simpler 권고 (array-of-set-membership) 채택:
+//     state = [hash, hash, ...]  linear search membership.
+//   "SHBF approximation pending hexa-lang bit ops upstream" — docs/HEXA_UPSTREAM.md.
+//
+// upstream candidate: bit ops (& | ^ << >>) → 진짜 1024-bit SHBF.
+
+use "./r0_common"
+
+let RING_PSO = GAMEBOX_HOME + "/forge/genomes-gptk-pso.ring"
+
+// ─── 8-axis hash combine ───
+// 8 개 16-bit field 를 single int 로 정체화. 단순 multiplicative hash (Knuth-style).
+// 각 field 별 다른 prime mix → 충돌 확률 낮춤. result 는 int (값 자체가 PSO id).
+fn pso_compute_hash(vh: int, fh: int, ch: int, ds: int, bl: int, ra: int, pr: int, rs: int) -> int {
+    let h = vh * 2654435761
+    h = h + fh * 40503
+    h = h + ch * 2246822519
+    h = h + ds * 3266489917
+    h = h + bl * 668265263
+    h = h + ra * 374761393
+    h = h + pr * 2147483647
+    h = h + rs * 1597334677
+    // positive 보장
+    if h < 0 { h = 0 - h }
+    if h < 0 { h = 0 }
+    return h
+}
+
+// ─── SHBF (array-of-set-membership approximation) ───
+fn shbf_init() -> array {
+    return []
+}
+
+fn shbf_contains(state: array, hash: int) -> bool {
+    let i = 0
+    let n = len(state)
+    while i < n {
+        if state[i] == hash { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn shbf_add(state: array, hash: int) -> array {
+    if shbf_contains(state, hash) { return state }
+    return state + [hash]
+}
+
+// ─── stage classifier ───
+// 8-axis 중 vertex/fragment/compute hash 값 (0 == unset) 만 보고 stage 분류.
+//   "vs"   — vertex only
+//   "ps"   — fragment only
+//   "cs"   — compute only
+//   "vsps" — vertex + fragment (graphics pipeline)
+//   "vscs" — vertex + compute  (rare combo)
+//   "pscs" — fragment + compute
+//   "all"  — vs + ps + cs
+//   "none" — 모두 0
+fn classify_stage(vertex_hash: int, fragment_hash: int, compute_hash: int) -> str {
+    let has_v = vertex_hash != 0
+    let has_p = fragment_hash != 0
+    let has_c = compute_hash != 0
+    if has_v {
+        if has_p {
+            if has_c { return "all" }
+            return "vsps"
+        }
+        if has_c { return "vscs" }
+        return "vs"
+    }
+    if has_p {
+        if has_c { return "pscs" }
+        return "ps"
+    }
+    if has_c { return "cs" }
+    return "none"
+}
+
+// ─── module-level dedup state ───
+// append_pso 가 idempotent set 으로 SHBF 에 hash 등록.
+// 모듈 재진입 시 reset 되므로 self-test 스코프 내에서만 의미.
+let pso_state = shbf_init()
+let pso_dedup_hits = 0
+let pso_total_added = 0
+
+fn pso_state_reset() -> void {
+    pso_state = shbf_init()
+    pso_dedup_hits = 0
+    pso_total_added = 0
+}
+
+// ─── append_pso ───
+// 새 PSO record 를 ring file 에 append + JSONL session emit.
+// SHBF 에 이미 있으면 dedup (false 반환), 없으면 add (true 반환).
+fn append_pso(vh: int, fh: int, ch: int, ds: int, bl: int, ra: int, pr: int, rs: int, compile_ms: int) -> bool {
+    let h = pso_compute_hash(vh, fh, ch, ds, bl, ra, pr, rs)
+    if shbf_contains(pso_state, h) {
+        pso_dedup_hits = pso_dedup_hits + 1
+        return false
+    }
+    pso_state = shbf_add(pso_state, h)
+    pso_total_added = pso_total_added + 1
+
+    let stage = classify_stage(vh, fh, ch)
+    let ts_ms = to_int(exec("date +%s").trim()) * 1000
+
+    let payload = "\"vertex_hash\":" + to_string(vh)
+        + ",\"fragment_hash\":" + to_string(fh)
+        + ",\"compute_hash\":" + to_string(ch)
+        + ",\"depth_stencil\":" + to_string(ds)
+        + ",\"blend\":" + to_string(bl)
+        + ",\"raster\":" + to_string(ra)
+        + ",\"primitive\":" + to_string(pr)
+        + ",\"resource_sig\":" + to_string(rs)
+        + ",\"ts_ms\":" + to_string(ts_ms)
+        + ",\"hit_count\":1"
+        + ",\"compile_ms\":" + to_string(compile_ms)
+        + ",\"stage\":\"" + stage + "\""
+        + ",\"pso_h\":" + to_string(h)
+    r0_emit("pso_record", payload)
+
+    let _mk = exec("mkdir -p '" + GAMEBOX_HOME + "/forge'")
+    let line = "{\"axes\":8,\"rec_bytes\":24,\"component\":\"PSO\"," + payload + "}"
+    r0_append_line(RING_PSO, line)
+
+    return true
+}
+
+// ─── self-test ───
+// 50 unique PSO + 50 dup → dedup_hits == 50, total_added == 50.
+fn self_test() -> void {
+    let sid = "cpso-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // ring file fresh start (clean prior runs)
+    let _rm = exec("rm -f '" + RING_PSO + "'")
+
+    pso_state_reset()
+
+    // 1. classify_stage 정확도
+    if classify_stage(0, 0, 0) != "none" { panic("c_pso FAIL [classify none]") }
+    if classify_stage(1, 0, 0) != "vs"   { panic("c_pso FAIL [classify vs]") }
+    if classify_stage(0, 1, 0) != "ps"   { panic("c_pso FAIL [classify ps]") }
+    if classify_stage(0, 0, 1) != "cs"   { panic("c_pso FAIL [classify cs]") }
+    if classify_stage(1, 1, 0) != "vsps" { panic("c_pso FAIL [classify vsps]") }
+    if classify_stage(1, 0, 1) != "vscs" { panic("c_pso FAIL [classify vscs]") }
+    if classify_stage(0, 1, 1) != "pscs" { panic("c_pso FAIL [classify pscs]") }
+    if classify_stage(1, 1, 1) != "all"  { panic("c_pso FAIL [classify all]") }
+
+    // 2. shbf 기본 동작
+    let s0 = shbf_init()
+    if len(s0) != 0 { panic("c_pso FAIL [shbf init non-empty]") }
+    if shbf_contains(s0, 42) { panic("c_pso FAIL [shbf empty contains]") }
+    let s1 = shbf_add(s0, 42)
+    if len(s1) != 1 { panic("c_pso FAIL [shbf add len]") }
+    if shbf_contains(s1, 42) == false { panic("c_pso FAIL [shbf added missing]") }
+    let s2 = shbf_add(s1, 42)
+    if len(s2) != 1 { panic("c_pso FAIL [shbf idempotent add]") }
+
+    // 3. pso_compute_hash — 같은 input 같은 output, 다른 input 다른 output
+    let h_a = pso_compute_hash(1, 2, 3, 4, 5, 6, 7, 8)
+    let h_b = pso_compute_hash(1, 2, 3, 4, 5, 6, 7, 8)
+    let h_c = pso_compute_hash(1, 2, 3, 4, 5, 6, 7, 9)
+    if h_a != h_b { panic("c_pso FAIL [hash determinism] a=" + to_string(h_a) + " b=" + to_string(h_b)) }
+    if h_a == h_c { panic("c_pso FAIL [hash collision strong] a==c=" + to_string(h_a)) }
+    if h_a < 0    { panic("c_pso FAIL [hash negative] a=" + to_string(h_a)) }
+
+    // 4. 50 unique PSO insert → total_added == 50, dedup_hits == 0
+    let i = 0
+    while i < 50 {
+        let added = append_pso(i + 1, i + 2, 0, i + 3, i + 4, i + 5, i + 6, i + 7, 12)
+        if added == false {
+            panic("c_pso FAIL [unique not added] i=" + to_string(i))
+        }
+        i = i + 1
+    }
+    if pso_total_added != 50 {
+        panic("c_pso FAIL [unique total_added] expected=50 got=" + to_string(pso_total_added))
+    }
+    if pso_dedup_hits != 0 {
+        panic("c_pso FAIL [unique dedup_hits] expected=0 got=" + to_string(pso_dedup_hits))
+    }
+
+    // 5. 50 dup PSO insert (동일 axes 재시도) → dedup_hits == 50, total_added 변화 없음
+    let j = 0
+    while j < 50 {
+        let added = append_pso(j + 1, j + 2, 0, j + 3, j + 4, j + 5, j + 6, j + 7, 12)
+        if added != false {
+            panic("c_pso FAIL [dup added] j=" + to_string(j))
+        }
+        j = j + 1
+    }
+    if pso_total_added != 50 {
+        panic("c_pso FAIL [post-dup total_added] expected=50 got=" + to_string(pso_total_added))
+    }
+    if pso_dedup_hits != 50 {
+        panic("c_pso FAIL [dedup_hits] expected=50 got=" + to_string(pso_dedup_hits))
+    }
+
+    // 6. ring file 에 50 line (unique 만 append)
+    let ring_cnt_str = exec("wc -l < '" + RING_PSO + "' | tr -d ' '").trim()
+    let ring_cnt = to_int(ring_cnt_str)
+    if ring_cnt != 50 {
+        panic("c_pso FAIL [ring count] expected=50 got=" + to_string(ring_cnt))
+    }
+
+    // 7. session 에 50 emit (pso_record event)
+    let session_cnt = r0_session_count(sid)
+    if session_cnt != 50 {
+        panic("c_pso FAIL [session emit count] expected=50 got=" + to_string(session_cnt))
+    }
+
+    println("  ✅ c_pso self_test PASS (50 unique + 50 dup → added=" + to_string(pso_total_added) + " dedup_hits=" + to_string(pso_dedup_hits) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "hash" {
+            // hash <vh> <fh> <ch> <ds> <bl> <ra> <pr> <rs>
+            if len(a) >= 11 {
+                let h = pso_compute_hash(to_int(a[3]), to_int(a[4]), to_int(a[5]), to_int(a[6]), to_int(a[7]), to_int(a[8]), to_int(a[9]), to_int(a[10]))
+                println(to_string(h))
+                return
+            }
+        }
+        if sub == "classify" {
+            // classify <vh> <fh> <ch>
+            if len(a) >= 6 {
+                println(classify_stage(to_int(a[3]), to_int(a[4]), to_int(a[5])))
+                return
+            }
+        }
+    }
+    println("usage: hexa run c_pso.hexa { self-test | hash <vh fh ch ds bl ra pr rs> | classify <vh fh ch> }")
+}

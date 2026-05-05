@@ -1,0 +1,184 @@
+// lib/perf/c_shader_warm_pp.hexa — C-SHADER-WARM++ (15/15)
+//
+// M10 c_shader_warm 의 진화 — SHBF + AC trie + columnar index + Holt forecast.
+// M12 c_shader_seq 의 next-zone forecast 활용 → pre-compile timing 정확화.
+//
+// 무기:
+//   - SHBF (M10 reuse) — "이 shader 이미 cache 에 있나?"
+//   - AC trie (M12 zone transition) — next-zone 예측 → 그 zone 의 shader hash array 확보
+//   - columnar index — shader hash → file path 매핑 (빠른 lookup)
+//   - Holt forecast — pre-compile 시점 결정 (몇 초 전 시작?)
+//
+// stage1 우회: dict literal 안됨 (M6 발견) → TSV 또는 평행 array.
+
+use "./r0_common"
+
+let WARM_PP_HOME = GAMEBOX_HOME + "/persist/shader_warm_pp"
+let WARM_PP_INDEX = WARM_PP_HOME + "/index.jsonl"
+
+// columnar index: shader hash → file path
+fn warm_index_append(hash: int, path: str, size_kb: int, last_used: int) -> void {
+    let _mk = exec("mkdir -p '" + WARM_PP_HOME + "'")
+    let line = "{\"hash\":" + to_string(hash) + ",\"path\":\"" + path + "\",\"size_kb\":" + to_string(size_kb) + ",\"last_used\":" + to_string(last_used) + "}"
+    r0_append_line(WARM_PP_INDEX, line)
+}
+
+// hash → path lookup (columnar grep)
+fn warm_index_lookup(hash: int) -> str {
+    let _check = exec("test -f '" + WARM_PP_INDEX + "' && echo ok").trim()
+    if _check != "ok" { return "" }
+    let cmd = "grep -E '\"hash\":" + to_string(hash) + "[,}]' '" + WARM_PP_INDEX + "' | tail -1 | sed 's/.*\"path\":\"\\([^\"]*\\)\".*/\\1/'"
+    return exec(cmd).trim()
+}
+
+// next-zone shader hashes (M12 의 zone → hashes 매핑) → pre-compile candidate list
+//   given_zone_shader_map = array of [zone, hashes_csv]
+fn select_pre_compile(zone_shader_map: array, target_zone: str) -> array {
+    let i = 0
+    while i < len(zone_shader_map) {
+        let row = zone_shader_map[i]
+        if row[0] == target_zone {
+            // CSV → array
+            let csv = row[1]
+            if csv == "" { return [] }
+            let parts = csv.split(",")
+            let result = []
+            let j = 0
+            while j < len(parts) {
+                if parts[j] != "" {
+                    result = result + [to_int(parts[j])]
+                }
+                j = j + 1
+            }
+            return result
+        }
+        i = i + 1
+    }
+    return []
+}
+
+// Holt forecast 활용 — 다음 zone 진입까지 N 초 (history of zone-stay durations) → pre-compile 시점 = N - lead_time
+fn pre_compile_lead_seconds(zone_durations: array, lead_seconds: int) -> int {
+    // simple Holt: alpha=60 beta=30
+    if len(zone_durations) < 2 {
+        if len(zone_durations) == 1 {
+            return zone_durations[0] - lead_seconds
+        }
+        return 30  // default 30s 후 fallback
+    }
+    let level = zone_durations[0]
+    let trend = zone_durations[1] - zone_durations[0]
+    let i = 1
+    while i < len(zone_durations) {
+        let v = zone_durations[i]
+        let one_step = level + trend
+        let new_level = (60 * v + 40 * one_step) / 100
+        let new_trend = (30 * (new_level - level) + 70 * trend) / 100
+        level = new_level
+        trend = new_trend
+        i = i + 1
+    }
+    let predicted_duration = level + trend
+    let lead_at = predicted_duration - lead_seconds
+    if lead_at < 0 { lead_at = 0 }
+    return lead_at
+}
+
+// pre-warm 액션 — index lookup + hint emit
+fn warm_pre_compile(hashes: array, ts_now: int) -> int {
+    let warmed = 0
+    let i = 0
+    while i < len(hashes) {
+        let h = hashes[i]
+        let path = warm_index_lookup(h)
+        if path != "" {
+            r0_emit("warm_pre_compile", "\"hash\":" + to_string(h) + ",\"path\":\"" + path + "\",\"ts_now\":" + to_string(ts_now))
+            warmed = warmed + 1
+        }
+        i = i + 1
+    }
+    return warmed
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "cwarmpp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. index round-trip
+    let _rm = exec("rm -f '" + WARM_PP_INDEX + "'")
+    warm_index_append(11111, "/cache/shader_11111.bin", 32, 1700000000)
+    warm_index_append(22222, "/cache/shader_22222.bin", 64, 1700000001)
+    warm_index_append(33333, "/cache/shader_33333.bin", 128, 1700000002)
+
+    let p1 = warm_index_lookup(22222)
+    if p1 != "/cache/shader_22222.bin" {
+        panic("c_shader_warm_pp FAIL [lookup 22222] expected=/cache/shader_22222.bin got=" + p1)
+    }
+    let p2 = warm_index_lookup(99999)
+    if p2 != "" {
+        panic("c_shader_warm_pp FAIL [lookup miss] expected='' got=" + p2)
+    }
+
+    // 2. zone → hashes 매핑 + select_pre_compile
+    let zsm = [
+        ["FracturedPeaks", "11111,22222,33333"],
+        ["DryStepps", "44444,55555"],
+        ["EmptyZone", ""]
+    ]
+    let next_hashes = select_pre_compile(zsm, "FracturedPeaks")
+    if len(next_hashes) != 3 {
+        panic("c_shader_warm_pp FAIL [select FP] expected=3 got=" + to_string(len(next_hashes)))
+    }
+    if next_hashes[0] != 11111 {
+        panic("c_shader_warm_pp FAIL [select FP[0]] expected=11111 got=" + to_string(next_hashes[0]))
+    }
+    let empty_hashes = select_pre_compile(zsm, "EmptyZone")
+    if len(empty_hashes) != 0 {
+        panic("c_shader_warm_pp FAIL [empty zone]")
+    }
+
+    // 3. Holt forecast — zone duration history
+    let durs = [60, 75, 90, 105, 120]
+    let lead = pre_compile_lead_seconds(durs, 5)
+    // Holt 가 monotonic 증가 추정 → predicted 가 ~135 정도, lead = 130
+    if lead < 100 || lead > 160 {
+        panic("c_shader_warm_pp FAIL [holt lead] expected~130 got=" + to_string(lead))
+    }
+
+    // 4. warm_pre_compile — 3 hash → 3 emit (모두 index 에 존재)
+    let n_warmed = warm_pre_compile(next_hashes, 1700000100)
+    if n_warmed != 3 {
+        panic("c_shader_warm_pp FAIL [warm count] expected=3 got=" + to_string(n_warmed))
+    }
+
+    // 5. session emit count
+    let cnt = r0_session_count(sid)
+    if cnt != 3 {
+        panic("c_shader_warm_pp FAIL [emit count] expected=3 got=" + to_string(cnt))
+    }
+
+    // cleanup
+    let _cleanup = exec("rm -f '" + WARM_PP_INDEX + "'")
+
+    println("  ✅ c_shader_warm_pp self_test PASS (index 3, lookup hit/miss, zone→3 hashes, Holt lead=" + to_string(lead) + ", warmed=3, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "lookup" {
+            if len(a) >= 4 {
+                let p = warm_index_lookup(to_int(a[3]))
+                println(p)
+                return
+            }
+        }
+    }
+    println("usage: hexa run c_shader_warm_pp.hexa { self-test | lookup <hash> }")
+}

@@ -1,0 +1,517 @@
+// lib/loader/pe_i386_x87_fpu_inst_real.hexa — D8-DF x87 FPU instruction set decode tracker
+//
+// Phase 후속 interpreter 가 i386 32-bit PE 의 x87 FPU 명령어 집합을
+// 디코드한 결과를 hexa side 가 받아 instruction-set coverage / stack op /
+// real-N kind / int-N kind / unsupported 분포를 추적한다.
+//
+// 추적 대상 (Intel SDM Vol 1 §8 + Vol 2A FPU instruction reference):
+//   - prefix byte D8..DF 별 명령어 1 row (inst_id / prefix_byte / modrm_byte / mnemonic / opcode_kind)
+//   - x87 stack push/pop/swap (op_kind 0=push 1=pop 2=swap, top_before / top_after)
+//   - real-N memory operand kind (real_size 4 / 8 / 10 — REAL4 / REAL8 / REAL10)
+//   - int-N memory operand kind (int_size 2 / 4 / 8 — INT16 / INT32 / INT64)
+//   - 미지원 (prefix, opcode_byte, modrm_byte) tuple — extended BCD load 등
+//
+// x87 FPU instruction prefix bytes (Intel SDM Vol 2A §3.2 — esc opcode):
+//   D8 = FADD  / FMUL  / FCOM  / FCOMP / FSUB / FSUBR / FDIV / FDIVR (real-32 mem)
+//   D9 = FLD   / FXCH  / FNOP  / FCHS  / FABS / FTST  / FXAM /
+//        FLD1 / FLDL2T / FLDL2E / FLDPI / FLDLG2 / FLDLN2 / FLDZ
+//   DA = FIADD / FIMUL / FICOM / FICOMP / FISUB / FISUBR / FIDIV / FIDIVR (int-32 mem)
+//        + FCMOVcc
+//   DB = FILD  / FIST  / FISTP (int-32) + FNCLEX / FNINIT / FUCOMI
+//   DC = FADD  / FMUL  / FCOM / FCOMP / FSUB / FSUBR / FDIV / FDIVR (real-64 mem)
+//   DD = FLD real-64 / FST / FSTP / FRSTOR / FNSAVE / FNSTSW
+//   DE = FIADD / FIMUL etc (int-16) + FADDP / FMULP / FCOMPP
+//   DF = FILD / FIST (int-16) + FBLD / FBSTP + FNSTSW AX
+//
+// own 1 enforcement: Wine / Box86 / CrossOver / Whisky / community 0 줄.
+//   - Wine wine/dlls/ntdll/x86_64/* 인용 X
+//   - Box86 dynarec_x87 인용 X
+//   - QEMU target/i386/ops_sse_helper 인용 X
+//   - Intel SDM Vol 1 §8 (FPU) 자체 구현만 OK
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종 — inst.tsv + stack_op.tsv + real_kind.tsv + int_kind.tsv + unsupported.tsv):
+//   inst.tsv        : inst_id<int> \t prefix_byte<str> \t modrm_byte<str> \t mnemonic<str> \t opcode_kind<int>
+//   stack_op.tsv    : stack_op_id<int> \t op_kind<int> \t top_before<int> \t top_after<int>
+//   real_kind.tsv   : real_kind_id<int> \t inst_id<int> \t real_size<int>
+//   int_kind.tsv    : int_kind_id<int> \t inst_id<int> \t int_size<int>
+//   unsupported.tsv : unsup_id<int> \t prefix_byte<str> \t opcode_byte<str> \t modrm_byte<str>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지.
+//   식별자: prefix_byte / opcode_kind / opcode_byte / modrm_byte
+//           inst_id / op_kind / stack_op_id
+//           real_kind_id / real_size / int_kind_id / int_size / unsup_id
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pifi_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_x87_fpu_inst_real"
+}
+
+fn pifi_inst_path() -> str {
+    return pifi_dir() + "/inst.tsv"
+}
+
+fn pifi_stack_op_path() -> str {
+    return pifi_dir() + "/stack_op.tsv"
+}
+
+fn pifi_real_kind_path() -> str {
+    return pifi_dir() + "/real_kind.tsv"
+}
+
+fn pifi_int_kind_path() -> str {
+    return pifi_dir() + "/int_kind.tsv"
+}
+
+fn pifi_unsupported_path() -> str {
+    return pifi_dir() + "/unsupported.tsv"
+}
+
+fn pifi_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pifi_dir() + "'")
+}
+
+fn cleanup_pifi() -> void {
+    pifi_ensure_dir()
+    let _ = exec("rm -f '" + pifi_inst_path()
+        + "' '" + pifi_stack_op_path()
+        + "' '" + pifi_real_kind_path()
+        + "' '" + pifi_int_kind_path()
+        + "' '" + pifi_unsupported_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pifi_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pifi_append_row(path: str, row: str) -> void {
+    pifi_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── prefix_name: prefix_byte hex → "D8".."DF" 정규화 ───
+fn prefix_name(prefix_byte: str) -> str {
+    if prefix_byte == "D8" { return "D8" }
+    if prefix_byte == "D9" { return "D9" }
+    if prefix_byte == "DA" { return "DA" }
+    if prefix_byte == "DB" { return "DB" }
+    if prefix_byte == "DC" { return "DC" }
+    if prefix_byte == "DD" { return "DD" }
+    if prefix_byte == "DE" { return "DE" }
+    if prefix_byte == "DF" { return "DF" }
+    return ""
+}
+
+// ─── opcode_kind_name: 0..5 → label ───
+fn opcode_kind_name(k: int) -> str {
+    if k == 0 { return "load" }
+    if k == 1 { return "store" }
+    if k == 2 { return "arith" }
+    if k == 3 { return "compare" }
+    if k == 4 { return "trans" }
+    if k == 5 { return "control" }
+    return ""
+}
+
+// ─── record_inst: x87 FPU instruction 1 건 ───
+fn record_inst(inst_id: int, prefix_byte: str, modrm_byte: str, mnemonic: str, opcode_kind: int) -> void {
+    if inst_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_inst] expected=inst_id>=0 got=" + to_string(inst_id))
+    }
+    let pn = prefix_name(prefix_byte)
+    if pn == "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_inst] expected=prefix_byte=D8..DF got=" + prefix_byte)
+    }
+    if modrm_byte == "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_inst] expected=modrm_byte!=empty got=empty")
+    }
+    if mnemonic == "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_inst] expected=mnemonic!=empty got=empty")
+    }
+    if opcode_kind < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_inst] expected=opcode_kind>=0 got=" + to_string(opcode_kind))
+    }
+    if opcode_kind > 5 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_inst] expected=opcode_kind<=5 got=" + to_string(opcode_kind))
+    }
+    let row = to_string(inst_id) + "\t" + prefix_byte + "\t" + modrm_byte + "\t"
+        + mnemonic + "\t" + to_string(opcode_kind) + "\n"
+    pifi_append_row(pifi_inst_path(), row)
+}
+
+// ─── record_stack_op: x87 stack push/pop/swap 1 건 ───
+fn record_stack_op(stack_op_id: int, op_kind: int, top_before: int, top_after: int) -> void {
+    if stack_op_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=stack_op_id>=0 got=" + to_string(stack_op_id))
+    }
+    if op_kind < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=op_kind>=0 got=" + to_string(op_kind))
+    }
+    if op_kind > 2 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=op_kind<=2 got=" + to_string(op_kind))
+    }
+    if top_before < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=top_before>=0 got=" + to_string(top_before))
+    }
+    if top_before > 7 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=top_before<=7 got=" + to_string(top_before))
+    }
+    if top_after < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=top_after>=0 got=" + to_string(top_after))
+    }
+    if top_after > 7 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_stack_op] expected=top_after<=7 got=" + to_string(top_after))
+    }
+    let row = to_string(stack_op_id) + "\t" + to_string(op_kind) + "\t"
+        + to_string(top_before) + "\t" + to_string(top_after) + "\n"
+    pifi_append_row(pifi_stack_op_path(), row)
+}
+
+// ─── record_real_kind: real-N memory operand 추적 (REAL4/8/10) ───
+fn record_real_kind(real_kind_id: int, inst_id: int, real_size: int) -> void {
+    if real_kind_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_real_kind] expected=real_kind_id>=0 got=" + to_string(real_kind_id))
+    }
+    if inst_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_real_kind] expected=inst_id>=0 got=" + to_string(inst_id))
+    }
+    if real_size != 4 {
+        if real_size != 8 {
+            if real_size != 10 {
+                panic("pe_i386_x87_fpu_inst_real FAIL [record_real_kind] expected=real_size in {4,8,10} got=" + to_string(real_size))
+            }
+        }
+    }
+    let row = to_string(real_kind_id) + "\t" + to_string(inst_id) + "\t"
+        + to_string(real_size) + "\n"
+    pifi_append_row(pifi_real_kind_path(), row)
+}
+
+// ─── record_int_kind: int-N memory operand 추적 (INT16/32/64) ───
+fn record_int_kind(int_kind_id: int, inst_id: int, int_size: int) -> void {
+    if int_kind_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_int_kind] expected=int_kind_id>=0 got=" + to_string(int_kind_id))
+    }
+    if inst_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_int_kind] expected=inst_id>=0 got=" + to_string(inst_id))
+    }
+    if int_size != 2 {
+        if int_size != 4 {
+            if int_size != 8 {
+                panic("pe_i386_x87_fpu_inst_real FAIL [record_int_kind] expected=int_size in {2,4,8} got=" + to_string(int_size))
+            }
+        }
+    }
+    let row = to_string(int_kind_id) + "\t" + to_string(inst_id) + "\t"
+        + to_string(int_size) + "\n"
+    pifi_append_row(pifi_int_kind_path(), row)
+}
+
+// ─── record_unsupported: 미지원 opcode 추적 ───
+fn record_unsupported(unsup_id: int, prefix_byte: str, opcode_byte: str, modrm_byte: str) -> void {
+    if unsup_id < 0 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_unsupported] expected=unsup_id>=0 got=" + to_string(unsup_id))
+    }
+    let pn = prefix_name(prefix_byte)
+    if pn == "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_unsupported] expected=prefix_byte=D8..DF got=" + prefix_byte)
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_unsupported] expected=opcode_byte!=empty got=empty")
+    }
+    if modrm_byte == "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [record_unsupported] expected=modrm_byte!=empty got=empty")
+    }
+    let row = to_string(unsup_id) + "\t" + prefix_byte + "\t" + opcode_byte + "\t" + modrm_byte + "\n"
+    pifi_append_row(pifi_unsupported_path(), row)
+}
+
+// ─── 통계 헬퍼 ───
+fn pifi_count_rows(path: str, min_cols: int) -> int {
+    let t = pifi_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn inst_count() -> int {
+    return pifi_count_rows(pifi_inst_path(), 5)
+}
+
+fn stack_op_count() -> int {
+    return pifi_count_rows(pifi_stack_op_path(), 4)
+}
+
+fn real_kind_count() -> int {
+    return pifi_count_rows(pifi_real_kind_path(), 3)
+}
+
+fn int_kind_count() -> int {
+    return pifi_count_rows(pifi_int_kind_path(), 3)
+}
+
+fn unsupported_count() -> int {
+    return pifi_count_rows(pifi_unsupported_path(), 4)
+}
+
+// ─── pifi_stats: [inst_count, stack_op_count, real_kind_count, int_kind_count, unsupported_count] ───
+fn pifi_stats() -> array {
+    let mut out = []
+    out.push(inst_count())
+    out.push(stack_op_count())
+    out.push(real_kind_count())
+    out.push(int_kind_count())
+    out.push(unsupported_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pifi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pifi()
+
+    // 2. record_inst 6종 (D8 FADD r32 / D9 FLD / DA FIADD i32 / DB FILD i32 / DC FADD r64 / DD FSTP)
+    //    Intel SDM Vol 2A FADD/FLD/FIADD/FILD/FSTP reference 기준
+    record_inst(0, "D8", "06", "FADD m32fp",  2)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_inst",
+        "\"inst_id\":0,\"prefix_byte\":\"D8\",\"modrm_byte\":\"06\",\"mnemonic\":\"FADD m32fp\",\"opcode_kind\":2,\"target\":\"arith.real32\"")
+
+    record_inst(1, "D9", "00", "FLD m32fp",   0)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_inst",
+        "\"inst_id\":1,\"prefix_byte\":\"D9\",\"modrm_byte\":\"00\",\"mnemonic\":\"FLD m32fp\",\"opcode_kind\":0,\"target\":\"load.real32\"")
+
+    record_inst(2, "DA", "06", "FIADD m32int", 2)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_inst",
+        "\"inst_id\":2,\"prefix_byte\":\"DA\",\"modrm_byte\":\"06\",\"mnemonic\":\"FIADD m32int\",\"opcode_kind\":2,\"target\":\"arith.int32\"")
+
+    record_inst(3, "DB", "00", "FILD m32int", 0)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_inst",
+        "\"inst_id\":3,\"prefix_byte\":\"DB\",\"modrm_byte\":\"00\",\"mnemonic\":\"FILD m32int\",\"opcode_kind\":0,\"target\":\"load.int32\"")
+
+    record_inst(4, "DC", "06", "FADD m64fp",  2)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_inst",
+        "\"inst_id\":4,\"prefix_byte\":\"DC\",\"modrm_byte\":\"06\",\"mnemonic\":\"FADD m64fp\",\"opcode_kind\":2,\"target\":\"arith.real64\"")
+
+    record_inst(5, "DD", "1E", "FSTP m64fp",  1)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_inst",
+        "\"inst_id\":5,\"prefix_byte\":\"DD\",\"modrm_byte\":\"1E\",\"mnemonic\":\"FSTP m64fp\",\"opcode_kind\":1,\"target\":\"store.real64\"")
+
+    // 3. record_stack_op 4종 (3 push + 1 pop) — FLD/FILD/FLD r64 push, FSTP pop
+    //    TOP pointer: push → top decrement (mod 8), pop → top increment (mod 8)
+    record_stack_op(0, 0, 7, 6)  // push: FLD m32fp, top 7→6
+    r0_emit("pe_i386_x87_fpu_inst_real_record_stack_op",
+        "\"stack_op_id\":0,\"op_kind\":0,\"top_before\":7,\"top_after\":6,\"target\":\"FLD.push\"")
+
+    record_stack_op(1, 0, 6, 5)  // push: FILD m32int, top 6→5
+    r0_emit("pe_i386_x87_fpu_inst_real_record_stack_op",
+        "\"stack_op_id\":1,\"op_kind\":0,\"top_before\":6,\"top_after\":5,\"target\":\"FILD.push\"")
+
+    record_stack_op(2, 0, 5, 4)  // push: FLD m64fp, top 5→4
+    r0_emit("pe_i386_x87_fpu_inst_real_record_stack_op",
+        "\"stack_op_id\":2,\"op_kind\":0,\"top_before\":5,\"top_after\":4,\"target\":\"FLD.real64.push\"")
+
+    record_stack_op(3, 1, 4, 5)  // pop: FSTP m64fp, top 4→5
+    r0_emit("pe_i386_x87_fpu_inst_real_record_stack_op",
+        "\"stack_op_id\":3,\"op_kind\":1,\"top_before\":4,\"top_after\":5,\"target\":\"FSTP.pop\"")
+
+    // 4. record_real_kind 3종 (size 4 / 8 / 10)
+    record_real_kind(0, 1, 4)   // FLD m32fp → REAL4
+    r0_emit("pe_i386_x87_fpu_inst_real_record_real_kind",
+        "\"real_kind_id\":0,\"inst_id\":1,\"real_size\":4,\"target\":\"REAL4.single\"")
+
+    record_real_kind(1, 4, 8)   // FADD m64fp → REAL8
+    r0_emit("pe_i386_x87_fpu_inst_real_record_real_kind",
+        "\"real_kind_id\":1,\"inst_id\":4,\"real_size\":8,\"target\":\"REAL8.double\"")
+
+    record_real_kind(2, 5, 10)  // FSTP m80 — 80-bit extended (REAL10)
+    r0_emit("pe_i386_x87_fpu_inst_real_record_real_kind",
+        "\"real_kind_id\":2,\"inst_id\":5,\"real_size\":10,\"target\":\"REAL10.extended\"")
+
+    // 5. record_int_kind 2종 (size 2 / 4)
+    record_int_kind(0, 3, 2)    // FILD m16int — INT16
+    r0_emit("pe_i386_x87_fpu_inst_real_record_int_kind",
+        "\"int_kind_id\":0,\"inst_id\":3,\"int_size\":2,\"target\":\"INT16\"")
+
+    record_int_kind(1, 3, 4)    // FILD m32int — INT32
+    r0_emit("pe_i386_x87_fpu_inst_real_record_int_kind",
+        "\"int_kind_id\":1,\"inst_id\":3,\"int_size\":4,\"target\":\"INT32\"")
+
+    // 6. record_unsupported 1종 — DF FBLD m80bcd (extended BCD load 미구현)
+    record_unsupported(0, "DF", "F4", "20")
+    r0_emit("pe_i386_x87_fpu_inst_real_record_unsupported",
+        "\"unsup_id\":0,\"prefix_byte\":\"DF\",\"opcode_byte\":\"F4\",\"modrm_byte\":\"20\",\"target\":\"FBLD.m80bcd.unimpl\"")
+
+    // 7. assertion: inst == 6
+    let ic = inst_count()
+    if ic != 6 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [inst_count] expected=6 got=" + to_string(ic))
+    }
+
+    // 8. assertion: stack_op == 4
+    let soc = stack_op_count()
+    if soc != 4 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stack_op_count] expected=4 got=" + to_string(soc))
+    }
+
+    // 9. assertion: real_kind == 3
+    let rkc = real_kind_count()
+    if rkc != 3 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [real_kind_count] expected=3 got=" + to_string(rkc))
+    }
+
+    // 10. assertion: int_kind == 2
+    let ikc = int_kind_count()
+    if ikc != 2 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [int_kind_count] expected=2 got=" + to_string(ikc))
+    }
+
+    // 11. assertion: unsupported == 1
+    let uc = unsupported_count()
+    if uc != 1 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [unsupported_count] expected=1 got=" + to_string(uc))
+    }
+
+    // 12. opcode_kind_name sanity (0..5 + invalid)
+    if opcode_kind_name(0) != "load" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(0)] expected=load got=" + opcode_kind_name(0))
+    }
+    if opcode_kind_name(1) != "store" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(1)] expected=store got=" + opcode_kind_name(1))
+    }
+    if opcode_kind_name(2) != "arith" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(2)] expected=arith got=" + opcode_kind_name(2))
+    }
+    if opcode_kind_name(3) != "compare" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(3)] expected=compare got=" + opcode_kind_name(3))
+    }
+    if opcode_kind_name(4) != "trans" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(4)] expected=trans got=" + opcode_kind_name(4))
+    }
+    if opcode_kind_name(5) != "control" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(5)] expected=control got=" + opcode_kind_name(5))
+    }
+    if opcode_kind_name(99) != "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [opcode_kind_name(99)] expected=empty got=" + opcode_kind_name(99))
+    }
+
+    // 13. prefix_name sanity (D8..DF + invalid)
+    if prefix_name("D8") != "D8" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [prefix_name(D8)] expected=D8 got=" + prefix_name("D8"))
+    }
+    if prefix_name("DF") != "DF" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [prefix_name(DF)] expected=DF got=" + prefix_name("DF"))
+    }
+    if prefix_name("D7") != "" {
+        panic("pe_i386_x87_fpu_inst_real FAIL [prefix_name(D7)] expected=empty got=" + prefix_name("D7"))
+    }
+
+    // 14. pifi_stats() = [6, 4, 3, 2, 1]
+    let s = pifi_stats()
+    if len(s) != 5 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stats inst_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stats stack_op_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stats real_kind_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stats int_kind_count] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [stats unsupported_count] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_i386_x87_fpu_inst_real_stats",
+        "\"inst_count\":" + to_string(s[0])
+        + ",\"stack_op_count\":" + to_string(s[1])
+        + ",\"real_kind_count\":" + to_string(s[2])
+        + ",\"int_kind_count\":" + to_string(s[3])
+        + ",\"unsupported_count\":" + to_string(s[4]))
+
+    // 16. r0 emit count assertion (≥ 14)
+    //     실제 emit: 6 inst + 4 stack_op + 3 real_kind + 2 int_kind + 1 unsupported + 1 stats = 17
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_x87_fpu_inst_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pifi()
+    let s2 = pifi_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_x87_fpu_inst_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_x87_fpu_inst_real self_test PASS (inst=" + to_string(s[0])
+        + ", stack_op=" + to_string(s[1]) + ", real_kind=" + to_string(s[2])
+        + ", int_kind=" + to_string(s[3]) + ", unsupported=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pifi_stats()
+            println("inst_count\t" + to_string(s[0]))
+            println("stack_op_count\t" + to_string(s[1]))
+            println("real_kind_count\t" + to_string(s[2]))
+            println("int_kind_count\t" + to_string(s[3]))
+            println("unsupported_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pifi()
+            println("cleaned: " + pifi_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pifi_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_x87_fpu_inst_real.hexa { self-test | stats | cleanup | dir }")
+}

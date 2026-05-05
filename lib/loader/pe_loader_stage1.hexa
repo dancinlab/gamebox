@@ -1,0 +1,479 @@
+// lib/loader/pe_loader_stage1.hexa — Phase 0b — PE loader stage1 (mmap-equivalent simulator)
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Microsoft PE/COFF spec (https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) 만 참조.
+// own 2 mandate: r0_emit ≥ 3 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 입력: Phase 0a/0b 의 pe_parser / pe_loader 가 검증한 PE 파일 path
+// 출력: in-memory layout simulator —
+//   - 각 section 의 raw bytes 를 temp file 로 copy (section per-file)
+//   - section table + temp file paths + permissions = "loaded image"
+//   - read_section_bytes / check_permission / entry_address / unload API 제공
+//
+// stage1 우회 (raw#9 hexa-only):
+//   - native mmap 부재 → temp file copy 로 시뮬 (R/W/X 는 metadata 만, 실제 mprotect 는 stage2)
+//   - bit ops 부재 → Characteristics R/W/X 비트는 division (pe_loader.hexa 와 동일)
+//   - byte read 는 dd / od (own 1 — own use 만)
+//
+// upstream candidate (docs/HEXA_UPSTREAM.md):
+//   - native mmap (read-only / RW / RX page protection)
+//   - native mprotect (R/W/X page flag toggle)
+//   - native binary slice (현재 dd 우회)
+//
+// API:
+//   load_pe_stage1(path) -> [layout_dir, num_sections, image_base, entry_addr, sections_meta]
+//     sections_meta = nested array, 각 row = [name, vaddr, vsize, raw_off, raw_size, perms, temp_file]
+//   read_section_bytes(layout, name, off, len) -> str (hex string)
+//   check_permission(layout, name, "R"|"W"|"X") -> bool
+//   entry_address(layout) -> int
+//   layout_summary(layout) -> str
+//   unload(layout) -> int (number of temp files removed)
+
+use "../perf/r0_common"
+
+// ─── 저레벨 byte read 헬퍼 (pe_parser / pe_loader 와 동일 inline — own 1 enforcement) ───
+fn s1_read_u8(path: str, offset: int) -> int {
+    let cmd = "od -An -tu1 -N1 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn s1_read_u16(path: str, offset: int) -> int {
+    let cmd = "od -An -tu2 -N2 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn s1_read_u32(path: str, offset: int) -> int {
+    let cmd = "od -An -tu4 -N4 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn s1_read_str(path: str, offset: int, length: int) -> str {
+    let cmd = "dd if='" + path + "' bs=1 skip=" + to_string(offset) + " count=" + to_string(length) + " 2>/dev/null | tr -d '\\0'"
+    return exec(cmd).trim()
+}
+
+// ─── PE header walking (pe_loader.hexa 의 logic 재구성, own 1 — own use 만) ───
+fn s1_e_lfanew(path: str) -> int {
+    return s1_read_u32(path, 60)
+}
+
+fn s1_num_sections(path: str, e_lfanew: int) -> int {
+    return s1_read_u16(path, e_lfanew + 4 + 2)
+}
+
+fn s1_size_opt_header(path: str, e_lfanew: int) -> int {
+    return s1_read_u16(path, e_lfanew + 4 + 16)
+}
+
+fn s1_opt_magic(path: str, e_lfanew: int) -> int {
+    return s1_read_u16(path, e_lfanew + 24)
+}
+
+fn s1_entry_rva(path: str, e_lfanew: int) -> int {
+    return s1_read_u32(path, e_lfanew + 24 + 16)
+}
+
+fn s1_image_base_lo(path: str, e_lfanew: int, opt_magic: int) -> int {
+    if opt_magic == 267 {  // PE32
+        return s1_read_u32(path, e_lfanew + 24 + 28)
+    }
+    if opt_magic == 523 {  // PE32+
+        return s1_read_u32(path, e_lfanew + 24 + 24)
+    }
+    return 0
+}
+
+fn s1_section_offset(e_lfanew: int, size_opt: int) -> int {
+    return e_lfanew + 24 + size_opt
+}
+
+// ─── permission decoding (Microsoft PE/COFF Characteristics flags) ───
+//   IMAGE_SCN_MEM_EXECUTE = 0x20000000 (bit 29)
+//   IMAGE_SCN_MEM_READ    = 0x40000000 (bit 30)
+//   IMAGE_SCN_MEM_WRITE   = 0x80000000 (bit 31)
+fn s1_perms_str(characteristics: int) -> str {
+    let exec_bit = (characteristics / 536870912) % 2
+    let read_bit = (characteristics / 1073741824) % 2
+    let write_bit = (characteristics / 2147483648) % 2
+    let s = ""
+    if read_bit == 1 {
+        s = s + "R"
+    }
+    if write_bit == 1 {
+        s = s + "W"
+    }
+    if exec_bit == 1 {
+        s = s + "X"
+    }
+    if s == "" {
+        return "-"
+    }
+    return s
+}
+
+// ─── load_pe_stage1: PE → in-memory layout (mmap simulator) ───
+//   각 section 의 raw bytes 를 temp file 에 dd copy.
+//   layout = [layout_dir, num_sections, image_base, entry_addr, sections_meta]
+//   sections_meta[i] = [name, vaddr, vsize, raw_off, raw_size, perms, temp_file_path]
+fn load_pe_stage1(pe_path: str) -> array {
+    // 1. PE 헤더 walking
+    let e_lfanew = s1_e_lfanew(pe_path)
+    let num_sect = s1_num_sections(pe_path, e_lfanew)
+    let size_opt = s1_size_opt_header(pe_path, e_lfanew)
+    let opt_magic = s1_opt_magic(pe_path, e_lfanew)
+    let entry_rva = s1_entry_rva(pe_path, e_lfanew)
+    let image_base = s1_image_base_lo(pe_path, e_lfanew, opt_magic)
+    let entry_addr = image_base + entry_rva
+    let sect_off = s1_section_offset(e_lfanew, size_opt)
+
+    if num_sect < 1 {
+        panic("pe_loader_stage1 FAIL [load_pe_stage1] expected>=1 sections got=" + to_string(num_sect))
+    }
+    if num_sect > 96 {
+        panic("pe_loader_stage1 FAIL [load_pe_stage1] expected<=96 sections got=" + to_string(num_sect))
+    }
+
+    // 2. layout temp dir 생성 — uniqueness 위해 PID + epoch + RANDOM 조합
+    //   (BSD/macOS `date +%N` 미지원 → epoch 초 + $$ + $RANDOM 으로 충돌 회피)
+    let ts = exec("printf '%s_%s_%s' \"$(date +%s)\" \"$$\" \"$RANDOM\"").trim()
+    if ts == "" {
+        ts = exec("date +%s").trim()
+    }
+    let layout_dir = "/tmp/airgenome/pe_stage1/" + ts
+    let _mk = exec("mkdir -p '" + layout_dir + "'")
+
+    // 3. 각 section 별 metadata + temp file copy
+    let sections_meta = []
+    let i = 0
+    while i < num_sect {
+        let row_off = sect_off + i * 40
+        let name = s1_read_str(pe_path, row_off + 0, 8)
+        let vsize = s1_read_u32(pe_path, row_off + 8)
+        let vaddr = s1_read_u32(pe_path, row_off + 12)
+        let raw_size = s1_read_u32(pe_path, row_off + 16)
+        let raw_off2 = s1_read_u32(pe_path, row_off + 20)
+        let chars = s1_read_u32(pe_path, row_off + 36)
+        let perms = s1_perms_str(chars)
+
+        // section temp file 이름 — index + sanitized name (alnum/_/. 만)
+        let sanitized = exec("printf '%s' '" + name + "' | tr -c 'a-zA-Z0-9._' '_'").trim()
+        if sanitized == "" {
+            sanitized = "sect"
+        }
+        let temp_file = layout_dir + "/" + to_string(i) + "_" + sanitized + ".bin"
+
+        // raw bytes copy (raw_size 가 0 이면 skip — uninitialized section)
+        if raw_size > 0 {
+            let dd_cmd = "dd if='" + pe_path + "' of='" + temp_file
+                + "' bs=1 skip=" + to_string(raw_off2)
+                + " count=" + to_string(raw_size) + " 2>/dev/null"
+            let _ = exec(dd_cmd)
+        } else {
+            // empty section file (uninitialized BSS-like)
+            let _ = exec("touch '" + temp_file + "'")
+        }
+
+        let row = [name, vaddr, vsize, raw_off2, raw_size, perms, temp_file]
+        sections_meta = sections_meta + [row]
+        i = i + 1
+    }
+
+    return [layout_dir, num_sect, image_base, entry_addr, sections_meta]
+}
+
+// ─── section row 검색 (linear scan, n ≤ 96) ───
+fn s1_find_section(layout: array, section_name: str) -> array {
+    let sections_meta = layout[4]
+    let n = len(sections_meta)
+    let i = 0
+    while i < n {
+        let row = sections_meta[i]
+        if row[0] == section_name {
+            return row
+        }
+        i = i + 1
+    }
+    return []
+}
+
+// ─── read_section_bytes: section temp file 에서 byte 추출 (hex string 반환) ───
+fn read_section_bytes(layout: array, section_name: str, offset: int, length: int) -> str {
+    let row = s1_find_section(layout, section_name)
+    if len(row) == 0 {
+        panic("pe_loader_stage1 FAIL [read_section_bytes] section not found: " + section_name)
+    }
+    let raw_size = row[4]
+    let temp_file = row[6]
+    if raw_size == 0 {
+        panic("pe_loader_stage1 FAIL [read_section_bytes] empty section (raw_size=0): " + section_name)
+    }
+    if offset < 0 {
+        panic("pe_loader_stage1 FAIL [read_section_bytes] negative offset: " + to_string(offset))
+    }
+    if length <= 0 {
+        panic("pe_loader_stage1 FAIL [read_section_bytes] non-positive length: " + to_string(length))
+    }
+    if offset + length > raw_size {
+        panic("pe_loader_stage1 FAIL [read_section_bytes] out-of-bounds offset+length=" + to_string(offset + length) + " raw_size=" + to_string(raw_size))
+    }
+    // dd → xxd hex (lower-case, no spaces)
+    let cmd = "dd if='" + temp_file + "' bs=1 skip=" + to_string(offset)
+        + " count=" + to_string(length)
+        + " 2>/dev/null | od -An -tx1 | tr -d ' \\n'"
+    return exec(cmd).trim()
+}
+
+// ─── check_permission: section 의 R/W/X bit 확인 ───
+fn check_permission(layout: array, section_name: str, perm: str) -> bool {
+    let row = s1_find_section(layout, section_name)
+    if len(row) == 0 {
+        panic("pe_loader_stage1 FAIL [check_permission] section not found: " + section_name)
+    }
+    let perms = row[5]
+    if perm != "R" {
+        if perm != "W" {
+            if perm != "X" {
+                panic("pe_loader_stage1 FAIL [check_permission] invalid perm (must be R|W|X): " + perm)
+            }
+        }
+    }
+    return perms.contains(perm)
+}
+
+// ─── entry_address: ImageBase_lo + EntryPointRVA ───
+fn entry_address(layout: array) -> int {
+    return layout[3]
+}
+
+// ─── layout_summary: human-readable string (R0 emit 용) ───
+fn layout_summary(layout: array) -> str {
+    let layout_dir = layout[0]
+    let n = layout[1]
+    let image_base = layout[2]
+    let entry_addr = layout[3]
+    let sections_meta = layout[4]
+    let s = "layout_dir=" + layout_dir
+        + " sections=" + to_string(n)
+        + " image_base=" + to_string(image_base)
+        + " entry_addr=" + to_string(entry_addr)
+    let i = 0
+    while i < n {
+        let row = sections_meta[i]
+        s = s + " | " + row[0] + " vaddr=" + to_string(row[1]) + " vsize=" + to_string(row[2]) + " perms=" + row[5]
+        i = i + 1
+    }
+    return s
+}
+
+// ─── unload: temp files + temp dir 제거. removed file count 반환. ───
+fn unload(layout: array) -> int {
+    let layout_dir = layout[0]
+    let sections_meta = layout[4]
+    let n = len(sections_meta)
+    let removed = 0
+    let i = 0
+    while i < n {
+        let row = sections_meta[i]
+        let temp_file = row[6]
+        let exists = exec("test -f '" + temp_file + "' && echo ok").trim()
+        if exists == "ok" {
+            let _ = exec("rm -f '" + temp_file + "'")
+            removed = removed + 1
+        }
+        i = i + 1
+    }
+    let _ = exec("rmdir '" + layout_dir + "' 2>/dev/null")
+    return removed
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pestage1-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. test PE
+    let test_pe = HOME + "/Downloads/gamebox/Battle.net-Setup.exe"
+    let exists = exec("test -f '" + test_pe + "' && echo ok").trim()
+    if exists != "ok" {
+        println("  ⚠ test PE not found at " + test_pe)
+        println("  ⚠ pe_loader_stage1 self_test SKIP (PE binary absent)")
+        return
+    }
+
+    // 2. load_pe_stage1
+    let layout = load_pe_stage1(test_pe)
+    let layout_dir = layout[0]
+    let n_sect = layout[1]
+    let image_base = layout[2]
+    let entry_addr = layout[3]
+
+    if n_sect < 1 {
+        panic("pe_loader_stage1 FAIL [self_test load] expected>=1 sections got=" + to_string(n_sect))
+    }
+    if image_base == 0 {
+        panic("pe_loader_stage1 FAIL [self_test image_base] expected>0 got=0")
+    }
+    if entry_addr == 0 {
+        panic("pe_loader_stage1 FAIL [self_test entry_addr] expected>0 got=0")
+    }
+
+    r0_emit("pe_loader_stage1_loaded",
+        "\"sections\":" + to_string(n_sect)
+        + ",\"image_base\":" + to_string(image_base)
+        + ",\"entry_addr\":" + to_string(entry_addr)
+        + ",\"layout_dir\":\"" + layout_dir + "\""
+    )
+
+    // 3. each section r0_emit
+    let sections_meta = layout[4]
+    let i = 0
+    while i < n_sect {
+        let row = sections_meta[i]
+        r0_emit("pe_loader_stage1_section",
+            "\"index\":" + to_string(i)
+            + ",\"name\":\"" + row[0] + "\""
+            + ",\"vaddr\":" + to_string(row[1])
+            + ",\"vsize\":" + to_string(row[2])
+            + ",\"raw_off\":" + to_string(row[3])
+            + ",\"raw_size\":" + to_string(row[4])
+            + ",\"perms\":\"" + row[5] + "\""
+            + ",\"temp_file\":\"" + row[6] + "\""
+        )
+        // temp file 존재 확인
+        let raw_size = row[4]
+        if raw_size > 0 {
+            let tf_exists = exec("test -f '" + row[6] + "' && echo ok").trim()
+            if tf_exists != "ok" {
+                panic("pe_loader_stage1 FAIL [self_test section temp_file] missing for " + row[0])
+            }
+            // size 매칭 (≤ raw_size — dd 가 파일 끝에서 truncate 하면 작을 수 있지만 일반 case 일치)
+            let actual_size = to_int(exec("wc -c < '" + row[6] + "' | tr -d ' '").trim())
+            if actual_size != raw_size {
+                panic("pe_loader_stage1 FAIL [self_test temp_size] section=" + row[0] + " expected=" + to_string(raw_size) + " got=" + to_string(actual_size))
+            }
+        }
+        i = i + 1
+    }
+
+    // 4. read_section_bytes — .text 의 first 16 bytes
+    let text_row = s1_find_section(layout, ".text")
+    if len(text_row) == 0 {
+        panic("pe_loader_stage1 FAIL [self_test .text find] section .text not found")
+    }
+    let text_raw_size = text_row[4]
+    if text_raw_size < 16 {
+        panic("pe_loader_stage1 FAIL [self_test .text raw_size] expected>=16 got=" + to_string(text_raw_size))
+    }
+    let text_hex = read_section_bytes(layout, ".text", 0, 16)
+    // 16 bytes = 32 hex chars
+    if len(text_hex) != 32 {
+        panic("pe_loader_stage1 FAIL [self_test read_section_bytes len] expected=32 got=" + to_string(len(text_hex)))
+    }
+
+    // 5. check_permission — .text 는 X (executable)
+    let text_x = check_permission(layout, ".text", "X")
+    if text_x == false {
+        panic("pe_loader_stage1 FAIL [self_test .text X] expected=true got=false (perms=" + text_row[5] + ")")
+    }
+
+    // 6. check_permission — .rdata 는 W 가 아님 (read-only data)
+    let rdata_row = s1_find_section(layout, ".rdata")
+    if len(rdata_row) > 0 {
+        let rdata_w = check_permission(layout, ".rdata", "W")
+        if rdata_w == true {
+            panic("pe_loader_stage1 FAIL [self_test .rdata W] expected=false got=true (perms=" + rdata_row[5] + ")")
+        }
+    }
+
+    // 7. entry_address > 0
+    let ea = entry_address(layout)
+    if ea <= 0 {
+        panic("pe_loader_stage1 FAIL [self_test entry_address] expected>0 got=" + to_string(ea))
+    }
+    if ea != entry_addr {
+        panic("pe_loader_stage1 FAIL [self_test entry_address consistency] expected=" + to_string(entry_addr) + " got=" + to_string(ea))
+    }
+
+    // 8. layout_summary 검증
+    let summary = layout_summary(layout)
+    if summary.contains("layout_dir=") == false {
+        panic("pe_loader_stage1 FAIL [self_test summary] missing 'layout_dir='")
+    }
+    if summary.contains(".text") == false {
+        panic("pe_loader_stage1 FAIL [self_test summary] missing '.text'")
+    }
+
+    r0_emit("pe_loader_stage1_text_read",
+        "\"section\":\".text\""
+        + ",\"offset\":0"
+        + ",\"length\":16"
+        + ",\"hex_len\":" + to_string(len(text_hex))
+        + ",\"text_x\":" + to_string(text_x)
+    )
+
+    // 9. unload
+    let removed = unload(layout)
+    if removed < 1 {
+        panic("pe_loader_stage1 FAIL [self_test unload] expected>=1 got=" + to_string(removed))
+    }
+
+    // 10. unload 후 temp file 부재 확인 (첫 section 만 spot-check)
+    let first_temp = sections_meta[0][6]
+    let after_exists = exec("test -f '" + first_temp + "' && echo ok || echo gone").trim()
+    if after_exists != "gone" {
+        panic("pe_loader_stage1 FAIL [self_test unload spot-check] expected=gone got=" + after_exists)
+    }
+
+    r0_emit("pe_loader_stage1_unloaded",
+        "\"removed\":" + to_string(removed)
+        + ",\"sections\":" + to_string(n_sect)
+    )
+
+    // r0 events 개수 확인:
+    //   pe_loader_stage1_loaded (1) + pe_loader_stage1_section (n_sect)
+    //   + pe_loader_stage1_text_read (1) + pe_loader_stage1_unloaded (1)
+    //   = 3 + n_sect ≥ 4 → emit ≥ 3 만족.
+    let cnt = r0_session_count(sid)
+    let expected = 3 + n_sect
+    if cnt != expected {
+        panic("pe_loader_stage1 FAIL [self_test r0 events] expected=" + to_string(expected) + " got=" + to_string(cnt))
+    }
+
+    println("  ✅ pe_loader_stage1 self_test PASS (" + to_string(n_sect) + " sections, RWX OK, entry=" + to_string(entry_addr) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "load" {
+            if len(a) >= 4 {
+                let layout = load_pe_stage1(a[3])
+                println(layout_summary(layout))
+                let _ = unload(layout)
+                return
+            }
+        }
+        if sub == "summary" {
+            if len(a) >= 4 {
+                let layout = load_pe_stage1(a[3])
+                println(layout_summary(layout))
+                let _ = unload(layout)
+                return
+            }
+        }
+        if sub == "entry" {
+            if len(a) >= 4 {
+                let layout = load_pe_stage1(a[3])
+                println(to_string(entry_address(layout)))
+                let _ = unload(layout)
+                return
+            }
+        }
+    }
+    println("usage: hexa run pe_loader_stage1.hexa { self-test | load <path> | summary <path> | entry <path> }")
+}

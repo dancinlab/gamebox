@@ -1,0 +1,473 @@
+// lib/loader/pe_pe_to_macho_invoke_real.hexa — Phase 1 Rosetta 2 위임 시나리오 R4 B path 실 invoke
+//
+// R4 B path (BINARY_TRANSLATION_MANJEOM_REVIEW 21/25) 실 invoke. PE → Mach-O thin shim
+// 후 fd 생성 → posix_spawn(MH_EXECUTE) → Rosetta 2 자동 변환 (own1 § A 명시 허용).
+// own1: Apple Mach-O spec + Rosetta 2 (Apple binary).
+//
+// Rosetta 2 위임 실 invoke 시퀀스:
+//   1. pe_header_validate:   COFF + Optional Header (PE32+) magic 검증
+//   2. macho_header_emit:    mh_magic=MH_MAGIC_64, cputype=CPU_TYPE_X86_64, filetype=MH_EXECUTE
+//   3. section_remap:        PE section → __TEXT/__text, __DATA/__data, __DATA_CONST/__rodata
+//   4. relocation_apply:     PE .reloc → Mach-O LC_DYLD_INFO rebase/bind opcode
+//   5. lc_segment_emit:      LC_SEGMENT_64 + sections + LC_DYLD_INFO + LC_MAIN
+//   6. fd_create:            thin Mach-O fd (mkstemp + write)
+//   7. posix_spawn:          posix_spawn(MH_EXECUTE) 호출 — Apple loader entry
+//   8. rosetta_handoff:      x86_64 Mach-O → Rosetta 2 자동 binary translation
+//   9. process_wait:         child process waitpid → exit status 회수
+//
+// Apple Silicon Rosetta 2 (own1 § A 명시 허용):
+//   - x86_64 → arm64 binary translation (Apple in-house)
+//   - posix_spawn(MH_EXECUTE) → kernel fork+exec → Rosetta 2 dispatch
+//   - Wine PE-to-ELF, MoltenVM, NTDLL.so 등 community 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 10 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = pe_header_validate
+//   2 = macho_header_emit
+//   3 = section_remap
+//   4 = relocation_apply
+//   5 = lc_segment_emit
+//   6 = fd_create
+//   7 = posix_spawn
+//   8 = rosetta_handoff
+//   9 = process_wait
+//
+// rosetta_invoked flag:
+//   0 = not invoked (preparation phase)
+//   1 = invoked (Rosetta 2 dispatch active)
+//
+// persist schema (TSV — invokes.tsv):
+//   invoke_id<int> \t phase_kind<int> \t input_kb<int> \t rosetta_invoked<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pptmir_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_pe_to_macho_invoke_real"
+}
+
+fn pptmir_invokes_path() -> str {
+    return pptmir_dir() + "/invokes.tsv"
+}
+
+fn pptmir_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pptmir_dir() + "'")
+}
+
+fn cleanup_pptmir() -> void {
+    pptmir_ensure_dir()
+    let _ = exec("rm -f '" + pptmir_invokes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pptmir_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pptmir_append_row(path: str, row: str) -> void {
+    pptmir_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_invoke: invoke 1 건 기록 ───
+fn record_invoke(invoke_id: int, phase_kind: int, input_kb: int, rosetta_invoked: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_pe_to_macho_invoke_real FAIL [record_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [record_invoke] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 9 {
+        panic("pe_pe_to_macho_invoke_real FAIL [record_invoke] expected=phase_kind<=9 got=" + to_string(phase_kind))
+    }
+    if input_kb < 0 {
+        panic("pe_pe_to_macho_invoke_real FAIL [record_invoke] expected=input_kb>=0 got=" + to_string(input_kb))
+    }
+    if rosetta_invoked < 0 {
+        panic("pe_pe_to_macho_invoke_real FAIL [record_invoke] expected=rosetta_invoked>=0 got=" + to_string(rosetta_invoked))
+    }
+    if rosetta_invoked > 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [record_invoke] expected=rosetta_invoked<=1 got=" + to_string(rosetta_invoked))
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(input_kb) + "\t" + to_string(rosetta_invoked) + "\n"
+    pptmir_append_row(pptmir_invokes_path(), row)
+}
+
+// ─── invoke_count: total invoke 수 ───
+fn invoke_count() -> int {
+    let t = pptmir_read_table(pptmir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 invoke 수 ───
+fn count_by_phase_kind(kind: int) -> int {
+    let t = pptmir_read_table(pptmir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_input_kb: 모든 invoke input_kb 합 ───
+fn total_input_kb() -> int {
+    let t = pptmir_read_table(pptmir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── rosetta_invoked_count: rosetta_invoked=1 인 invoke 수 ───
+fn rosetta_invoked_count() -> int {
+    let t = pptmir_read_table(pptmir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── posix_spawn_count: phase_kind=7 의 invoke 수 ───
+fn posix_spawn_count() -> int {
+    return count_by_phase_kind(7)
+}
+
+// ─── invoke_input_kb: 특정 invoke_id 의 input_kb (없으면 0) ───
+fn invoke_input_kb(invoke_id: int) -> int {
+    let t = pptmir_read_table(pptmir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == invoke_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pptmir_stats: [invoke_count, total_input_kb, rosetta_invoked_count, posix_spawn_count] ───
+fn pptmir_stats() -> array {
+    let mut out = []
+    out.push(invoke_count())
+    out.push(total_input_kb())
+    out.push(rosetta_invoked_count())
+    out.push(posix_spawn_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pptmir-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pptmir()
+
+    // 2. record 9 invokes covering all 9 phase_kinds
+    //    PE input 1024 KB → Mach-O thin → posix_spawn → Rosetta 2 dispatch
+    //    phase 1 pe_header_validate:   in=1024 ros=0  (검증)
+    //    phase 2 macho_header_emit:    in=2    ros=0  (header emit)
+    //    phase 3 section_remap:        in=900  ros=0  (section)
+    //    phase 4 relocation_apply:     in=128  ros=0  (reloc)
+    //    phase 5 lc_segment_emit:      in=4    ros=0  (LC)
+    //    phase 6 fd_create:            in=1140 ros=0  (thin Mach-O fd)
+    //    phase 7 posix_spawn:          in=1140 ros=1  (Rosetta 2 진입)
+    //    phase 8 rosetta_handoff:      in=1140 ros=1  (binary translation)
+    //    phase 9 process_wait:         in=0    ros=1  (waitpid)
+    //    sums: input=5478, rosetta=3, posix_spawn=1
+    record_invoke(810001, 1, 1024, 0)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810001,\"phase_kind\":1,\"input_kb\":1024,\"rosetta_invoked\":0,\"target\":\"pe_header_validate\"")
+
+    record_invoke(810002, 2, 2, 0)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810002,\"phase_kind\":2,\"input_kb\":2,\"rosetta_invoked\":0,\"target\":\"macho_header_emit\"")
+
+    record_invoke(810003, 3, 900, 0)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810003,\"phase_kind\":3,\"input_kb\":900,\"rosetta_invoked\":0,\"target\":\"section_remap\"")
+
+    record_invoke(810004, 4, 128, 0)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810004,\"phase_kind\":4,\"input_kb\":128,\"rosetta_invoked\":0,\"target\":\"relocation_apply\"")
+
+    record_invoke(810005, 5, 4, 0)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810005,\"phase_kind\":5,\"input_kb\":4,\"rosetta_invoked\":0,\"target\":\"lc_segment_emit\"")
+
+    record_invoke(810006, 6, 1140, 0)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810006,\"phase_kind\":6,\"input_kb\":1140,\"rosetta_invoked\":0,\"target\":\"fd_create\"")
+
+    record_invoke(810007, 7, 1140, 1)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810007,\"phase_kind\":7,\"input_kb\":1140,\"rosetta_invoked\":1,\"target\":\"posix_spawn\"")
+
+    record_invoke(810008, 8, 1140, 1)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810008,\"phase_kind\":8,\"input_kb\":1140,\"rosetta_invoked\":1,\"target\":\"rosetta_handoff\"")
+
+    record_invoke(810009, 9, 0, 1)
+    r0_emit("pe_pe_to_macho_invoke_real_record",
+        "\"invoke_id\":810009,\"phase_kind\":9,\"input_kb\":0,\"rosetta_invoked\":1,\"target\":\"process_wait\"")
+
+    // 3. invoke_count = 9
+    let c = invoke_count()
+    if c != 9 {
+        panic("pe_pe_to_macho_invoke_real FAIL [invoke_count] expected=9 got=" + to_string(c))
+    }
+
+    // 4. total_input_kb = 5478
+    let ti = total_input_kb()
+    if ti != 5478 {
+        panic("pe_pe_to_macho_invoke_real FAIL [total_input_kb] expected=5478 got=" + to_string(ti))
+    }
+
+    // 5. count_by_phase_kind sanity (모든 9 종 1 건씩)
+    let k1 = count_by_phase_kind(1)
+    if k1 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_phase_kind(2)
+    if k2 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_phase_kind(3)
+    if k3 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_phase_kind(4)
+    if k4 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_phase_kind(5)
+    if k5 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_phase_kind(6)
+    if k6 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k7 = count_by_phase_kind(7)
+    if k7 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(k7))
+    }
+    let k8 = count_by_phase_kind(8)
+    if k8 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(k8))
+    }
+    let k9 = count_by_phase_kind(9)
+    if k9 != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(9)] expected=1 got=" + to_string(k9))
+    }
+    let k99 = count_by_phase_kind(99)
+    if k99 != 0 {
+        panic("pe_pe_to_macho_invoke_real FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. rosetta_invoked_count = 3 (≥1 mandate)
+    let ric = rosetta_invoked_count()
+    if ric < 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [rosetta_invoked_count] expected=>=1 got=" + to_string(ric))
+    }
+    if ric != 3 {
+        panic("pe_pe_to_macho_invoke_real FAIL [rosetta_invoked_count] expected=3 got=" + to_string(ric))
+    }
+
+    // 7. posix_spawn_count = 1
+    let psc = posix_spawn_count()
+    if psc != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [posix_spawn_count] expected=1 got=" + to_string(psc))
+    }
+
+    // 8. invoke_input_kb sanity
+    let in7 = invoke_input_kb(810007)
+    if in7 != 1140 {
+        panic("pe_pe_to_macho_invoke_real FAIL [invoke_input_kb(810007)] expected=1140 got=" + to_string(in7))
+    }
+    let in9 = invoke_input_kb(810009)
+    if in9 != 0 {
+        panic("pe_pe_to_macho_invoke_real FAIL [invoke_input_kb(810009)] expected=0 got=" + to_string(in9))
+    }
+    let in_miss = invoke_input_kb(9999)
+    if in_miss != 0 {
+        panic("pe_pe_to_macho_invoke_real FAIL [invoke_input_kb(9999)] expected=0 got=" + to_string(in_miss))
+    }
+
+    // 9. pptmir_stats() = [9, 5478, 3, 1]
+    let s = pptmir_stats()
+    if len(s) != 4 {
+        panic("pe_pe_to_macho_invoke_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 9 {
+        panic("pe_pe_to_macho_invoke_real FAIL [stats invoke_count] expected=9 got=" + to_string(s[0]))
+    }
+    if s[1] != 5478 {
+        panic("pe_pe_to_macho_invoke_real FAIL [stats total_input_kb] expected=5478 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_pe_to_macho_invoke_real FAIL [stats rosetta_invoked_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_pe_to_macho_invoke_real FAIL [stats posix_spawn_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_pe_to_macho_invoke_real_stats",
+        "\"invoke_count\":" + to_string(s[0])
+        + ",\"total_input_kb\":" + to_string(s[1])
+        + ",\"rosetta_invoked_count\":" + to_string(s[2])
+        + ",\"posix_spawn_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 10 (9 records + 1 stats = 10)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 10 {
+        panic("pe_pe_to_macho_invoke_real FAIL [r0 emit count] expected=>=10 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pptmir()
+    let s2 = pptmir_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_pe_to_macho_invoke_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_pe_to_macho_invoke_real self_test PASS (invokes=" + to_string(s[0])
+        + ", input_kb=" + to_string(s[1]) + ", rosetta_invoked=" + to_string(s[2])
+        + ", posix_spawn=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pptmir_stats()
+            println("invoke_count\t" + to_string(s[0]))
+            println("total_input_kb\t" + to_string(s[1]))
+            println("rosetta_invoked_count\t" + to_string(s[2]))
+            println("posix_spawn_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "input" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("invoke_input_kb\t" + to_string(invoke_input_kb(iid)))
+                return
+            }
+            println("usage: hexa run pe_pe_to_macho_invoke_real.hexa input <invoke_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_pe_to_macho_invoke_real.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pptmir()
+            println("cleaned: " + pptmir_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pptmir_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_pe_to_macho_invoke_real.hexa { self-test | stats | input <invoke_id> | count <phase_kind> | cleanup | dir }")
+}

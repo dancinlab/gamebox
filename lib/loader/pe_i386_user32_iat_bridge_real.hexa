@@ -1,0 +1,509 @@
+// lib/loader/pe_i386_user32_iat_bridge_real.hexa — PE i386 USER32 IAT entry →
+// helper IPC kind=14 routing tracker (R3-11 USER32 bridge 의 hexa pair).
+//
+// 본 module 은 shim cpp wave4 USER32 IAT thunk 가 trace stub 0 return 대신
+// helper IPC kind=14 호출로 routing 되는 path 의 instrumentation. 실제 IPC
+// transport 와 USER32 implementation 은 cpp shim + native helper 책임이며,
+// 이 hexa 는 routing path 의 IAT dispatch / helper call / arg marshal /
+// response / callback_back 5 단계를 record + coverage 추적만 한다.
+//
+// own 1: Wine / Box86 / community USER32 implementation 0 줄. Apple SDK 호출
+//        0 줄. Microsoft Win32 USER32 API doc 만 참조. 우회 금지.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic.
+//
+// persist schema (TSV — 5 separate tables):
+//   iat_dispatch.tsv : call_id<int>        \t iat_va_hex<str>      \t fn_name<str>           \t helper_fn_id<int> \t arg_count<int>
+//   helper_call.tsv  : helper_call_id<int> \t fn_id<int>           \t kind<int>              \t send_ts_ns<int>   \t recv_ts_ns<int>
+//   arg_marshal.tsv  : marshal_id<int>     \t helper_call_id<int>  \t arg_idx<int>           \t arg_value_hex<str> \t arg_kind<int>
+//   response.tsv     : response_id<int>    \t helper_call_id<int>  \t return_value_hex<str>  \t ack_status<int>
+//   callback_back.tsv: callback_id<int>    \t msg_code_hex<str>    \t hwnd_hex<str>          \t wparam_hex<str>   \t lparam_hex<str>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piub_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_user32_iat_bridge_real"
+}
+
+fn piub_iat_dispatch_path() -> str {
+    return piub_dir() + "/iat_dispatch.tsv"
+}
+
+fn piub_helper_call_path() -> str {
+    return piub_dir() + "/helper_call.tsv"
+}
+
+fn piub_arg_marshal_path() -> str {
+    return piub_dir() + "/arg_marshal.tsv"
+}
+
+fn piub_response_path() -> str {
+    return piub_dir() + "/response.tsv"
+}
+
+fn piub_callback_back_path() -> str {
+    return piub_dir() + "/callback_back.tsv"
+}
+
+fn piub_calls_path() -> str {
+    return piub_dir() + "/iat_dispatch.tsv"
+}
+
+fn piub_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piub_dir() + "'")
+}
+
+fn cleanup_piub() -> void {
+    piub_ensure_dir()
+    let _ = exec("rm -f '" + piub_iat_dispatch_path()
+        + "' '" + piub_helper_call_path()
+        + "' '" + piub_arg_marshal_path()
+        + "' '" + piub_response_path()
+        + "' '" + piub_callback_back_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piub_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piub_append_row(path: str, row: str) -> void {
+    piub_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn piub_count_rows(path: str, min_cols: int) -> int {
+    let t = piub_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+// kind: 14=user32_call 15=gdi32_call (helper IPC routing kind)
+fn kind_name(k: int) -> str {
+    if k == 14 { return "user32_call" }
+    if k == 15 { return "gdi32_call" }
+    return "?"
+}
+
+// arg_kind: 0=int 1=ptr_str 2=ptr_struct 3=hwnd 4=hdc
+fn arg_kind_name(k: int) -> str {
+    if k == 0 { return "int" }
+    if k == 1 { return "ptr_str" }
+    if k == 2 { return "ptr_struct" }
+    if k == 3 { return "hwnd" }
+    if k == 4 { return "hdc" }
+    return "?"
+}
+
+// ─── record_iat_dispatch: USER32 IAT entry thunk 호출 추적 ───
+fn record_iat_dispatch(call_id: int, iat_va_hex: str, fn_name: str,
+                       helper_fn_id: int, arg_count: int) -> void {
+    if call_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_iat_dispatch] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if iat_va_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_iat_dispatch] expected=iat_va_hex!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_iat_dispatch] expected=fn_name!=empty got=empty")
+    }
+    if helper_fn_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_iat_dispatch] expected=helper_fn_id>0 got=" + to_string(helper_fn_id))
+    }
+    if arg_count < 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_iat_dispatch] expected=arg_count>=0 got=" + to_string(arg_count))
+    }
+    let row = to_string(call_id) + "\t" + iat_va_hex + "\t" + fn_name
+        + "\t" + to_string(helper_fn_id) + "\t" + to_string(arg_count) + "\n"
+    piub_append_row(piub_iat_dispatch_path(), row)
+}
+
+// ─── record_helper_call: helper IPC kind=14/15 호출 + ts 추적 ───
+fn record_helper_call(helper_call_id: int, fn_id: int, kind: int,
+                      send_ts_ns: int, recv_ts_ns: int) -> void {
+    if helper_call_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_helper_call] expected=helper_call_id>0 got=" + to_string(helper_call_id))
+    }
+    if fn_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_helper_call] expected=fn_id>0 got=" + to_string(fn_id))
+    }
+    if kind != 14 {
+        if kind != 15 {
+            panic("pe_i386_user32_iat_bridge_real FAIL [record_helper_call] expected=kind in {14,15} got=" + to_string(kind))
+        }
+    }
+    if send_ts_ns < 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_helper_call] expected=send_ts_ns>=0 got=" + to_string(send_ts_ns))
+    }
+    if recv_ts_ns < 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_helper_call] expected=recv_ts_ns>=0 got=" + to_string(recv_ts_ns))
+    }
+    let row = to_string(helper_call_id) + "\t" + to_string(fn_id) + "\t"
+        + to_string(kind) + "\t" + to_string(send_ts_ns) + "\t"
+        + to_string(recv_ts_ns) + "\n"
+    piub_append_row(piub_helper_call_path(), row)
+}
+
+// ─── record_arg_marshal: arg index → helper wire 변환 추적 ───
+fn record_arg_marshal(marshal_id: int, helper_call_id: int, arg_idx: int,
+                      arg_value_hex: str, arg_kind: int) -> void {
+    if marshal_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_arg_marshal] expected=marshal_id>0 got=" + to_string(marshal_id))
+    }
+    if helper_call_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_arg_marshal] expected=helper_call_id>0 got=" + to_string(helper_call_id))
+    }
+    if arg_idx < 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_arg_marshal] expected=arg_idx>=0 got=" + to_string(arg_idx))
+    }
+    if arg_value_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_arg_marshal] expected=arg_value_hex!=empty got=empty")
+    }
+    if arg_kind < 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_arg_marshal] expected=arg_kind>=0 got=" + to_string(arg_kind))
+    }
+    if arg_kind > 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_arg_marshal] expected=arg_kind<=4 got=" + to_string(arg_kind))
+    }
+    let row = to_string(marshal_id) + "\t" + to_string(helper_call_id) + "\t"
+        + to_string(arg_idx) + "\t" + arg_value_hex + "\t"
+        + to_string(arg_kind) + "\n"
+    piub_append_row(piub_arg_marshal_path(), row)
+}
+
+// ─── record_response: helper → shim return value 추적 ───
+fn record_response(response_id: int, helper_call_id: int,
+                   return_value_hex: str, ack_status: int) -> void {
+    if response_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_response] expected=response_id>0 got=" + to_string(response_id))
+    }
+    if helper_call_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_response] expected=helper_call_id>0 got=" + to_string(helper_call_id))
+    }
+    if return_value_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_response] expected=return_value_hex!=empty got=empty")
+    }
+    if ack_status < 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_response] expected=ack_status>=0 got=" + to_string(ack_status))
+    }
+    let row = to_string(response_id) + "\t" + to_string(helper_call_id) + "\t"
+        + return_value_hex + "\t" + to_string(ack_status) + "\n"
+    piub_append_row(piub_response_path(), row)
+}
+
+// ─── record_callback_back: helper → shim WM_* callback 역방향 routing ───
+fn record_callback_back(callback_id: int, msg_code_hex: str, hwnd_hex: str,
+                        wparam_hex: str, lparam_hex: str) -> void {
+    if callback_id <= 0 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_callback_back] expected=callback_id>0 got=" + to_string(callback_id))
+    }
+    if msg_code_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_callback_back] expected=msg_code_hex!=empty got=empty")
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_callback_back] expected=hwnd_hex!=empty got=empty")
+    }
+    if wparam_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_callback_back] expected=wparam_hex!=empty got=empty")
+    }
+    if lparam_hex == "" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [record_callback_back] expected=lparam_hex!=empty got=empty")
+    }
+    let row = to_string(callback_id) + "\t" + msg_code_hex + "\t" + hwnd_hex
+        + "\t" + wparam_hex + "\t" + lparam_hex + "\n"
+    piub_append_row(piub_callback_back_path(), row)
+}
+
+// ─── statistics ───
+fn iat_dispatch_count() -> int {
+    return piub_count_rows(piub_iat_dispatch_path(), 5)
+}
+
+fn helper_call_count() -> int {
+    return piub_count_rows(piub_helper_call_path(), 5)
+}
+
+fn arg_marshal_count() -> int {
+    return piub_count_rows(piub_arg_marshal_path(), 5)
+}
+
+fn response_count() -> int {
+    return piub_count_rows(piub_response_path(), 4)
+}
+
+fn callback_back_count() -> int {
+    return piub_count_rows(piub_callback_back_path(), 5)
+}
+
+fn piub_stats() -> array {
+    let mut out = []
+    out.push(iat_dispatch_count())
+    out.push(helper_call_count())
+    out.push(arg_marshal_count())
+    out.push(response_count())
+    out.push(callback_back_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 + assertions ───
+fn self_test() -> void {
+    let sid = "piub-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_piub()
+
+    // ─ 1. iat_dispatch × 4 — RegisterClassExA / CreateWindowExA / ShowWindow / GetMessageA ─
+    record_iat_dispatch(1, "0x00410000", "RegisterClassExA", 1, 1)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"iat_dispatch\",\"call_id\":1,\"iat_va\":\"0x00410000\",\"fn\":\"RegisterClassExA\",\"helper_fn_id\":1,\"args\":1")
+
+    record_iat_dispatch(2, "0x00410004", "CreateWindowExA", 2, 12)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"iat_dispatch\",\"call_id\":2,\"iat_va\":\"0x00410004\",\"fn\":\"CreateWindowExA\",\"helper_fn_id\":2,\"args\":12")
+
+    record_iat_dispatch(3, "0x00410008", "ShowWindow", 3, 2)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"iat_dispatch\",\"call_id\":3,\"iat_va\":\"0x00410008\",\"fn\":\"ShowWindow\",\"helper_fn_id\":3,\"args\":2")
+
+    record_iat_dispatch(4, "0x0041000C", "GetMessageA", 5, 4)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"iat_dispatch\",\"call_id\":4,\"iat_va\":\"0x0041000C\",\"fn\":\"GetMessageA\",\"helper_fn_id\":5,\"args\":4")
+
+    // ─ 2. helper_call × 4 — kind=14 (USER32) — fn_id 1/2/3/5, send/recv ts ─
+    record_helper_call(1, 1, 14, 100, 200)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"helper_call\",\"helper_call_id\":1,\"fn_id\":1,\"ipc_kind\":14,\"name\":\"user32_call\",\"send_ts_ns\":100,\"recv_ts_ns\":200")
+
+    record_helper_call(2, 2, 14, 200, 350)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"helper_call\",\"helper_call_id\":2,\"fn_id\":2,\"ipc_kind\":14,\"name\":\"user32_call\",\"send_ts_ns\":200,\"recv_ts_ns\":350")
+
+    record_helper_call(3, 3, 14, 150, 250)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"helper_call\",\"helper_call_id\":3,\"fn_id\":3,\"ipc_kind\":14,\"name\":\"user32_call\",\"send_ts_ns\":150,\"recv_ts_ns\":250")
+
+    record_helper_call(4, 5, 14, 400, 600)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"helper_call\",\"helper_call_id\":4,\"fn_id\":5,\"ipc_kind\":14,\"name\":\"user32_call\",\"send_ts_ns\":400,\"recv_ts_ns\":600")
+
+    // ─ 3. arg_marshal × 8 — CreateWindowExA 의 12 arg 중 8 sample ─
+    //    dwExStyle int / lpClassName ptr_str / lpWindowName ptr_str / dwStyle int /
+    //    x int / y int / w int / h int  (helper_call_id=2)
+    record_arg_marshal(1, 2, 0, "0x00000000", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":1,\"helper_call_id\":2,\"arg_idx\":0,\"arg_value\":\"0x00000000\",\"arg_kind\":0,\"arg_kind_name\":\"int\"")
+
+    record_arg_marshal(2, 2, 1, "0x00420000", 1)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":2,\"helper_call_id\":2,\"arg_idx\":1,\"arg_value\":\"0x00420000\",\"arg_kind\":1,\"arg_kind_name\":\"ptr_str\"")
+
+    record_arg_marshal(3, 2, 2, "0x00420020", 1)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":3,\"helper_call_id\":2,\"arg_idx\":2,\"arg_value\":\"0x00420020\",\"arg_kind\":1,\"arg_kind_name\":\"ptr_str\"")
+
+    record_arg_marshal(4, 2, 3, "0x00CF0000", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":4,\"helper_call_id\":2,\"arg_idx\":3,\"arg_value\":\"0x00CF0000\",\"arg_kind\":0,\"arg_kind_name\":\"int\"")
+
+    record_arg_marshal(5, 2, 4, "0x00000000", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":5,\"helper_call_id\":2,\"arg_idx\":4,\"arg_value\":\"0x00000000\",\"arg_kind\":0,\"arg_kind_name\":\"int\"")
+
+    record_arg_marshal(6, 2, 5, "0x00000000", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":6,\"helper_call_id\":2,\"arg_idx\":5,\"arg_value\":\"0x00000000\",\"arg_kind\":0,\"arg_kind_name\":\"int\"")
+
+    record_arg_marshal(7, 2, 6, "0x00000320", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":7,\"helper_call_id\":2,\"arg_idx\":6,\"arg_value\":\"0x00000320\",\"arg_kind\":0,\"arg_kind_name\":\"int\"")
+
+    record_arg_marshal(8, 2, 7, "0x00000258", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"arg_marshal\",\"marshal_id\":8,\"helper_call_id\":2,\"arg_idx\":7,\"arg_value\":\"0x00000258\",\"arg_kind\":0,\"arg_kind_name\":\"int\"")
+
+    // ─ 4. response × 4 — 각 helper_call 별 return value ─
+    //    1: RegisterClassExA → 1 (ATOM)
+    //    2: CreateWindowExA → 0x10001 (HWND)
+    //    3: ShowWindow → 1 (BOOL prev visible)
+    //    4: GetMessageA → 1 (BOOL got msg)
+    record_response(1, 1, "0x00000001", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"response\",\"response_id\":1,\"helper_call_id\":1,\"ret\":\"0x00000001\",\"ack_status\":0")
+
+    record_response(2, 2, "0x00010001", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"response\",\"response_id\":2,\"helper_call_id\":2,\"ret\":\"0x00010001\",\"ack_status\":0")
+
+    record_response(3, 3, "0x00000001", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"response\",\"response_id\":3,\"helper_call_id\":3,\"ret\":\"0x00000001\",\"ack_status\":0")
+
+    record_response(4, 4, "0x00000001", 0)
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"response\",\"response_id\":4,\"helper_call_id\":4,\"ret\":\"0x00000001\",\"ack_status\":0")
+
+    // ─ 5. callback_back × 2 — WM_LBUTTONDOWN 0x0201 / WM_KEYDOWN 0x0100 ─
+    record_callback_back(1, "0x00000201", "0x00010001", "0x00000001", "0x000A000A")
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"callback_back\",\"callback_id\":1,\"msg_code\":\"0x00000201\",\"hwnd\":\"0x00010001\",\"wparam\":\"0x00000001\",\"lparam\":\"0x000A000A\"")
+
+    record_callback_back(2, "0x00000100", "0x00010001", "0x0000000D", "0x001E0001")
+    r0_emit("pe_i386_user32_iat_bridge_real_record",
+        "\"kind\":\"callback_back\",\"callback_id\":2,\"msg_code\":\"0x00000100\",\"hwnd\":\"0x00010001\",\"wparam\":\"0x0000000D\",\"lparam\":\"0x001E0001\"")
+
+    // ─── assertions ───
+    let id = iat_dispatch_count()
+    if id != 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [iat_dispatch_count] expected=4 got=" + to_string(id))
+    }
+    let hc = helper_call_count()
+    if hc != 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [helper_call_count] expected=4 got=" + to_string(hc))
+    }
+    let am = arg_marshal_count()
+    if am != 8 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [arg_marshal_count] expected=8 got=" + to_string(am))
+    }
+    let rc = response_count()
+    if rc != 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [response_count] expected=4 got=" + to_string(rc))
+    }
+    let cb = callback_back_count()
+    if cb != 2 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [callback_back_count] expected=2 got=" + to_string(cb))
+    }
+
+    // ─── name lookup assertions ───
+    let kn14 = kind_name(14)
+    if kn14 != "user32_call" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [kind_name(14)] expected=user32_call got=" + kn14)
+    }
+    let kn15 = kind_name(15)
+    if kn15 != "gdi32_call" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [kind_name(15)] expected=gdi32_call got=" + kn15)
+    }
+    let ak0 = arg_kind_name(0)
+    if ak0 != "int" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [arg_kind_name(0)] expected=int got=" + ak0)
+    }
+    let ak1 = arg_kind_name(1)
+    if ak1 != "ptr_str" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [arg_kind_name(1)] expected=ptr_str got=" + ak1)
+    }
+    let ak2 = arg_kind_name(2)
+    if ak2 != "ptr_struct" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [arg_kind_name(2)] expected=ptr_struct got=" + ak2)
+    }
+    let ak3 = arg_kind_name(3)
+    if ak3 != "hwnd" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [arg_kind_name(3)] expected=hwnd got=" + ak3)
+    }
+    let ak4 = arg_kind_name(4)
+    if ak4 != "hdc" {
+        panic("pe_i386_user32_iat_bridge_real FAIL [arg_kind_name(4)] expected=hdc got=" + ak4)
+    }
+
+    // ─── stats sanity ───
+    let s = piub_stats()
+    if len(s) != 5 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [stats iat_dispatch] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [stats helper_call] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 8 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [stats arg_marshal] expected=8 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [stats response] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [stats callback_back] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (record 22 + 이 1 = 23 ≥ 14) ───
+    r0_emit("pe_i386_user32_iat_bridge_real_stats",
+        "\"iat_dispatch_count\":" + to_string(s[0])
+        + ",\"helper_call_count\":" + to_string(s[1])
+        + ",\"arg_marshal_count\":" + to_string(s[2])
+        + ",\"response_count\":" + to_string(s[3])
+        + ",\"callback_back_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_user32_iat_bridge_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_piub()
+    let s2 = piub_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_user32_iat_bridge_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_user32_iat_bridge_real self_test PASS (iat_dispatch=" + to_string(s[0])
+        + ", helper_call=" + to_string(s[1]) + ", arg_marshal=" + to_string(s[2])
+        + ", response=" + to_string(s[3]) + ", callback_back=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piub_stats()
+            println("iat_dispatch_count\t" + to_string(s[0]))
+            println("helper_call_count\t" + to_string(s[1]))
+            println("arg_marshal_count\t" + to_string(s[2]))
+            println("response_count\t" + to_string(s[3]))
+            println("callback_back_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piub()
+            println("cleaned: " + piub_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piub_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_user32_iat_bridge_real.hexa { self-test | stats | cleanup | dir }")
+}

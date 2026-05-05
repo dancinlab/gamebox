@@ -1,0 +1,438 @@
+// lib/loader/pe_kernelbase_core.hexa — KERNELBASE.dll modern Win32 forward-only API surface (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine kernelbase source 인용 0.
+//       kernelbase.dll 직접 binding 0. macOS POSIX bridge / Mach VM / dispatch_io / Foundation
+//       NSFileManager·NSData·NSURL·NSDictionary·NSURLSession 직접 binding 0.
+//       NOTE: KERNELBASE 측 KERNEL32 split fn 측 modern Win32 API 측 forward-only surface
+//       baseline; GetFileInformationByHandleEx + VirtualAlloc2 + CreateRemoteThreadEx 측
+//       BY_HANDLE_FILE_INFORMATION_EX / MEM_EXTENDED_PARAMETER / PROCESS_MITIGATION_POLICY
+//       round-trip (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 16 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BL1 — KERNELBASE modern split surface 12 fn skeleton-tier (file/memory/process modern).
+// cycle 55 352/435 (~80.92%) → cycle 56 ~364/435 (~83.68%) (+12 fn, BL bundled part 1/4).
+//
+// 대상 fn (12 fn — 3 group, fn_kind 0..11):
+//   FILE_EXTRAS    (4): GetFileInformationByHandleEx(0) / SetFileInformationByHandle(1) /
+//                       CopyFile2(2) / FindFirstFileExW(3)
+//   MEMORY         (4): VirtualAlloc2(4) / MapViewOfFile3(5) / CreateFileMappingFromApp(6) /
+//                       VirtualLock(7)
+//   PROCESS_MODERN (4): CreateRemoteThreadEx(8) / SetProcessMitigationPolicy(9) /
+//                       GetProcessMitigationPolicy(10) / CreateProcessAsUserW(11)
+//
+// synthetic struct families:
+//   FILE_BASIC_INFO 40B / FILE_STANDARD_INFO 24B / FILE_NAME_INFO_var d2r_savegame_d2s.
+//   COPYFILE2_EXTENDED_PARAMETERS 40B dwSize=40 dwCopyFlags 0x00000001 COPY_FILE_FAIL_IF_EXISTS.
+//   WIN32_FIND_DATAW 592B d4_install_root.
+//   MEM_EXTENDED_PARAMETER 16B Type=2 ULONG64 NumaNode + MEM_RESERVE_PLACEHOLDER 0x40000.
+//   PROCESS_MITIGATION_POLICY enum DEP=0 ASLR=1 ControlFlowGuard=7 BinarySignature=8.
+//   STARTUPINFOEX 112B + LPPROC_THREAD_ATTRIBUTE_LIST 0xC0010100 synth.
+//
+// persist schema (TSV — 4 table):
+//   syscall_invoke / file_extras_event / memory_event / process_modern_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn put_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_kernelbase_core"
+}
+
+fn put_syscall_invoke_path() -> str {
+    return put_dir() + "/syscall_invoke.tsv"
+}
+
+fn put_file_extras_event_path() -> str {
+    return put_dir() + "/file_extras_event.tsv"
+}
+
+fn put_memory_event_path() -> str {
+    return put_dir() + "/memory_event.tsv"
+}
+
+fn put_process_modern_event_path() -> str {
+    return put_dir() + "/process_modern_event.tsv"
+}
+
+fn put_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + put_dir() + "'")
+}
+
+fn cleanup_put() -> void {
+    put_ensure_dir()
+    let _ = exec("rm -f '" + put_syscall_invoke_path() + "' '" + put_file_extras_event_path()
+        + "' '" + put_memory_event_path() + "' '" + put_process_modern_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn put_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn put_append_row(path: str, row: str) -> void {
+    put_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn put_count_rows(path: str, min_cols: int) -> int {
+    let t = put_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (12 fn coverage, fn_kind 0..11) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "GetFileInformationByHandleEx" }
+    if k == 1 { return "SetFileInformationByHandle" }
+    if k == 2 { return "CopyFile2" }
+    if k == 3 { return "FindFirstFileExW" }
+    if k == 4 { return "VirtualAlloc2" }
+    if k == 5 { return "MapViewOfFile3" }
+    if k == 6 { return "CreateFileMappingFromApp" }
+    if k == 7 { return "VirtualLock" }
+    if k == 8 { return "CreateRemoteThreadEx" }
+    if k == 9 { return "SetProcessMitigationPolicy" }
+    if k == 10 { return "GetProcessMitigationPolicy" }
+    if k == 11 { return "CreateProcessAsUserW" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (3 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "file_extras"
+        }
+    }
+    if k >= 4 {
+        if k <= 7 {
+            return "memory"
+        }
+    }
+    if k >= 8 {
+        if k <= 11 {
+            return "process_modern"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: KERNELBASE fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_kernelbase_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_kernelbase_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 11 {
+        panic("pe_kernelbase_core FAIL [record_syscall_invoke] expected=fn_kind<=11 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_kernelbase_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_kernelbase_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    put_append_row(put_syscall_invoke_path(), row)
+}
+
+// ─── record_file_extras_event: GetFileInformationByHandleEx/SetFileInformationByHandle/CopyFile2/FindFirstFileExW row ───
+fn record_file_extras_event(evt_id: int, f_kind: str, info_class: str, file_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_kernelbase_core FAIL [record_file_extras_event] evt_id<=0") }
+    if f_kind == "" { panic("pe_kernelbase_core FAIL [record_file_extras_event] f_kind=empty") }
+    if info_class == "" { panic("pe_kernelbase_core FAIL [record_file_extras_event] info_class=empty") }
+    if file_synth == "" { panic("pe_kernelbase_core FAIL [record_file_extras_event] file_synth=empty") }
+    if status == "" { panic("pe_kernelbase_core FAIL [record_file_extras_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + f_kind + "\t" + info_class + "\t" + file_synth + "\t" + status + "\n"
+    put_append_row(put_file_extras_event_path(), row)
+}
+
+// ─── record_memory_event: VirtualAlloc2/MapViewOfFile3/CreateFileMappingFromApp/VirtualLock row ───
+fn record_memory_event(evt_id: int, m_kind: str, addr_synth: str, size_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_kernelbase_core FAIL [record_memory_event] evt_id<=0") }
+    if m_kind == "" { panic("pe_kernelbase_core FAIL [record_memory_event] m_kind=empty") }
+    if addr_synth == "" { panic("pe_kernelbase_core FAIL [record_memory_event] addr_synth=empty") }
+    if size_synth == "" { panic("pe_kernelbase_core FAIL [record_memory_event] size_synth=empty") }
+    if status == "" { panic("pe_kernelbase_core FAIL [record_memory_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + m_kind + "\t" + addr_synth + "\t" + size_synth + "\t" + status + "\n"
+    put_append_row(put_memory_event_path(), row)
+}
+
+// ─── record_process_modern_event: CreateRemoteThreadEx/(Set|Get)ProcessMitigationPolicy/CreateProcessAsUserW row ───
+fn record_process_modern_event(evt_id: int, p_kind: str, policy_synth: str, target_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_kernelbase_core FAIL [record_process_modern_event] evt_id<=0") }
+    if p_kind == "" { panic("pe_kernelbase_core FAIL [record_process_modern_event] p_kind=empty") }
+    if policy_synth == "" { panic("pe_kernelbase_core FAIL [record_process_modern_event] policy_synth=empty") }
+    if target_synth == "" { panic("pe_kernelbase_core FAIL [record_process_modern_event] target_synth=empty") }
+    if status == "" { panic("pe_kernelbase_core FAIL [record_process_modern_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + p_kind + "\t" + policy_synth + "\t" + target_synth + "\t" + status + "\n"
+    put_append_row(put_process_modern_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return put_count_rows(put_syscall_invoke_path(), 4)
+}
+
+fn file_extras_event_count() -> int {
+    return put_count_rows(put_file_extras_event_path(), 5)
+}
+
+fn memory_event_count() -> int {
+    return put_count_rows(put_memory_event_path(), 5)
+}
+
+fn process_modern_event_count() -> int {
+    return put_count_rows(put_process_modern_event_path(), 5)
+}
+
+fn put_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(file_extras_event_count())
+    out.push(memory_event_count())
+    out.push(process_modern_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 16 ───
+fn self_test() -> void {
+    let sid = "put-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_put()
+
+    // ─── 1. syscall_invoke × 12 (one per fn, 3 group coverage) ───
+    //   FILE_EXTRAS group (4)
+    record_syscall_invoke(1, 0, "GetFileInformationByHandleEx", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL GetFileInformationByHandleEx")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"GetFileInformationByHandleEx\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"hFile\":\"0xC0010100_HFILE\",\"FileInformationClass\":\"FileBasicInfo_0\",\"out_lpFileInformation\":\"FILE_BASIC_INFO_40B\",\"dwBufferSize\":40,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(2, 1, "SetFileInformationByHandle", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL SetFileInformationByHandle")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"SetFileInformationByHandle\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"hFile\":\"0xC0010100_HFILE\",\"FileInformationClass\":\"FileEndOfFileInfo_6\",\"lpFileInformation\":\"FILE_END_OF_FILE_INFO_8B_synth\",\"dwBufferSize\":8,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(3, 2, "CopyFile2", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL CopyFile2")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"CopyFile2\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"pwszExistingFileName\":\"d2r_install_savegame_src_d2s\",\"pwszNewFileName\":\"d2r_install_savegame_dst_d2s\",\"pExtendedParameters\":\"COPYFILE2_EXTENDED_PARAMETERS_40B_dwCopyFlags_0x1\",\"struct_bytes\":40,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(4, 3, "FindFirstFileExW", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL FindFirstFileExW")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"FindFirstFileExW\",\"fn_group\":\"file_extras\",\"status\":\"PARTIAL\",\"lpFileName\":\"d4_install_root_search_pattern\",\"fInfoLevelId\":\"FindExInfoBasic_1\",\"lpFindFileData\":\"WIN32_FIND_DATAW_592B\",\"struct_bytes\":592,\"fSearchOp\":\"FindExSearchNameMatch_0\",\"out_HANDLE\":\"0xC0020100_HFIND\",\"return_handle\":\"0xC0020100\"")
+
+    //   MEMORY group (4)
+    record_syscall_invoke(5, 4, "VirtualAlloc2", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL VirtualAlloc2")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"VirtualAlloc2\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"Process\":\"NULL_self\",\"BaseAddress\":\"NULL_let_OS_choose\",\"Size\":\"0x100000_1MB\",\"AllocationType\":\"MEM_RESERVE_PLACEHOLDER_0x40000\",\"PageProtection\":\"PAGE_NOACCESS_0x1\",\"ExtendedParameters\":\"MEM_EXTENDED_PARAMETER_16B_Type_2_NumaNode\",\"ParameterCount\":1,\"return_lpvoid\":\"0xC0030000_VA\"")
+    record_syscall_invoke(6, 5, "MapViewOfFile3", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL MapViewOfFile3")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"MapViewOfFile3\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"FileMapping\":\"0xC0040100_HSEC\",\"Process\":\"NULL_self\",\"BaseAddress\":\"0xC0030000_placeholder\",\"Offset\":0,\"ViewSize\":\"0x100000\",\"AllocationType\":\"MEM_REPLACE_PLACEHOLDER_0x4000\",\"PageProtection\":\"PAGE_READWRITE_0x4\",\"return_lpvoid\":\"0xC0030000\"")
+    record_syscall_invoke(7, 6, "CreateFileMappingFromApp", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL CreateFileMappingFromApp")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"CreateFileMappingFromApp\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"hFile\":\"0xC0010100_HFILE\",\"SecurityAttributes\":0,\"PageProtection\":\"PAGE_READWRITE_0x4\",\"MaximumSize\":\"0x100000\",\"Name\":\"d2r_savegame_d2s_mmap\",\"return_handle\":\"0xC0040100_HSEC\"")
+    record_syscall_invoke(8, 7, "VirtualLock", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL VirtualLock")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"VirtualLock\",\"fn_group\":\"memory\",\"status\":\"PARTIAL\",\"lpAddress\":\"0xC0030000\",\"dwSize\":\"0x100000_1MB\",\"return_bool\":\"TRUE_1\",\"working_set_lock_baseline\":\"warden_anti_paging\"")
+
+    //   PROCESS_MODERN group (4)
+    record_syscall_invoke(9, 8, "CreateRemoteThreadEx", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL CreateRemoteThreadEx")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"CreateRemoteThreadEx\",\"fn_group\":\"process_modern\",\"status\":\"PARTIAL\",\"hProcess\":\"0xC0050100_HPROCESS_d2r\",\"lpThreadAttributes\":0,\"dwStackSize\":0,\"lpStartAddress\":\"0x7FFE00001000_synth_RVA\",\"lpParameter\":0,\"dwCreationFlags\":\"CREATE_SUSPENDED_0x4\",\"lpAttributeList\":\"PROC_THREAD_ATTRIBUTE_LIST_0xC0010100_synth\",\"out_lpThreadId\":12345,\"return_handle\":\"0xC0060100_HTHREAD\"")
+    record_syscall_invoke(10, 9, "SetProcessMitigationPolicy", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL SetProcessMitigationPolicy")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"SetProcessMitigationPolicy\",\"fn_group\":\"process_modern\",\"status\":\"PARTIAL\",\"MitigationPolicy\":\"ProcessControlFlowGuardPolicy_7\",\"lpBuffer\":\"PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY_4B_EnableControlFlowGuard_1\",\"dwLength\":4,\"return_bool\":\"TRUE_1\",\"warden_compat_baseline\":true")
+    record_syscall_invoke(11, 10, "GetProcessMitigationPolicy", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL GetProcessMitigationPolicy")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"GetProcessMitigationPolicy\",\"fn_group\":\"process_modern\",\"status\":\"PARTIAL\",\"hProcess\":\"0xC0050100_HPROCESS_d2r\",\"MitigationPolicy\":\"ProcessSignaturePolicy_8\",\"lpBuffer\":\"PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY_4B\",\"dwLength\":4,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(12, 11, "CreateProcessAsUserW", "PARTIAL")
+    println("__KERNELBASE__ PARTIAL CreateProcessAsUserW")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"CreateProcessAsUserW\",\"fn_group\":\"process_modern\",\"status\":\"PARTIAL\",\"hToken\":\"0xC0070100_HTOKEN_user_synth\",\"lpApplicationName\":\"d4_launcher_exe\",\"lpCommandLine\":\"--user-mode-headless\",\"lpProcessAttributes\":0,\"lpThreadAttributes\":0,\"bInheritHandles\":\"FALSE_0\",\"dwCreationFlags\":\"NORMAL_PRIORITY_CLASS_0x20\",\"lpStartupInfo\":\"STARTUPINFOEX_112B\",\"out_lpProcessInformation\":\"PROCESS_INFORMATION_24B_pid_2048_tid_2049\",\"return_bool\":\"TRUE_1\"")
+
+    // ─── 2. file_extras_event × 4 (info-by-handle/set/copy2/find-ex) ───
+    record_file_extras_event(1, "info_by_handle_basic", "FileBasicInfo_0", "FILE_BASIC_INFO_40B_d2r_savegame_d2s", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"file_extras_event\",\"evt_id\":1,\"f_kind\":\"info_by_handle_basic\",\"info_class\":\"FileBasicInfo_0\",\"file_synth\":\"FILE_BASIC_INFO_40B_d2r_savegame_d2s\",\"struct_bytes\":40,\"d2r_savegame_baseline\":true,\"status\":\"PARTIAL\"")
+    record_file_extras_event(2, "set_eof_truncate", "FileEndOfFileInfo_6", "FILE_END_OF_FILE_INFO_8B_d4_log_truncate", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"file_extras_event\",\"evt_id\":2,\"f_kind\":\"set_eof_truncate\",\"info_class\":\"FileEndOfFileInfo_6\",\"file_synth\":\"FILE_END_OF_FILE_INFO_8B_d4_log_truncate\",\"struct_bytes\":8,\"d4_install_log_baseline\":true,\"status\":\"PARTIAL\"")
+    record_file_extras_event(3, "copy2_savegame", "COPYFILE2_EXTENDED_PARAMETERS_40B", "savegame_d2s_to_backup", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"file_extras_event\",\"evt_id\":3,\"f_kind\":\"copy2_savegame\",\"info_class\":\"COPYFILE2_EXTENDED_PARAMETERS_40B\",\"file_synth\":\"savegame_d2s_to_backup\",\"struct_bytes\":40,\"dwCopyFlags\":\"COPY_FILE_FAIL_IF_EXISTS_0x1\",\"battlenet_install_baseline\":true,\"status\":\"PARTIAL\"")
+    record_file_extras_event(4, "find_ex_install_root", "FindExInfoBasic_1", "WIN32_FIND_DATAW_592B_d4_install_root", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"file_extras_event\",\"evt_id\":4,\"f_kind\":\"find_ex_install_root\",\"info_class\":\"FindExInfoBasic_1\",\"file_synth\":\"WIN32_FIND_DATAW_592B_d4_install_root\",\"struct_bytes\":592,\"fSearchOp\":\"FindExSearchNameMatch_0\",\"d4_install_scan_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── 3. memory_event × 4 (alloc2/map3/mapping_app/lock) ───
+    record_memory_event(1, "alloc2_placeholder", "0xC0030000", "0x100000_1MB", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"memory_event\",\"evt_id\":1,\"m_kind\":\"alloc2_placeholder\",\"addr_synth\":\"0xC0030000\",\"size_synth\":\"0x100000_1MB\",\"AllocationType\":\"MEM_RESERVE_PLACEHOLDER_0x40000\",\"NumaNode\":1,\"d2r_savegame_arena_baseline\":true,\"status\":\"PARTIAL\"")
+    record_memory_event(2, "map3_replace_placeholder", "0xC0030000", "0x100000_1MB", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"memory_event\",\"evt_id\":2,\"m_kind\":\"map3_replace_placeholder\",\"addr_synth\":\"0xC0030000\",\"size_synth\":\"0x100000_1MB\",\"AllocationType\":\"MEM_REPLACE_PLACEHOLDER_0x4000\",\"PageProtection\":\"PAGE_READWRITE_0x4\",\"d2r_mpq_arena_baseline\":true,\"status\":\"PARTIAL\"")
+    record_memory_event(3, "mapping_from_app", "0xC0040100_HSEC", "0x100000_1MB", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"memory_event\",\"evt_id\":3,\"m_kind\":\"mapping_from_app\",\"addr_synth\":\"0xC0040100_HSEC\",\"size_synth\":\"0x100000_1MB\",\"PageProtection\":\"PAGE_READWRITE_0x4\",\"name_synth\":\"d2r_savegame_d2s_mmap\",\"status\":\"PARTIAL\"")
+    record_memory_event(4, "lock_warden_anti_paging", "0xC0030000", "0x100000_1MB", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"memory_event\",\"evt_id\":4,\"m_kind\":\"lock_warden_anti_paging\",\"addr_synth\":\"0xC0030000\",\"size_synth\":\"0x100000_1MB\",\"working_set_lock_baseline\":\"warden_anti_paging\",\"warden_compat_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── 4. process_modern_event × 4 (remote_thread_ex/set_mitigation/get_mitigation/createprocess_as_user) ───
+    record_process_modern_event(1, "remote_thread_ex_d2r_inject", "PROC_THREAD_ATTRIBUTE_LIST_0xC0010100_synth", "0xC0050100_HPROCESS_d2r", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"process_modern_event\",\"evt_id\":1,\"p_kind\":\"remote_thread_ex_d2r_inject\",\"policy_synth\":\"PROC_THREAD_ATTRIBUTE_LIST_0xC0010100_synth\",\"target_synth\":\"0xC0050100_HPROCESS_d2r\",\"dwCreationFlags\":\"CREATE_SUSPENDED_0x4\",\"out_lpThreadId\":12345,\"d2r_remote_thread_baseline\":true,\"status\":\"PARTIAL\"")
+    record_process_modern_event(2, "set_mitigation_cfg", "ProcessControlFlowGuardPolicy_7", "PROCESS_MITIGATION_CFG_4B_Enable_1", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"process_modern_event\",\"evt_id\":2,\"p_kind\":\"set_mitigation_cfg\",\"policy_synth\":\"ProcessControlFlowGuardPolicy_7\",\"target_synth\":\"PROCESS_MITIGATION_CFG_4B_Enable_1\",\"struct_bytes\":4,\"warden_compat_baseline\":true,\"status\":\"PARTIAL\"")
+    record_process_modern_event(3, "get_mitigation_signature", "ProcessSignaturePolicy_8", "PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY_4B", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"process_modern_event\",\"evt_id\":3,\"p_kind\":\"get_mitigation_signature\",\"policy_synth\":\"ProcessSignaturePolicy_8\",\"target_synth\":\"PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY_4B\",\"struct_bytes\":4,\"battlenet_signature_check_baseline\":true,\"status\":\"PARTIAL\"")
+    record_process_modern_event(4, "createprocess_as_user_d4_launcher", "STARTUPINFOEX_112B", "d4_launcher_exe", "PARTIAL")
+    r0_emit("pe_kernelbase_core_record", "\"kind\":\"process_modern_event\",\"evt_id\":4,\"p_kind\":\"createprocess_as_user_d4_launcher\",\"policy_synth\":\"STARTUPINFOEX_112B\",\"target_synth\":\"d4_launcher_exe\",\"struct_bytes\":112,\"hToken\":\"0xC0070100_HTOKEN_user_synth\",\"out_pid\":2048,\"out_tid\":2049,\"d4_launcher_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 12 {
+        panic("pe_kernelbase_core FAIL [syscall_invoke_count] expected=12 got=" + to_string(si))
+    }
+    let fe = file_extras_event_count()
+    if fe != 4 {
+        panic("pe_kernelbase_core FAIL [file_extras_event_count] expected=4 got=" + to_string(fe))
+    }
+    let me = memory_event_count()
+    if me != 4 {
+        panic("pe_kernelbase_core FAIL [memory_event_count] expected=4 got=" + to_string(me))
+    }
+    let pme = process_modern_event_count()
+    if pme != 4 {
+        panic("pe_kernelbase_core FAIL [process_modern_event_count] expected=4 got=" + to_string(pme))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "GetFileInformationByHandleEx" { panic("pe_kernelbase_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "CopyFile2" { panic("pe_kernelbase_core FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "VirtualAlloc2" { panic("pe_kernelbase_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(8) != "CreateRemoteThreadEx" { panic("pe_kernelbase_core FAIL [fn_kind_name(8)]") }
+    if fn_kind_name(11) != "CreateProcessAsUserW" { panic("pe_kernelbase_core FAIL [fn_kind_name(11)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_kernelbase_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "file_extras" { panic("pe_kernelbase_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "memory" { panic("pe_kernelbase_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(8) != "process_modern" { panic("pe_kernelbase_core FAIL [fn_group_name(8)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_kernelbase_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = put_stats()
+    if len(s) != 4 { panic("pe_kernelbase_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 12 { panic("pe_kernelbase_core FAIL [stats syscall_invoke_count] expected=12 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_kernelbase_core FAIL [stats file_extras_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_kernelbase_core FAIL [stats memory_event_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 4 { panic("pe_kernelbase_core FAIL [stats process_modern_event_count] expected=4 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_kernelbase_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"file_extras_event_count\":" + to_string(s[1])
+        + ",\"memory_event_count\":" + to_string(s[2])
+        + ",\"process_modern_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_kernelbase_core_summary",
+        "\"target\":\"KERNELBASE.dll\",\"fn_total\":12,\"fn_emit_partial\":12,\"groups\":[\"file_extras\",\"memory\",\"process_modern\"],\"hfile_synth\":\"0xC0010100\",\"file_basic_info_bytes\":40,\"copyfile2_ext_params_bytes\":40,\"win32_find_dataw_bytes\":592,\"mem_extended_param_bytes\":16,\"startupinfoex_bytes\":112,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_kernelbase_core_kpi",
+        "\"file_extras_emits\":4,\"memory_emits\":4,\"process_modern_emits\":4,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"d2r_savegame_baseline\":true,\"d4_launcher_baseline\":true,\"battlenet_install_baseline\":true,\"posix_bridge_binding\":false,\"mach_vm_binding\":false,\"nsfilemanager_binding\":false")
+
+    // ─── cycle 55 → 56 KERNELBASE coverage progression evidence emit ───
+    r0_emit("pe_kernelbase_core_coverage_progression",
+        "\"surface\":\"KERNELBASE_full_435_fn\",\"cycle_55_count\":352,\"cycle_56_count\":364,\"delta\":12,\"cycle_55_percent\":80.92,\"cycle_56_percent\":83.68,\"cycle_56_module\":\"pe_kernelbase_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bl1_cycle_increment\":12,\"track_bl_bundled_part_1_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_kernelbase_core_round_trip_matrix",
+        "\"surface\":\"KERNELBASE_core_12_fn\",\"fn_partial\":12,\"fn_groups\":3,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real GetFileInformationByHandleEx + VirtualAlloc2 + CreateRemoteThreadEx = POSIX fstat/mmap_named/dispatch_io + Mach VM vm_allocate/vm_protect + pthread_create_in_target_task bridge pending separate cycle (long-horizon modern split API pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BL1 expansion emit (cycle 56, KERNELBASE +12 fn) ───
+    r0_emit("pe_kernelbase_core_bl1_expansion",
+        "\"track\":\"BL1\",\"cycle\":56,\"surface\":\"KERNELBASE_new\",\"new_fn\":12,\"groups\":[\"file_extras\",\"memory\",\"process_modern\"],\"file_extras_count\":4,\"memory_count\":4,\"process_modern_count\":4,\"emit_format\":\"__KERNELBASE__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_1_evidence_augment\":true,\"track_bl_bundled_part_1_of_4\":true,\"kernel32_split_modern_family\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 16 {
+        panic("pe_kernelbase_core FAIL [r0 emit count] expected=>=16 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_put()
+    let s2 = put_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_kernelbase_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_kernelbase_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", file_extras_event=" + to_string(s[1])
+        + ", memory_event=" + to_string(s[2]) + ", process_modern_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = put_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("file_extras_event_count\t" + to_string(s[1]))
+            println("memory_event_count\t" + to_string(s[2]))
+            println("process_modern_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_kernelbase_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_kernelbase_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_put()
+            println("cleaned: " + put_dir())
+            return
+        }
+        if sub == "dir" {
+            println(put_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_kernelbase_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

@@ -1,0 +1,398 @@
+// lib/loader/pe_heap_walk.hexa — cycle 72 Win32 HeapWalk / HeapValidate iterator skeleton
+//
+// Win32 process heap walker — HeapWalk(hHeap, &PROCESS_HEAP_ENTRY) 로 heap chain
+// 순회 + HeapValidate(hHeap, 0, NULL) 무결성 검증. region (PROCESS_HEAP_REGION),
+// busy block (PROCESS_HEAP_ENTRY_BUSY), free block, uncommitted range 를 entry_kind
+// 로 분류해 telemetry table 에 누적.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 entry iterator tracker — 실 HeapWalk() 호출 X (host helper stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// entry_kind code:
+//   1 = region        (PROCESS_HEAP_REGION)
+//   2 = busy          (PROCESS_HEAP_ENTRY_BUSY allocated block)
+//   3 = free          (free block on freelist)
+//   4 = uncommitted   (PROCESS_HEAP_UNCOMMITTED_RANGE)
+//
+// persist schema (TSV — walks.tsv):
+//   walk_id<int> \t entry_kind<int> \t entry_size<int> \t region_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn phw_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_heap_walk"
+}
+
+fn phw_walks_path() -> str {
+    return phw_dir() + "/walks.tsv"
+}
+
+fn phw_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + phw_dir() + "'")
+}
+
+fn cleanup_phw() -> void {
+    phw_ensure_dir()
+    let _ = exec("rm -f '" + phw_walks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn phw_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn phw_append_row(path: str, row: str) -> void {
+    phw_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_walk: heap entry 1 건 기록 ───
+fn record_walk(walk_id: int, entry_kind: int, entry_size: int, region_id: int) -> void {
+    if walk_id <= 0 {
+        panic("pe_heap_walk FAIL [record_walk] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if entry_kind < 1 {
+        panic("pe_heap_walk FAIL [record_walk] expected=entry_kind>=1 got=" + to_string(entry_kind))
+    }
+    if entry_kind > 4 {
+        panic("pe_heap_walk FAIL [record_walk] expected=entry_kind<=4 got=" + to_string(entry_kind))
+    }
+    if entry_size < 0 {
+        panic("pe_heap_walk FAIL [record_walk] expected=entry_size>=0 got=" + to_string(entry_size))
+    }
+    if region_id < 0 {
+        panic("pe_heap_walk FAIL [record_walk] expected=region_id>=0 got=" + to_string(region_id))
+    }
+    let row = to_string(walk_id) + "\t" + to_string(entry_kind)
+        + "\t" + to_string(entry_size) + "\t" + to_string(region_id) + "\n"
+    phw_append_row(phw_walks_path(), row)
+}
+
+// ─── walk_count: total entry 수 ───
+fn walk_count() -> int {
+    let t = phw_read_table(phw_walks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_entry_size: 모든 entry_size 합 ───
+fn total_entry_size() -> int {
+    let t = phw_read_table(phw_walks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_entry_kind: 특정 entry_kind 의 entry 수 ───
+fn count_by_entry_kind(entry_kind: int) -> int {
+    let t = phw_read_table(phw_walks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == entry_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_regions: 고유 region_id 개수 ───
+fn distinct_regions() -> int {
+    let t = phw_read_table(phw_walks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let rid = to_int(parts[3])
+                let mut found = false
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == rid {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    seen.push(rid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── walk_size: 특정 walk_id 의 entry_size (없으면 0) ───
+fn walk_size(walk_id: int) -> int {
+    let t = phw_read_table(phw_walks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == walk_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── phw_stats: [walk_count, total_entry_size, distinct_regions, count_by_entry_kind(2)] ───
+fn phw_stats() -> array {
+    let mut out = []
+    out.push(walk_count())
+    out.push(total_entry_size())
+    out.push(distinct_regions())
+    out.push(count_by_entry_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "phw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_phw()
+
+    // 2. record 6 walks across all 4 entry_kinds and 2 regions
+    record_walk(120001, 1, 65536, 1)
+    r0_emit("pe_heap_walk_record",
+        "\"walk_id\":120001,\"entry_kind\":1,\"entry_size\":65536,\"region_id\":1,\"target\":\"region\"")
+
+    record_walk(120002, 2, 256, 1)
+    r0_emit("pe_heap_walk_record",
+        "\"walk_id\":120002,\"entry_kind\":2,\"entry_size\":256,\"region_id\":1,\"target\":\"busy\"")
+
+    record_walk(120003, 3, 128, 1)
+    r0_emit("pe_heap_walk_record",
+        "\"walk_id\":120003,\"entry_kind\":3,\"entry_size\":128,\"region_id\":1,\"target\":\"free\"")
+
+    record_walk(120004, 4, 4096, 1)
+    r0_emit("pe_heap_walk_record",
+        "\"walk_id\":120004,\"entry_kind\":4,\"entry_size\":4096,\"region_id\":1,\"target\":\"uncommitted\"")
+
+    record_walk(120005, 1, 131072, 2)
+    r0_emit("pe_heap_walk_record",
+        "\"walk_id\":120005,\"entry_kind\":1,\"entry_size\":131072,\"region_id\":2,\"target\":\"region\"")
+
+    record_walk(120006, 2, 512, 2)
+    r0_emit("pe_heap_walk_record",
+        "\"walk_id\":120006,\"entry_kind\":2,\"entry_size\":512,\"region_id\":2,\"target\":\"busy\"")
+
+    // 3. walk_count = 6
+    let c = walk_count()
+    if c != 6 {
+        panic("pe_heap_walk FAIL [walk_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_entry_size = 65536 + 256 + 128 + 4096 + 131072 + 512 = 201600
+    let ts = total_entry_size()
+    if ts != 201600 {
+        panic("pe_heap_walk FAIL [total_entry_size] expected=201600 got=" + to_string(ts))
+    }
+
+    // 5. count_by_entry_kind sanity
+    let k1 = count_by_entry_kind(1)
+    if k1 != 2 {
+        panic("pe_heap_walk FAIL [count_by_entry_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_entry_kind(2)
+    if k2 != 2 {
+        panic("pe_heap_walk FAIL [count_by_entry_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_entry_kind(3)
+    if k3 != 1 {
+        panic("pe_heap_walk FAIL [count_by_entry_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_entry_kind(4)
+    if k4 != 1 {
+        panic("pe_heap_walk FAIL [count_by_entry_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_entry_kind(99)
+    if k99 != 0 {
+        panic("pe_heap_walk FAIL [count_by_entry_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_regions = 2
+    let dr = distinct_regions()
+    if dr != 2 {
+        panic("pe_heap_walk FAIL [distinct_regions] expected=2 got=" + to_string(dr))
+    }
+
+    // 7. walk_size sanity
+    let s2 = walk_size(120002)
+    if s2 != 256 {
+        panic("pe_heap_walk FAIL [walk_size(120002)] expected=256 got=" + to_string(s2))
+    }
+    let s4 = walk_size(120004)
+    if s4 != 4096 {
+        panic("pe_heap_walk FAIL [walk_size(120004)] expected=4096 got=" + to_string(s4))
+    }
+    let s_miss = walk_size(9999)
+    if s_miss != 0 {
+        panic("pe_heap_walk FAIL [walk_size(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. phw_stats() = [6, 201600, 2, 2]
+    let s = phw_stats()
+    if len(s) != 4 {
+        panic("pe_heap_walk FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_heap_walk FAIL [stats walk_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 201600 {
+        panic("pe_heap_walk FAIL [stats total_entry_size] expected=201600 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_heap_walk FAIL [stats distinct_regions] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_heap_walk FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_heap_walk_stats",
+        "\"walk_count\":" + to_string(s[0])
+        + ",\"total_entry_size\":" + to_string(s[1])
+        + ",\"distinct_regions\":" + to_string(s[2])
+        + ",\"kind_busy\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_heap_walk FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_phw()
+    let s_post = phw_stats()
+    let i = 0
+    while i < len(s_post) {
+        if s_post[i] != 0 {
+            panic("pe_heap_walk FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s_post[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_heap_walk self_test PASS (walks=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", regions=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = phw_stats()
+            println("walk_count\t" + to_string(s[0]))
+            println("total_entry_size\t" + to_string(s[1]))
+            println("distinct_regions\t" + to_string(s[2]))
+            println("count_kind_busy\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let wid = to_int(a[3])
+                println("walk_size\t" + to_string(walk_size(wid)))
+                return
+            }
+            println("usage: hexa run pe_heap_walk.hexa size <walk_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let entry_kind = to_int(a[3])
+                println("count_by_entry_kind\t" + to_string(count_by_entry_kind(entry_kind)))
+                return
+            }
+            println("usage: hexa run pe_heap_walk.hexa count <entry_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_phw()
+            println("cleaned: " + phw_dir())
+            return
+        }
+        if sub == "dir" {
+            println(phw_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_heap_walk.hexa { self-test | stats | size <walk_id> | count <entry_kind> | cleanup | dir }")
+}

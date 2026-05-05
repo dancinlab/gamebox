@@ -1,0 +1,752 @@
+// lib/loader/win32_kernel32_stage2.hexa — Phase 3a stage2 thread + sync 실제 simulation
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft 공식 Win32 API spec:
+//     - Threads:    https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/
+//     - Sync:       https://learn.microsoft.com/en-us/windows/win32/api/synchapi/
+//     - WaitFor:    https://learn.microsoft.com/en-us/windows/win32/sync/wait-functions
+//   Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 4 (실제: k32s2_thread + k32s2_mutex + k32s2_event + k32s2_cs)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("win32_kernel32_stage2 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 3a stage2 — stage1 = file/memory, stage2 = thread/sync):
+//   hexa stage1 native thread 부재 → fork-based 또는 single-threaded simulation.
+//   Win32 thread/sync API 호출 → 4 종 handle table 경유 → 동작 round-trip 검증.
+//
+// handle id 범위 (handle type 식별 = id range 기반):
+//   thread          : 7xxx  (7000 = synthetic main thread, 7001 부터 발급)
+//   mutex           : 8xxx
+//   event           : 9xxx
+//   critical section: 10xxx
+//
+// 4 handle tables (TSV):
+//   thread_table.tsv  : "tid\tstate\texit_code\tstart_ts"
+//                          state ∈ { running, signaled, exited }
+//   mutex_table.tsv   : "mid\towner_thread\tlock_count\tcreated_ts"
+//                          owner_thread = 0 (free) 또는 tid.
+//   event_table.tsv   : "eid\tsignaled\tmanual_reset\tcreated_ts"
+//                          signaled  ∈ { 0, 1 }
+//                          manual_reset ∈ { 0, 1 }
+//   cs_table.tsv      : "csid\towner_thread\trecursion\tcreated_ts"
+//                          recursion = lock 깊이 (re-entrant).
+//
+// wait_for_single_object semantics (synthetic):
+//   - thread (7xxx) : 항상 즉시 signaled (synthetic instant completion). state → "signaled".
+//   - mutex (8xxx)  : owner == 0 → acquire (owner = current_thread, lock_count = 1) → 0.
+//                     owner == current_thread → re-entrant (lock_count++) → 0.
+//                     owner != current_thread → timeout 258 (간단화 — 실제 wait 미구현).
+//   - event (9xxx)  : signaled == 1 → 0. auto-reset (manual_reset == 0) 일 경우 reset.
+//                     signaled == 0 → 258 (timeout).
+//   - cs (10xxx)    : wait 미적용 (enter/leave 별도 API).
+//
+// Win32 retval 정의:
+//   WAIT_OBJECT_0   = 0
+//   WAIT_TIMEOUT    = 258 (0x102)
+
+use "../perf/r0_common"
+
+// ─── handle table 디렉터리 ───
+fn handle_dir() -> str {
+    return GAMEBOX_HOME + "/persist/k32s2_handles"
+}
+
+fn thread_table_path() -> str {
+    return handle_dir() + "/thread_table.tsv"
+}
+
+fn mutex_table_path() -> str {
+    return handle_dir() + "/mutex_table.tsv"
+}
+
+fn event_table_path() -> str {
+    return handle_dir() + "/event_table.tsv"
+}
+
+fn cs_table_path() -> str {
+    return handle_dir() + "/cs_table.tsv"
+}
+
+fn ensure_dirs() -> void {
+    let _ = exec("mkdir -p '" + handle_dir() + "'")
+}
+
+// ─── 일반 TSV 읽기/쓰기 ───
+fn read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn write_table(path: str, content: str) -> void {
+    ensure_dirs()
+    write_file(path, content)
+}
+
+fn append_row(path: str, row: str) -> void {
+    ensure_dirs()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn cleanup_all() -> void {
+    ensure_dirs()
+    let _ = exec("rm -f '" + thread_table_path() + "' '" + mutex_table_path() + "' '" + event_table_path() + "' '" + cs_table_path() + "'")
+}
+
+fn now_ts() -> str {
+    return exec("date +%s").trim()
+}
+
+// ─── 다음 handle id (해당 table 내 max + 1; empty → base) ───
+fn next_id_in_table(path: str, base: int) -> int {
+    let t = read_table(path)
+    if t == "" {
+        return base
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let max_h = base - 1
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                let h = to_int(parts[0])
+                if h > max_h {
+                    max_h = h
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_h + 1
+}
+
+// ─── lookup row by id (4 column 형식 공통) → "c1\tc2\tc3" 또는 "" ───
+fn lookup_row(path: str, hnd: int) -> str {
+    let t = read_table(path)
+    if t == "" {
+        return ""
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── update row: 동일 id row 만 새 값으로 교체 ───
+fn update_row(path: str, hnd: int, c1: str, c2: str, c3: str) -> bool {
+    let t = read_table(path)
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    let mut out = ""
+    let mut found = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    out = out + key + "\t" + c1 + "\t" + c2 + "\t" + c3 + "\n"
+                    found = true
+                } else {
+                    out = out + line + "\n"
+                }
+            }
+        }
+        i = i + 1
+    }
+    if found {
+        write_table(path, out)
+    }
+    return found
+}
+
+// ─── remove row by id ───
+fn remove_row(path: str, hnd: int) -> bool {
+    let t = read_table(path)
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    let mut out = ""
+    let mut found = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                if parts[0] == key {
+                    found = true
+                } else {
+                    out = out + line + "\n"
+                }
+            }
+        }
+        i = i + 1
+    }
+    write_table(path, out)
+    return found
+}
+
+// ─── row count ───
+fn count_rows(path: str) -> int {
+    let t = read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                c = c + 1
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── synthetic main thread = 7000 (table 미저장 — 항상 존재) ───
+fn get_current_thread() -> int {
+    return 7000
+}
+
+// ─── CreateThread(start_proc) → synthetic thread ───
+//   실제 pthread_create 우회 — synthetic id 발급 + state="running".
+//   다음 wait_for_single_object 호출 시 즉시 signaled (synthetic instant completion).
+//   start_proc 는 *기록 only* (실행 없음 — stage2 = simulation).
+fn create_thread(start_proc: str) -> int {
+    ensure_dirs()
+    let tid = next_id_in_table(thread_table_path(), 7001)
+    let row = to_string(tid) + "\trunning\t0\t" + now_ts() + "\n"
+    append_row(thread_table_path(), row)
+    // start_proc 는 현재 schema 외 — 향후 enriched row 확장 시 활용.
+    let _ = start_proc
+    return tid
+}
+
+// ─── ExitThread(code) → current thread state="exited", exit_code=code ───
+//   synthetic main (7000) 은 table 부재 → no-op true.
+fn exit_thread(code: int) -> bool {
+    let cur = get_current_thread()
+    if cur == 7000 {
+        // synthetic main — table 외. true.
+        return true
+    }
+    return update_row(thread_table_path(), cur, "exited", to_string(code), now_ts())
+}
+
+// ─── WaitForSingleObject(handle, timeout_ms) ───
+//   retval: 0 = WAIT_OBJECT_0 (signaled / acquired)
+//           258 = WAIT_TIMEOUT
+//           -1 = invalid handle (Win32 0xFFFFFFFF, 단순화)
+fn wait_for_single_object(hnd: int, timeout_ms: int) -> int {
+    // thread 7xxx
+    if hnd >= 7000 {
+        if hnd < 8000 {
+            // synthetic main 7000 → 항상 signaled (즉시 self-wait return).
+            if hnd == 7000 {
+                return 0
+            }
+            let row = lookup_row(thread_table_path(), hnd)
+            if row == "" {
+                return -1
+            }
+            // synthetic instant completion: state → signaled, return 0.
+            let parts = row.split("\t")
+            // parts[0]=state, parts[1]=exit_code, parts[2]=start_ts
+            let _ = update_row(thread_table_path(), hnd, "signaled", parts[1], parts[2])
+            let _ = timeout_ms
+            return 0
+        }
+    }
+    // mutex 8xxx
+    if hnd >= 8000 {
+        if hnd < 9000 {
+            let row = lookup_row(mutex_table_path(), hnd)
+            if row == "" {
+                return -1
+            }
+            let parts = row.split("\t")
+            // parts[0]=owner_thread, parts[1]=lock_count, parts[2]=created_ts
+            let owner = to_int(parts[0])
+            let lock_count = to_int(parts[1])
+            let cur = get_current_thread()
+            if owner == 0 {
+                // free → acquire.
+                let _ = update_row(mutex_table_path(), hnd, to_string(cur), "1", parts[2])
+                return 0
+            }
+            if owner == cur {
+                // re-entrant: increment.
+                let _ = update_row(mutex_table_path(), hnd, parts[0], to_string(lock_count + 1), parts[2])
+                return 0
+            }
+            // 다른 thread 소유 → 단순화: timeout.
+            let _ = timeout_ms
+            return 258
+        }
+    }
+    // event 9xxx
+    if hnd >= 9000 {
+        if hnd < 10000 {
+            let row = lookup_row(event_table_path(), hnd)
+            if row == "" {
+                return -1
+            }
+            let parts = row.split("\t")
+            // parts[0]=signaled, parts[1]=manual_reset, parts[2]=created_ts
+            let signaled = to_int(parts[0])
+            let manual_reset = to_int(parts[1])
+            if signaled == 1 {
+                if manual_reset == 0 {
+                    // auto-reset → consume (signaled → 0).
+                    let _ = update_row(event_table_path(), hnd, "0", parts[1], parts[2])
+                }
+                let _ = timeout_ms
+                return 0
+            }
+            // signaled == 0 → timeout.
+            let _ = timeout_ms
+            return 258
+        }
+    }
+    // critical section 등 — wait_for_single_object 미지원 → -1.
+    return -1
+}
+
+// ─── CreateMutexW(initial_owner) → synthetic mutex ───
+fn create_mutex_w(initial_owner: bool) -> int {
+    ensure_dirs()
+    let mid = next_id_in_table(mutex_table_path(), 8000)
+    let mut owner = "0"
+    let mut lc = "0"
+    if initial_owner {
+        owner = to_string(get_current_thread())
+        lc = "1"
+    }
+    let row = to_string(mid) + "\t" + owner + "\t" + lc + "\t" + now_ts() + "\n"
+    append_row(mutex_table_path(), row)
+    return mid
+}
+
+// ─── ReleaseMutex(handle) → owner == current_thread 일 때만 release ───
+//   re-entrant: lock_count > 1 → decrement. lock_count == 1 → owner = 0.
+fn release_mutex(hnd: int) -> bool {
+    let row = lookup_row(mutex_table_path(), hnd)
+    if row == "" {
+        return false
+    }
+    let parts = row.split("\t")
+    let owner = to_int(parts[0])
+    let lock_count = to_int(parts[1])
+    let cur = get_current_thread()
+    if owner != cur {
+        return false
+    }
+    if lock_count > 1 {
+        return update_row(mutex_table_path(), hnd, parts[0], to_string(lock_count - 1), parts[2])
+    }
+    // 마지막 release → free.
+    return update_row(mutex_table_path(), hnd, "0", "0", parts[2])
+}
+
+// ─── CreateEvent(manual_reset, initial_state) → synthetic event ───
+fn create_event(manual_reset: bool, initial_state: bool) -> int {
+    ensure_dirs()
+    let eid = next_id_in_table(event_table_path(), 9000)
+    let mut signaled = "0"
+    if initial_state {
+        signaled = "1"
+    }
+    let mut mr = "0"
+    if manual_reset {
+        mr = "1"
+    }
+    let row = to_string(eid) + "\t" + signaled + "\t" + mr + "\t" + now_ts() + "\n"
+    append_row(event_table_path(), row)
+    return eid
+}
+
+fn set_event(hnd: int) -> bool {
+    let row = lookup_row(event_table_path(), hnd)
+    if row == "" {
+        return false
+    }
+    let parts = row.split("\t")
+    return update_row(event_table_path(), hnd, "1", parts[1], parts[2])
+}
+
+fn reset_event(hnd: int) -> bool {
+    let row = lookup_row(event_table_path(), hnd)
+    if row == "" {
+        return false
+    }
+    let parts = row.split("\t")
+    return update_row(event_table_path(), hnd, "0", parts[1], parts[2])
+}
+
+// ─── InitializeCriticalSection() → synthetic CS ───
+fn initialize_critical_section() -> int {
+    ensure_dirs()
+    let csid = next_id_in_table(cs_table_path(), 10000)
+    let row = to_string(csid) + "\t0\t0\t" + now_ts() + "\n"
+    append_row(cs_table_path(), row)
+    return csid
+}
+
+// ─── EnterCriticalSection — re-entrant (owner == cur 일 때 recursion++) ───
+fn enter_critical_section(cs: int) -> bool {
+    let row = lookup_row(cs_table_path(), cs)
+    if row == "" {
+        return false
+    }
+    let parts = row.split("\t")
+    let owner = to_int(parts[0])
+    let recursion = to_int(parts[1])
+    let cur = get_current_thread()
+    if owner == 0 {
+        return update_row(cs_table_path(), cs, to_string(cur), "1", parts[2])
+    }
+    if owner == cur {
+        return update_row(cs_table_path(), cs, parts[0], to_string(recursion + 1), parts[2])
+    }
+    // 다른 thread 소유 — stage2 single-threaded simulation 에선 발생 X. false.
+    return false
+}
+
+fn leave_critical_section(cs: int) -> bool {
+    let row = lookup_row(cs_table_path(), cs)
+    if row == "" {
+        return false
+    }
+    let parts = row.split("\t")
+    let owner = to_int(parts[0])
+    let recursion = to_int(parts[1])
+    let cur = get_current_thread()
+    if owner != cur {
+        return false
+    }
+    if recursion > 1 {
+        return update_row(cs_table_path(), cs, parts[0], to_string(recursion - 1), parts[2])
+    }
+    // 마지막 leave — owner=0, recursion=0.
+    return update_row(cs_table_path(), cs, "0", "0", parts[2])
+}
+
+fn delete_critical_section(cs: int) -> bool {
+    return remove_row(cs_table_path(), cs)
+}
+
+// ─── handle_counts() → [threads, mutexes, events, css] ───
+//   각 table 의 row 수 (synthetic main 7000 은 table 외 → 미포함).
+fn handle_counts() -> array {
+    let mut out = []
+    out.push(count_rows(thread_table_path()))
+    out.push(count_rows(mutex_table_path()))
+    out.push(count_rows(event_table_path()))
+    out.push(count_rows(cs_table_path()))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "k32s2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_all()
+
+    // 2. main thread = 7000
+    let tid = get_current_thread()
+    if tid != 7000 {
+        panic("win32_kernel32_stage2 FAIL [get_current_thread] expected=7000 got=" + to_string(tid))
+    }
+
+    // 3. create_thread → > 0 (7xxx range)
+    let thread1 = create_thread("test_proc")
+    if thread1 <= 0 {
+        panic("win32_kernel32_stage2 FAIL [create_thread] expected=>0 got=" + to_string(thread1))
+    }
+    if thread1 < 7001 {
+        panic("win32_kernel32_stage2 FAIL [thread range] expected=>=7001 got=" + to_string(thread1))
+    }
+    if thread1 >= 8000 {
+        panic("win32_kernel32_stage2 FAIL [thread range upper] expected=<8000 got=" + to_string(thread1))
+    }
+
+    // 4. wait_for_single_object(thread1, 0) → 0 (synthetic instant)
+    let wt = wait_for_single_object(thread1, 0)
+    if wt != 0 {
+        panic("win32_kernel32_stage2 FAIL [wait thread] expected=0 got=" + to_string(wt))
+    }
+
+    // r0_emit "k32s2_thread"
+    r0_emit("k32s2_thread",
+        "\"tid\":" + to_string(thread1)
+        + ",\"wait_result\":" + to_string(wt)
+        + ",\"main_tid\":" + to_string(tid))
+
+    // 5. create_mutex_w(false) → > 0 (8xxx)
+    let mutex = create_mutex_w(false)
+    if mutex <= 0 {
+        panic("win32_kernel32_stage2 FAIL [create_mutex_w] expected=>0 got=" + to_string(mutex))
+    }
+    if mutex < 8000 {
+        panic("win32_kernel32_stage2 FAIL [mutex range] expected=>=8000 got=" + to_string(mutex))
+    }
+    if mutex >= 9000 {
+        panic("win32_kernel32_stage2 FAIL [mutex range upper] expected=<9000 got=" + to_string(mutex))
+    }
+
+    // 6. wait_for_single_object(mutex, 100) → 0 (acquired)
+    let wm = wait_for_single_object(mutex, 100)
+    if wm != 0 {
+        panic("win32_kernel32_stage2 FAIL [wait mutex acquire] expected=0 got=" + to_string(wm))
+    }
+
+    // 7. release_mutex → true
+    let rm = release_mutex(mutex)
+    if !rm {
+        panic("win32_kernel32_stage2 FAIL [release_mutex] expected=true got=false")
+    }
+
+    // release 후 owner = 0 (다시 wait 가능 — sanity check)
+    let row_m = lookup_row(mutex_table_path(), mutex)
+    if row_m == "" {
+        panic("win32_kernel32_stage2 FAIL [mutex post-release lookup] expected=row got=empty")
+    }
+    let pm = row_m.split("\t")
+    if pm[0] != "0" {
+        panic("win32_kernel32_stage2 FAIL [mutex owner after release] expected=0 got=" + pm[0])
+    }
+
+    // r0_emit "k32s2_mutex"
+    r0_emit("k32s2_mutex",
+        "\"mid\":" + to_string(mutex)
+        + ",\"acquire\":" + to_string(wm)
+        + ",\"released\":1")
+
+    // 8. create_event(true, false) → > 0 (9xxx, manual_reset, not signaled)
+    let event1 = create_event(true, false)
+    if event1 <= 0 {
+        panic("win32_kernel32_stage2 FAIL [create_event] expected=>0 got=" + to_string(event1))
+    }
+    if event1 < 9000 {
+        panic("win32_kernel32_stage2 FAIL [event range] expected=>=9000 got=" + to_string(event1))
+    }
+    if event1 >= 10000 {
+        panic("win32_kernel32_stage2 FAIL [event range upper] expected=<10000 got=" + to_string(event1))
+    }
+
+    // 9. wait_for_single_object(event1, 0) → 258 (timeout — not signaled)
+    let we1 = wait_for_single_object(event1, 0)
+    if we1 != 258 {
+        panic("win32_kernel32_stage2 FAIL [wait event timeout] expected=258 got=" + to_string(we1))
+    }
+
+    // 10. set_event → true
+    let se = set_event(event1)
+    if !se {
+        panic("win32_kernel32_stage2 FAIL [set_event] expected=true got=false")
+    }
+
+    // 11. wait_for_single_object(event1, 0) → 0 (signaled)
+    let we2 = wait_for_single_object(event1, 0)
+    if we2 != 0 {
+        panic("win32_kernel32_stage2 FAIL [wait event signaled] expected=0 got=" + to_string(we2))
+    }
+
+    // manual_reset 이므로 wait 후에도 signaled 유지 검증
+    let row_e = lookup_row(event_table_path(), event1)
+    if row_e == "" {
+        panic("win32_kernel32_stage2 FAIL [event lookup] expected=row got=empty")
+    }
+    let pe = row_e.split("\t")
+    if pe[0] != "1" {
+        panic("win32_kernel32_stage2 FAIL [event manual_reset persist] expected=1 got=" + pe[0])
+    }
+
+    // 12. reset_event → true
+    let re = reset_event(event1)
+    if !re {
+        panic("win32_kernel32_stage2 FAIL [reset_event] expected=true got=false")
+    }
+    let row_e2 = lookup_row(event_table_path(), event1)
+    let pe2 = row_e2.split("\t")
+    if pe2[0] != "0" {
+        panic("win32_kernel32_stage2 FAIL [event signaled after reset] expected=0 got=" + pe2[0])
+    }
+
+    // r0_emit "k32s2_event"
+    r0_emit("k32s2_event",
+        "\"eid\":" + to_string(event1)
+        + ",\"timeout_first\":" + to_string(we1)
+        + ",\"signaled_after_set\":" + to_string(we2))
+
+    // 13. initialize_critical_section → > 0 (10xxx)
+    let cs = initialize_critical_section()
+    if cs <= 0 {
+        panic("win32_kernel32_stage2 FAIL [initialize_critical_section] expected=>0 got=" + to_string(cs))
+    }
+    if cs < 10000 {
+        panic("win32_kernel32_stage2 FAIL [cs range] expected=>=10000 got=" + to_string(cs))
+    }
+
+    // 14. enter_critical_section → true
+    let ec = enter_critical_section(cs)
+    if !ec {
+        panic("win32_kernel32_stage2 FAIL [enter_critical_section] expected=true got=false")
+    }
+
+    // re-entrant sanity: 두 번째 enter 도 성공 + recursion=2
+    let ec2 = enter_critical_section(cs)
+    if !ec2 {
+        panic("win32_kernel32_stage2 FAIL [enter_critical_section re-entrant] expected=true got=false")
+    }
+    let row_cs = lookup_row(cs_table_path(), cs)
+    let pc = row_cs.split("\t")
+    if pc[1] != "2" {
+        panic("win32_kernel32_stage2 FAIL [cs recursion] expected=2 got=" + pc[1])
+    }
+
+    // 두 번 leave 해야 owner 해제
+    let lc1 = leave_critical_section(cs)
+    if !lc1 {
+        panic("win32_kernel32_stage2 FAIL [leave_critical_section 1] expected=true got=false")
+    }
+
+    // 15. leave_critical_section → true (마지막 — owner 해제)
+    let lc2 = leave_critical_section(cs)
+    if !lc2 {
+        panic("win32_kernel32_stage2 FAIL [leave_critical_section] expected=true got=false")
+    }
+    let row_cs2 = lookup_row(cs_table_path(), cs)
+    let pc2 = row_cs2.split("\t")
+    if pc2[0] != "0" {
+        panic("win32_kernel32_stage2 FAIL [cs owner after final leave] expected=0 got=" + pc2[0])
+    }
+
+    // 16. delete_critical_section → true
+    let dc = delete_critical_section(cs)
+    if !dc {
+        panic("win32_kernel32_stage2 FAIL [delete_critical_section] expected=true got=false")
+    }
+    // delete 후 lookup → ""
+    let row_cs3 = lookup_row(cs_table_path(), cs)
+    if row_cs3 != "" {
+        panic("win32_kernel32_stage2 FAIL [post-delete cs lookup] expected=empty got=" + row_cs3)
+    }
+
+    // r0_emit "k32s2_cs"
+    r0_emit("k32s2_cs",
+        "\"csid\":" + to_string(cs)
+        + ",\"enter\":1,\"leave\":1,\"deleted\":1")
+
+    // 17. handle_counts → [1, 1, 1, 0]
+    let counts = handle_counts()
+    if len(counts) != 4 {
+        panic("win32_kernel32_stage2 FAIL [counts len] expected=4 got=" + to_string(len(counts)))
+    }
+    if counts[0] != 1 {
+        panic("win32_kernel32_stage2 FAIL [counts threads] expected=1 got=" + to_string(counts[0]))
+    }
+    if counts[1] != 1 {
+        panic("win32_kernel32_stage2 FAIL [counts mutexes] expected=1 got=" + to_string(counts[1]))
+    }
+    if counts[2] != 1 {
+        panic("win32_kernel32_stage2 FAIL [counts events] expected=1 got=" + to_string(counts[2]))
+    }
+    if counts[3] != 0 {
+        panic("win32_kernel32_stage2 FAIL [counts css] expected=0 got=" + to_string(counts[3]))
+    }
+
+    // exit_thread on synthetic main = no-op true
+    let et = exit_thread(0)
+    if !et {
+        panic("win32_kernel32_stage2 FAIL [exit_thread main no-op] expected=true got=false")
+    }
+
+    // 18. emit count >= 4 검증
+    let emit_n = r0_session_count(sid)
+    if emit_n < 4 {
+        panic("win32_kernel32_stage2 FAIL [r0 emit count] expected=>=4 got=" + to_string(emit_n))
+    }
+
+    // 19. cleanup
+    cleanup_all()
+
+    // 20. PASS
+    println("  ✅ win32_kernel32_stage2 self_test PASS (1 thread + 1 mutex + 1 event + 1 cs, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "counts" {
+            let c = handle_counts()
+            println("threads\t" + to_string(c[0]))
+            println("mutexes\t" + to_string(c[1]))
+            println("events\t" + to_string(c[2]))
+            println("css\t" + to_string(c[3]))
+            return
+        }
+        if sub == "tables" {
+            println(thread_table_path())
+            println(mutex_table_path())
+            println(event_table_path())
+            println(cs_table_path())
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_all()
+            println("cleaned: " + handle_dir())
+            return
+        }
+        if sub == "current-thread" {
+            println(to_string(get_current_thread()))
+            return
+        }
+    }
+    println("usage: hexa run win32_kernel32_stage2.hexa { self-test | counts | tables | cleanup | current-thread }")
+}

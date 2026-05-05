@@ -1,0 +1,280 @@
+// lib/loader/win32_abi.hexa — Phase 1 — x64 ABI shim skeleton
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   - Microsoft x64 ABI:   https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions
+//   - System V AMD64 ABI:  https://gitlab.com/x86-psABIs/x86-64-ABI
+//   참조 only — Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 1 (실제 ≥ 2: abi_convert_plan + abi_validation)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("win32_abi FAIL [<sub>] expected=X got=Y")
+//
+// 범위:
+//   x64 calling-convention 변환 *명세* (mapping table + plan summary).
+//   실제 register / stack manipulation 은 hexa stage1 에서 직접 수행 불가 →
+//   Phase 1 = 명세 검증 layer. native trampoline 은 stage2 (Phase 2+) 에서.
+//
+// MS x64 (Windows) calling convention:
+//   - Integer args: RCX, RDX, R8, R9 (4 개) — 나머지 stack
+//   - FP args:      XMM0-XMM3 (4 개)        — 나머지 stack
+//   - Caller allocates 32-byte "shadow space" on stack (always)
+//   - Callee-saved: RBX, RBP, RDI, RSI, R12, R13, R14, R15
+//
+// System V AMD64 (macOS / Linux):
+//   - Integer args: RDI, RSI, RDX, RCX, R8, R9 (6 개) — 나머지 stack
+//   - FP args:      XMM0-XMM7 (8 개)
+//   - No shadow space
+//   - Callee-saved: RBX, RBP, R12, R13, R14, R15
+//
+// 변환 (MS x64 → System V):
+//   arg0: RCX → RDI
+//   arg1: RDX → RSI
+//   arg2: R8  → RDX
+//   arg3: R9  → RCX
+//   arg4+: stack → R8 / R9 + remainder stack rearrange (shadow space drop)
+
+use "../perf/r0_common"
+
+// ─── MS x64 → System V integer-register mapping ───
+// MS arg index (0..3) → System V register name.
+// arg ≥ 4 는 MS = stack, System V = R8/R9 (then stack) → "STACK" placeholder.
+fn ms_to_sv_int_reg(ms_arg_idx: int) -> str {
+    if ms_arg_idx == 0 { return "RDI" }   // RCX → RDI
+    if ms_arg_idx == 1 { return "RSI" }   // RDX → RSI
+    if ms_arg_idx == 2 { return "RDX" }   // R8  → RDX
+    if ms_arg_idx == 3 { return "RCX" }   // R9  → RCX
+    if ms_arg_idx == 4 { return "R8" }    // stack → R8
+    if ms_arg_idx == 5 { return "R9" }    // stack → R9
+    return "STACK"                         // 나머지: System V 도 stack
+}
+
+// ─── System V → MS x64 integer-register mapping ───
+// System V arg index (0..5) → MS x64 register name.
+// arg ≥ 4 는 MS x64 = stack (4 args 만 register).
+fn sv_to_ms_int_reg(sv_arg_idx: int) -> str {
+    if sv_arg_idx == 0 { return "RCX" }   // RDI → RCX
+    if sv_arg_idx == 1 { return "RDX" }   // RSI → RDX
+    if sv_arg_idx == 2 { return "R8" }    // RDX → R8
+    if sv_arg_idx == 3 { return "R9" }    // RCX → R9
+    if sv_arg_idx == 4 { return "STACK" } // R8  → stack (+ shadow space)
+    if sv_arg_idx == 5 { return "STACK" } // R9  → stack
+    return "STACK"
+}
+
+// ─── shadow space size for MS x64 ───
+// always 32 bytes regardless of arg count. caller pre-allocates before CALL.
+// System V 는 shadow space 없음 — trampoline 시 drop.
+fn ms_shadow_space_bytes() -> int {
+    return 32
+}
+
+// ─── callee-saved (non-volatile) register sets ───
+// MS x64 includes RDI / RSI as callee-saved (System V 와 다른 핵심 차이점).
+fn ms_callee_saved() -> array {
+    return ["RBX", "RBP", "RDI", "RSI", "R12", "R13", "R14", "R15"]
+}
+
+fn sv_callee_saved() -> array {
+    return ["RBX", "RBP", "R12", "R13", "R14", "R15"]
+}
+
+// ─── caller-saved (volatile) register sets ───
+// MS x64 caller-saved: RAX, RCX, RDX, R8, R9, R10, R11 (+ XMM0-XMM5)
+// System V caller-saved: RAX, RCX, RDX, RSI, RDI, R8-R11 (+ XMM0-XMM15)
+fn ms_caller_saved() -> array {
+    return ["RAX", "RCX", "RDX", "R8", "R9", "R10", "R11"]
+}
+
+fn sv_caller_saved() -> array {
+    return ["RAX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "R10", "R11"]
+}
+
+// ─── 변환 plan summary (textual) ───
+// MS x64 함수를 System V 환경에서 호출할 때 어떤 변환 단계가 필요한지 기술.
+// num_int_args = 정수/포인터 인자 개수.
+fn convert_plan_summary(num_int_args: int) -> str {
+    let n_in_reg = num_int_args
+    if n_in_reg > 4 {
+        n_in_reg = 4
+    }
+    let parts = "ms_to_sv plan: "
+    parts = parts + "move " + to_string(n_in_reg) + " int args from MS regs (RCX,RDX,R8,R9)"
+    parts = parts + " to SV regs (RDI,RSI,RDX,RCX)"
+    if num_int_args >= 5 {
+        let n_extra = num_int_args - 4
+        parts = parts + "; promote " + to_string(n_extra) + " stack args"
+        parts = parts + " into SV R8/R9 + stack rearrange"
+    }
+    parts = parts + "; drop 32B MS shadow space"
+    parts = parts + "; preserve callee-saved diff RDI/RSI (MS-saved, SV-volatile)"
+    return parts
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "abitest-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    let pass_count = 0
+    let test_count = 0
+
+    // 1. 4 args 케이스 — ms_to_sv_int_reg(0..3) = RDI / RSI / RDX / RCX
+    test_count = test_count + 1
+    let r0 = ms_to_sv_int_reg(0)
+    if r0 != "RDI" {
+        panic("win32_abi FAIL [ms_to_sv arg0] expected=RDI got=" + r0)
+    }
+    let r1 = ms_to_sv_int_reg(1)
+    if r1 != "RSI" {
+        panic("win32_abi FAIL [ms_to_sv arg1] expected=RSI got=" + r1)
+    }
+    let r2 = ms_to_sv_int_reg(2)
+    if r2 != "RDX" {
+        panic("win32_abi FAIL [ms_to_sv arg2] expected=RDX got=" + r2)
+    }
+    let r3 = ms_to_sv_int_reg(3)
+    if r3 != "RCX" {
+        panic("win32_abi FAIL [ms_to_sv arg3] expected=RCX got=" + r3)
+    }
+    pass_count = pass_count + 1
+
+    // 1b. reverse direction sanity — sv_to_ms_int_reg(0..3)
+    test_count = test_count + 1
+    let s0 = sv_to_ms_int_reg(0)
+    if s0 != "RCX" {
+        panic("win32_abi FAIL [sv_to_ms arg0] expected=RCX got=" + s0)
+    }
+    let s1 = sv_to_ms_int_reg(1)
+    if s1 != "RDX" {
+        panic("win32_abi FAIL [sv_to_ms arg1] expected=RDX got=" + s1)
+    }
+    let s2 = sv_to_ms_int_reg(2)
+    if s2 != "R8" {
+        panic("win32_abi FAIL [sv_to_ms arg2] expected=R8 got=" + s2)
+    }
+    let s3 = sv_to_ms_int_reg(3)
+    if s3 != "R9" {
+        panic("win32_abi FAIL [sv_to_ms arg3] expected=R9 got=" + s3)
+    }
+    pass_count = pass_count + 1
+
+    // 2. shadow space = 32 검증
+    test_count = test_count + 1
+    let shadow = ms_shadow_space_bytes()
+    if shadow != 32 {
+        panic("win32_abi FAIL [shadow_space] expected=32 got=" + to_string(shadow))
+    }
+    pass_count = pass_count + 1
+
+    // 3. ms_callee_saved 가 RDI/RSI 포함 (System V 와 다름) 검증
+    test_count = test_count + 1
+    let ms_saved = ms_callee_saved()
+    let sv_saved = sv_callee_saved()
+    // MS 는 8 개, SV 는 6 개여야 함
+    if len(ms_saved) != 8 {
+        panic("win32_abi FAIL [ms_callee_saved size] expected=8 got=" + to_string(len(ms_saved)))
+    }
+    if len(sv_saved) != 6 {
+        panic("win32_abi FAIL [sv_callee_saved size] expected=6 got=" + to_string(len(sv_saved)))
+    }
+    // MS 가 RDI / RSI 포함 검증
+    let i = 0
+    let has_rdi = false
+    let has_rsi = false
+    while i < len(ms_saved) {
+        if ms_saved[i] == "RDI" { has_rdi = true }
+        if ms_saved[i] == "RSI" { has_rsi = true }
+        i = i + 1
+    }
+    if has_rdi == false {
+        panic("win32_abi FAIL [ms_callee_saved RDI] expected=present got=absent")
+    }
+    if has_rsi == false {
+        panic("win32_abi FAIL [ms_callee_saved RSI] expected=present got=absent")
+    }
+    // SV 가 RDI / RSI *제외* 검증 (System V 에서는 volatile)
+    let j = 0
+    let sv_has_rdi = false
+    let sv_has_rsi = false
+    while j < len(sv_saved) {
+        if sv_saved[j] == "RDI" { sv_has_rdi = true }
+        if sv_saved[j] == "RSI" { sv_has_rsi = true }
+        j = j + 1
+    }
+    if sv_has_rdi {
+        panic("win32_abi FAIL [sv_callee_saved RDI] expected=absent got=present")
+    }
+    if sv_has_rsi {
+        panic("win32_abi FAIL [sv_callee_saved RSI] expected=absent got=present")
+    }
+    pass_count = pass_count + 1
+
+    // 4. convert_plan_summary(6) 가 stack rearrange 언급 포함 검증
+    test_count = test_count + 1
+    let plan6 = convert_plan_summary(6)
+    if plan6.index_of("stack rearrange") < 0 {
+        panic("win32_abi FAIL [plan_summary stack] expected=mentions-rearrange got=" + plan6)
+    }
+    if plan6.index_of("shadow space") < 0 {
+        panic("win32_abi FAIL [plan_summary shadow] expected=mentions-shadow got=" + plan6)
+    }
+    pass_count = pass_count + 1
+
+    // 5. r0_emit "abi_convert_plan" {num_args, plan}
+    let plan4 = convert_plan_summary(4)
+    r0_emit("abi_convert_plan",
+        "\"num_args\":4,\"plan\":\"" + plan4 + "\"")
+
+    // 6. r0_emit "abi_validation" {tests, pass}
+    r0_emit("abi_validation",
+        "\"tests\":" + to_string(test_count)
+        + ",\"pass\":" + to_string(pass_count)
+        + ",\"shadow_bytes\":" + to_string(shadow)
+        + ",\"ms_callee_saved_count\":" + to_string(len(ms_saved))
+        + ",\"sv_callee_saved_count\":" + to_string(len(sv_saved)))
+
+    // R0 emit count 검증 — 정확히 2 events (abi_convert_plan + abi_validation)
+    let emit_n = r0_session_count(sid)
+    if emit_n != 2 {
+        panic("win32_abi FAIL [r0 emit count] expected=2 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ win32_abi self_test PASS (4 reg mappings + 32B shadow + callee-saved diff + summary, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "summary" {
+            if len(a) >= 4 {
+                let n = to_int(a[3])
+                println(convert_plan_summary(n))
+                return
+            }
+            println(convert_plan_summary(4))
+            return
+        }
+        if sub == "ms-reg" {
+            if len(a) >= 4 {
+                let n = to_int(a[3])
+                println(ms_to_sv_int_reg(n))
+                return
+            }
+        }
+        if sub == "sv-reg" {
+            if len(a) >= 4 {
+                let n = to_int(a[3])
+                println(sv_to_ms_int_reg(n))
+                return
+            }
+        }
+    }
+    println("usage: hexa run win32_abi.hexa { self-test | summary [n] | ms-reg <i> | sv-reg <i> }")
+}

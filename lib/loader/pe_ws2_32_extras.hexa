@@ -1,0 +1,473 @@
+// lib/loader/pe_ws2_32_extras.hexa — WS2_32.dll Winsock advanced surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine ws2_32 source 인용 0.
+//       ws2_32.dll 직접 binding 0. macOS BSD socket(2)/kqueue/Network.framework/CFSocket
+//       직접 binding 0. NOTE: Track K1 pe_winsock_ws2_32.hexa (basic 20 fn) 의 advanced
+//       extension — WSAIoctl/AcceptEx/IOCP overlapped 측 Battle.net D2R/D4 IOCP server
+//       pattern + WSAOVERLAPPED/WSABUF/GUID_AcceptEx/sockaddr_in6 struct round-trip baseline.
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track AZ2 — WS2_32 advanced/IOCP/async surface 12 fn skeleton-tier.
+// cycle 44 230/435 (~52.87%) → cycle 45 ~242/435 (~55.63%) (+12 fn, AZ bundled part 2/4).
+// NOTE: Distinct from Track K1 pe_winsock_ws2_32.hexa (basic API).
+//
+// 대상 fn (12 fn — 4 group, fn_kind 0..11):
+//   IOCTL   (3): WSAIoctl(0) / WSARecvFrom(1) / WSASendTo(2)
+//   OPTIONS (4): getsockopt(3) / setsockopt(4) / getpeername(5) / getsockname(6)
+//   ASYNC   (3): AcceptEx(7) / ConnectEx(8) / DisconnectEx(9)
+//   MISC    (2): inet_pton(10) / inet_ntop(11)
+//
+// synthetic struct families:
+//   WSAOVERLAPPED 32B (Internal/Offset/hEvent 0x99010100/Pointer/pad).
+//   WSABUF 16B (len 1500 + buf ptr 0x99010200).
+//   GUID_AcceptEx 16B LE B5367DF1-CBAC-11CF (WSAID_ACCEPTEX).
+//   sockaddr_in 16B: AF_INET + port 1119 BE + 24.105.62.129 Battle.net REST.
+//   sockaddr_in6 28B: AF_INET6 + port 443 + addr 16B + scope_id 0.
+//   IOCP_completion_port 0x99020000.
+//   inet_pton/ntop "192.0.2.1" ↔ 0xC0000201 BE / "2001:db8::1" ↔ 16B LE.
+//
+// persist schema (TSV — 5 table): syscall_invoke/ioctl_event/option_event/async_event/misc_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwx_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ws2_32_extras"
+}
+
+fn pwx_syscall_invoke_path() -> str {
+    return pwx_dir() + "/syscall_invoke.tsv"
+}
+
+fn pwx_ioctl_event_path() -> str {
+    return pwx_dir() + "/ioctl_event.tsv"
+}
+
+fn pwx_option_event_path() -> str {
+    return pwx_dir() + "/option_event.tsv"
+}
+
+fn pwx_async_event_path() -> str {
+    return pwx_dir() + "/async_event.tsv"
+}
+
+fn pwx_misc_event_path() -> str {
+    return pwx_dir() + "/misc_event.tsv"
+}
+
+fn pwx_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwx_dir() + "'")
+}
+
+fn cleanup_pwx() -> void {
+    pwx_ensure_dir()
+    let _ = exec("rm -f '" + pwx_syscall_invoke_path() + "' '" + pwx_ioctl_event_path()
+        + "' '" + pwx_option_event_path() + "' '" + pwx_async_event_path()
+        + "' '" + pwx_misc_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwx_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwx_append_row(path: str, row: str) -> void {
+    pwx_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwx_count_rows(path: str, min_cols: int) -> int {
+    let t = pwx_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (12 fn coverage, fn_kind 0..11) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "WSAIoctl" }
+    if k == 1 { return "WSARecvFrom" }
+    if k == 2 { return "WSASendTo" }
+    if k == 3 { return "getsockopt" }
+    if k == 4 { return "setsockopt" }
+    if k == 5 { return "getpeername" }
+    if k == 6 { return "getsockname" }
+    if k == 7 { return "AcceptEx" }
+    if k == 8 { return "ConnectEx" }
+    if k == 9 { return "DisconnectEx" }
+    if k == 10 { return "inet_pton" }
+    if k == 11 { return "inet_ntop" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (4 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 2 {
+            return "ioctl"
+        }
+    }
+    if k >= 3 {
+        if k <= 6 {
+            return "options"
+        }
+    }
+    if k >= 7 {
+        if k <= 9 {
+            return "async"
+        }
+    }
+    if k >= 10 {
+        if k <= 11 {
+            return "misc"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: WS2_32 advanced fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_ws2_32_extras FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_ws2_32_extras FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 11 {
+        panic("pe_ws2_32_extras FAIL [record_syscall_invoke] expected=fn_kind<=11 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_ws2_32_extras FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_ws2_32_extras FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pwx_append_row(pwx_syscall_invoke_path(), row)
+}
+
+// ─── record_ioctl_event: WSAIoctl/WSARecvFrom/WSASendTo row ───
+fn record_ioctl_event(evt_id: int, i_kind: str, sock_synth: str, ovl_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_ws2_32_extras FAIL [record_ioctl_event] evt_id<=0") }
+    if i_kind == "" { panic("pe_ws2_32_extras FAIL [record_ioctl_event] i_kind=empty") }
+    if sock_synth == "" { panic("pe_ws2_32_extras FAIL [record_ioctl_event] sock_synth=empty") }
+    if ovl_synth == "" { panic("pe_ws2_32_extras FAIL [record_ioctl_event] ovl_synth=empty") }
+    if status == "" { panic("pe_ws2_32_extras FAIL [record_ioctl_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + i_kind + "\t" + sock_synth + "\t" + ovl_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_ioctl_event_path(), row)
+}
+
+// ─── record_option_event: getsockopt/setsockopt/getpeername/getsockname row ───
+fn record_option_event(evt_id: int, o_kind: str, sock_synth: str, opt_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_ws2_32_extras FAIL [record_option_event] evt_id<=0") }
+    if o_kind == "" { panic("pe_ws2_32_extras FAIL [record_option_event] o_kind=empty") }
+    if sock_synth == "" { panic("pe_ws2_32_extras FAIL [record_option_event] sock_synth=empty") }
+    if opt_synth == "" { panic("pe_ws2_32_extras FAIL [record_option_event] opt_synth=empty") }
+    if status == "" { panic("pe_ws2_32_extras FAIL [record_option_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + o_kind + "\t" + sock_synth + "\t" + opt_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_option_event_path(), row)
+}
+
+// ─── record_async_event: AcceptEx/ConnectEx/DisconnectEx row ───
+fn record_async_event(evt_id: int, a_kind: str, listen_sock_synth: str, async_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_ws2_32_extras FAIL [record_async_event] evt_id<=0") }
+    if a_kind == "" { panic("pe_ws2_32_extras FAIL [record_async_event] a_kind=empty") }
+    if listen_sock_synth == "" { panic("pe_ws2_32_extras FAIL [record_async_event] listen_sock_synth=empty") }
+    if async_synth == "" { panic("pe_ws2_32_extras FAIL [record_async_event] async_synth=empty") }
+    if status == "" { panic("pe_ws2_32_extras FAIL [record_async_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + a_kind + "\t" + listen_sock_synth + "\t" + async_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_async_event_path(), row)
+}
+
+// ─── record_misc_event: inet_pton/inet_ntop row ───
+fn record_misc_event(evt_id: int, m_kind: str, addr_str: str, addr_bytes: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_ws2_32_extras FAIL [record_misc_event] evt_id<=0") }
+    if m_kind == "" { panic("pe_ws2_32_extras FAIL [record_misc_event] m_kind=empty") }
+    if addr_str == "" { panic("pe_ws2_32_extras FAIL [record_misc_event] addr_str=empty") }
+    if addr_bytes == "" { panic("pe_ws2_32_extras FAIL [record_misc_event] addr_bytes=empty") }
+    if status == "" { panic("pe_ws2_32_extras FAIL [record_misc_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + m_kind + "\t" + addr_str + "\t" + addr_bytes + "\t" + status + "\n"
+    pwx_append_row(pwx_misc_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pwx_count_rows(pwx_syscall_invoke_path(), 4)
+}
+
+fn ioctl_event_count() -> int {
+    return pwx_count_rows(pwx_ioctl_event_path(), 5)
+}
+
+fn option_event_count() -> int {
+    return pwx_count_rows(pwx_option_event_path(), 5)
+}
+
+fn async_event_count() -> int {
+    return pwx_count_rows(pwx_async_event_path(), 5)
+}
+
+fn misc_event_count() -> int {
+    return pwx_count_rows(pwx_misc_event_path(), 5)
+}
+
+fn pwx_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(ioctl_event_count())
+    out.push(option_event_count())
+    out.push(async_event_count())
+    out.push(misc_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwx-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwx()
+
+    // ─── 1. syscall_invoke × 12 (one per fn, 4 group coverage) ───
+    //   IOCTL group (3)
+    record_syscall_invoke(1, 0, "WSAIoctl", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL WSAIoctl")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"WSAIoctl\",\"fn_group\":\"ioctl\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"dwIoControlCode\":\"SIO_GET_EXTENSION_FUNCTION_POINTER_0xC8000006\",\"lpvInBuffer\":\"GUID_WSAID_ACCEPTEX_B5367DF1\",\"cbInBuffer\":16,\"lpvOutBuffer\":\"AcceptEx_fn_ptr_synth\",\"cbOutBuffer\":8,\"lpcbBytesReturned_synth\":8,\"lpOverlapped\":\"WSAOVERLAPPED_32B\",\"lpCompletionRoutine\":0,\"return_int\":0")
+    record_syscall_invoke(2, 1, "WSARecvFrom", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL WSARecvFrom")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"WSARecvFrom\",\"fn_group\":\"ioctl\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"lpBuffers\":\"WSABUF_16B_buf_0x99010200_len_1500\",\"dwBufferCount\":1,\"lpNumberOfBytesRecvd_synth\":1500,\"lpFlags\":0,\"lpFrom\":\"sockaddr_in_16B_24_105_62_129_port_1119\",\"lpFromlen\":16,\"lpOverlapped\":\"WSAOVERLAPPED_32B\",\"return_int\":0")
+    record_syscall_invoke(3, 2, "WSASendTo", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL WSASendTo")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"WSASendTo\",\"fn_group\":\"ioctl\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"lpBuffers\":\"WSABUF_16B_buf_0x99010200_len_1500\",\"dwBufferCount\":1,\"lpNumberOfBytesSent_synth\":1500,\"dwFlags\":0,\"lpTo\":\"sockaddr_in_16B_24_105_62_129_port_1119\",\"iTolen\":16,\"lpOverlapped\":\"WSAOVERLAPPED_32B\",\"return_int\":0")
+
+    //   OPTIONS group (4)
+    record_syscall_invoke(4, 3, "getsockopt", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL getsockopt")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"getsockopt\",\"fn_group\":\"options\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"level\":\"SOL_SOCKET_0xFFFF\",\"optname\":\"SO_KEEPALIVE_0x0008\",\"optval_synth\":\"int_1_TRUE\",\"optlen\":4,\"return_int\":0")
+    record_syscall_invoke(5, 4, "setsockopt", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL setsockopt")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"setsockopt\",\"fn_group\":\"options\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"level\":\"IPPROTO_TCP_0x0006\",\"optname\":\"TCP_NODELAY_0x0001\",\"optval_synth\":\"int_1_enable\",\"optlen\":4,\"return_int\":0")
+    record_syscall_invoke(6, 5, "getpeername", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL getpeername")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"getpeername\",\"fn_group\":\"options\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"name_out\":\"sockaddr_in_16B_24_105_62_129_port_1119\",\"namelen_out\":16,\"return_int\":0")
+    record_syscall_invoke(7, 6, "getsockname", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL getsockname")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"getsockname\",\"fn_group\":\"options\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"name_out\":\"sockaddr_in_16B_192_168_1_100_port_56789\",\"namelen_out\":16,\"return_int\":0")
+
+    //   ASYNC group (3)
+    record_syscall_invoke(8, 7, "AcceptEx", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL AcceptEx")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"AcceptEx\",\"fn_group\":\"async\",\"status\":\"PARTIAL\",\"listen_sock_synth\":\"SOCKET_0x99010000\",\"accept_sock_synth\":\"SOCKET_0x99010001\",\"lpOutputBuffer_synth\":\"sockaddr_in_pair_buffer_88B\",\"dwReceiveDataLength\":0,\"dwLocalAddressLength\":32,\"dwRemoteAddressLength\":32,\"lpdwBytesReceived_synth\":0,\"lpOverlapped\":\"WSAOVERLAPPED_32B\",\"return_bool\":\"FALSE_pending_overlapped\"")
+    record_syscall_invoke(9, 8, "ConnectEx", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL ConnectEx")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"ConnectEx\",\"fn_group\":\"async\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"name\":\"sockaddr_in_16B_24_105_62_129_port_1119\",\"namelen\":16,\"lpSendBuffer_synth\":0,\"dwSendDataLength\":0,\"lpdwBytesSent_synth\":0,\"lpOverlapped\":\"WSAOVERLAPPED_32B\",\"return_bool\":\"FALSE_pending_overlapped\"")
+    record_syscall_invoke(10, 9, "DisconnectEx", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL DisconnectEx")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"DisconnectEx\",\"fn_group\":\"async\",\"status\":\"PARTIAL\",\"sock_synth\":\"SOCKET_0x99010000\",\"lpOverlapped\":\"WSAOVERLAPPED_32B\",\"dwFlags\":\"TF_REUSE_SOCKET_0x00000002\",\"reserved\":0,\"return_bool\":\"TRUE_1\"")
+
+    //   MISC group (2)
+    record_syscall_invoke(11, 10, "inet_pton", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL inet_pton")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"inet_pton\",\"fn_group\":\"misc\",\"status\":\"PARTIAL\",\"af\":\"AF_INET_2\",\"src_string\":\"192.0.2.1\",\"dst_bytes_out\":\"0xC0_0x00_0x02_0x01_BE_4B\",\"return_int\":1")
+    record_syscall_invoke(12, 11, "inet_ntop", "PARTIAL")
+    println("__WS2_32_EX__ PARTIAL inet_ntop")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"inet_ntop\",\"fn_group\":\"misc\",\"status\":\"PARTIAL\",\"af\":\"AF_INET6_23\",\"src_bytes\":\"2001_db8_0_0_0_0_0_1_LE_16B\",\"dst_string_out\":\"2001:db8::1\",\"size\":46,\"return_str\":\"2001:db8::1\"")
+
+    // ─── 2. ioctl_event × 3 (wsa_ioctl/recvfrom/sendto) ───
+    record_ioctl_event(1, "wsa_ioctl_get_acceptex_ptr", "SOCKET_0x99010000", "WSAOVERLAPPED_32B_hEvent_0x99010100", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"ioctl_event\",\"evt_id\":1,\"i_kind\":\"wsa_ioctl_get_acceptex_ptr\",\"sock_synth\":\"SOCKET_0x99010000\",\"ovl_synth\":\"WSAOVERLAPPED_32B_hEvent_0x99010100\",\"struct_bytes\":32,\"ioctl_code\":\"SIO_GET_EXTENSION_FUNCTION_POINTER\",\"status\":\"PARTIAL\"")
+    record_ioctl_event(2, "wsa_recvfrom_udp_battlenet_rest", "SOCKET_0x99010000", "WSABUF_buf_1500_sockaddr_in_24_105_62_129", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"ioctl_event\",\"evt_id\":2,\"i_kind\":\"wsa_recvfrom_udp_battlenet_rest\",\"sock_synth\":\"SOCKET_0x99010000\",\"ovl_synth\":\"WSABUF_buf_1500_sockaddr_in_24_105_62_129\",\"len\":1500,\"port\":1119,\"status\":\"PARTIAL\"")
+    record_ioctl_event(3, "wsa_sendto_udp_battlenet_rest", "SOCKET_0x99010000", "WSABUF_buf_1500_sockaddr_in_24_105_62_129", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"ioctl_event\",\"evt_id\":3,\"i_kind\":\"wsa_sendto_udp_battlenet_rest\",\"sock_synth\":\"SOCKET_0x99010000\",\"ovl_synth\":\"WSABUF_buf_1500_sockaddr_in_24_105_62_129\",\"len\":1500,\"port\":1119,\"status\":\"PARTIAL\"")
+
+    // ─── 3. option_event × 4 (getopt/setopt/peer/sock) ───
+    record_option_event(1, "getopt_so_keepalive", "SOCKET_0x99010000", "SO_KEEPALIVE_int_1_TRUE", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"option_event\",\"evt_id\":1,\"o_kind\":\"getopt_so_keepalive\",\"sock_synth\":\"SOCKET_0x99010000\",\"opt_synth\":\"SO_KEEPALIVE_int_1_TRUE\",\"level\":\"SOL_SOCKET\",\"optname\":\"SO_KEEPALIVE\",\"status\":\"PARTIAL\"")
+    record_option_event(2, "setopt_tcp_nodelay", "SOCKET_0x99010000", "TCP_NODELAY_int_1_enable", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"option_event\",\"evt_id\":2,\"o_kind\":\"setopt_tcp_nodelay\",\"sock_synth\":\"SOCKET_0x99010000\",\"opt_synth\":\"TCP_NODELAY_int_1_enable\",\"level\":\"IPPROTO_TCP\",\"optname\":\"TCP_NODELAY\",\"status\":\"PARTIAL\"")
+    record_option_event(3, "getpeername_battlenet_remote", "SOCKET_0x99010000", "sockaddr_in_24_105_62_129_port_1119", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"option_event\",\"evt_id\":3,\"o_kind\":\"getpeername_battlenet_remote\",\"sock_synth\":\"SOCKET_0x99010000\",\"opt_synth\":\"sockaddr_in_24_105_62_129_port_1119\",\"namelen\":16,\"status\":\"PARTIAL\"")
+    record_option_event(4, "getsockname_local_ephemeral", "SOCKET_0x99010000", "sockaddr_in_192_168_1_100_port_56789", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"option_event\",\"evt_id\":4,\"o_kind\":\"getsockname_local_ephemeral\",\"sock_synth\":\"SOCKET_0x99010000\",\"opt_synth\":\"sockaddr_in_192_168_1_100_port_56789\",\"namelen\":16,\"status\":\"PARTIAL\"")
+
+    // ─── 4. async_event × 3 (acceptex/connectex/disconnectex) ───
+    record_async_event(1, "acceptex_iocp_pending", "SOCKET_0x99010000_listen", "WSAOVERLAPPED_32B_hEvent_0x99010100", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"async_event\",\"evt_id\":1,\"a_kind\":\"acceptex_iocp_pending\",\"listen_sock_synth\":\"SOCKET_0x99010000_listen\",\"async_synth\":\"WSAOVERLAPPED_32B_hEvent_0x99010100\",\"struct_bytes\":32,\"buffer_size\":88,\"status\":\"PARTIAL\"")
+    record_async_event(2, "connectex_iocp_pending_battlenet", "SOCKET_0x99010000", "WSAOVERLAPPED_32B_hEvent_0x99010100_dest_24_105_62_129", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"async_event\",\"evt_id\":2,\"a_kind\":\"connectex_iocp_pending_battlenet\",\"listen_sock_synth\":\"SOCKET_0x99010000\",\"async_synth\":\"WSAOVERLAPPED_32B_hEvent_0x99010100_dest_24_105_62_129\",\"struct_bytes\":32,\"port\":1119,\"status\":\"PARTIAL\"")
+    record_async_event(3, "disconnectex_reuse_socket", "SOCKET_0x99010000", "WSAOVERLAPPED_32B_TF_REUSE_SOCKET_0x00000002", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"async_event\",\"evt_id\":3,\"a_kind\":\"disconnectex_reuse_socket\",\"listen_sock_synth\":\"SOCKET_0x99010000\",\"async_synth\":\"WSAOVERLAPPED_32B_TF_REUSE_SOCKET_0x00000002\",\"flags\":\"TF_REUSE_SOCKET\",\"status\":\"PARTIAL\"")
+
+    // ─── 5. misc_event × 2 (inet_pton/ntop) ───
+    record_misc_event(1, "inet_pton_v4_192_0_2_1", "192.0.2.1", "0xC0_0x00_0x02_0x01_BE_4B", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"misc_event\",\"evt_id\":1,\"m_kind\":\"inet_pton_v4_192_0_2_1\",\"addr_str\":\"192.0.2.1\",\"addr_bytes\":\"0xC0_0x00_0x02_0x01_BE_4B\",\"af\":\"AF_INET\",\"return_int\":1,\"status\":\"PARTIAL\"")
+    record_misc_event(2, "inet_ntop_v6_2001_db8_1", "2001:db8::1", "2001_db8_0_0_0_0_0_1_LE_16B", "PARTIAL")
+    r0_emit("pe_ws2_32_extras_record", "\"kind\":\"misc_event\",\"evt_id\":2,\"m_kind\":\"inet_ntop_v6_2001_db8_1\",\"addr_str\":\"2001:db8::1\",\"addr_bytes\":\"2001_db8_0_0_0_0_0_1_LE_16B\",\"af\":\"AF_INET6\",\"size\":46,\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 12 {
+        panic("pe_ws2_32_extras FAIL [syscall_invoke_count] expected=12 got=" + to_string(si))
+    }
+    let ie = ioctl_event_count()
+    if ie != 3 {
+        panic("pe_ws2_32_extras FAIL [ioctl_event_count] expected=3 got=" + to_string(ie))
+    }
+    let oe = option_event_count()
+    if oe != 4 {
+        panic("pe_ws2_32_extras FAIL [option_event_count] expected=4 got=" + to_string(oe))
+    }
+    let ae = async_event_count()
+    if ae != 3 {
+        panic("pe_ws2_32_extras FAIL [async_event_count] expected=3 got=" + to_string(ae))
+    }
+    let me = misc_event_count()
+    if me != 2 {
+        panic("pe_ws2_32_extras FAIL [misc_event_count] expected=2 got=" + to_string(me))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "WSAIoctl" { panic("pe_ws2_32_extras FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(3) != "getsockopt" { panic("pe_ws2_32_extras FAIL [fn_kind_name(3)]") }
+    if fn_kind_name(7) != "AcceptEx" { panic("pe_ws2_32_extras FAIL [fn_kind_name(7)]") }
+    if fn_kind_name(11) != "inet_ntop" { panic("pe_ws2_32_extras FAIL [fn_kind_name(11)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_ws2_32_extras FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "ioctl" { panic("pe_ws2_32_extras FAIL [fn_group_name(0)]") }
+    if fn_group_name(3) != "options" { panic("pe_ws2_32_extras FAIL [fn_group_name(3)]") }
+    if fn_group_name(7) != "async" { panic("pe_ws2_32_extras FAIL [fn_group_name(7)]") }
+    if fn_group_name(10) != "misc" { panic("pe_ws2_32_extras FAIL [fn_group_name(10)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_ws2_32_extras FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pwx_stats()
+    if len(s) != 5 { panic("pe_ws2_32_extras FAIL [stats len] expected=5 got=" + to_string(len(s))) }
+    if s[0] != 12 { panic("pe_ws2_32_extras FAIL [stats syscall_invoke_count] expected=12 got=" + to_string(s[0])) }
+    if s[1] != 3 { panic("pe_ws2_32_extras FAIL [stats ioctl_event_count] expected=3 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_ws2_32_extras FAIL [stats option_event_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_ws2_32_extras FAIL [stats async_event_count] expected=3 got=" + to_string(s[3])) }
+    if s[4] != 2 { panic("pe_ws2_32_extras FAIL [stats misc_event_count] expected=2 got=" + to_string(s[4])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_ws2_32_extras_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"ioctl_event_count\":" + to_string(s[1])
+        + ",\"option_event_count\":" + to_string(s[2])
+        + ",\"async_event_count\":" + to_string(s[3])
+        + ",\"misc_event_count\":" + to_string(s[4]))
+
+    r0_emit("pe_ws2_32_extras_summary",
+        "\"target\":\"WS2_32.dll_advanced_extras\",\"fn_total\":12,\"fn_emit_partial\":12,\"groups\":[\"ioctl\",\"options\",\"async\",\"misc\"],\"wsaoverlapped_synth_bytes\":32,\"wsabuf_synth_bytes\":16,\"sockaddr_in_synth_bytes\":16,\"sockaddr_in6_synth_bytes\":28,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\",\"distinct_from_track_k_basic\":true")
+
+    r0_emit("pe_ws2_32_extras_kpi",
+        "\"ioctl_emits\":3,\"option_emits\":4,\"async_emits\":3,\"misc_emits\":2,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"battlenet_iocp_pattern_baseline\":true,\"d2r_d4_overlapped_io_baseline\":true,\"network_framework_kqueue_cfsocket_binding\":false,\"bsd_socket_2_setsockopt_2_recvfrom_2_binding\":false")
+
+    // ─── cycle 44 → 45 WS2_32 advanced coverage progression evidence emit ───
+    r0_emit("pe_ws2_32_extras_coverage_progression",
+        "\"surface\":\"WS2_32_full_435_fn\",\"cycle_44_count\":230,\"cycle_45_count\":242,\"delta\":12,\"cycle_44_percent\":52.87,\"cycle_45_percent\":55.63,\"cycle_45_module\":\"pe_ws2_32_extras.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_az2_cycle_increment\":12,\"track_az_bundled_part_2_of_4\":true,\"distinct_from_track_k1_pe_winsock_ws2_32\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_ws2_32_extras_round_trip_matrix",
+        "\"surface\":\"WS2_32_extras_12_fn\",\"fn_partial\":12,\"fn_groups\":4,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real WSAIoctl + AcceptEx + ConnectEx = BSD socket(2) + kqueue + Network.framework bridge pending separate cycle (long-horizon Battle.net IOCP pattern)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track AZ2 expansion emit (cycle 45, WS2_32 extras +12 fn) ───
+    r0_emit("pe_ws2_32_extras_az2_expansion",
+        "\"track\":\"AZ2\",\"cycle\":45,\"surface\":\"WS2_32_advanced_new\",\"new_fn\":12,\"groups\":[\"ioctl\",\"options\",\"async\",\"misc\"],\"ioctl_count\":3,\"options_count\":4,\"async_count\":3,\"misc_count\":2,\"emit_format\":\"__WS2_32_EX__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_1_evidence_augment\":true,\"track_az_bundled_part_2_of_4\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_ws2_32_extras FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwx()
+    let s2 = pwx_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ws2_32_extras FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ws2_32_extras self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", ioctl_event=" + to_string(s[1])
+        + ", option_event=" + to_string(s[2]) + ", async_event=" + to_string(s[3])
+        + ", misc_event=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwx_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("ioctl_event_count\t" + to_string(s[1]))
+            println("option_event_count\t" + to_string(s[2]))
+            println("async_event_count\t" + to_string(s[3]))
+            println("misc_event_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_ws2_32_extras.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_ws2_32_extras.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwx()
+            println("cleaned: " + pwx_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwx_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ws2_32_extras.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

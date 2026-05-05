@@ -1,0 +1,613 @@
+// lib/loader/pe_msvc_static_crt_inline.hexa
+// — static CRT linkage binary 의 inline CRT 함수 추적기
+//
+// MSVC `/MT` (static CRT) 빌드는 ucrtbase.dll / vcruntime140.dll import 없이
+// CRT 의 startup helper 들을 binary `.text` 안에 직접 inline 시킨다. Battle.net
+// Setup 같은 vcredist-free installer 가 대표 케이스.
+//
+// 결과적으로 IAT walk 만으론 _initterm / _security_init_cookie /
+// __scrt_common_main_seh / EncodePointer / mainCRTStartup 의 site 를 잡을 수
+// 없고, `.text` 안의 inline copy 를 signature-match (call shape, prologue,
+// xor rsp_cookie, etc.) 로 식별해야 한다.
+//
+// 본 hexa 는 그 inline copy 의 va/길이/inst_count + signature confidence + call
+// site + dll 이 inline 되었는지 dynamic-link 인지 분류 telemetry 만 기록.
+// 실제 실행 path 는 native shim 영역.
+//
+// own 1 enforcement: Wine msvcrt source / Microsoft msvcrt source / CrossOver /
+//                    GPTK / Whisky 0 줄. Microsoft UCRT public ABI doc 만 참조.
+//   - Wine dlls/msvcrt 인용 X
+//   - third-party Wine 계열 추천/언급 X (game-changer trigger 금지)
+//   - Microsoft msvcrt source 인용 X
+// own 2 mandate: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe +
+//                panic 형식.
+//
+// persist schema (TSV 5 종):
+//   inline_fn.tsv         : fn_id<int>     \t fn_va_hex<str>   \t fn_kind<int>
+//                           \t length_bytes<int>
+//   call_site.tsv         : call_id<int>   \t site_va_hex<str> \t target_fn_id<int>
+//                           \t calling_convention<int>
+//   inline_inst_count.tsv : count_id<int>  \t fn_id<int>       \t inst_count<int>
+//   signature_match.tsv   : match_id<int>  \t fn_id<int>       \t signature_kind<int>
+//                           \t confidence<int>
+//   static_vs_dynamic.tsv : class_id<int>  \t dll_name_or_inline<str>
+//                           \t is_static<int>
+//
+// fn_kind code:
+//   0 = security_init_cookie   (__security_init_cookie)
+//   1 = initterm               (_initterm / _initterm_e)
+//   2 = scrt_common_main_seh   (__scrt_common_main_seh)
+//   3 = encode_pointer         (EncodePointer / DecodePointer)
+//   4 = mainCRTStartup         (mainCRTStartup / WinMainCRTStartup)
+//   5 = other
+//
+// calling_convention code (record_call_site 와 inline_fn 간 cross-ref 용):
+//   0 = cdecl
+//   1 = stdcall
+//   2 = fastcall
+//   3 = vectorcall
+//   4 = ms_x64
+//   5 = thiscall
+//   6 = unknown
+//
+// signature_kind code (record_signature_match 보조):
+//   0 = prologue_pattern
+//   1 = epilogue_pattern
+//   2 = call_shape
+//   3 = xor_rsp_cookie
+//   4 = scrt_seh_handler_ref
+//   5 = other
+//
+// is_static: 0 = dynamic-linked (DLL import), 1 = static (binary 내 inline)
+//
+// Hexa 예약어 회피: type/mod/handle/kind 단독 identifier 금지 → fn_kind /
+// signature_kind / calling_convention 등 명시적 명칭 사용.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmsci_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_static_crt_inline"
+}
+
+fn pmsci_inline_fn_path() -> str {
+    return pmsci_dir() + "/inline_fn.tsv"
+}
+
+fn pmsci_call_site_path() -> str {
+    return pmsci_dir() + "/call_site.tsv"
+}
+
+fn pmsci_inline_inst_count_path() -> str {
+    return pmsci_dir() + "/inline_inst_count.tsv"
+}
+
+fn pmsci_signature_match_path() -> str {
+    return pmsci_dir() + "/signature_match.tsv"
+}
+
+fn pmsci_static_vs_dynamic_path() -> str {
+    return pmsci_dir() + "/static_vs_dynamic.tsv"
+}
+
+fn pmsci_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmsci_dir() + "'")
+}
+
+fn cleanup_pmsci() -> void {
+    pmsci_ensure_dir()
+    let _ = exec("rm -f '" + pmsci_inline_fn_path()
+        + "' '" + pmsci_call_site_path()
+        + "' '" + pmsci_inline_inst_count_path()
+        + "' '" + pmsci_signature_match_path()
+        + "' '" + pmsci_static_vs_dynamic_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmsci_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmsci_append_row(path: str, row: str) -> void {
+    pmsci_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_inline_fn: inline CRT 함수 1 건 ───
+//   fn_kind: 0=security_init_cookie 1=initterm 2=scrt_common_main_seh
+//            3=encode_pointer 4=mainCRTStartup 5=other
+fn record_inline_fn(fn_id: int, fn_va_hex: str, fn_kind: int, length_bytes: int) -> void {
+    if fn_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_fn] expected=fn_id>0 got=" + to_string(fn_id))
+    }
+    if fn_va_hex == "" {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_fn] expected=fn_va_hex!=empty got=empty")
+    }
+    if fn_kind < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_fn] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 5 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_fn] expected=fn_kind<=5 got=" + to_string(fn_kind))
+    }
+    if length_bytes < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_fn] expected=length_bytes>=0 got=" + to_string(length_bytes))
+    }
+    let row = to_string(fn_id) + "\t" + fn_va_hex + "\t" + to_string(fn_kind)
+        + "\t" + to_string(length_bytes) + "\n"
+    pmsci_append_row(pmsci_inline_fn_path(), row)
+}
+
+// ─── record_call_site: inline 함수의 call site 1 건 ───
+//   calling_convention: 0=cdecl 1=stdcall 2=fastcall 3=vectorcall 4=ms_x64 5=thiscall 6=unknown
+fn record_call_site(call_id: int, site_va_hex: str, target_fn_id: int, calling_convention: int) -> void {
+    if call_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_call_site] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if site_va_hex == "" {
+        panic("pe_msvc_static_crt_inline FAIL [record_call_site] expected=site_va_hex!=empty got=empty")
+    }
+    if target_fn_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_call_site] expected=target_fn_id>0 got=" + to_string(target_fn_id))
+    }
+    if calling_convention < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_call_site] expected=calling_convention>=0 got=" + to_string(calling_convention))
+    }
+    if calling_convention > 6 {
+        panic("pe_msvc_static_crt_inline FAIL [record_call_site] expected=calling_convention<=6 got=" + to_string(calling_convention))
+    }
+    let row = to_string(call_id) + "\t" + site_va_hex + "\t" + to_string(target_fn_id)
+        + "\t" + to_string(calling_convention) + "\n"
+    pmsci_append_row(pmsci_call_site_path(), row)
+}
+
+// ─── record_inline_inst_count: inline 함수의 instruction 개수 1 건 ───
+fn record_inline_inst_count(count_id: int, fn_id: int, inst_count: int) -> void {
+    if count_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_inst_count] expected=count_id>0 got=" + to_string(count_id))
+    }
+    if fn_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_inst_count] expected=fn_id>0 got=" + to_string(fn_id))
+    }
+    if inst_count < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_inline_inst_count] expected=inst_count>=0 got=" + to_string(inst_count))
+    }
+    let row = to_string(count_id) + "\t" + to_string(fn_id) + "\t" + to_string(inst_count) + "\n"
+    pmsci_append_row(pmsci_inline_inst_count_path(), row)
+}
+
+// ─── record_signature_match: signature 매칭 1 건 (confidence 0-100) ───
+//   signature_kind: 0=prologue_pattern 1=epilogue_pattern 2=call_shape
+//                   3=xor_rsp_cookie 4=scrt_seh_handler_ref 5=other
+fn record_signature_match(match_id: int, fn_id: int, signature_kind: int, confidence: int) -> void {
+    if match_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_signature_match] expected=match_id>0 got=" + to_string(match_id))
+    }
+    if fn_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_signature_match] expected=fn_id>0 got=" + to_string(fn_id))
+    }
+    if signature_kind < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_signature_match] expected=signature_kind>=0 got=" + to_string(signature_kind))
+    }
+    if signature_kind > 5 {
+        panic("pe_msvc_static_crt_inline FAIL [record_signature_match] expected=signature_kind<=5 got=" + to_string(signature_kind))
+    }
+    if confidence < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_signature_match] expected=confidence>=0 got=" + to_string(confidence))
+    }
+    if confidence > 100 {
+        panic("pe_msvc_static_crt_inline FAIL [record_signature_match] expected=confidence<=100 got=" + to_string(confidence))
+    }
+    let row = to_string(match_id) + "\t" + to_string(fn_id) + "\t" + to_string(signature_kind)
+        + "\t" + to_string(confidence) + "\n"
+    pmsci_append_row(pmsci_signature_match_path(), row)
+}
+
+// ─── record_static_vs_dynamic: dll-import vs binary-inline 분류 1 건 ───
+//   is_static: 0=dynamic-linked 1=static (binary 내 inline)
+fn record_static_vs_dynamic(class_id: int, dll_name_or_inline: str, is_static: int) -> void {
+    if class_id <= 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_static_vs_dynamic] expected=class_id>0 got=" + to_string(class_id))
+    }
+    if dll_name_or_inline == "" {
+        panic("pe_msvc_static_crt_inline FAIL [record_static_vs_dynamic] expected=dll_name_or_inline!=empty got=empty")
+    }
+    if is_static < 0 {
+        panic("pe_msvc_static_crt_inline FAIL [record_static_vs_dynamic] expected=is_static>=0 got=" + to_string(is_static))
+    }
+    if is_static > 1 {
+        panic("pe_msvc_static_crt_inline FAIL [record_static_vs_dynamic] expected=is_static<=1 got=" + to_string(is_static))
+    }
+    let row = to_string(class_id) + "\t" + dll_name_or_inline + "\t" + to_string(is_static) + "\n"
+    pmsci_append_row(pmsci_static_vs_dynamic_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmsci_count_rows(path: str, min_fields: int) -> int {
+    let t = pmsci_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn inline_fn_count() -> int {
+    return pmsci_count_rows(pmsci_inline_fn_path(), 4)
+}
+
+fn call_site_count() -> int {
+    return pmsci_count_rows(pmsci_call_site_path(), 4)
+}
+
+fn inline_inst_count() -> int {
+    return pmsci_count_rows(pmsci_inline_inst_count_path(), 3)
+}
+
+fn signature_match_count() -> int {
+    return pmsci_count_rows(pmsci_signature_match_path(), 4)
+}
+
+fn static_vs_dynamic_count() -> int {
+    return pmsci_count_rows(pmsci_static_vs_dynamic_path(), 3)
+}
+
+// ─── fn_kind_name: 0..5 → 명칭 ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 {
+        return "security_init_cookie"
+    }
+    if k == 1 {
+        return "initterm"
+    }
+    if k == 2 {
+        return "scrt_common_main_seh"
+    }
+    if k == 3 {
+        return "encode_pointer"
+    }
+    if k == 4 {
+        return "mainCRTStartup"
+    }
+    if k == 5 {
+        return "other"
+    }
+    panic("pe_msvc_static_crt_inline FAIL [fn_kind_name] expected=0..5 got=" + to_string(k))
+}
+
+// ─── cc_name: 0..6 → 명칭 ───
+fn cc_name(c: int) -> str {
+    if c == 0 {
+        return "cdecl"
+    }
+    if c == 1 {
+        return "stdcall"
+    }
+    if c == 2 {
+        return "fastcall"
+    }
+    if c == 3 {
+        return "vectorcall"
+    }
+    if c == 4 {
+        return "ms_x64"
+    }
+    if c == 5 {
+        return "thiscall"
+    }
+    if c == 6 {
+        return "unknown"
+    }
+    panic("pe_msvc_static_crt_inline FAIL [cc_name] expected=0..6 got=" + to_string(c))
+}
+
+// ─── pmsci_stats: [inline_fn, call_site, inline_inst, signature_match, static_vs_dynamic] ───
+fn pmsci_stats() -> array {
+    let mut out = []
+    out.push(inline_fn_count())
+    out.push(call_site_count())
+    out.push(inline_inst_count())
+    out.push(signature_match_count())
+    out.push(static_vs_dynamic_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmsci-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmsci()
+
+    // 2. record_inline_fn x6 — 각 fn_kind (0..5) 한 번씩
+    //    Battle.net Setup 류 static-CRT 빌드의 inline copy 가정:
+    //    - security_init_cookie  fn_id=1 va=0x140012000 length=0x40=64 bytes
+    //    - initterm              fn_id=2 va=0x140012080 length=0x30=48 bytes
+    //    - scrt_common_main_seh  fn_id=3 va=0x140013000 length=0x180=384 bytes
+    //    - encode_pointer        fn_id=4 va=0x140013200 length=0x20=32 bytes
+    //    - mainCRTStartup        fn_id=5 va=0x140013400 length=0x60=96 bytes
+    //    - other                 fn_id=6 va=0x140013500 length=0x20=32 bytes
+    record_inline_fn(1, "0x140012000", 0, 64)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_fn",
+        "\"fn_id\":1,\"fn_va_hex\":\"0x140012000\",\"fn_kind\":0,\"name\":\""
+        + fn_kind_name(0) + "\",\"length_bytes\":64")
+
+    record_inline_fn(2, "0x140012080", 1, 48)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_fn",
+        "\"fn_id\":2,\"fn_va_hex\":\"0x140012080\",\"fn_kind\":1,\"name\":\""
+        + fn_kind_name(1) + "\",\"length_bytes\":48")
+
+    record_inline_fn(3, "0x140013000", 2, 384)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_fn",
+        "\"fn_id\":3,\"fn_va_hex\":\"0x140013000\",\"fn_kind\":2,\"name\":\""
+        + fn_kind_name(2) + "\",\"length_bytes\":384")
+
+    record_inline_fn(4, "0x140013200", 3, 32)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_fn",
+        "\"fn_id\":4,\"fn_va_hex\":\"0x140013200\",\"fn_kind\":3,\"name\":\""
+        + fn_kind_name(3) + "\",\"length_bytes\":32")
+
+    record_inline_fn(5, "0x140013400", 4, 96)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_fn",
+        "\"fn_id\":5,\"fn_va_hex\":\"0x140013400\",\"fn_kind\":4,\"name\":\""
+        + fn_kind_name(4) + "\",\"length_bytes\":96")
+
+    record_inline_fn(6, "0x140013500", 5, 32)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_fn",
+        "\"fn_id\":6,\"fn_va_hex\":\"0x140013500\",\"fn_kind\":5,\"name\":\""
+        + fn_kind_name(5) + "\",\"length_bytes\":32")
+
+    // 3. record_call_site x4 — mainCRTStartup(fn_id=5) 가
+    //    security_init_cookie / initterm / scrt_common_main_seh / encode_pointer
+    //    를 각각 호출 (ms_x64 cc, BattleNet Setup 64-bit binary 가정)
+    record_call_site(1, "0x140013410", 1, 4)
+    r0_emit("pe_msvc_static_crt_inline_record_call_site",
+        "\"call_id\":1,\"site_va_hex\":\"0x140013410\",\"target_fn_id\":1,\"cc\":4,\"cc_name\":\""
+        + cc_name(4) + "\"")
+
+    record_call_site(2, "0x140013420", 2, 4)
+    r0_emit("pe_msvc_static_crt_inline_record_call_site",
+        "\"call_id\":2,\"site_va_hex\":\"0x140013420\",\"target_fn_id\":2,\"cc\":4,\"cc_name\":\""
+        + cc_name(4) + "\"")
+
+    record_call_site(3, "0x140013430", 3, 4)
+    r0_emit("pe_msvc_static_crt_inline_record_call_site",
+        "\"call_id\":3,\"site_va_hex\":\"0x140013430\",\"target_fn_id\":3,\"cc\":4,\"cc_name\":\""
+        + cc_name(4) + "\"")
+
+    record_call_site(4, "0x140013440", 4, 4)
+    r0_emit("pe_msvc_static_crt_inline_record_call_site",
+        "\"call_id\":4,\"site_va_hex\":\"0x140013440\",\"target_fn_id\":4,\"cc\":4,\"cc_name\":\""
+        + cc_name(4) + "\"")
+
+    // 4. record_inline_inst_count x6 — fn_id 1..6 각각 instruction count
+    //    (length_bytes 와 별개로 disasm 후 inst 단위로 측정)
+    //    security_init_cookie ≈ 16 inst, initterm ≈ 12, scrt_common_main_seh ≈ 96,
+    //    encode_pointer ≈ 8, mainCRTStartup ≈ 24, other ≈ 8
+    record_inline_inst_count(1, 1, 16)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_inst_count",
+        "\"count_id\":1,\"fn_id\":1,\"inst_count\":16")
+
+    record_inline_inst_count(2, 2, 12)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_inst_count",
+        "\"count_id\":2,\"fn_id\":2,\"inst_count\":12")
+
+    record_inline_inst_count(3, 3, 96)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_inst_count",
+        "\"count_id\":3,\"fn_id\":3,\"inst_count\":96")
+
+    record_inline_inst_count(4, 4, 8)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_inst_count",
+        "\"count_id\":4,\"fn_id\":4,\"inst_count\":8")
+
+    record_inline_inst_count(5, 5, 24)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_inst_count",
+        "\"count_id\":5,\"fn_id\":5,\"inst_count\":24")
+
+    record_inline_inst_count(6, 6, 8)
+    r0_emit("pe_msvc_static_crt_inline_record_inline_inst_count",
+        "\"count_id\":6,\"fn_id\":6,\"inst_count\":8")
+
+    // 5. record_signature_match x4 — confidence 80-100 사이
+    //    fn_id=1 (security_init_cookie) prologue_pattern conf=95
+    //    fn_id=2 (initterm)             call_shape       conf=88
+    //    fn_id=3 (scrt_common_main_seh) scrt_seh_handler_ref conf=92
+    //    fn_id=5 (mainCRTStartup)       prologue_pattern conf=80
+    record_signature_match(1, 1, 0, 95)
+    r0_emit("pe_msvc_static_crt_inline_record_signature_match",
+        "\"match_id\":1,\"fn_id\":1,\"signature_kind\":0,\"confidence\":95")
+
+    record_signature_match(2, 2, 2, 88)
+    r0_emit("pe_msvc_static_crt_inline_record_signature_match",
+        "\"match_id\":2,\"fn_id\":2,\"signature_kind\":2,\"confidence\":88")
+
+    record_signature_match(3, 3, 4, 92)
+    r0_emit("pe_msvc_static_crt_inline_record_signature_match",
+        "\"match_id\":3,\"fn_id\":3,\"signature_kind\":4,\"confidence\":92")
+
+    record_signature_match(4, 5, 0, 80)
+    r0_emit("pe_msvc_static_crt_inline_record_signature_match",
+        "\"match_id\":4,\"fn_id\":5,\"signature_kind\":0,\"confidence\":80")
+
+    // 6. record_static_vs_dynamic x2 — Battle.net Setup 가정:
+    //    "inline" → is_static=1 (CRT 자체가 binary 내 inline)
+    //    "KERNEL32.dll" → is_static=0 (dynamic-linked)
+    record_static_vs_dynamic(1, "inline", 1)
+    r0_emit("pe_msvc_static_crt_inline_record_static_vs_dynamic",
+        "\"class_id\":1,\"dll_name_or_inline\":\"inline\",\"is_static\":1")
+
+    record_static_vs_dynamic(2, "KERNEL32.dll", 0)
+    r0_emit("pe_msvc_static_crt_inline_record_static_vs_dynamic",
+        "\"class_id\":2,\"dll_name_or_inline\":\"KERNEL32.dll\",\"is_static\":0")
+
+    // 7. assertion: inline_fn_count == 6
+    let nf = inline_fn_count()
+    if nf != 6 {
+        panic("pe_msvc_static_crt_inline FAIL [inline_fn_count] expected=6 got=" + to_string(nf))
+    }
+
+    // 8. assertion: call_site_count == 4
+    let nc = call_site_count()
+    if nc != 4 {
+        panic("pe_msvc_static_crt_inline FAIL [call_site_count] expected=4 got=" + to_string(nc))
+    }
+
+    // 9. assertion: inline_inst_count == 6
+    let ni = inline_inst_count()
+    if ni != 6 {
+        panic("pe_msvc_static_crt_inline FAIL [inline_inst_count] expected=6 got=" + to_string(ni))
+    }
+
+    // 10. assertion: signature_match_count == 4
+    let nm = signature_match_count()
+    if nm != 4 {
+        panic("pe_msvc_static_crt_inline FAIL [signature_match_count] expected=4 got=" + to_string(nm))
+    }
+
+    // 11. assertion: static_vs_dynamic_count == 2
+    let nv = static_vs_dynamic_count()
+    if nv != 2 {
+        panic("pe_msvc_static_crt_inline FAIL [static_vs_dynamic_count] expected=2 got=" + to_string(nv))
+    }
+
+    // 12. fn_kind_name sanity (0..5)
+    let k0 = fn_kind_name(0)
+    if k0 != "security_init_cookie" {
+        panic("pe_msvc_static_crt_inline FAIL [fn_kind_name(0)] expected=security_init_cookie got=" + k0)
+    }
+    let k1 = fn_kind_name(1)
+    if k1 != "initterm" {
+        panic("pe_msvc_static_crt_inline FAIL [fn_kind_name(1)] expected=initterm got=" + k1)
+    }
+    let k2 = fn_kind_name(2)
+    if k2 != "scrt_common_main_seh" {
+        panic("pe_msvc_static_crt_inline FAIL [fn_kind_name(2)] expected=scrt_common_main_seh got=" + k2)
+    }
+    let k3 = fn_kind_name(3)
+    if k3 != "encode_pointer" {
+        panic("pe_msvc_static_crt_inline FAIL [fn_kind_name(3)] expected=encode_pointer got=" + k3)
+    }
+    let k4 = fn_kind_name(4)
+    if k4 != "mainCRTStartup" {
+        panic("pe_msvc_static_crt_inline FAIL [fn_kind_name(4)] expected=mainCRTStartup got=" + k4)
+    }
+    let k5 = fn_kind_name(5)
+    if k5 != "other" {
+        panic("pe_msvc_static_crt_inline FAIL [fn_kind_name(5)] expected=other got=" + k5)
+    }
+
+    // 13. cc_name sanity (0..6)
+    let c0 = cc_name(0)
+    if c0 != "cdecl" {
+        panic("pe_msvc_static_crt_inline FAIL [cc_name(0)] expected=cdecl got=" + c0)
+    }
+    let c4 = cc_name(4)
+    if c4 != "ms_x64" {
+        panic("pe_msvc_static_crt_inline FAIL [cc_name(4)] expected=ms_x64 got=" + c4)
+    }
+    let c6 = cc_name(6)
+    if c6 != "unknown" {
+        panic("pe_msvc_static_crt_inline FAIL [cc_name(6)] expected=unknown got=" + c6)
+    }
+
+    // 14. pmsci_stats() == [6, 4, 6, 4, 2]
+    let s = pmsci_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_static_crt_inline FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_msvc_static_crt_inline FAIL [stats inline_fn] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_static_crt_inline FAIL [stats call_site] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 6 {
+        panic("pe_msvc_static_crt_inline FAIL [stats inline_inst] expected=6 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_static_crt_inline FAIL [stats signature_match] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_static_crt_inline FAIL [stats static_vs_dynamic] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_msvc_static_crt_inline_stats",
+        "\"inline_fn\":" + to_string(s[0])
+        + ",\"call_site\":" + to_string(s[1])
+        + ",\"inline_inst\":" + to_string(s[2])
+        + ",\"signature_match\":" + to_string(s[3])
+        + ",\"static_vs_dynamic\":" + to_string(s[4]))
+
+    // 16. emit count >= 12 — 6 inline_fn + 4 call_site + 6 inst + 4 sig + 2 sv + 1 stats = 23
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_msvc_static_crt_inline FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pmsci()
+    let s2 = pmsci_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_static_crt_inline FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_static_crt_inline self_test PASS (inline_fn=" + to_string(s[0])
+        + ", call_site=" + to_string(s[1]) + ", inline_inst=" + to_string(s[2])
+        + ", signature_match=" + to_string(s[3]) + ", static_vs_dynamic=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmsci_stats()
+            println("inline_fn_count\t" + to_string(s[0]))
+            println("call_site_count\t" + to_string(s[1]))
+            println("inline_inst_count\t" + to_string(s[2]))
+            println("signature_match_count\t" + to_string(s[3]))
+            println("static_vs_dynamic_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmsci()
+            println("cleaned: " + pmsci_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmsci_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_static_crt_inline.hexa { self-test | stats | cleanup | dir }")
+}

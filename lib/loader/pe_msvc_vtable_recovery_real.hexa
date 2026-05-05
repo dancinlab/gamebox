@@ -1,0 +1,220 @@
+// pe_msvc_vtable_recovery_real.hexa — vtable corruption recovery tracker
+//
+// shim phase 17 의 indirect call (`call [eax+disp]`) 시 EAX=0 또는 garbage
+// 발생 패턴 추적. wave 15-A 의 fake_vtable_region (0x90000000+) 으로
+// graceful redirect + slot mark 결과 기록.
+//
+// own1: hexa pure, Wine 0줄. research-G GCC VTV reference (algorithm only).
+// own2: r0_emit ≥ 14, panic, self-test, headless safe.
+
+use "../perf/r0_common"
+
+fn pmvr_dir() -> str { return GAMEBOX_HOME + "/persist/pe_msvc_vtable_recovery_real" }
+fn pmvr_corrupt_path() -> str { return pmvr_dir() + "/corruption.tsv" }
+fn pmvr_region_path() -> str { return pmvr_dir() + "/fake_region.tsv" }
+fn pmvr_dispatch_path() -> str { return pmvr_dir() + "/slot_dispatch.tsv" }
+fn pmvr_action_path() -> str { return pmvr_dir() + "/recovery_action.tsv" }
+fn pmvr_pattern_path() -> str { return pmvr_dir() + "/caller_pattern.tsv" }
+
+fn pmvr_ensure_dir() -> void { let _ = exec("mkdir -p '" + pmvr_dir() + "'") }
+fn cleanup_pmvr() -> void {
+    pmvr_ensure_dir()
+    let _ = exec("rm -f '" + pmvr_corrupt_path() + "' '" + pmvr_region_path()
+        + "' '" + pmvr_dispatch_path() + "' '" + pmvr_action_path()
+        + "' '" + pmvr_pattern_path() + "'")
+}
+
+fn pmvr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmvr_append_row(path: str, row: str) -> void {
+    pmvr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// kind: 0=null 1=garbage 2=outside_region 3=partial_init
+fn record_vtable_corruption(corrupt_id: int, eip_hex: str, reg_name: str, addr_hex: str, kind: int) -> void {
+    if corrupt_id <= 0 { panic("pe_msvc_vtable_recovery_real FAIL [corruption] id>0") }
+    if eip_hex == "" { panic("pe_msvc_vtable_recovery_real FAIL [corruption] eip non-empty") }
+    if reg_name == "" { panic("pe_msvc_vtable_recovery_real FAIL [corruption] reg non-empty") }
+    if addr_hex == "" { panic("pe_msvc_vtable_recovery_real FAIL [corruption] addr non-empty") }
+    if kind < 0 { panic("pe_msvc_vtable_recovery_real FAIL [corruption] kind>=0") }
+    if kind > 3 { panic("pe_msvc_vtable_recovery_real FAIL [corruption] kind<=3") }
+    let row = to_string(corrupt_id) + "\t" + eip_hex + "\t" + reg_name + "\t" + addr_hex + "\t" + to_string(kind) + "\n"
+    pmvr_append_row(pmvr_corrupt_path(), row)
+}
+
+fn record_fake_vtable_region(region_id: int, va_start_hex: str, va_end_hex: str, slot_count: int, fill_target_hex: str) -> void {
+    if region_id <= 0 { panic("pe_msvc_vtable_recovery_real FAIL [region] id>0") }
+    if va_start_hex == "" || va_end_hex == "" || fill_target_hex == "" { panic("pe_msvc_vtable_recovery_real FAIL [region] hex non-empty") }
+    if slot_count < 0 { panic("pe_msvc_vtable_recovery_real FAIL [region] slot_count>=0") }
+    let row = to_string(region_id) + "\t" + va_start_hex + "\t" + va_end_hex + "\t" + to_string(slot_count) + "\t" + fill_target_hex + "\n"
+    pmvr_append_row(pmvr_region_path(), row)
+}
+
+fn record_slot_dispatch(dispatch_id: int, vtable_addr_hex: str, slot_offset: int, target_addr_hex: str, fake_handler: int) -> void {
+    if dispatch_id <= 0 { panic("pe_msvc_vtable_recovery_real FAIL [dispatch] id>0") }
+    if vtable_addr_hex == "" || target_addr_hex == "" { panic("pe_msvc_vtable_recovery_real FAIL [dispatch] hex non-empty") }
+    if slot_offset < 0 { panic("pe_msvc_vtable_recovery_real FAIL [dispatch] slot_offset>=0") }
+    if fake_handler < 0 { panic("pe_msvc_vtable_recovery_real FAIL [dispatch] fake_handler>=0") }
+    let row = to_string(dispatch_id) + "\t" + vtable_addr_hex + "\t" + to_string(slot_offset) + "\t" + target_addr_hex + "\t" + to_string(fake_handler) + "\n"
+    pmvr_append_row(pmvr_dispatch_path(), row)
+}
+
+// kind: 0=fake_redirect 1=eax_zero 2=skip 3=halt
+fn record_recovery_action(action_id: int, corrupt_id: int, action_kind: int, success: int) -> void {
+    if action_id <= 0 { panic("pe_msvc_vtable_recovery_real FAIL [action] id>0") }
+    if corrupt_id <= 0 { panic("pe_msvc_vtable_recovery_real FAIL [action] corrupt_id>0") }
+    if action_kind < 0 || action_kind > 3 { panic("pe_msvc_vtable_recovery_real FAIL [action] kind 0-3") }
+    if success < 0 || success > 1 { panic("pe_msvc_vtable_recovery_real FAIL [action] success 0/1") }
+    let row = to_string(action_id) + "\t" + to_string(corrupt_id) + "\t" + to_string(action_kind) + "\t" + to_string(success) + "\n"
+    pmvr_append_row(pmvr_action_path(), row)
+}
+
+// kind: 0=mov_eax_ecx 1=call_eax_disp 2=call_ecx 3=mov_edx_ecx_call_edx
+fn record_caller_pattern(pattern_id: int, caller_eip_hex: str, pattern_kind: int) -> void {
+    if pattern_id <= 0 { panic("pe_msvc_vtable_recovery_real FAIL [pattern] id>0") }
+    if caller_eip_hex == "" { panic("pe_msvc_vtable_recovery_real FAIL [pattern] eip non-empty") }
+    if pattern_kind < 0 || pattern_kind > 3 { panic("pe_msvc_vtable_recovery_real FAIL [pattern] kind 0-3") }
+    let row = to_string(pattern_id) + "\t" + caller_eip_hex + "\t" + to_string(pattern_kind) + "\n"
+    pmvr_append_row(pmvr_pattern_path(), row)
+}
+
+fn count_rows(path: str, min_cols: int) -> int {
+    let t = pmvr_read_table(path)
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= min_cols { cnt = cnt + 1 }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn vtable_corruption_count() -> int { return count_rows(pmvr_corrupt_path(), 5) }
+fn fake_vtable_region_count() -> int { return count_rows(pmvr_region_path(), 5) }
+fn slot_dispatch_count() -> int { return count_rows(pmvr_dispatch_path(), 5) }
+fn recovery_action_count() -> int { return count_rows(pmvr_action_path(), 4) }
+fn caller_pattern_count() -> int { return count_rows(pmvr_pattern_path(), 3) }
+
+fn corruption_kind_name(k: int) -> str {
+    if k == 0 { return "null" }
+    if k == 1 { return "garbage" }
+    if k == 2 { return "outside_region" }
+    if k == 3 { return "partial_init" }
+    return ""
+}
+fn action_kind_name(k: int) -> str {
+    if k == 0 { return "fake_redirect" }
+    if k == 1 { return "eax_zero" }
+    if k == 2 { return "skip" }
+    if k == 3 { return "halt" }
+    return ""
+}
+fn pattern_kind_name(k: int) -> str {
+    if k == 0 { return "mov_eax_ecx" }
+    if k == 1 { return "call_eax_disp" }
+    if k == 2 { return "call_ecx" }
+    if k == 3 { return "mov_edx_ecx_call_edx" }
+    return ""
+}
+
+fn pmvr_stats() -> array {
+    let mut out = []
+    out.push(vtable_corruption_count())
+    out.push(fake_vtable_region_count())
+    out.push(slot_dispatch_count())
+    out.push(recovery_action_count())
+    out.push(caller_pattern_count())
+    return out
+}
+
+fn self_test() -> void {
+    let sid = "pmvr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+    cleanup_pmvr()
+
+    record_vtable_corruption(1, "0x4212B9", "eax", "0x00000000", 0); r0_emit("pmvr_corrupt", "\"id\":1,\"kind\":0")
+    record_vtable_corruption(2, "0x42130A", "ecx", "0xDEADBEEF", 1); r0_emit("pmvr_corrupt", "\"id\":2,\"kind\":1")
+    record_vtable_corruption(3, "0x423456", "edx", "0x12345678", 2); r0_emit("pmvr_corrupt", "\"id\":3,\"kind\":2")
+    record_vtable_corruption(4, "0x42789A", "eax", "0x00800110", 3); r0_emit("pmvr_corrupt", "\"id\":4,\"kind\":3")
+
+    record_fake_vtable_region(1, "0x90000000", "0x90100000", 65536, "0x40000000"); r0_emit("pmvr_region", "\"id\":1")
+
+    record_slot_dispatch(1, "0x90000000", 0, "0x40000000", 1); r0_emit("pmvr_dispatch", "\"id\":1")
+    record_slot_dispatch(2, "0x90000000", 4, "0x40000000", 1); r0_emit("pmvr_dispatch", "\"id\":2")
+    record_slot_dispatch(3, "0x90001000", 8, "0x40000000", 1); r0_emit("pmvr_dispatch", "\"id\":3")
+    record_slot_dispatch(4, "0x90002000", 12, "0x40000000", 1); r0_emit("pmvr_dispatch", "\"id\":4")
+
+    record_recovery_action(1, 1, 0, 1); r0_emit("pmvr_action", "\"id\":1,\"kind\":0")
+    record_recovery_action(2, 2, 1, 1); r0_emit("pmvr_action", "\"id\":2,\"kind\":1")
+    record_recovery_action(3, 3, 2, 1); r0_emit("pmvr_action", "\"id\":3,\"kind\":2")
+    record_recovery_action(4, 4, 3, 0); r0_emit("pmvr_action", "\"id\":4,\"kind\":3")
+
+    record_caller_pattern(1, "0x4212B7", 0); r0_emit("pmvr_pattern", "\"id\":1,\"kind\":0")
+    record_caller_pattern(2, "0x42130A", 1); r0_emit("pmvr_pattern", "\"id\":2,\"kind\":1")
+    record_caller_pattern(3, "0x423458", 2); r0_emit("pmvr_pattern", "\"id\":3,\"kind\":2")
+    record_caller_pattern(4, "0x4278A0", 3); r0_emit("pmvr_pattern", "\"id\":4,\"kind\":3")
+
+    if vtable_corruption_count() != 4 { panic("pe_msvc_vtable_recovery_real FAIL [count corrupt] expected=4") }
+    if fake_vtable_region_count() != 1 { panic("pe_msvc_vtable_recovery_real FAIL [count region] expected=1") }
+    if slot_dispatch_count() != 4 { panic("pe_msvc_vtable_recovery_real FAIL [count dispatch] expected=4") }
+    if recovery_action_count() != 4 { panic("pe_msvc_vtable_recovery_real FAIL [count action] expected=4") }
+    if caller_pattern_count() != 4 { panic("pe_msvc_vtable_recovery_real FAIL [count pattern] expected=4") }
+
+    if corruption_kind_name(0) != "null" { panic("pe_msvc_vtable_recovery_real FAIL [name null]") }
+    if action_kind_name(2) != "skip" { panic("pe_msvc_vtable_recovery_real FAIL [name skip]") }
+    if pattern_kind_name(1) != "call_eax_disp" { panic("pe_msvc_vtable_recovery_real FAIL [name call_eax_disp]") }
+
+    let s = pmvr_stats()
+    r0_emit("pmvr_stats", "\"corrupt\":" + to_string(s[0]) + ",\"region\":" + to_string(s[1])
+        + ",\"dispatch\":" + to_string(s[2]) + ",\"action\":" + to_string(s[3])
+        + ",\"pattern\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 { panic("pe_msvc_vtable_recovery_real FAIL [emit count] expected>=14 got=" + to_string(emit_n)) }
+
+    cleanup_pmvr()
+    let s2 = pmvr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 { panic("pe_msvc_vtable_recovery_real FAIL [cleanup]") }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_vtable_recovery_real self_test PASS (corrupt=" + to_string(s[0])
+        + ", region=" + to_string(s[1]) + ", dispatch=" + to_string(s[2])
+        + ", action=" + to_string(s[3]) + ", pattern=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pmvr_stats()
+            println("corrupt\t" + to_string(s[0]))
+            println("region\t" + to_string(s[1]))
+            println("dispatch\t" + to_string(s[2]))
+            println("action\t" + to_string(s[3]))
+            println("pattern\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" { cleanup_pmvr(); println("cleaned: " + pmvr_dir()); return }
+        if sub == "dir" { println(pmvr_dir()); return }
+    }
+    println("usage: hexa run pe_msvc_vtable_recovery_real.hexa { self-test | stats | cleanup | dir }")
+}

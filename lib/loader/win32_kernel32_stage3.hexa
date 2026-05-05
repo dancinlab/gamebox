@@ -1,0 +1,231 @@
+// lib/loader/win32_kernel32_stage3.hexa — Phase 3a stage3 (process + module)
+//
+// own 1: only `use "../perf/r0_common"`. POSIX equivalent path.
+// own 2: r0_emit ≥ 4, fn self_test() + main(), headless,
+//        panic("win32_kernel32_stage3 FAIL [<sub>] expected=X got=Y").
+
+use "../perf/r0_common"
+
+let K32S3_DIR = GAMEBOX_HOME + "/persist/k32s3_handles"
+let PROC_TABLE = K32S3_DIR + "/process_table.tsv"
+let MODULE_TABLE = K32S3_DIR + "/module_table.tsv"
+let PROC_ADDR_TABLE = K32S3_DIR + "/proc_addr_table.tsv"
+let SYNTHETIC_PID = 11000
+
+fn handle_dir() -> str { return K32S3_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + K32S3_DIR + "'")
+}
+
+fn next_id(file: str, prefix: int) -> int {
+    let exists = exec("test -f '" + file + "' && echo ok").trim()
+    if exists != "ok" { return prefix }
+    let last = exec("awk -F'\\t' '{print $1}' '" + file + "' | sort -n | tail -1").trim()
+    if last == "" { return prefix }
+    return to_int(last) + 1
+}
+
+fn append_row(file: str, row: str) -> void {
+    ensure_dir()
+    let tmp = file + ".tmp"
+    write_file(tmp, row + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + file + "' && rm -f '" + tmp + "'")
+}
+
+// built-in module list (synthetic supported DLLs)
+fn is_built_in_module(name: str) -> bool {
+    if name == "KERNEL32.dll" { return true }
+    if name == "USER32.dll" { return true }
+    if name == "GDI32.dll" { return true }
+    if name == "ADVAPI32.dll" { return true }
+    if name == "NTDLL.dll" { return true }
+    if name == "MSVCRT.dll" { return true }
+    if name == "WS2_32.dll" { return true }
+    if name == "D3D11.dll" { return true }
+    if name == "D3D12.dll" { return true }
+    if name == "DXGI.dll" { return true }
+    return false
+}
+
+// ─── Process ───
+fn create_process_w(exe_path: str, cmdline: str) -> int {
+    let pid = next_id(PROC_TABLE, SYNTHETIC_PID + 1)
+    let ts = exec("date +%s").trim()
+    append_row(PROC_TABLE, to_string(pid) + "\t" + exe_path + "\t" + to_string(SYNTHETIC_PID) + "\t-1\trunning\t" + ts)
+    r0_emit("k32s3_create_process", "\"pid\":" + to_string(pid) + ",\"exe\":\"" + exe_path + "\"")
+    return pid
+}
+
+fn get_current_process() -> int { return SYNTHETIC_PID }
+fn get_current_process_id() -> int { return SYNTHETIC_PID }
+
+fn terminate_process(pid: int, exit_code: int) -> bool {
+    if pid <= 0 { return false }
+    let line = exec("grep -E '^" + to_string(pid) + "\\s' '" + PROC_TABLE + "' 2>/dev/null").trim()
+    if line == "" { return false }
+    let _ = exec("sed -i.bak '/^" + to_string(pid) + "\\s/d' '" + PROC_TABLE + "' 2>/dev/null && rm -f '" + PROC_TABLE + ".bak'")
+    let ts = exec("date +%s").trim()
+    let parts = line.split("\t")
+    let exe = ""
+    if len(parts) >= 2 { exe = parts[1] }
+    append_row(PROC_TABLE, to_string(pid) + "\t" + exe + "\t" + to_string(SYNTHETIC_PID) + "\t" + to_string(exit_code) + "\tterminated\t" + ts)
+    r0_emit("k32s3_terminate", "\"pid\":" + to_string(pid) + ",\"exit_code\":" + to_string(exit_code))
+    return true
+}
+
+fn get_startup_info_w() -> str {
+    return "STARTUPINFO\tcb=104\tcountChars=80\tcountLines=24\tflags=0"
+}
+
+fn get_command_line_w() -> str {
+    return "/test/process.exe arg1 arg2"
+}
+
+fn get_exit_code_process(pid: int) -> int {
+    let line = exec("grep -E '^" + to_string(pid) + "\\s' '" + PROC_TABLE + "' | tail -1").trim()
+    if line == "" { return 259 }  // STILL_ACTIVE
+    let parts = line.split("\t")
+    if len(parts) >= 4 { return to_int(parts[3]) }
+    return 259
+}
+
+// ─── Module ───
+fn load_library_w(dll_name: str) -> int {
+    if !is_built_in_module(dll_name) { return 0 }
+    let mid = next_id(MODULE_TABLE, 12000)
+    let ts = exec("date +%s").trim()
+    let base_addr = 0x10000000 + (mid - 12000) * 0x100000
+    append_row(MODULE_TABLE, to_string(mid) + "\t" + dll_name + "\t" + to_string(base_addr) + "\t1048576\t1\t" + ts)
+    r0_emit("k32s3_load_library", "\"module_id\":" + to_string(mid) + ",\"dll\":\"" + dll_name + "\"")
+    return mid
+}
+
+fn free_library(module_id: int) -> bool {
+    if module_id <= 0 { return false }
+    let line = exec("grep -E '^" + to_string(module_id) + "\\s' '" + MODULE_TABLE + "' 2>/dev/null").trim()
+    if line == "" { return false }
+    let _ = exec("sed -i.bak '/^" + to_string(module_id) + "\\s/d' '" + MODULE_TABLE + "' 2>/dev/null && rm -f '" + MODULE_TABLE + ".bak'")
+    return true
+}
+
+fn get_proc_address(module_id: int, proc_name: str) -> int {
+    if module_id <= 0 { return 0 }
+    // built-in proc name (synthetic — known Win32 API names)
+    let known = false
+    if proc_name == "CreateFileW" { known = true }
+    if proc_name == "ReadFile" { known = true }
+    if proc_name == "WriteFile" { known = true }
+    if proc_name == "CloseHandle" { known = true }
+    if proc_name == "VirtualAlloc" { known = true }
+    if proc_name == "MessageBoxW" { known = true }
+    if proc_name == "CreateWindowExW" { known = true }
+    if proc_name == "RegOpenKeyExW" { known = true }
+    if proc_name == "socket" { known = true }
+    if proc_name == "send" { known = true }
+    if !known { return 0 }
+    let aid = next_id(PROC_ADDR_TABLE, 13000)
+    let ts = exec("date +%s").trim()
+    append_row(PROC_ADDR_TABLE, to_string(aid) + "\t" + to_string(module_id) + "\t" + proc_name + "\t" + ts)
+    r0_emit("k32s3_get_proc_address", "\"module_id\":" + to_string(module_id) + ",\"proc\":\"" + proc_name + "\",\"addr\":" + to_string(aid))
+    return aid
+}
+
+fn get_module_handle_w(dll_name: str) -> int {
+    let line = exec("grep -E '\\s" + dll_name + "\\s' '" + MODULE_TABLE + "' 2>/dev/null | tail -1").trim()
+    if line == "" { return 0 }
+    let parts = line.split("\t")
+    if len(parts) >= 1 { return to_int(parts[0]) }
+    return 0
+}
+
+fn handle_counts() -> array {
+    let exists_p = exec("test -f '" + PROC_TABLE + "' && echo ok").trim()
+    let p = 0
+    if exists_p == "ok" {
+        p = to_int(exec("wc -l < '" + PROC_TABLE + "' | tr -d ' '").trim())
+    }
+    let exists_m = exec("test -f '" + MODULE_TABLE + "' && echo ok").trim()
+    let m = 0
+    if exists_m == "ok" {
+        m = to_int(exec("wc -l < '" + MODULE_TABLE + "' | tr -d ' '").trim())
+    }
+    let exists_a = exec("test -f '" + PROC_ADDR_TABLE + "' && echo ok").trim()
+    let a = 0
+    if exists_a == "ok" {
+        a = to_int(exec("wc -l < '" + PROC_ADDR_TABLE + "' | tr -d ' '").trim())
+    }
+    return [p, m, a]
+}
+
+fn cleanup_k32s3() -> void {
+    let _ = exec("rm -rf '" + K32S3_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "k32s3-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_k32s3()
+
+    // 1. current process
+    let cpid = get_current_process()
+    if cpid != SYNTHETIC_PID { panic("win32_kernel32_stage3 FAIL [current_process] expected=" + to_string(SYNTHETIC_PID) + " got=" + to_string(cpid)) }
+    let cpid_id = get_current_process_id()
+    if cpid_id != SYNTHETIC_PID { panic("win32_kernel32_stage3 FAIL [current_process_id]") }
+
+    // 2. create + terminate
+    let pid1 = create_process_w("/test/notepad.exe", "/test/notepad.exe foo.txt")
+    if pid1 <= SYNTHETIC_PID { panic("win32_kernel32_stage3 FAIL [pid1] expected>11000 got=" + to_string(pid1)) }
+    let cmdline = get_command_line_w()
+    if !cmdline.contains("test") { panic("win32_kernel32_stage3 FAIL [cmdline] expected contains 'test' got=" + cmdline) }
+    let term_ok = terminate_process(pid1, 0)
+    if !term_ok { panic("win32_kernel32_stage3 FAIL [terminate]") }
+    let exit_code = get_exit_code_process(pid1)
+    if exit_code != 0 { panic("win32_kernel32_stage3 FAIL [exit_code] expected=0 got=" + to_string(exit_code)) }
+
+    // 3. module
+    let mod1 = load_library_w("KERNEL32.dll")
+    if mod1 <= 0 { panic("win32_kernel32_stage3 FAIL [mod1] expected>0 got=" + to_string(mod1)) }
+    let mod2 = load_library_w("UnknownLib.dll")
+    if mod2 != 0 { panic("win32_kernel32_stage3 FAIL [mod2 unknown] expected=0 got=" + to_string(mod2)) }
+
+    // 4. get_proc_address
+    let proc1 = get_proc_address(mod1, "CreateFileW")
+    if proc1 <= 0 { panic("win32_kernel32_stage3 FAIL [proc1] expected>0 got=" + to_string(proc1)) }
+    let proc2 = get_proc_address(mod1, "FakeFunction")
+    if proc2 != 0 { panic("win32_kernel32_stage3 FAIL [proc2] expected=0 got=" + to_string(proc2)) }
+
+    // 5. get_module_handle
+    let mod_existing = get_module_handle_w("KERNEL32.dll")
+    if mod_existing != mod1 { panic("win32_kernel32_stage3 FAIL [mod_existing] expected=" + to_string(mod1) + " got=" + to_string(mod_existing)) }
+    let mod_missing = get_module_handle_w("NotLoaded.dll")
+    if mod_missing != 0 { panic("win32_kernel32_stage3 FAIL [mod_missing] expected=0 got=" + to_string(mod_missing)) }
+
+    // 6. free_library
+    let free_ok = free_library(mod1)
+    if !free_ok { panic("win32_kernel32_stage3 FAIL [free_library]") }
+
+    // 7. emit count (≥ 4)
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("win32_kernel32_stage3 FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    cleanup_k32s3()
+
+    println("  ✅ win32_kernel32_stage3 self_test PASS (process + terminate + module + proc_addr + free, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "counts" {
+            let c = handle_counts()
+            println("processes=" + to_string(c[0]) + " modules=" + to_string(c[1]) + " proc_addrs=" + to_string(c[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_k32s3(); println("cleaned"); return }
+    }
+    println("usage: hexa run win32_kernel32_stage3.hexa { self-test | counts | cleanup }")
+}

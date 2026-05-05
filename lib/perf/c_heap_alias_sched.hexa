@@ -1,0 +1,163 @@
+// lib/perf/c_heap_alias_sched.hexa — CN-37 PSB-7 만점 15/15
+//
+// Metal heap aliasing — frame 안 mutually exclusive resource → memory alias.
+// D4 G-buffer A 와 SSR temp B 같은 frame 안 동시에 안 씀 → heap 같은 영역 alias.
+//
+// 무기: temporal exclusivity graph + Metal heap alias placement.
+// 효과: VRAM peak 감소 (transient resource alias).
+
+use "./r0_common"
+
+let HAS_DIR = GAMEBOX_HOME + "/persist/heap_alias_sched"
+let LIFETIME_LOG = HAS_DIR + "/lifetimes.tsv"
+let ALIAS_HISTORY = HAS_DIR + "/aliases.jsonl"
+
+fn has_dir() -> str { return HAS_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + HAS_DIR + "'")
+}
+
+// ─── resource lifetime 등록 ───
+//   resource_id, frame_id, start_pass, end_pass, size_kb
+fn register_lifetime(resource_id: int, frame_id: int, start_pass: int, end_pass: int, size_kb: int) -> void {
+    ensure_dir()
+    let line = to_string(resource_id) + "\t" + to_string(frame_id) + "\t" + to_string(start_pass) + "\t" + to_string(end_pass) + "\t" + to_string(size_kb)
+    let tmp = LIFETIME_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + LIFETIME_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── two resources mutually exclusive? ───
+//   r1 [s1,e1] vs r2 [s2,e2] — 겹치지 않으면 alias 가능
+fn are_exclusive(s1: int, e1: int, s2: int, e2: int) -> bool {
+    if e1 < s2 { return true }   // r1 ends before r2 starts
+    if e2 < s1 { return true }   // r2 ends before r1 starts
+    return false
+}
+
+// ─── frame 안 alias schedule — greedy ───
+//   각 resource 를 alias bucket 에 assign — 같은 bucket 안 모두 mutually exclusive
+//   return: [total_resources, total_size, alias_buckets, peak_size]
+fn schedule_aliases(frame_id: int) -> array {
+    let exists = exec("test -f '" + LIFETIME_LOG + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0, 0, 0] }
+    let total_str = exec("awk -F'\\t' -v f=" + to_string(frame_id) + " '$1!=\"\" && $2==f' '" + LIFETIME_LOG + "' | wc -l | tr -d ' '").trim()
+    let total = to_int(total_str)
+    if total == 0 { return [0, 0, 0, 0] }
+    let total_size_str = exec("awk -F'\\t' -v f=" + to_string(frame_id) + " '$2==f {s+=$5} END{print s+0}' '" + LIFETIME_LOG + "'").trim()
+    let total_size = to_int(total_size_str)
+
+    // greedy bucket assign — sorted by start_pass
+    // bucket 별 max end_pass + max size 추적
+    // peak = max bucket size 합
+    let cmd = "awk -F'\\t' -v f=" + to_string(frame_id) + " '$2==f' '" + LIFETIME_LOG + "' | sort -k3,3n -t$'\\t' | awk -F'\\t' 'BEGIN{nb=0} { s=$3; e=$4; sz=$5; placed=0; for (b=0; b<nb; b++) { if (b_end[b] < s) { b_end[b]=e; if (b_max[b]<sz) b_max[b]=sz; placed=1; break } } if (!placed) { b_end[nb]=e; b_max[nb]=sz; nb++ } } END { peak=0; for (b=0; b<nb; b++) peak+=b_max[b]; print nb, peak }'"
+    let result = exec(cmd).trim()
+    if result == "" { return [total, total_size, total, total_size] }
+    let parts = result.split(" ")
+    if len(parts) < 2 { return [total, total_size, total, total_size] }
+    let buckets = to_int(parts[0])
+    let peak = to_int(parts[1])
+    return [total, total_size, buckets, peak]
+}
+
+// ─── alias 결과 기록 ───
+fn record_alias(frame_id: int, total: int, total_size: int, buckets: int, peak: int) -> void {
+    ensure_dir()
+    let saved = total_size - peak
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"frame\":" + to_string(frame_id) + ",\"resources\":" + to_string(total) + ",\"total_size\":" + to_string(total_size) + ",\"buckets\":" + to_string(buckets) + ",\"peak\":" + to_string(peak) + ",\"saved_kb\":" + to_string(saved) + "}"
+    let tmp = ALIAS_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + ALIAS_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("heap_alias_schedule", "\"frame\":" + to_string(frame_id) + ",\"resources\":" + to_string(total) + ",\"buckets\":" + to_string(buckets) + ",\"peak\":" + to_string(peak) + ",\"saved_kb\":" + to_string(saved))
+}
+
+fn alias_stats() -> array {
+    let exists_l = exec("test -f '" + LIFETIME_LOG + "' && echo ok").trim()
+    let lifetimes = 0
+    if exists_l == "ok" {
+        lifetimes = to_int(exec("wc -l < '" + LIFETIME_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_a = exec("test -f '" + ALIAS_HISTORY + "' && echo ok").trim()
+    let frames = 0
+    let saved_total = 0
+    if exists_a == "ok" {
+        frames = to_int(exec("wc -l < '" + ALIAS_HISTORY + "' | tr -d ' '").trim())
+        let s_str = exec("grep -oE '\"saved_kb\":[0-9]+' '" + ALIAS_HISTORY + "' | cut -d: -f2 | awk '{s+=$1} END{print s+0}'").trim()
+        if s_str != "" { saved_total = to_int(s_str) }
+    }
+    return [lifetimes, frames, saved_total]
+}
+
+fn cleanup_has() -> void {
+    let _ = exec("rm -rf '" + HAS_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "has-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_has()
+
+    // exclusive test
+    if !are_exclusive(0, 5, 10, 15) { panic("c_heap_alias_sched FAIL [excl 1]") }
+    if are_exclusive(0, 10, 5, 15) { panic("c_heap_alias_sched FAIL [excl 2 overlap]") }
+
+    // 합성 frame 1 — 4 resource, 2 alias-able + 2 not
+    // GBuffer-A: pass 0~3 (4096kb)
+    // SSR-temp:  pass 5~7 (4096kb) — GBuffer 끝나고 시작 → alias 가능
+    // Shadow:    pass 0~10 (8192kb) — long lifetime
+    // PostFX:    pass 8~10 (2048kb) — alias 불가 with shadow (overlap)
+    register_lifetime(101, 1, 0, 3, 4096)
+    register_lifetime(102, 1, 5, 7, 4096)
+    register_lifetime(103, 1, 0, 10, 8192)
+    register_lifetime(104, 1, 8, 10, 2048)
+
+    let res = schedule_aliases(1)
+    if res[0] != 4 { panic("c_heap_alias_sched FAIL [total] expected=4 got=" + to_string(res[0])) }
+    if res[1] != 18432 { panic("c_heap_alias_sched FAIL [total size] expected=18432 got=" + to_string(res[1])) }
+    // bucket 1: GBuffer-A(0-3) + SSR-temp(5-7) → 4096
+    // bucket 2: Shadow(0-10) → 8192 (cannot alias due overlap)
+    // bucket 3: PostFX(8-10) → 2048 (overlaps shadow but not GBuffer-A or SSR-temp; GBuffer-A end<8, SSR-temp end=7<8 so could alias bucket 1)
+    // sort by start_pass: GBuffer-A(0,3,4096), Shadow(0,10,8192), SSR-temp(5,7,4096), PostFX(8,10,2048)
+    // bucket 0: GBuffer-A → end=3, max=4096
+    // Shadow: bucket 0 end=3<0 NO (s=0), can't reuse → bucket 1: Shadow → end=10, max=8192
+    // SSR-temp: bucket 0 end=3<5 YES → reuse bucket 0, end=7, max=4096
+    // PostFX: bucket 0 end=7<8 YES → reuse bucket 0, end=10, max=4096
+    // → 2 buckets, peak = 4096 + 8192 = 12288
+    if res[2] != 2 { panic("c_heap_alias_sched FAIL [buckets] expected=2 got=" + to_string(res[2])) }
+    if res[3] != 12288 { panic("c_heap_alias_sched FAIL [peak] expected=12288 got=" + to_string(res[3])) }
+
+    record_alias(1, res[0], res[1], res[2], res[3])
+
+    // stats
+    let stats = alias_stats()
+    if stats[0] != 4 { panic("c_heap_alias_sched FAIL [stats lifetimes] expected=4 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_heap_alias_sched FAIL [stats frames] expected=1 got=" + to_string(stats[1])) }
+    if stats[2] != 6144 { panic("c_heap_alias_sched FAIL [stats saved] expected=6144 got=" + to_string(stats[2])) }
+
+    r0_emit("heap_alias_summary", "\"lifetimes\":" + to_string(stats[0]) + ",\"frames\":" + to_string(stats[1]) + ",\"saved_kb\":" + to_string(stats[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_heap_alias_sched FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_has()
+
+    println("  ✅ c_heap_alias_sched self_test PASS (4 resources, 2 buckets, peak=12288 vs total=18432, saved=6144kb, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = alias_stats()
+            println("lifetimes=" + to_string(s[0]) + " frames=" + to_string(s[1]) + " saved=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_has(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_heap_alias_sched.hexa { self-test | stats | cleanup }")
+}

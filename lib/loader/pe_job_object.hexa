@@ -1,0 +1,419 @@
+// lib/loader/pe_job_object.hexa — Win32 Job Object telemetry skeleton (cycle 74)
+//
+// Win32 Job (CreateJobObject + AssignProcessToJobObject + SetInformationJobObject
+// + TerminateJobObject) — per-job process lifetime / resource limit tracker.
+// Hexa skeleton: 실 Win32 API 호출 X. host native helper bridge 단계에서 연결.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 job op tracker — 실 CreateJobObject() / AssignProcessToJobObject()
+//   호출 X (후속 stage host helper bridge 에서 처리).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = create
+//   2 = assign
+//   3 = set_info
+//   4 = terminate
+//
+// limit_flags bit (Win32 JOBOBJECT_BASIC_LIMIT_INFORMATION 참조):
+//   0x0001 = ACTIVE_PROCESS
+//   0x0002 = PROCESS_TIME
+//   0x0004 = JOB_TIME
+//   0x0008 = WORKINGSET
+//   0x0010 = PROCESS_MEMORY
+//   0x0020 = JOB_MEMORY
+//   0x0040 = DIE_ON_UNHANDLED_EXCEPTION
+//   0x0080 = KILL_ON_JOB_CLOSE
+//
+// persist schema (TSV — ops.tsv):
+//   job_id<int> \t op_kind<int> \t process_count<int> \t limit_flags<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pjo_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_job_object"
+}
+
+fn pjo_ops_path() -> str {
+    return pjo_dir() + "/ops.tsv"
+}
+
+fn pjo_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pjo_dir() + "'")
+}
+
+fn cleanup_pjo() -> void {
+    pjo_ensure_dir()
+    let _ = exec("rm -f '" + pjo_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pjo_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pjo_append_row(path: str, row: str) -> void {
+    pjo_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: job op 1 건 기록 ───
+fn record_op(job_id: int, op_kind: int, process_count: int, limit_flags: int) -> void {
+    if job_id <= 0 {
+        panic("pe_job_object FAIL [record_op] expected=job_id>0 got=" + to_string(job_id))
+    }
+    if op_kind < 1 {
+        panic("pe_job_object FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_job_object FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if process_count < 0 {
+        panic("pe_job_object FAIL [record_op] expected=process_count>=0 got=" + to_string(process_count))
+    }
+    if limit_flags < 0 {
+        panic("pe_job_object FAIL [record_op] expected=limit_flags>=0 got=" + to_string(limit_flags))
+    }
+    let row = to_string(job_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(process_count) + "\t" + to_string(limit_flags) + "\n"
+    pjo_append_row(pjo_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pjo_read_table(pjo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_processes: 모든 op 의 process_count 합 ───
+fn total_processes() -> int {
+    let t = pjo_read_table(pjo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pjo_read_table(pjo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_limit_bit: limit_flags 의 특정 bit 가 set 된 row 수 ───
+fn count_by_limit_bit(bit_mask: int) -> int {
+    let t = pjo_read_table(pjo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let flags = to_int(parts[3])
+                if (flags & bit_mask) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── op_process_count: 특정 job_id 의 latest process_count (없으면 0) ───
+fn op_process_count(job_id: int) -> int {
+    let t = pjo_read_table(pjo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut last = 0
+    let mut found = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == job_id {
+                    last = to_int(parts[2])
+                    found = 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if found == 0 {
+        return 0
+    }
+    return last
+}
+
+// ─── pjo_stats: [op_count, total_processes, count_by_op_kind(2), count_by_limit_bit(0x0001)] ───
+fn pjo_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_processes())
+    out.push(count_by_op_kind(2))
+    out.push(count_by_limit_bit(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pjo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pjo()
+
+    // 2. record 5 ops across ≥3 op_kinds with varying limit_flags
+    //    create        — flags=0x0009 (ACTIVE_PROCESS|WORKINGSET)
+    record_op(74001, 1, 0, 9)
+    r0_emit("pe_job_object_record",
+        "\"job_id\":74001,\"op_kind\":1,\"process_count\":0,\"limit_flags\":9,\"target\":\"create\"")
+
+    //    assign #1     — flags=0x0001 (ACTIVE_PROCESS)
+    record_op(74001, 2, 1, 1)
+    r0_emit("pe_job_object_record",
+        "\"job_id\":74001,\"op_kind\":2,\"process_count\":1,\"limit_flags\":1,\"target\":\"assign\"")
+
+    //    assign #2     — flags=0x0001
+    record_op(74001, 2, 2, 1)
+    r0_emit("pe_job_object_record",
+        "\"job_id\":74001,\"op_kind\":2,\"process_count\":2,\"limit_flags\":1,\"target\":\"assign\"")
+
+    //    set_info      — flags=0x0080 (KILL_ON_JOB_CLOSE)
+    record_op(74001, 3, 2, 128)
+    r0_emit("pe_job_object_record",
+        "\"job_id\":74001,\"op_kind\":3,\"process_count\":2,\"limit_flags\":128,\"target\":\"set_info\"")
+
+    //    terminate     — flags=0x0000
+    record_op(74001, 4, 0, 0)
+    r0_emit("pe_job_object_record",
+        "\"job_id\":74001,\"op_kind\":4,\"process_count\":0,\"limit_flags\":0,\"target\":\"terminate\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_job_object FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_processes = 0+1+2+2+0 = 5
+    let tp = total_processes()
+    if tp != 5 {
+        panic("pe_job_object FAIL [total_processes] expected=5 got=" + to_string(tp))
+    }
+
+    // 5. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_job_object FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_job_object FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_job_object FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_job_object FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_job_object FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. count_by_limit_bit sanity
+    //    bit 0x0001 (ACTIVE_PROCESS) — set in row1(9), row2(1), row3(1) = 3 rows
+    let bp = count_by_limit_bit(1)
+    if bp != 3 {
+        panic("pe_job_object FAIL [count_by_limit_bit(1)] expected=3 got=" + to_string(bp))
+    }
+    //    bit 0x0008 (WORKINGSET) — set only in row1(9) = 1 row
+    let bw = count_by_limit_bit(8)
+    if bw != 1 {
+        panic("pe_job_object FAIL [count_by_limit_bit(8)] expected=1 got=" + to_string(bw))
+    }
+    //    bit 0x0080 (KILL_ON_JOB_CLOSE) — set only in row4(128) = 1 row
+    let bk = count_by_limit_bit(128)
+    if bk != 1 {
+        panic("pe_job_object FAIL [count_by_limit_bit(128)] expected=1 got=" + to_string(bk))
+    }
+    //    bit 0x0400 — unset everywhere
+    let bz = count_by_limit_bit(1024)
+    if bz != 0 {
+        panic("pe_job_object FAIL [count_by_limit_bit(1024)] expected=0 got=" + to_string(bz))
+    }
+
+    // 7. op_process_count — latest row of job_id=74001 is terminate (process_count=0)
+    let pc = op_process_count(74001)
+    if pc != 0 {
+        panic("pe_job_object FAIL [op_process_count(74001)] expected=0 got=" + to_string(pc))
+    }
+    let pc_miss = op_process_count(99999)
+    if pc_miss != 0 {
+        panic("pe_job_object FAIL [op_process_count(99999)] expected=0 got=" + to_string(pc_miss))
+    }
+
+    // 8. pjo_stats() = [5, 5, 2, 3]
+    let s = pjo_stats()
+    if len(s) != 4 {
+        panic("pe_job_object FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_job_object FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 5 {
+        panic("pe_job_object FAIL [stats total_processes] expected=5 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_job_object FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_job_object FAIL [stats count_limit_bit(1)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_job_object_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_processes\":" + to_string(s[1])
+        + ",\"kind_assign\":" + to_string(s[2])
+        + ",\"limit_active_process\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_job_object FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pjo()
+    let s2 = pjo_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_job_object FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_job_object self_test PASS (ops=" + to_string(s[0])
+        + ", procs=" + to_string(s[1]) + ", assign=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pjo_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_processes\t" + to_string(s[1]))
+            println("count_kind_assign\t" + to_string(s[2]))
+            println("count_limit_active_process\t" + to_string(s[3]))
+            return
+        }
+        if sub == "procs" {
+            if len(a) >= 4 {
+                let jid = to_int(a[3])
+                println("op_process_count\t" + to_string(op_process_count(jid)))
+                return
+            }
+            println("usage: hexa run pe_job_object.hexa procs <job_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_job_object.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pjo()
+            println("cleaned: " + pjo_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pjo_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_job_object.hexa { self-test | stats | procs <job_id> | count <op_kind> | cleanup | dir }")
+}

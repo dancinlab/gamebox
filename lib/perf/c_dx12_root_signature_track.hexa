@@ -1,0 +1,171 @@
+// lib/perf/c_dx12_root_signature_track.hexa — CN-124 skeleton manjeom 15/15
+//
+// DX12 root signature 분석 — slot/parameter table → Metal argument buffer tier 2 매핑.
+// D4 / D2R / Bnet DX12 클라이언트 root signature 의 CBV/SRV/UAV/Sampler/Constants 를
+// Metal buffer/texture/sampler binding 으로 1:1 변환하여 layout overhead 를 제거.
+//
+// 무기: parameter table columnar (type histogram) + Metal mapping rule.
+// 효과: root signature → argument buffer 변환 cost 정적화, runtime branch 제거.
+
+use "./r0_common"
+
+let RS_DIR = GAMEBOX_HOME + "/persist/dx12_root_signature"
+let PARAM_LOG = RS_DIR + "/params.tsv"
+let MAP_HISTORY = RS_DIR + "/maps.jsonl"
+
+fn rs_dir() -> str { return RS_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + RS_DIR + "'")
+}
+
+// ─── root parameter 등록 ───
+//   rs_name, slot, param_type ∈ ["CBV","SRV","UAV","Sampler","Constants"]
+fn record_root_param(rs_name: str, slot: int, param_type: str) -> void {
+    ensure_dir()
+    let line = rs_name + "\t" + to_string(slot) + "\t" + param_type
+    let tmp = PARAM_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PARAM_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── root signature 안 parameter 수 ───
+fn param_count(rs_name: str) -> int {
+    let exists = exec("test -f '" + PARAM_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n_str = exec("awk -F'\\t' -v r='" + rs_name + "' '$1==r' '" + PARAM_LOG + "' | wc -l | tr -d ' '").trim()
+    return to_int(n_str)
+}
+
+// ─── 전체에서 type 별 수 ───
+fn param_count_by_type(type_str: str) -> int {
+    let exists = exec("test -f '" + PARAM_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n_str = exec("awk -F'\\t' -v t='" + type_str + "' '$3==t' '" + PARAM_LOG + "' | wc -l | tr -d ' '").trim()
+    return to_int(n_str)
+}
+
+// ─── DX12 param_type → Metal argument buffer slot kind ───
+fn map_to_metal_arg(param_type: str) -> str {
+    if param_type == "CBV" { return "buffer" }
+    if param_type == "SRV" { return "texture/buffer" }
+    if param_type == "UAV" { return "texture (rw)" }
+    if param_type == "Sampler" { return "sampler" }
+    if param_type == "Constants" { return "buffer (constant)" }
+    return "unknown"
+}
+
+// ─── mapping 결과 기록 ───
+fn record_map(rs_name: str, total: int, cbv: int, srv: int, uav: int, sampler: int, consts: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"rs\":\"" + rs_name + "\",\"total\":" + to_string(total) + ",\"cbv\":" + to_string(cbv) + ",\"srv\":" + to_string(srv) + ",\"uav\":" + to_string(uav) + ",\"sampler\":" + to_string(sampler) + ",\"constants\":" + to_string(consts) + "}"
+    let tmp = MAP_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + MAP_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("dx12_rs_map", "\"rs\":\"" + rs_name + "\",\"total\":" + to_string(total) + ",\"cbv\":" + to_string(cbv) + ",\"srv\":" + to_string(srv) + ",\"uav\":" + to_string(uav) + ",\"sampler\":" + to_string(sampler) + ",\"constants\":" + to_string(consts))
+}
+
+fn rs_stats() -> array {
+    let exists_p = exec("test -f '" + PARAM_LOG + "' && echo ok").trim()
+    let params = 0
+    if exists_p == "ok" {
+        params = to_int(exec("wc -l < '" + PARAM_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_m = exec("test -f '" + MAP_HISTORY + "' && echo ok").trim()
+    let maps = 0
+    if exists_m == "ok" {
+        maps = to_int(exec("wc -l < '" + MAP_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [params, maps]
+}
+
+fn cleanup_rs() -> void {
+    let _ = exec("rm -rf '" + RS_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dx12rs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_rs()
+
+    // 합성 root signature: D4 main pass — 5 slot
+    //   slot 0: CBV (per-frame constants)
+    //   slot 1: SRV (texture)
+    //   slot 2: UAV (compute output)
+    //   slot 3: Sampler (linear)
+    //   slot 4: Constants (push)
+    record_root_param("d4_main", 0, "CBV")
+    record_root_param("d4_main", 1, "SRV")
+    record_root_param("d4_main", 2, "UAV")
+    record_root_param("d4_main", 3, "Sampler")
+    record_root_param("d4_main", 4, "Constants")
+
+    // count 검증
+    let n = param_count("d4_main")
+    if n != 5 { panic("c_dx12_root_signature_track FAIL [count] expected=5 got=" + to_string(n)) }
+
+    let n_other = param_count("nonexistent")
+    if n_other != 0 { panic("c_dx12_root_signature_track FAIL [count nonexistent] expected=0 got=" + to_string(n_other)) }
+
+    // type 별 count
+    let cbv = param_count_by_type("CBV")
+    let srv = param_count_by_type("SRV")
+    let uav = param_count_by_type("UAV")
+    let smp = param_count_by_type("Sampler")
+    let cst = param_count_by_type("Constants")
+    if cbv != 1 { panic("c_dx12_root_signature_track FAIL [CBV] expected=1 got=" + to_string(cbv)) }
+    if srv != 1 { panic("c_dx12_root_signature_track FAIL [SRV] expected=1 got=" + to_string(srv)) }
+    if uav != 1 { panic("c_dx12_root_signature_track FAIL [UAV] expected=1 got=" + to_string(uav)) }
+    if smp != 1 { panic("c_dx12_root_signature_track FAIL [Sampler] expected=1 got=" + to_string(smp)) }
+    if cst != 1 { panic("c_dx12_root_signature_track FAIL [Constants] expected=1 got=" + to_string(cst)) }
+
+    // Metal mapping 검증
+    if map_to_metal_arg("CBV") != "buffer" { panic("c_dx12_root_signature_track FAIL [map CBV] got=" + map_to_metal_arg("CBV")) }
+    if map_to_metal_arg("SRV") != "texture/buffer" { panic("c_dx12_root_signature_track FAIL [map SRV] got=" + map_to_metal_arg("SRV")) }
+    if map_to_metal_arg("UAV") != "texture (rw)" { panic("c_dx12_root_signature_track FAIL [map UAV] got=" + map_to_metal_arg("UAV")) }
+    if map_to_metal_arg("Sampler") != "sampler" { panic("c_dx12_root_signature_track FAIL [map Sampler] got=" + map_to_metal_arg("Sampler")) }
+    if map_to_metal_arg("Constants") != "buffer (constant)" { panic("c_dx12_root_signature_track FAIL [map Constants] got=" + map_to_metal_arg("Constants")) }
+    if map_to_metal_arg("garbage") != "unknown" { panic("c_dx12_root_signature_track FAIL [map unknown] got=" + map_to_metal_arg("garbage")) }
+
+    record_map("d4_main", n, cbv, srv, uav, smp, cst)
+
+    // 두번째 root signature (Bnet UI — sampler 만)
+    record_root_param("bnet_ui", 0, "Sampler")
+    record_root_param("bnet_ui", 1, "Sampler")
+    let n2 = param_count("bnet_ui")
+    if n2 != 2 { panic("c_dx12_root_signature_track FAIL [bnet count] expected=2 got=" + to_string(n2)) }
+    let smp2 = param_count_by_type("Sampler")
+    if smp2 != 3 { panic("c_dx12_root_signature_track FAIL [Sampler total] expected=3 got=" + to_string(smp2)) }
+    record_map("bnet_ui", n2, 0, 0, 0, 2, 0)
+
+    // stats
+    let stats = rs_stats()
+    if stats[0] != 7 { panic("c_dx12_root_signature_track FAIL [stats params] expected=7 got=" + to_string(stats[0])) }
+    if stats[1] != 2 { panic("c_dx12_root_signature_track FAIL [stats maps] expected=2 got=" + to_string(stats[1])) }
+
+    r0_emit("dx12_rs_summary", "\"params\":" + to_string(stats[0]) + ",\"maps\":" + to_string(stats[1]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_dx12_root_signature_track FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_rs()
+
+    println("  ✅ c_dx12_root_signature_track self_test PASS (7 params, 2 maps, 5 metal mappings, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = rs_stats()
+            println("params=" + to_string(s[0]) + " maps=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_rs(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_dx12_root_signature_track.hexa { self-test | stats | cleanup }")
+}

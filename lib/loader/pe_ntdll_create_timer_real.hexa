@@ -1,0 +1,464 @@
+// lib/loader/pe_ntdll_create_timer_real.hexa — NTDLL NtCreateTimer/NtSetTimer/NtCancelTimer 실 호출 추적
+//
+// NTDLL NtCreateTimer/NtSetTimer/NtCancelTimer 실 호출 → kqueue bridge:
+//   NtCreateTimer(out TimerHandle, DesiredAccess, OBJECT_ATTRIBUTES*, TIMER_TYPE)
+//     → kqueue() + EV_ADD + EVFILT_TIMER (one-shot or repeating)
+//   NtSetTimer(TimerHandle, DueTime, TimerApcRoutine, ..., Period, ...)
+//     → kevent EV_ADD + EVFILT_TIMER, fflags=NOTE_USECONDS, data=period_us
+//   NtCancelTimer(TimerHandle, ...)
+//     → kevent EV_DELETE + EVFILT_TIMER
+//   timer_kind translation:
+//     NotificationTimer    → EVFILT_TIMER (manual reset semantics carried at handle layer)
+//     SynchronizationTimer → EVFILT_TIMER (auto reset semantics carried at handle layer)
+//     high_resolution      → mach_absolute_time + NOTE_NSECONDS scaling
+//   periodic timer (period_ms > 0)
+//     → fflags=NOTE_USECONDS + repeat (kqueue auto re-arms)
+//   period_ms == 0 → one-shot (single fire, EV_ONESHOT)
+// own1: NTDLL spec + Apple kqueue. Wine ntdll/sync.c 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NT timer API call tracker — 실 NtCreateTimer / kqueue 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = NtCreateTimer
+//   2 = NtSetTimer
+//   3 = NtCancelTimer
+//   4 = NtOpenTimer
+//
+// timer_kind code:
+//   1 = NotificationTimer
+//   2 = SynchronizationTimer
+//   3 = high_resolution (mach_absolute_time path)
+//
+// period_ms:
+//   0 = one-shot (single EVFILT_TIMER fire)
+//   N > 0 = periodic timer (NOTE_USECONDS + repeat, period in ms)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t timer_kind<int> \t period_ms<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnctr2_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_create_timer_real"
+}
+
+fn pnctr2_ops_path() -> str {
+    return pnctr2_dir() + "/ops.tsv"
+}
+
+fn pnctr2_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnctr2_dir() + "'")
+}
+
+fn cleanup_pnctr2() -> void {
+    pnctr2_ensure_dir()
+    let _ = exec("rm -f '" + pnctr2_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnctr2_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnctr2_append_row(path: str, row: str) -> void {
+    pnctr2_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: NT timer API op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, timer_kind: int, period_ms: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_create_timer_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ntdll_create_timer_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_ntdll_create_timer_real FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if timer_kind < 1 {
+        panic("pe_ntdll_create_timer_real FAIL [record_op] expected=timer_kind>=1 got=" + to_string(timer_kind))
+    }
+    if timer_kind > 3 {
+        panic("pe_ntdll_create_timer_real FAIL [record_op] expected=timer_kind<=3 got=" + to_string(timer_kind))
+    }
+    if period_ms < 0 {
+        panic("pe_ntdll_create_timer_real FAIL [record_op] expected=period_ms>=0 got=" + to_string(period_ms))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(timer_kind) + "\t" + to_string(period_ms) + "\n"
+    pnctr2_append_row(pnctr2_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pnctr2_read_table(pnctr2_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pnctr2_read_table(pnctr2_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_timer_kind: 특정 timer_kind 의 op 수 ───
+fn count_by_timer_kind(kind: int) -> int {
+    let t = pnctr2_read_table(pnctr2_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_period_ms: 모든 op 의 period_ms 합 ───
+fn total_period_ms() -> int {
+    let t = pnctr2_read_table(pnctr2_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── periodic_count: period_ms > 0 인 op 수 ───
+fn periodic_count() -> int {
+    let t = pnctr2_read_table(pnctr2_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) > 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── op_period: 특정 op_id 의 period_ms (없으면 -1) ───
+fn op_period(op_id: int) -> int {
+    let t = pnctr2_read_table(pnctr2_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnctr2_stats: [op_count, periodic_count, count_by_op_kind(2), count_by_timer_kind(3)] ───
+fn pnctr2_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(periodic_count())
+    out.push(count_by_op_kind(2))
+    out.push(count_by_timer_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnctr2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnctr2()
+
+    // 2. record 6 ops — covers ≥3 op_kinds (1,2,3) and ≥2 timer_kinds (1,2,3) with ≥2 periodic
+    //    NtCreateTimer NotificationTimer one-shot
+    record_op(140001, 1, 1, 0)
+    r0_emit("pe_ntdll_create_timer_real_record",
+        "\"op_id\":140001,\"op_kind\":1,\"timer_kind\":1,\"period_ms\":0,\"target\":\"NtCreateTimer\"")
+
+    //    NtSetTimer SynchronizationTimer periodic 100ms (D2R frame tick)
+    record_op(140002, 2, 2, 100)
+    r0_emit("pe_ntdll_create_timer_real_record",
+        "\"op_id\":140002,\"op_kind\":2,\"timer_kind\":2,\"period_ms\":100,\"target\":\"NtSetTimer\"")
+
+    //    NtSetTimer high_resolution periodic 16ms (~60fps render tick)
+    record_op(140003, 2, 3, 16)
+    r0_emit("pe_ntdll_create_timer_real_record",
+        "\"op_id\":140003,\"op_kind\":2,\"timer_kind\":3,\"period_ms\":16,\"target\":\"NtSetTimer\"")
+
+    //    NtCreateTimer high_resolution one-shot
+    record_op(140004, 1, 3, 0)
+    r0_emit("pe_ntdll_create_timer_real_record",
+        "\"op_id\":140004,\"op_kind\":1,\"timer_kind\":3,\"period_ms\":0,\"target\":\"NtCreateTimer\"")
+
+    //    NtCancelTimer SynchronizationTimer
+    record_op(140005, 3, 2, 0)
+    r0_emit("pe_ntdll_create_timer_real_record",
+        "\"op_id\":140005,\"op_kind\":3,\"timer_kind\":2,\"period_ms\":0,\"target\":\"NtCancelTimer\"")
+
+    //    NtSetTimer NotificationTimer periodic 1000ms
+    record_op(140006, 2, 1, 1000)
+    r0_emit("pe_ntdll_create_timer_real_record",
+        "\"op_id\":140006,\"op_kind\":2,\"timer_kind\":1,\"period_ms\":1000,\"target\":\"NtSetTimer\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_ntdll_create_timer_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (≥3 op_kinds covered: 1,2,3)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 3 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_op_kind(2)] expected=3 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 0 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_op_kind(4)] expected=0 got=" + to_string(k4))
+    }
+
+    // 5. count_by_timer_kind sanity (≥2 timer_kinds covered: 1,2,3)
+    let t1 = count_by_timer_kind(1)
+    if t1 != 2 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_timer_kind(1)] expected=2 got=" + to_string(t1))
+    }
+    let t2 = count_by_timer_kind(2)
+    if t2 != 2 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_timer_kind(2)] expected=2 got=" + to_string(t2))
+    }
+    let t3 = count_by_timer_kind(3)
+    if t3 != 2 {
+        panic("pe_ntdll_create_timer_real FAIL [count_by_timer_kind(3)] expected=2 got=" + to_string(t3))
+    }
+
+    // 6. periodic_count = 3 (140002:100, 140003:16, 140006:1000)
+    let pc = periodic_count()
+    if pc != 3 {
+        panic("pe_ntdll_create_timer_real FAIL [periodic_count] expected=3 got=" + to_string(pc))
+    }
+
+    // 7. total_period_ms = 100 + 16 + 1000 = 1116
+    let tp = total_period_ms()
+    if tp != 1116 {
+        panic("pe_ntdll_create_timer_real FAIL [total_period_ms] expected=1116 got=" + to_string(tp))
+    }
+
+    // 8. op_period sanity
+    let p1 = op_period(140002)
+    if p1 != 100 {
+        panic("pe_ntdll_create_timer_real FAIL [op_period(140002)] expected=100 got=" + to_string(p1))
+    }
+    let p2 = op_period(140004)
+    if p2 != 0 {
+        panic("pe_ntdll_create_timer_real FAIL [op_period(140004)] expected=0 got=" + to_string(p2))
+    }
+    let p_miss = op_period(9999)
+    if p_miss != -1 {
+        panic("pe_ntdll_create_timer_real FAIL [op_period(9999)] expected=-1 got=" + to_string(p_miss))
+    }
+
+    // 9. pnctr2_stats() = [6, 3, 3, 2]
+    let s = pnctr2_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_create_timer_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_ntdll_create_timer_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_ntdll_create_timer_real FAIL [stats periodic_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_ntdll_create_timer_real FAIL [stats op_kind(2)] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ntdll_create_timer_real FAIL [stats timer_kind(3)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit)
+    r0_emit("pe_ntdll_create_timer_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"periodic_count\":" + to_string(s[1])
+        + ",\"op_kind_set\":" + to_string(s[2])
+        + ",\"timer_kind_high_res\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_ntdll_create_timer_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pnctr2()
+    let s2 = pnctr2_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_create_timer_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_create_timer_real self_test PASS (ops=" + to_string(s[0])
+        + ", periodic=" + to_string(s[1]) + ", set=" + to_string(s[2])
+        + ", high_res=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnctr2_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("periodic_count\t" + to_string(s[1]))
+            println("count_op_kind_set\t" + to_string(s[2]))
+            println("count_timer_kind_high_res\t" + to_string(s[3]))
+            return
+        }
+        if sub == "period" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_period\t" + to_string(op_period(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_create_timer_real.hexa period <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "op" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+                if what == "timer" {
+                    println("count_by_timer_kind\t" + to_string(count_by_timer_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_create_timer_real.hexa count { op <op_kind> | timer <timer_kind> }")
+            return
+        }
+        if sub == "total" {
+            println("total_period_ms\t" + to_string(total_period_ms()))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnctr2()
+            println("cleaned: " + pnctr2_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnctr2_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_create_timer_real.hexa { self-test | stats | period <op_id> | count op <op_kind> | count timer <timer_kind> | total | cleanup | dir }")
+}

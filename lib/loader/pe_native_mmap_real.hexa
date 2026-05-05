@@ -1,0 +1,450 @@
+// lib/loader/pe_native_mmap_real.hexa — stage7 real mmap(2) IPC frame skeleton
+//
+// stage4 (pe_native_mmap_wrapper) 의 PE-side region tracker → stage7 helper.mm
+// 실 mmap(2) 호출 IPC frame. 본 module 은 host helper.mm 에 보낼 mmap request
+// 의 (length, prot, flags) tuple 과 응답 record 를 TSV 로 누적 — 실제 mmap(2)
+// syscall 은 helper.mm 에서 수행 (R1 phase 1 stage7 boundary).
+//
+// helper.mm IPC frame:
+//   request:  {kind: "mmap", length: <size_t>, prot: <int>, flags: <int>, addr_hint: <uintptr|0>}
+//   response: {addr: <uintptr>, errno: <int>}
+// Apple Silicon 제약:
+//   - 16KB page granularity (NOT 4KB) — length must be multiple of 16384
+//   - W^X — PROT_WRITE|PROT_EXEC 동시 X (must use MAP_JIT + pthread_jit_write_protect_np toggle)
+//   - hardened runtime: com.apple.security.cs.allow-jit entitlement required for MAP_JIT
+// own1: helper.mm 자체 구현, Wine/CrossOver mmap shim 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Apple mmap(2) man page + Apple Silicon W^X / MAP_JIT policy 만 참조.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// prot_flags bitmask (sys/mman.h):
+//   PROT_READ  = 1
+//   PROT_WRITE = 2
+//   PROT_EXEC  = 4
+// map_flags bitmask (sys/mman.h — Apple values):
+//   MAP_PRIVATE = 2
+//   MAP_FIXED   = 16
+//   MAP_JIT     = 2048
+//   MAP_ANON    = 4096
+//
+// persist schema (TSV — mmaps.tsv):
+//   mmap_id<int> \t prot_flags<int> \t map_flags<int> \t length_kb<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnmr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_mmap_real"
+}
+
+fn pnmr_mmaps_path() -> str {
+    return pnmr_dir() + "/mmaps.tsv"
+}
+
+fn pnmr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnmr_dir() + "'")
+}
+
+fn cleanup_pnmr() -> void {
+    pnmr_ensure_dir()
+    let _ = exec("rm -f '" + pnmr_mmaps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnmr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnmr_append_row(path: str, row: str) -> void {
+    pnmr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_mmap: mmap request 1 건 기록 ───
+fn record_mmap(mmap_id: int, prot_flags: int, map_flags: int, length_kb: int) -> void {
+    if mmap_id <= 0 {
+        panic("pe_native_mmap_real FAIL [record_mmap] expected=mmap_id>0 got=" + to_string(mmap_id))
+    }
+    if prot_flags < 0 {
+        panic("pe_native_mmap_real FAIL [record_mmap] expected=prot_flags>=0 got=" + to_string(prot_flags))
+    }
+    if prot_flags > 7 {
+        panic("pe_native_mmap_real FAIL [record_mmap] expected=prot_flags<=7 got=" + to_string(prot_flags))
+    }
+    if map_flags < 0 {
+        panic("pe_native_mmap_real FAIL [record_mmap] expected=map_flags>=0 got=" + to_string(map_flags))
+    }
+    if length_kb <= 0 {
+        panic("pe_native_mmap_real FAIL [record_mmap] expected=length_kb>0 got=" + to_string(length_kb))
+    }
+    let row = to_string(mmap_id) + "\t" + to_string(prot_flags)
+        + "\t" + to_string(map_flags) + "\t" + to_string(length_kb) + "\n"
+    pnmr_append_row(pnmr_mmaps_path(), row)
+}
+
+// ─── mmap_count: 전체 row 수 ───
+fn mmap_count() -> int {
+    let t = pnmr_read_table(pnmr_mmaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_length_kb: length_kb sum ───
+fn total_length_kb() -> int {
+    let t = pnmr_read_table(pnmr_mmaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_prot_bit: (prot_flags AND bit_mask) != 0 인 row 수 ───
+fn count_by_prot_bit(bit_mask: int) -> int {
+    let t = pnmr_read_table(pnmr_mmaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let pf = to_int(parts[1])
+                if (pf & bit_mask) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_map_bit: (map_flags AND bit_mask) != 0 인 row 수 ───
+fn count_by_map_bit(bit_mask: int) -> int {
+    let t = pnmr_read_table(pnmr_mmaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let mf = to_int(parts[2])
+                if (mf & bit_mask) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── jit_count: (map_flags AND MAP_JIT=2048) != 0 인 row 수 ───
+fn jit_count() -> int {
+    return count_by_map_bit(2048)
+}
+
+// ─── mmap_length_kb: 특정 mmap_id 의 length_kb (없으면 0) ───
+fn mmap_length_kb(mmap_id: int) -> int {
+    let t = pnmr_read_table(pnmr_mmaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut out = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == mmap_id {
+                    out = to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── pnmr_stats: [mmap_count, total_length_kb, jit_count, count_by_prot_bit(PROT_EXEC=4)] ───
+fn pnmr_stats() -> array {
+    let mut out = []
+    out.push(mmap_count())
+    out.push(total_length_kb())
+    out.push(jit_count())
+    out.push(count_by_prot_bit(4))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnmr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnmr()
+
+    // 2. record 6 synthetic mmap requests covering RWX combos + ≥2 MAP_JIT
+    //    PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
+    //    MAP_PRIVATE=2, MAP_FIXED=16, MAP_JIT=2048, MAP_ANON=4096
+    //
+    //    row 1: R       , PRIVATE|ANON          , 16  KB  → ro page
+    //    row 2: R+W     , PRIVATE|ANON          , 64  KB  → heap rw
+    //    row 3: R+X     , PRIVATE|ANON|JIT      , 128 KB  → JIT exec (post-toggle)  *MAP_JIT
+    //    row 4: X       , PRIVATE|ANON|JIT      , 32  KB  → JIT exec-only           *MAP_JIT
+    //    row 5: W       , PRIVATE|ANON          , 16  KB  → write-only stage
+    //    row 6: R+W+X   , PRIVATE|ANON|JIT|FIXED, 256 KB  → fixed-addr JIT region    *MAP_JIT
+    //
+    //    aggregates:
+    //      mmap_count = 6
+    //      total_length_kb = 16+64+128+32+16+256 = 512
+    //      count_by_prot_bit(R=1) = rows 1,2,3,6 = 4
+    //      count_by_prot_bit(W=2) = rows 2,5,6  = 3
+    //      count_by_prot_bit(X=4) = rows 3,4,6  = 3
+    //      count_by_map_bit(PRIVATE=2)  = 6
+    //      count_by_map_bit(ANON=4096)  = 6
+    //      count_by_map_bit(JIT=2048)   = rows 3,4,6 = 3
+    //      count_by_map_bit(FIXED=16)   = row 6 = 1
+    //      jit_count = 3
+
+    record_mmap(70001, 1, 4098, 16)
+    r0_emit("pe_native_mmap_real_record",
+        "\"mmap_id\":70001,\"prot_flags\":1,\"map_flags\":4098,\"length_kb\":16,\"label\":\"ro_page\"")
+
+    record_mmap(70002, 3, 4098, 64)
+    r0_emit("pe_native_mmap_real_record",
+        "\"mmap_id\":70002,\"prot_flags\":3,\"map_flags\":4098,\"length_kb\":64,\"label\":\"heap_rw\"")
+
+    record_mmap(70003, 5, 6146, 128)
+    r0_emit("pe_native_mmap_real_record",
+        "\"mmap_id\":70003,\"prot_flags\":5,\"map_flags\":6146,\"length_kb\":128,\"label\":\"jit_rx\"")
+
+    record_mmap(70004, 4, 6146, 32)
+    r0_emit("pe_native_mmap_real_record",
+        "\"mmap_id\":70004,\"prot_flags\":4,\"map_flags\":6146,\"length_kb\":32,\"label\":\"jit_x\"")
+
+    record_mmap(70005, 2, 4098, 16)
+    r0_emit("pe_native_mmap_real_record",
+        "\"mmap_id\":70005,\"prot_flags\":2,\"map_flags\":4098,\"length_kb\":16,\"label\":\"write_stage\"")
+
+    record_mmap(70006, 7, 6162, 256)
+    r0_emit("pe_native_mmap_real_record",
+        "\"mmap_id\":70006,\"prot_flags\":7,\"map_flags\":6162,\"length_kb\":256,\"label\":\"jit_fixed_rwx\"")
+
+    // 3. mmap_count = 6
+    let mc = mmap_count()
+    if mc != 6 {
+        panic("pe_native_mmap_real FAIL [mmap_count] expected=6 got=" + to_string(mc))
+    }
+
+    // 4. total_length_kb = 512
+    let tl = total_length_kb()
+    if tl != 512 {
+        panic("pe_native_mmap_real FAIL [total_length_kb] expected=512 got=" + to_string(tl))
+    }
+
+    // 5. count_by_prot_bit
+    let pr = count_by_prot_bit(1)
+    if pr != 4 {
+        panic("pe_native_mmap_real FAIL [count_by_prot_bit(R=1)] expected=4 got=" + to_string(pr))
+    }
+    let pw = count_by_prot_bit(2)
+    if pw != 3 {
+        panic("pe_native_mmap_real FAIL [count_by_prot_bit(W=2)] expected=3 got=" + to_string(pw))
+    }
+    let px = count_by_prot_bit(4)
+    if px != 3 {
+        panic("pe_native_mmap_real FAIL [count_by_prot_bit(X=4)] expected=3 got=" + to_string(px))
+    }
+
+    // 6. count_by_map_bit
+    let mp = count_by_map_bit(2)
+    if mp != 6 {
+        panic("pe_native_mmap_real FAIL [count_by_map_bit(PRIVATE=2)] expected=6 got=" + to_string(mp))
+    }
+    let ma = count_by_map_bit(4096)
+    if ma != 6 {
+        panic("pe_native_mmap_real FAIL [count_by_map_bit(ANON=4096)] expected=6 got=" + to_string(ma))
+    }
+    let mj = count_by_map_bit(2048)
+    if mj != 3 {
+        panic("pe_native_mmap_real FAIL [count_by_map_bit(JIT=2048)] expected=3 got=" + to_string(mj))
+    }
+    let mf = count_by_map_bit(16)
+    if mf != 1 {
+        panic("pe_native_mmap_real FAIL [count_by_map_bit(FIXED=16)] expected=1 got=" + to_string(mf))
+    }
+
+    // 7. jit_count = 3
+    let jc = jit_count()
+    if jc != 3 {
+        panic("pe_native_mmap_real FAIL [jit_count] expected=3 got=" + to_string(jc))
+    }
+
+    // 8. mmap_length_kb lookup
+    let l3 = mmap_length_kb(70003)
+    if l3 != 128 {
+        panic("pe_native_mmap_real FAIL [mmap_length_kb(70003)] expected=128 got=" + to_string(l3))
+    }
+    let l6 = mmap_length_kb(70006)
+    if l6 != 256 {
+        panic("pe_native_mmap_real FAIL [mmap_length_kb(70006)] expected=256 got=" + to_string(l6))
+    }
+    let lx = mmap_length_kb(9999)
+    if lx != 0 {
+        panic("pe_native_mmap_real FAIL [mmap_length_kb(9999)] expected=0 got=" + to_string(lx))
+    }
+
+    // 9. pnmr_stats() = [6, 512, 3, 3]
+    let s = pnmr_stats()
+    if len(s) != 4 {
+        panic("pe_native_mmap_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_native_mmap_real FAIL [stats[0] mmap_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 512 {
+        panic("pe_native_mmap_real FAIL [stats[1] total_length_kb] expected=512 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_native_mmap_real FAIL [stats[2] jit_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_native_mmap_real FAIL [stats[3] exec_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_native_mmap_real_stats",
+        "\"mmap_count\":" + to_string(s[0])
+        + ",\"total_length_kb\":" + to_string(s[1])
+        + ",\"jit_count\":" + to_string(s[2])
+        + ",\"exec_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_native_mmap_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pnmr()
+    let s2 = pnmr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_native_mmap_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_mmap_real self_test PASS (mmaps=" + to_string(s[0])
+        + ", length_kb=" + to_string(s[1]) + ", jit=" + to_string(s[2])
+        + ", exec=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnmr_stats()
+            println("mmap_count\t" + to_string(s[0]))
+            println("total_length_kb\t" + to_string(s[1]))
+            println("jit_count\t" + to_string(s[2]))
+            println("exec_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "length" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("mmap_length_kb\t" + to_string(mmap_length_kb(mid)))
+                return
+            }
+            println("usage: hexa run pe_native_mmap_real.hexa length <mmap_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let bit = to_int(a[4])
+                if dim == "prot" {
+                    println("count_by_prot_bit\t" + to_string(count_by_prot_bit(bit)))
+                    return
+                }
+                if dim == "map" {
+                    println("count_by_map_bit\t" + to_string(count_by_map_bit(bit)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_native_mmap_real.hexa count { prot | map } <bit>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnmr()
+            println("cleaned: " + pnmr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnmr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_mmap_real.hexa { self-test | stats | length <mmap_id> | count prot <bit> | count map <bit> | cleanup | dir }")
+}

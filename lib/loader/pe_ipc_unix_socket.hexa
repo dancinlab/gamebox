@@ -1,0 +1,387 @@
+// lib/loader/pe_ipc_unix_socket.hexa — stage5 Unix domain socket transport skeleton
+//
+// docker hexa ↔ host native helper 통신 — AF_UNIX SOCK_STREAM. socket path
+// = ~/.airgenome/gamebox/ipc/helper.sock (host bind, docker connect via
+// volume mount). 양방향 byte stream.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 socket op tracker — 실 socket() / bind() / connect() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = connect
+//   2 = send
+//   3 = recv
+//   4 = close
+//
+// persist schema (TSV — socket_ops.tsv):
+//   op_id<int> \t op_kind<int> \t byte_count<int> \t success<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pius_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_unix_socket"
+}
+
+fn pius_ops_path() -> str {
+    return pius_dir() + "/socket_ops.tsv"
+}
+
+fn pius_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pius_dir() + "'")
+}
+
+fn cleanup_pius() -> void {
+    pius_ensure_dir()
+    let _ = exec("rm -f '" + pius_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pius_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pius_append_row(path: str, row: str) -> void {
+    pius_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_socket_op: socket op 1 건 기록 ───
+fn record_socket_op(op_id: int, op_kind: int, byte_count: int, success: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ipc_unix_socket FAIL [record_socket_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ipc_unix_socket FAIL [record_socket_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_ipc_unix_socket FAIL [record_socket_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if byte_count < 0 {
+        panic("pe_ipc_unix_socket FAIL [record_socket_op] expected=byte_count>=0 got=" + to_string(byte_count))
+    }
+    if success < 0 {
+        panic("pe_ipc_unix_socket FAIL [record_socket_op] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_ipc_unix_socket FAIL [record_socket_op] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(byte_count) + "\t" + to_string(success) + "\n"
+    pius_append_row(pius_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pius_read_table(pius_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes: 모든 op byte_count 합 ───
+fn total_bytes() -> int {
+    let t = pius_read_table(pius_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pius_read_table(pius_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: success=1 인 op 수 ───
+fn success_count() -> int {
+    let t = pius_read_table(pius_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── op_bytes: 특정 op_id 의 byte_count (없으면 0) ───
+fn op_bytes(op_id: int) -> int {
+    let t = pius_read_table(pius_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pius_stats: [op_count, total_bytes, success_count, count_by_op_kind(2)] ───
+fn pius_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_bytes())
+    out.push(success_count())
+    out.push(count_by_op_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pius-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pius()
+
+    // 2. record 5 socket ops (deterministic synthetic)
+    record_socket_op(110001, 1, 0, 1)
+    r0_emit("pe_ipc_unix_socket_record",
+        "\"op_id\":110001,\"op_kind\":1,\"byte_count\":0,\"success\":1,\"target\":\"connect\"")
+
+    record_socket_op(110002, 2, 64, 1)
+    r0_emit("pe_ipc_unix_socket_record",
+        "\"op_id\":110002,\"op_kind\":2,\"byte_count\":64,\"success\":1,\"target\":\"send\"")
+
+    record_socket_op(110003, 3, 256, 1)
+    r0_emit("pe_ipc_unix_socket_record",
+        "\"op_id\":110003,\"op_kind\":3,\"byte_count\":256,\"success\":1,\"target\":\"recv\"")
+
+    record_socket_op(110004, 2, 128, 1)
+    r0_emit("pe_ipc_unix_socket_record",
+        "\"op_id\":110004,\"op_kind\":2,\"byte_count\":128,\"success\":1,\"target\":\"send\"")
+
+    record_socket_op(110005, 4, 0, 1)
+    r0_emit("pe_ipc_unix_socket_record",
+        "\"op_id\":110005,\"op_kind\":4,\"byte_count\":0,\"success\":1,\"target\":\"close\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_ipc_unix_socket FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_bytes = 448
+    let tb = total_bytes()
+    if tb != 448 {
+        panic("pe_ipc_unix_socket FAIL [total_bytes] expected=448 got=" + to_string(tb))
+    }
+
+    // 5. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_ipc_unix_socket FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_ipc_unix_socket FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ipc_unix_socket FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_ipc_unix_socket FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ipc_unix_socket FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. success_count = 5
+    let sc = success_count()
+    if sc != 5 {
+        panic("pe_ipc_unix_socket FAIL [success_count] expected=5 got=" + to_string(sc))
+    }
+
+    // 7. op_bytes sanity
+    let b2 = op_bytes(110002)
+    if b2 != 64 {
+        panic("pe_ipc_unix_socket FAIL [op_bytes(110002)] expected=64 got=" + to_string(b2))
+    }
+    let b3 = op_bytes(110003)
+    if b3 != 256 {
+        panic("pe_ipc_unix_socket FAIL [op_bytes(110003)] expected=256 got=" + to_string(b3))
+    }
+    let b_miss = op_bytes(9999)
+    if b_miss != 0 {
+        panic("pe_ipc_unix_socket FAIL [op_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 8. pius_stats() = [5, 448, 5, 2]
+    let s = pius_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_unix_socket FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ipc_unix_socket FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 448 {
+        panic("pe_ipc_unix_socket FAIL [stats total_bytes] expected=448 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_ipc_unix_socket FAIL [stats success_count] expected=5 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ipc_unix_socket FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_unix_socket_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_bytes\":" + to_string(s[1])
+        + ",\"success_count\":" + to_string(s[2])
+        + ",\"kind_send\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ipc_unix_socket FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pius()
+    let s2 = pius_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_unix_socket FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_unix_socket self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", success=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pius_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_bytes\t" + to_string(s[1]))
+            println("success_count\t" + to_string(s[2]))
+            println("count_kind_send\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_bytes\t" + to_string(op_bytes(oid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_unix_socket.hexa bytes <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_ipc_unix_socket.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pius()
+            println("cleaned: " + pius_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pius_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_unix_socket.hexa { self-test | stats | bytes <op_id> | count <op_kind> | cleanup | dir }")
+}

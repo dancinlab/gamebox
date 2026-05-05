@@ -1,0 +1,404 @@
+// lib/loader/pe_console_screen_buffer.hexa — cycle 72 WriteConsoleOutput CHAR_INFO telemetry
+//
+// Win32 WriteConsoleOutput / WriteConsoleOutputAttribute / FillConsoleOutputCharacter
+// / FillConsoleOutputAttribute / ScrollConsoleScreenBuffer 등 console screen buffer
+// write op tracker. write region rect (left/top/right/bottom) + cell count + 색상
+// attribute mask 를 persist 하여 telemetry 분석에 사용.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 console write tracker — 실 WriteConsoleOutput() 호출 X.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// write_kind code:
+//   1 = output            (WriteConsoleOutput — CHAR_INFO rect)
+//   2 = output_attribute  (WriteConsoleOutputAttribute)
+//   3 = fill_char         (FillConsoleOutputCharacter)
+//   4 = fill_attribute    (FillConsoleOutputAttribute)
+//   5 = scroll            (ScrollConsoleScreenBuffer)
+//
+// persist schema (TSV — writes.tsv):
+//   write_id<int> \t write_kind<int> \t cell_count<int> \t attributes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcsb_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_console_screen_buffer"
+}
+
+fn pcsb_writes_path() -> str {
+    return pcsb_dir() + "/writes.tsv"
+}
+
+fn pcsb_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcsb_dir() + "'")
+}
+
+fn cleanup_pcsb() -> void {
+    pcsb_ensure_dir()
+    let _ = exec("rm -f '" + pcsb_writes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcsb_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcsb_append_row(path: str, row: str) -> void {
+    pcsb_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_write: console write 1 건 기록 ───
+fn record_write(write_id: int, write_kind: int, cell_count: int, attributes: int) -> void {
+    if write_id <= 0 {
+        panic("pe_console_screen_buffer FAIL [record_write] expected=write_id>0 got=" + to_string(write_id))
+    }
+    if write_kind < 1 {
+        panic("pe_console_screen_buffer FAIL [record_write] expected=write_kind>=1 got=" + to_string(write_kind))
+    }
+    if write_kind > 5 {
+        panic("pe_console_screen_buffer FAIL [record_write] expected=write_kind<=5 got=" + to_string(write_kind))
+    }
+    if cell_count < 0 {
+        panic("pe_console_screen_buffer FAIL [record_write] expected=cell_count>=0 got=" + to_string(cell_count))
+    }
+    if attributes < 0 {
+        panic("pe_console_screen_buffer FAIL [record_write] expected=attributes>=0 got=" + to_string(attributes))
+    }
+    let row = to_string(write_id) + "\t" + to_string(write_kind)
+        + "\t" + to_string(cell_count) + "\t" + to_string(attributes) + "\n"
+    pcsb_append_row(pcsb_writes_path(), row)
+}
+
+// ─── write_count: total write 수 ───
+fn write_count() -> int {
+    let t = pcsb_read_table(pcsb_writes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_cells: 모든 write cell_count 합 ───
+fn total_cells() -> int {
+    let t = pcsb_read_table(pcsb_writes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_write_kind: 특정 write_kind 의 write 수 ───
+fn count_by_write_kind(kind: int) -> int {
+    let t = pcsb_read_table(pcsb_writes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_attributes: 고유 attribute mask 개수 ───
+fn distinct_attributes() -> int {
+    let t = pcsb_read_table(pcsb_writes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let attr = to_int(parts[3])
+                let m = len(seen)
+                let j = 0
+                let mut found = 0
+                while j < m {
+                    if seen[j] == attr {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(attr)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── write_cells: 특정 write_id 의 cell_count (없으면 0) ───
+fn write_cells(write_id: int) -> int {
+    let t = pcsb_read_table(pcsb_writes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == write_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pcsb_stats: [write_count, total_cells, distinct_attributes, count_by_write_kind(1)] ───
+fn pcsb_stats() -> array {
+    let mut out = []
+    out.push(write_count())
+    out.push(total_cells())
+    out.push(distinct_attributes())
+    out.push(count_by_write_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcsb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcsb()
+
+    // 2. record 6 writes across ≥3 write_kinds (1=output, 2=output_attribute, 3=fill_char, 4=fill_attribute, 5=scroll)
+    record_write(720001, 1, 80, 7)
+    r0_emit("pe_console_screen_buffer_record",
+        "\"write_id\":720001,\"write_kind\":1,\"cell_count\":80,\"attributes\":7,\"target\":\"output\"")
+
+    record_write(720002, 1, 160, 7)
+    r0_emit("pe_console_screen_buffer_record",
+        "\"write_id\":720002,\"write_kind\":1,\"cell_count\":160,\"attributes\":7,\"target\":\"output\"")
+
+    record_write(720003, 2, 40, 12)
+    r0_emit("pe_console_screen_buffer_record",
+        "\"write_id\":720003,\"write_kind\":2,\"cell_count\":40,\"attributes\":12,\"target\":\"output_attribute\"")
+
+    record_write(720004, 3, 200, 0)
+    r0_emit("pe_console_screen_buffer_record",
+        "\"write_id\":720004,\"write_kind\":3,\"cell_count\":200,\"attributes\":0,\"target\":\"fill_char\"")
+
+    record_write(720005, 4, 200, 15)
+    r0_emit("pe_console_screen_buffer_record",
+        "\"write_id\":720005,\"write_kind\":4,\"cell_count\":200,\"attributes\":15,\"target\":\"fill_attribute\"")
+
+    record_write(720006, 5, 320, 7)
+    r0_emit("pe_console_screen_buffer_record",
+        "\"write_id\":720006,\"write_kind\":5,\"cell_count\":320,\"attributes\":7,\"target\":\"scroll\"")
+
+    // 3. write_count = 6
+    let c = write_count()
+    if c != 6 {
+        panic("pe_console_screen_buffer FAIL [write_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_cells = 80+160+40+200+200+320 = 1000
+    let tc = total_cells()
+    if tc != 1000 {
+        panic("pe_console_screen_buffer FAIL [total_cells] expected=1000 got=" + to_string(tc))
+    }
+
+    // 5. count_by_write_kind sanity (kind 1=2, 2=1, 3=1, 4=1, 5=1, 99=0)
+    let k1 = count_by_write_kind(1)
+    if k1 != 2 {
+        panic("pe_console_screen_buffer FAIL [count_by_write_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_write_kind(2)
+    if k2 != 1 {
+        panic("pe_console_screen_buffer FAIL [count_by_write_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_write_kind(3)
+    if k3 != 1 {
+        panic("pe_console_screen_buffer FAIL [count_by_write_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_write_kind(4)
+    if k4 != 1 {
+        panic("pe_console_screen_buffer FAIL [count_by_write_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_write_kind(5)
+    if k5 != 1 {
+        panic("pe_console_screen_buffer FAIL [count_by_write_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_write_kind(99)
+    if k99 != 0 {
+        panic("pe_console_screen_buffer FAIL [count_by_write_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_attributes = {7, 12, 0, 15} = 4
+    let da = distinct_attributes()
+    if da != 4 {
+        panic("pe_console_screen_buffer FAIL [distinct_attributes] expected=4 got=" + to_string(da))
+    }
+
+    // 7. write_cells sanity
+    let wc2 = write_cells(720002)
+    if wc2 != 160 {
+        panic("pe_console_screen_buffer FAIL [write_cells(720002)] expected=160 got=" + to_string(wc2))
+    }
+    let wc6 = write_cells(720006)
+    if wc6 != 320 {
+        panic("pe_console_screen_buffer FAIL [write_cells(720006)] expected=320 got=" + to_string(wc6))
+    }
+    let wc_miss = write_cells(9999)
+    if wc_miss != 0 {
+        panic("pe_console_screen_buffer FAIL [write_cells(9999)] expected=0 got=" + to_string(wc_miss))
+    }
+
+    // 8. pcsb_stats() = [6, 1000, 4, 2]
+    let s = pcsb_stats()
+    if len(s) != 4 {
+        panic("pe_console_screen_buffer FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_console_screen_buffer FAIL [stats write_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 1000 {
+        panic("pe_console_screen_buffer FAIL [stats total_cells] expected=1000 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_console_screen_buffer FAIL [stats distinct_attributes] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_console_screen_buffer FAIL [stats kind_output] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_console_screen_buffer_stats",
+        "\"write_count\":" + to_string(s[0])
+        + ",\"total_cells\":" + to_string(s[1])
+        + ",\"distinct_attributes\":" + to_string(s[2])
+        + ",\"kind_output\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_console_screen_buffer FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pcsb()
+    let s2 = pcsb_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_console_screen_buffer FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_console_screen_buffer self_test PASS (writes=" + to_string(s[0])
+        + ", cells=" + to_string(s[1]) + ", attrs=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcsb_stats()
+            println("write_count\t" + to_string(s[0]))
+            println("total_cells\t" + to_string(s[1]))
+            println("distinct_attributes\t" + to_string(s[2]))
+            println("count_kind_output\t" + to_string(s[3]))
+            return
+        }
+        if sub == "cells" {
+            if len(a) >= 4 {
+                let wid = to_int(a[3])
+                println("write_cells\t" + to_string(write_cells(wid)))
+                return
+            }
+            println("usage: hexa run pe_console_screen_buffer.hexa cells <write_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_write_kind\t" + to_string(count_by_write_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_console_screen_buffer.hexa count <write_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcsb()
+            println("cleaned: " + pcsb_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcsb_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_console_screen_buffer.hexa { self-test | stats | cells <write_id> | count <write_kind> | cleanup | dir }")
+}

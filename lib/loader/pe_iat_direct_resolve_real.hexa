@@ -1,0 +1,414 @@
+// lib/loader/pe_iat_direct_resolve_real.hexa — cycle 80 R3 phase 1
+// PE direct name-import IAT resolve (real walk) skeleton
+//
+// PE Import Directory walk:
+//   IMAGE_IMPORT_DESCRIPTOR { OriginalFirstThunk → ILT, FirstThunk → IAT }
+//   ILT entry (PE32+):
+//     IMAGE_THUNK_DATA64.AddressOfData → IMAGE_IMPORT_BY_NAME { Hint, Name[1] }
+//     high bit set → ordinal (R3-B 별도)
+//   resolve: name string → own2 stub function 의 dlsym 동등 lookup → IAT slot 에 absolute addr 쓰기
+//   patched flag: 성공 시 1, 실패 (forwarder/api-set/등) 시 0 → fallback 영역
+// own1: PE spec only, Wine __wine_set_unix_funcs 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 import resolve tracker — 실 IAT patch / dlsym X (R3-C 이후).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// dll_kind code:
+//   1 = kernel32
+//   2 = user32
+//   3 = advapi32
+//   4 = gdi32
+//   5 = other
+//
+// persist schema (TSV — imports.tsv):
+//   import_id<int> \t dll_kind<int> \t name_hash<int> \t patched<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pidr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_iat_direct_resolve_real"
+}
+
+fn pidr_imports_path() -> str {
+    return pidr_dir() + "/imports.tsv"
+}
+
+fn pidr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pidr_dir() + "'")
+}
+
+fn cleanup_pidr() -> void {
+    pidr_ensure_dir()
+    let _ = exec("rm -f '" + pidr_imports_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pidr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pidr_append_row(path: str, row: str) -> void {
+    pidr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── import_name_hash: deterministic name → int hash ───
+//   exec/cat/test/mkdir/rm constraint 으로 native char-code 접근 X.
+//   ALPHA 안에서 char index 를 찾아 djb2-like 누적. 미스 char 는 95 (sentinel).
+fn import_name_hash(name: str) -> int {
+    let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_."
+    let na = len(alpha)
+    let n = len(name)
+    let i = 0
+    let mut h = 5381
+    while i < n {
+        let ch = name[i]
+        let mut j = 0
+        let mut code = 95
+        while j < na {
+            if alpha[j] == ch {
+                code = j + 33
+                j = na
+            } else {
+                j = j + 1
+            }
+        }
+        h = h * 33 + code
+        if h < 0 {
+            h = 0 - h
+        }
+        if h > 2147483000 {
+            h = h % 2147483000
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ─── record_import: import 1 건 기록 ───
+fn record_import(import_id: int, dll_kind: int, name_hash: int, patched: int) -> void {
+    if import_id <= 0 {
+        panic("pe_iat_direct_resolve_real FAIL [record_import] expected=import_id>0 got=" + to_string(import_id))
+    }
+    if dll_kind < 1 {
+        panic("pe_iat_direct_resolve_real FAIL [record_import] expected=dll_kind>=1 got=" + to_string(dll_kind))
+    }
+    if dll_kind > 5 {
+        panic("pe_iat_direct_resolve_real FAIL [record_import] expected=dll_kind<=5 got=" + to_string(dll_kind))
+    }
+    if name_hash < 0 {
+        panic("pe_iat_direct_resolve_real FAIL [record_import] expected=name_hash>=0 got=" + to_string(name_hash))
+    }
+    if patched < 0 {
+        panic("pe_iat_direct_resolve_real FAIL [record_import] expected=patched>=0 got=" + to_string(patched))
+    }
+    if patched > 1 {
+        panic("pe_iat_direct_resolve_real FAIL [record_import] expected=patched<=1 got=" + to_string(patched))
+    }
+    let row = to_string(import_id) + "\t" + to_string(dll_kind)
+        + "\t" + to_string(name_hash) + "\t" + to_string(patched) + "\n"
+    pidr_append_row(pidr_imports_path(), row)
+}
+
+// ─── import_count: total import 수 ───
+fn import_count() -> int {
+    let t = pidr_read_table(pidr_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── patched_count: patched=1 인 import 수 ───
+fn patched_count() -> int {
+    let t = pidr_read_table(pidr_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_dll_kind: 특정 dll_kind 의 import 수 ───
+fn count_by_dll_kind(kind: int) -> int {
+    let t = pidr_read_table(pidr_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── unpatched_count: patched=0 인 import 수 (fallback 영역) ───
+fn unpatched_count() -> int {
+    let t = pidr_read_table(pidr_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pidr_stats: [import_count, patched_count, unpatched_count, count_by_dll_kind(1)] ───
+fn pidr_stats() -> array {
+    let mut out = []
+    out.push(import_count())
+    out.push(patched_count())
+    out.push(unpatched_count())
+    out.push(count_by_dll_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pidr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pidr()
+
+    // 2. record 6 imports across 4 dll_kinds (kernel32 x2, user32 x2, advapi32 x1, gdi32 x1)
+    //    patched: 4 success, 2 fallback (forwarder/api-set 등)
+    let h1 = import_name_hash("CreateFileW")
+    record_import(120001, 1, h1, 1)
+    r0_emit("pe_iat_direct_resolve_real_record",
+        "\"import_id\":120001,\"dll_kind\":1,\"name\":\"CreateFileW\",\"patched\":1")
+
+    let h2 = import_name_hash("GetProcAddress")
+    record_import(120002, 1, h2, 1)
+    r0_emit("pe_iat_direct_resolve_real_record",
+        "\"import_id\":120002,\"dll_kind\":1,\"name\":\"GetProcAddress\",\"patched\":1")
+
+    let h3 = import_name_hash("MessageBoxW")
+    record_import(120003, 2, h3, 1)
+    r0_emit("pe_iat_direct_resolve_real_record",
+        "\"import_id\":120003,\"dll_kind\":2,\"name\":\"MessageBoxW\",\"patched\":1")
+
+    let h4 = import_name_hash("SetWindowTextW")
+    record_import(120004, 2, h4, 0)
+    r0_emit("pe_iat_direct_resolve_real_record",
+        "\"import_id\":120004,\"dll_kind\":2,\"name\":\"SetWindowTextW\",\"patched\":0")
+
+    let h5 = import_name_hash("RegOpenKeyExW")
+    record_import(120005, 3, h5, 1)
+    r0_emit("pe_iat_direct_resolve_real_record",
+        "\"import_id\":120005,\"dll_kind\":3,\"name\":\"RegOpenKeyExW\",\"patched\":1")
+
+    let h6 = import_name_hash("CreateCompatibleDC")
+    record_import(120006, 4, h6, 0)
+    r0_emit("pe_iat_direct_resolve_real_record",
+        "\"import_id\":120006,\"dll_kind\":4,\"name\":\"CreateCompatibleDC\",\"patched\":0")
+
+    // 3. import_count = 6
+    let c = import_count()
+    if c != 6 {
+        panic("pe_iat_direct_resolve_real FAIL [import_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. patched_count = 4
+    let pc = patched_count()
+    if pc != 4 {
+        panic("pe_iat_direct_resolve_real FAIL [patched_count] expected=4 got=" + to_string(pc))
+    }
+
+    // 5. unpatched_count = 2
+    let uc = unpatched_count()
+    if uc != 2 {
+        panic("pe_iat_direct_resolve_real FAIL [unpatched_count] expected=2 got=" + to_string(uc))
+    }
+
+    // 6. count_by_dll_kind sanity
+    let k1 = count_by_dll_kind(1)
+    if k1 != 2 {
+        panic("pe_iat_direct_resolve_real FAIL [count_by_dll_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_dll_kind(2)
+    if k2 != 2 {
+        panic("pe_iat_direct_resolve_real FAIL [count_by_dll_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_dll_kind(3)
+    if k3 != 1 {
+        panic("pe_iat_direct_resolve_real FAIL [count_by_dll_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_dll_kind(4)
+    if k4 != 1 {
+        panic("pe_iat_direct_resolve_real FAIL [count_by_dll_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_dll_kind(5)
+    if k5 != 0 {
+        panic("pe_iat_direct_resolve_real FAIL [count_by_dll_kind(5)] expected=0 got=" + to_string(k5))
+    }
+
+    // 7. import_name_hash determinism + non-zero
+    if h1 <= 0 {
+        panic("pe_iat_direct_resolve_real FAIL [name_hash CreateFileW] expected=>0 got=" + to_string(h1))
+    }
+    let h1b = import_name_hash("CreateFileW")
+    if h1b != h1 {
+        panic("pe_iat_direct_resolve_real FAIL [name_hash determinism] expected=" + to_string(h1) + " got=" + to_string(h1b))
+    }
+    if h1 == h2 {
+        panic("pe_iat_direct_resolve_real FAIL [name_hash distinct] CreateFileW==GetProcAddress hash=" + to_string(h1))
+    }
+
+    // 8. pidr_stats() = [6, 4, 2, 2]
+    let s = pidr_stats()
+    if len(s) != 4 {
+        panic("pe_iat_direct_resolve_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_iat_direct_resolve_real FAIL [stats import_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_iat_direct_resolve_real FAIL [stats patched_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_iat_direct_resolve_real FAIL [stats unpatched_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_iat_direct_resolve_real FAIL [stats kind_kernel32] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_iat_direct_resolve_real_stats",
+        "\"import_count\":" + to_string(s[0])
+        + ",\"patched_count\":" + to_string(s[1])
+        + ",\"unpatched_count\":" + to_string(s[2])
+        + ",\"kind_kernel32\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_iat_direct_resolve_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pidr()
+    let s2 = pidr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_iat_direct_resolve_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_iat_direct_resolve_real self_test PASS (imports=" + to_string(s[0])
+        + ", patched=" + to_string(s[1]) + ", unpatched=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pidr_stats()
+            println("import_count\t" + to_string(s[0]))
+            println("patched_count\t" + to_string(s[1]))
+            println("unpatched_count\t" + to_string(s[2]))
+            println("kind_kernel32\t" + to_string(s[3]))
+            return
+        }
+        if sub == "hash" {
+            if len(a) >= 4 {
+                let nm = a[3]
+                println("name_hash\t" + to_string(import_name_hash(nm)))
+                return
+            }
+            println("usage: hexa run pe_iat_direct_resolve_real.hexa hash <import_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_dll_kind\t" + to_string(count_by_dll_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_iat_direct_resolve_real.hexa count <dll_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pidr()
+            println("cleaned: " + pidr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pidr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_iat_direct_resolve_real.hexa { self-test | stats | hash <import_id> | count <dll_kind> | cleanup | dir }")
+}

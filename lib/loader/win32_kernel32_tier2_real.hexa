@@ -1,0 +1,461 @@
+// lib/loader/win32_kernel32_tier2_real.hexa — cycle 82 R6 Tier 2 real tracker
+//
+// Tier 2 KERNEL32 POSIX 매핑:
+//   CreateFileW(path, GENERIC_READ|WRITE, FILE_SHARE_READ, NULL, dwCreate, dwFlags, NULL)
+//     → open(utf8_path, O_RDWR|O_CREAT, mode) + Win32 OPEN_EXISTING/CREATE_ALWAYS dwCreate translate
+//   ReadFile(h, buf, n, &out, NULL)         → read(fd, buf, n)
+//   WriteFile(h, buf, n, &out, NULL)        → write(fd, buf, n)
+//   SetFilePointer(h, dist, hi, SEEK_*)     → lseek(fd, off, whence)
+//   GetFileSize(h, hi)                      → fstat(fd, &st).st_size
+//   DeleteFileW(path)                       → unlink(utf8_path)
+//   MoveFileW(src, dst)                     → rename(src, dst)
+//   CopyFileW(src, dst, fail_if_exists)     → copyfile(src, dst, NULL, COPYFILE_DATA)
+//   CreateDirectoryW(path, sec)             → mkdir(utf8_path, 0755)
+//   RemoveDirectoryW(path)                  → rmdir(utf8_path)
+//   path translate: UTF-16 LE → UTF-8 + 'C:\foo' → '/Volumes/.../foo' or relative
+//   handle: HANDLE 은 fd + handle table entry (cycle 81 pe_handle_table_real cross-ref)
+// own1: Apple POSIX libc + MSDN. Wine kernel32/file.c 인용 X
+//
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// func_kind code:
+//   1  = CreateFileW
+//   2  = ReadFile
+//   3  = WriteFile
+//   4  = SetFilePointer
+//   5  = GetFileSize
+//   6  = DeleteFileW
+//   7  = MoveFileW
+//   8  = CopyFileW
+//   9  = CreateDirectoryW
+//   10 = RemoveDirectoryW
+//
+// posix_kind code:
+//   1  = open
+//   2  = read
+//   3  = write
+//   4  = lseek
+//   5  = fstat
+//   6  = unlink
+//   7  = rename
+//   8  = copyfile
+//   9  = mkdir
+//   10 = rmdir
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t func_kind<int> \t posix_kind<int> \t bytes_transferred<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn wkt2_dir() -> str {
+    return GAMEBOX_HOME + "/persist/win32_kernel32_tier2_real"
+}
+
+fn wkt2_calls_path() -> str {
+    return wkt2_dir() + "/calls.tsv"
+}
+
+fn wkt2_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + wkt2_dir() + "'")
+}
+
+fn cleanup_wkt2() -> void {
+    wkt2_ensure_dir()
+    let _ = exec("rm -f '" + wkt2_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn wkt2_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn wkt2_append_row(path: str, row: str) -> void {
+    wkt2_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: KERNEL32 call 1 건 기록 ───
+fn record_call(call_id: int, func_kind: int, posix_kind: int, bytes_transferred: int) -> void {
+    if call_id <= 0 {
+        panic("win32_kernel32_tier2_real FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if func_kind < 1 {
+        panic("win32_kernel32_tier2_real FAIL [record_call] expected=func_kind>=1 got=" + to_string(func_kind))
+    }
+    if func_kind > 10 {
+        panic("win32_kernel32_tier2_real FAIL [record_call] expected=func_kind<=10 got=" + to_string(func_kind))
+    }
+    if posix_kind < 1 {
+        panic("win32_kernel32_tier2_real FAIL [record_call] expected=posix_kind>=1 got=" + to_string(posix_kind))
+    }
+    if posix_kind > 10 {
+        panic("win32_kernel32_tier2_real FAIL [record_call] expected=posix_kind<=10 got=" + to_string(posix_kind))
+    }
+    if bytes_transferred < 0 {
+        panic("win32_kernel32_tier2_real FAIL [record_call] expected=bytes_transferred>=0 got=" + to_string(bytes_transferred))
+    }
+    let row = to_string(call_id) + "\t" + to_string(func_kind)
+        + "\t" + to_string(posix_kind) + "\t" + to_string(bytes_transferred) + "\n"
+    wkt2_append_row(wkt2_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = wkt2_read_table(wkt2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_func_kind: 특정 func_kind 의 call 수 ───
+fn count_by_func_kind(func_kind: int) -> int {
+    let t = wkt2_read_table(wkt2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == func_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_posix_kind: 특정 posix_kind 의 call 수 ───
+fn count_by_posix_kind(posix_kind: int) -> int {
+    let t = wkt2_read_table(wkt2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == posix_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes_transferred: 모든 call bytes_transferred 합 ───
+fn total_bytes_transferred() -> int {
+    let t = wkt2_read_table(wkt2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── read_write_count: ReadFile + WriteFile 의 call 수 ───
+fn read_write_count() -> int {
+    return count_by_func_kind(2) + count_by_func_kind(3)
+}
+
+// ─── call_bytes: 특정 call_id 의 bytes_transferred (없으면 0) ───
+fn call_bytes(call_id: int) -> int {
+    let t = wkt2_read_table(wkt2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── wkt2_stats: [call_count, total_bytes_transferred, read_write_count, count_by_func_kind(1)] ───
+fn wkt2_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(total_bytes_transferred())
+    out.push(read_write_count())
+    out.push(count_by_func_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "wkt2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_wkt2()
+
+    // 2. record 6 calls across 5 distinct func_kinds
+    //    func_kind 1 (CreateFileW → open), bytes=0
+    record_call(820001, 1, 1, 0)
+    r0_emit("win32_kernel32_tier2_real_record",
+        "\"call_id\":820001,\"func_kind\":1,\"posix_kind\":1,\"bytes_transferred\":0,\"target\":\"CreateFileW->open\"")
+
+    //    func_kind 3 (WriteFile → write), bytes=512
+    record_call(820002, 3, 3, 512)
+    r0_emit("win32_kernel32_tier2_real_record",
+        "\"call_id\":820002,\"func_kind\":3,\"posix_kind\":3,\"bytes_transferred\":512,\"target\":\"WriteFile->write\"")
+
+    //    func_kind 2 (ReadFile → read), bytes=1024
+    record_call(820003, 2, 2, 1024)
+    r0_emit("win32_kernel32_tier2_real_record",
+        "\"call_id\":820003,\"func_kind\":2,\"posix_kind\":2,\"bytes_transferred\":1024,\"target\":\"ReadFile->read\"")
+
+    //    func_kind 2 (ReadFile → read), bytes=2048
+    record_call(820004, 2, 2, 2048)
+    r0_emit("win32_kernel32_tier2_real_record",
+        "\"call_id\":820004,\"func_kind\":2,\"posix_kind\":2,\"bytes_transferred\":2048,\"target\":\"ReadFile->read\"")
+
+    //    func_kind 4 (SetFilePointer → lseek), bytes=0
+    record_call(820005, 4, 4, 0)
+    r0_emit("win32_kernel32_tier2_real_record",
+        "\"call_id\":820005,\"func_kind\":4,\"posix_kind\":4,\"bytes_transferred\":0,\"target\":\"SetFilePointer->lseek\"")
+
+    //    func_kind 9 (CreateDirectoryW → mkdir), bytes=0
+    record_call(820006, 9, 9, 0)
+    r0_emit("win32_kernel32_tier2_real_record",
+        "\"call_id\":820006,\"func_kind\":9,\"posix_kind\":9,\"bytes_transferred\":0,\"target\":\"CreateDirectoryW->mkdir\"")
+
+    // 3. call_count = 6
+    let c = call_count()
+    if c != 6 {
+        panic("win32_kernel32_tier2_real FAIL [call_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_bytes_transferred = 512 + 1024 + 2048 = 3584
+    let tb = total_bytes_transferred()
+    if tb != 3584 {
+        panic("win32_kernel32_tier2_real FAIL [total_bytes_transferred] expected=3584 got=" + to_string(tb))
+    }
+
+    // 5. count_by_func_kind sanity
+    let f1 = count_by_func_kind(1)
+    if f1 != 1 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_func_kind(1)] expected=1 got=" + to_string(f1))
+    }
+    let f2 = count_by_func_kind(2)
+    if f2 != 2 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_func_kind(2)] expected=2 got=" + to_string(f2))
+    }
+    let f3 = count_by_func_kind(3)
+    if f3 != 1 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_func_kind(3)] expected=1 got=" + to_string(f3))
+    }
+    let f4 = count_by_func_kind(4)
+    if f4 != 1 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_func_kind(4)] expected=1 got=" + to_string(f4))
+    }
+    let f9 = count_by_func_kind(9)
+    if f9 != 1 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_func_kind(9)] expected=1 got=" + to_string(f9))
+    }
+    let f7 = count_by_func_kind(7)
+    if f7 != 0 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_func_kind(7)] expected=0 got=" + to_string(f7))
+    }
+
+    // 6. count_by_posix_kind sanity
+    let p1 = count_by_posix_kind(1)
+    if p1 != 1 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_posix_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_posix_kind(2)
+    if p2 != 2 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_posix_kind(2)] expected=2 got=" + to_string(p2))
+    }
+    let p9 = count_by_posix_kind(9)
+    if p9 != 1 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_posix_kind(9)] expected=1 got=" + to_string(p9))
+    }
+    let p10 = count_by_posix_kind(10)
+    if p10 != 0 {
+        panic("win32_kernel32_tier2_real FAIL [count_by_posix_kind(10)] expected=0 got=" + to_string(p10))
+    }
+
+    // 7. read_write_count = ReadFile(2) + WriteFile(1) = 3
+    let rw = read_write_count()
+    if rw != 3 {
+        panic("win32_kernel32_tier2_real FAIL [read_write_count] expected=3 got=" + to_string(rw))
+    }
+
+    // 8. call_bytes sanity
+    let b3 = call_bytes(820003)
+    if b3 != 1024 {
+        panic("win32_kernel32_tier2_real FAIL [call_bytes(820003)] expected=1024 got=" + to_string(b3))
+    }
+    let b4 = call_bytes(820004)
+    if b4 != 2048 {
+        panic("win32_kernel32_tier2_real FAIL [call_bytes(820004)] expected=2048 got=" + to_string(b4))
+    }
+    let b_miss = call_bytes(9999)
+    if b_miss != 0 {
+        panic("win32_kernel32_tier2_real FAIL [call_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 9. wkt2_stats() = [6, 3584, 3, 1]
+    let s = wkt2_stats()
+    if len(s) != 4 {
+        panic("win32_kernel32_tier2_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("win32_kernel32_tier2_real FAIL [stats call_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3584 {
+        panic("win32_kernel32_tier2_real FAIL [stats total_bytes_transferred] expected=3584 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("win32_kernel32_tier2_real FAIL [stats read_write_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("win32_kernel32_tier2_real FAIL [stats count_func_kind(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit — 6 records + 1 stats)
+    r0_emit("win32_kernel32_tier2_real_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"total_bytes_transferred\":" + to_string(s[1])
+        + ",\"read_write_count\":" + to_string(s[2])
+        + ",\"create_file_w\":" + to_string(s[3]))
+
+    // 11. emit count >= 7
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("win32_kernel32_tier2_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_wkt2()
+    let s2 = wkt2_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("win32_kernel32_tier2_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ win32_kernel32_tier2_real self_test PASS (calls=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", rw=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = wkt2_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("total_bytes_transferred\t" + to_string(s[1]))
+            println("read_write_count\t" + to_string(s[2]))
+            println("count_create_file_w\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_bytes\t" + to_string(call_bytes(cid)))
+                return
+            }
+            println("usage: hexa run win32_kernel32_tier2_real.hexa bytes <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let mode = a[3]
+                let kind = to_int(a[4])
+                if mode == "func" {
+                    println("count_by_func_kind\t" + to_string(count_by_func_kind(kind)))
+                    return
+                }
+                if mode == "posix" {
+                    println("count_by_posix_kind\t" + to_string(count_by_posix_kind(kind)))
+                    return
+                }
+                println("usage: hexa run win32_kernel32_tier2_real.hexa count { func | posix } <kind>")
+                return
+            }
+            println("usage: hexa run win32_kernel32_tier2_real.hexa count { func | posix } <kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_wkt2()
+            println("cleaned: " + wkt2_dir())
+            return
+        }
+        if sub == "dir" {
+            println(wkt2_dir())
+            return
+        }
+    }
+    println("usage: hexa run win32_kernel32_tier2_real.hexa { self-test | stats | bytes <call_id> | count func <func_kind> | count posix <posix_kind> | cleanup | dir }")
+}

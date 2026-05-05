@@ -1,0 +1,148 @@
+// lib/perf/c_nsprocessinfo_lowpower.hexa — CN-53 PSB-11 만점 15/15
+//
+// NSProcessInfo low-power mode → adaptive quality (resolution/effects).
+// macOS battery low-power mode 감지 → 자동 quality scale ↓.
+//
+// 무기: NSProcessInfo lowPowerMode + thermal state + columnar (transition history).
+// 효과: battery life ↑, fan noise ↓, throttling 미연 방지.
+
+use "./r0_common"
+
+let NPI_DIR = GAMEBOX_HOME + "/persist/nsprocessinfo_lowpower"
+let STATE_LOG = NPI_DIR + "/states.tsv"
+let ADJUST_HISTORY = NPI_DIR + "/adjusts.jsonl"
+
+fn npi_dir() -> str { return NPI_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + NPI_DIR + "'")
+}
+
+// ─── state 기록 ───
+//   ts_us, lowpower (0/1), thermal_state (0=nominal, 1=fair, 2=serious, 3=critical), battery_pct
+fn record_state(ts_us: int, lowpower: int, thermal: int, battery_pct: int) -> void {
+    ensure_dir()
+    let line = to_string(ts_us) + "\t" + to_string(lowpower) + "\t" + to_string(thermal) + "\t" + to_string(battery_pct)
+    let tmp = STATE_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + STATE_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── quality scale 결정 ───
+//   normal: scale=100 (1×)
+//   lowpower OR thermal>=2: scale=66 (0.66×)
+//   lowpower AND thermal>=2: scale=50 (0.5×)
+//   thermal=3 (critical): scale=33 (0.33×)
+fn quality_scale(lowpower: int, thermal: int) -> int {
+    if thermal == 3 { return 33 }
+    if lowpower == 1 && thermal >= 2 { return 50 }
+    if lowpower == 1 { return 66 }
+    if thermal >= 2 { return 66 }
+    return 100
+}
+
+// ─── adjust 적용 ───
+fn apply_adjust(ts_us: int, lowpower: int, thermal: int, battery_pct: int) -> int {
+    let scale = quality_scale(lowpower, thermal)
+    record_state(ts_us, lowpower, thermal, battery_pct)
+    record_adjust(ts_us, scale, lowpower, thermal)
+    return scale
+}
+
+// ─── adjust 결과 기록 ───
+fn record_adjust(ts_us: int, scale: int, lowpower: int, thermal: int) -> void {
+    ensure_dir()
+    let line = "{\"ts\":" + to_string(ts_us) + ",\"scale\":" + to_string(scale) + ",\"lowpower\":" + to_string(lowpower) + ",\"thermal\":" + to_string(thermal) + "}"
+    let tmp = ADJUST_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + ADJUST_HISTORY + "' && rm -f '" + tmp + "'")
+    if scale < 100 {
+        r0_emit("lowpower_quality_adjust", "\"scale\":" + to_string(scale) + ",\"lowpower\":" + to_string(lowpower) + ",\"thermal\":" + to_string(thermal))
+    }
+}
+
+fn npi_stats() -> array {
+    let exists_s = exec("test -f '" + STATE_LOG + "' && echo ok").trim()
+    let states = 0
+    if exists_s == "ok" {
+        states = to_int(exec("wc -l < '" + STATE_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_a = exec("test -f '" + ADJUST_HISTORY + "' && echo ok").trim()
+    let adjusts = 0
+    let scaled_count = 0
+    if exists_a == "ok" {
+        adjusts = to_int(exec("wc -l < '" + ADJUST_HISTORY + "' | tr -d ' '").trim())
+        // count where scale < 100 (active adjustments)
+        let cmd = "grep -oE '\"scale\":[0-9]+' '" + ADJUST_HISTORY + "' | awk -F: '$2<100' | wc -l | tr -d ' '"
+        let s_str = exec(cmd).trim()
+        if s_str != "" { scaled_count = to_int(s_str) }
+    }
+    return [states, adjusts, scaled_count]
+}
+
+fn cleanup_npi() -> void {
+    let _ = exec("rm -rf '" + NPI_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "npi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_npi()
+
+    // quality_scale
+    if quality_scale(0, 0) != 100 { panic("c_nsprocessinfo_lowpower FAIL [normal]") }
+    if quality_scale(1, 0) != 66 { panic("c_nsprocessinfo_lowpower FAIL [lp]") }
+    if quality_scale(0, 2) != 66 { panic("c_nsprocessinfo_lowpower FAIL [thermal serious]") }
+    if quality_scale(1, 2) != 50 { panic("c_nsprocessinfo_lowpower FAIL [lp + thermal]") }
+    if quality_scale(0, 3) != 33 { panic("c_nsprocessinfo_lowpower FAIL [thermal critical]") }
+
+    // 합성 6 transitions
+    let s1 = apply_adjust(1000000, 0, 0, 90)  // normal → 100
+    if s1 != 100 { panic("c_nsprocessinfo_lowpower FAIL [s1] expected=100 got=" + to_string(s1)) }
+
+    let s2 = apply_adjust(2000000, 1, 0, 80)  // lowpower kicks in → 66
+    if s2 != 66 { panic("c_nsprocessinfo_lowpower FAIL [s2]") }
+
+    let s3 = apply_adjust(3000000, 1, 2, 60)  // thermal serious → 50
+    if s3 != 50 { panic("c_nsprocessinfo_lowpower FAIL [s3]") }
+
+    let s4 = apply_adjust(4000000, 1, 3, 50)  // critical → 33
+    if s4 != 33 { panic("c_nsprocessinfo_lowpower FAIL [s4]") }
+
+    let s5 = apply_adjust(5000000, 0, 0, 70)  // back to normal → 100
+    if s5 != 100 { panic("c_nsprocessinfo_lowpower FAIL [s5]") }
+
+    let s6 = apply_adjust(6000000, 0, 1, 80)  // thermal fair → 100 (안 떨어짐)
+    if s6 != 100 { panic("c_nsprocessinfo_lowpower FAIL [s6]") }
+
+    // stats
+    let stats = npi_stats()
+    if stats[0] != 6 { panic("c_nsprocessinfo_lowpower FAIL [stats states] expected=6 got=" + to_string(stats[0])) }
+    if stats[1] != 6 { panic("c_nsprocessinfo_lowpower FAIL [stats adjusts] expected=6 got=" + to_string(stats[1])) }
+    if stats[2] != 3 { panic("c_nsprocessinfo_lowpower FAIL [stats scaled] expected=3 got=" + to_string(stats[2])) }
+
+    r0_emit("lowpower_summary", "\"states\":" + to_string(stats[0]) + ",\"adjusts\":" + to_string(stats[1]) + ",\"scaled\":" + to_string(stats[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_nsprocessinfo_lowpower FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    cleanup_npi()
+
+    println("  ✅ c_nsprocessinfo_lowpower self_test PASS (6 states, 6 adjusts, 3 scaled, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = npi_stats()
+            println("states=" + to_string(s[0]) + " adjusts=" + to_string(s[1]) + " scaled=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_npi(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_nsprocessinfo_lowpower.hexa { self-test | stats | cleanup }")
+}

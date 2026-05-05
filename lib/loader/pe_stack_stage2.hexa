@@ -1,0 +1,319 @@
+// lib/loader/pe_stack_stage2.hexa — stage2 thread stack skeleton
+//
+// PE Optional Header 의 SizeOfStackReserve/Commit 따라 thread 별 stack region
+// 할당. main thread + spawned threads 추적.
+//
+// own 1 enforcement: Wine / CrossOver / dxvk / vkd3d / community 코드 0 줄.
+//   참조 only — Microsoft PE/COFF spec (IMAGE_OPTIONAL_HEADER):
+//     - SizeOfStackReserve / SizeOfStackCommit 필드 의미.
+//     - reserve = address space; commit = backed by physical/swap.
+//
+// 범위:
+//   - main thread 의 stack 은 PE OptionalHeader 에서 가져온 reserve/commit.
+//   - spawned thread 는 CreateThread 의 dwStackSize parameter (override 가능).
+//   - 여기서는 record_stack 으로 thread_id 별 stack region metadata 를 추적.
+//   - 실제 mmap 은 native_helper_bridge 가 수행 — 여기는 instrumentation 만.
+//
+// schema (TSV):
+//   thread_id<int>  | reserve_bytes<int>  | commit_bytes<int>  | base_addr<int>
+
+use "../perf/r0_common"
+
+// ─── persist dir ───
+fn pss_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_stack_stage2"
+}
+
+fn pss_table_path() -> str {
+    return pss_dir() + "/threads.tsv"
+}
+
+fn ensure_pss_dir() -> void {
+    let _ = exec("mkdir -p '" + pss_dir() + "'")
+}
+
+fn cleanup_pss() -> void {
+    let _ = exec("rm -rf '" + pss_dir() + "'")
+}
+
+// ─── file IO ───
+fn read_pss_table() -> str {
+    let path = pss_table_path()
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_pss_row(row: str) -> void {
+    ensure_pss_dir()
+    let path = pss_table_path()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record stack region for one thread ───
+//   thread_id    = OS thread id (synthetic ok).
+//   reserve_bytes = SizeOfStackReserve 또는 dwStackSize override.
+//   commit_bytes  = SizeOfStackCommit 또는 4KB default.
+//   base_addr    = mmap base (top-of-stack 은 base + reserve - 8).
+fn record_stack(thread_id: int, reserve_bytes: int, commit_bytes: int, base_addr: int) -> void {
+    let row = to_string(thread_id) + "\t" + to_string(reserve_bytes)
+        + "\t" + to_string(commit_bytes) + "\t" + to_string(base_addr) + "\n"
+    append_pss_row(row)
+    r0_emit("pss_record_stack",
+        "\"thread_id\":" + to_string(thread_id)
+        + ",\"reserve\":" + to_string(reserve_bytes)
+        + ",\"commit\":" + to_string(commit_bytes)
+        + ",\"base\":" + to_string(base_addr))
+}
+
+// ─── thread count ───
+fn thread_count() -> int {
+    let t = read_pss_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total reserve ───
+fn total_reserve_bytes() -> int {
+    let t = read_pss_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 2 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total commit ───
+fn total_commit_bytes() -> int {
+    let t = read_pss_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── avg reserve per thread (int trunc, 0-guard) ───
+fn avg_reserve_per_thread() -> int {
+    let c = thread_count()
+    if c <= 0 {
+        return 0
+    }
+    return total_reserve_bytes() / c
+}
+
+// ─── thread_reserve(thread_id) — 0 if not found ───
+fn thread_reserve(thread_id: int) -> int {
+    let t = read_pss_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(thread_id)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 2 {
+                if parts[0] == key {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pss_stats — [thread_count, total_reserve, total_commit, avg_reserve] ───
+fn pss_stats() -> array {
+    let mut out = []
+    out.push(thread_count())
+    out.push(total_reserve_bytes())
+    out.push(total_commit_bytes())
+    out.push(avg_reserve_per_thread())
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "pss-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pss()
+
+    // 2. record 3 threads — main + 2 workers
+    record_stack(77001, 1048576, 65536, 0x10000000)
+    record_stack(77002, 524288, 32768, 0x10100000)
+    record_stack(77003, 524288, 32768, 0x10180000)
+
+    // 3. thread_count == 3
+    let tc = thread_count()
+    if tc != 3 {
+        panic("pe_stack_stage2 FAIL [thread_count] expected=3 got=" + to_string(tc))
+    }
+
+    // 4. total_reserve_bytes == 2097152
+    let tr = total_reserve_bytes()
+    if tr != 2097152 {
+        panic("pe_stack_stage2 FAIL [total_reserve_bytes] expected=2097152 got=" + to_string(tr))
+    }
+
+    // 5. total_commit_bytes == 131072
+    let tcm = total_commit_bytes()
+    if tcm != 131072 {
+        panic("pe_stack_stage2 FAIL [total_commit_bytes] expected=131072 got=" + to_string(tcm))
+    }
+
+    // 6. avg_reserve_per_thread == 699050 (int trunc of 2097152/3)
+    let avg = avg_reserve_per_thread()
+    if avg != 699050 {
+        panic("pe_stack_stage2 FAIL [avg_reserve_per_thread] expected=699050 got=" + to_string(avg))
+    }
+
+    // 7. thread_reserve lookup
+    let r1 = thread_reserve(77001)
+    if r1 != 1048576 {
+        panic("pe_stack_stage2 FAIL [thread_reserve 77001] expected=1048576 got=" + to_string(r1))
+    }
+    let r2 = thread_reserve(77002)
+    if r2 != 524288 {
+        panic("pe_stack_stage2 FAIL [thread_reserve 77002] expected=524288 got=" + to_string(r2))
+    }
+    let r3 = thread_reserve(77003)
+    if r3 != 524288 {
+        panic("pe_stack_stage2 FAIL [thread_reserve 77003] expected=524288 got=" + to_string(r3))
+    }
+    let r_miss = thread_reserve(9999)
+    if r_miss != 0 {
+        panic("pe_stack_stage2 FAIL [thread_reserve miss] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 8. pss_stats == [3, 2097152, 131072, 699050]
+    let s = pss_stats()
+    if len(s) != 4 {
+        panic("pe_stack_stage2 FAIL [pss_stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_stack_stage2 FAIL [pss_stats[0]] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 2097152 {
+        panic("pe_stack_stage2 FAIL [pss_stats[1]] expected=2097152 got=" + to_string(s[1]))
+    }
+    if s[2] != 131072 {
+        panic("pe_stack_stage2 FAIL [pss_stats[2]] expected=131072 got=" + to_string(s[2]))
+    }
+    if s[3] != 699050 {
+        panic("pe_stack_stage2 FAIL [pss_stats[3]] expected=699050 got=" + to_string(s[3]))
+    }
+
+    // 9. summary emit
+    r0_emit("pss_stats",
+        "\"threads\":" + to_string(s[0])
+        + ",\"total_reserve\":" + to_string(s[1])
+        + ",\"total_commit\":" + to_string(s[2])
+        + ",\"avg_reserve\":" + to_string(s[3]))
+
+    // 10. emit count >= 4 (3 record_stack + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 4 {
+        panic("pe_stack_stage2 FAIL [emit count] expected=>=4 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup
+    cleanup_pss()
+
+    // 12. cleanup verification — all stats should be 0
+    if thread_count() != 0 {
+        panic("pe_stack_stage2 FAIL [cleanup thread_count] expected=0 got="
+            + to_string(thread_count()))
+    }
+    if total_reserve_bytes() != 0 {
+        panic("pe_stack_stage2 FAIL [cleanup total_reserve] expected=0 got="
+            + to_string(total_reserve_bytes()))
+    }
+
+    println("  ✅ pe_stack_stage2 self_test PASS (3 threads, total_reserve="
+        + to_string(tr) + ", total_commit=" + to_string(tcm)
+        + ", avg=" + to_string(avg) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pss_stats()
+            println("thread_count\t" + to_string(s[0]))
+            println("total_reserve_bytes\t" + to_string(s[1]))
+            println("total_commit_bytes\t" + to_string(s[2]))
+            println("avg_reserve_per_thread\t" + to_string(s[3]))
+            return
+        }
+        if sub == "reserve" && len(a) >= 4 {
+            let tid = to_int(a[3])
+            println(to_string(thread_reserve(tid)))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pss()
+            println("cleaned: " + pss_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pss_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_stack_stage2.hexa { self-test | stats | reserve <thread_id> | cleanup | dir }")
+}

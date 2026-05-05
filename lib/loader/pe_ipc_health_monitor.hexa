@@ -1,0 +1,387 @@
+// lib/loader/pe_ipc_health_monitor.hexa — stage5 IPC health monitor skeleton
+//
+// 주기적 heartbeat ping/pong (e.g., 5s 간격). N 연속 timeout = unhealthy.
+// auto-reconnect 또는 native helper 자동 재시작. uptime 누적 추적.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 health tracker — 실 reconnect / restart X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// status legend:
+//   1 = healthy     (ping/pong OK, low latency)
+//   2 = degraded    (high latency, intermittent)
+//   3 = unhealthy   (N 연속 timeout)
+//   4 = disconnected (socket close / helper dead)
+//
+// persist schema (TSV — checks.tsv):
+//   check_id<int> \t status<int> \t latency_us<int> \t uptime_s<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pihm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_health_monitor"
+}
+
+fn pihm_checks_path() -> str {
+    return pihm_dir() + "/checks.tsv"
+}
+
+fn pihm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pihm_dir() + "'")
+}
+
+fn cleanup_pihm() -> void {
+    pihm_ensure_dir()
+    let _ = exec("rm -f '" + pihm_checks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pihm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pihm_append_row(path: str, row: str) -> void {
+    pihm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_health: health check 1 건 기록 ───
+fn record_health(check_id: int, status: int, latency_us: int, uptime_s: int) -> void {
+    if check_id <= 0 {
+        panic("pe_ipc_health_monitor FAIL [record_health] expected=check_id>0 got=" + to_string(check_id))
+    }
+    if status < 1 {
+        panic("pe_ipc_health_monitor FAIL [record_health] expected=status>=1 got=" + to_string(status))
+    }
+    if status > 4 {
+        panic("pe_ipc_health_monitor FAIL [record_health] expected=status<=4 got=" + to_string(status))
+    }
+    if latency_us < 0 {
+        panic("pe_ipc_health_monitor FAIL [record_health] expected=latency_us>=0 got=" + to_string(latency_us))
+    }
+    if uptime_s < 0 {
+        panic("pe_ipc_health_monitor FAIL [record_health] expected=uptime_s>=0 got=" + to_string(uptime_s))
+    }
+    let row = to_string(check_id) + "\t" + to_string(status)
+        + "\t" + to_string(latency_us) + "\t" + to_string(uptime_s) + "\n"
+    pihm_append_row(pihm_checks_path(), row)
+}
+
+// ─── check_count: total health check 수 ───
+fn check_count() -> int {
+    let t = pihm_read_table(pihm_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_status: 특정 status 인 check 수 ───
+fn count_by_status(status: int) -> int {
+    let t = pihm_read_table(pihm_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == status {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_latency_us: 모든 check latency 합산 ───
+fn total_latency_us() -> int {
+    let t = pihm_read_table(pihm_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── max_uptime_s: 최대 uptime 값 ───
+fn max_uptime_s() -> int {
+    let t = pihm_read_table(pihm_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut mx = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let v = to_int(parts[3])
+                if v > mx {
+                    mx = v
+                }
+            }
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+// ─── check_status: 특정 check_id 의 status (없으면 0) ───
+fn check_status(check_id: int) -> int {
+    let t = pihm_read_table(pihm_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == check_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pihm_stats: [check_count, count_by_status(1), count_by_status(3), max_uptime_s] ───
+fn pihm_stats() -> array {
+    let mut out = []
+    out.push(check_count())
+    out.push(count_by_status(1))
+    out.push(count_by_status(3))
+    out.push(max_uptime_s())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pihm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pihm()
+
+    // 2. record 5 health checks (deterministic synthetic)
+    record_health(117001, 1, 80, 60)
+    r0_emit("pe_ipc_health_monitor_record",
+        "\"check_id\":117001,\"status\":1,\"latency_us\":80,\"uptime_s\":60,\"target\":\"healthy_1min\"")
+
+    record_health(117002, 1, 90, 120)
+    r0_emit("pe_ipc_health_monitor_record",
+        "\"check_id\":117002,\"status\":1,\"latency_us\":90,\"uptime_s\":120,\"target\":\"healthy_2min\"")
+
+    record_health(117003, 2, 240, 180)
+    r0_emit("pe_ipc_health_monitor_record",
+        "\"check_id\":117003,\"status\":2,\"latency_us\":240,\"uptime_s\":180,\"target\":\"degraded_high_latency\"")
+
+    record_health(117004, 3, 5000, 240)
+    r0_emit("pe_ipc_health_monitor_record",
+        "\"check_id\":117004,\"status\":3,\"latency_us\":5000,\"uptime_s\":240,\"target\":\"unhealthy_timeout\"")
+
+    record_health(117005, 4, 0, 240)
+    r0_emit("pe_ipc_health_monitor_record",
+        "\"check_id\":117005,\"status\":4,\"latency_us\":0,\"uptime_s\":240,\"target\":\"disconnected\"")
+
+    // 3. check_count = 5
+    let c = check_count()
+    if c != 5 {
+        panic("pe_ipc_health_monitor FAIL [check_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_status sanity
+    let h1 = count_by_status(1)
+    if h1 != 2 {
+        panic("pe_ipc_health_monitor FAIL [count_by_status(1)] expected=2 got=" + to_string(h1))
+    }
+    let h2 = count_by_status(2)
+    if h2 != 1 {
+        panic("pe_ipc_health_monitor FAIL [count_by_status(2)] expected=1 got=" + to_string(h2))
+    }
+    let h3 = count_by_status(3)
+    if h3 != 1 {
+        panic("pe_ipc_health_monitor FAIL [count_by_status(3)] expected=1 got=" + to_string(h3))
+    }
+    let h4 = count_by_status(4)
+    if h4 != 1 {
+        panic("pe_ipc_health_monitor FAIL [count_by_status(4)] expected=1 got=" + to_string(h4))
+    }
+    let h_miss = count_by_status(99)
+    if h_miss != 0 {
+        panic("pe_ipc_health_monitor FAIL [count_by_status(99)] expected=0 got=" + to_string(h_miss))
+    }
+
+    // 5. total_latency_us = 80+90+240+5000+0 = 5410
+    let tl = total_latency_us()
+    if tl != 5410 {
+        panic("pe_ipc_health_monitor FAIL [total_latency_us] expected=5410 got=" + to_string(tl))
+    }
+
+    // 6. max_uptime_s = 240
+    let mu = max_uptime_s()
+    if mu != 240 {
+        panic("pe_ipc_health_monitor FAIL [max_uptime_s] expected=240 got=" + to_string(mu))
+    }
+
+    // 7. check_status sanity
+    let cs1 = check_status(117001)
+    if cs1 != 1 {
+        panic("pe_ipc_health_monitor FAIL [check_status(117001)] expected=1 got=" + to_string(cs1))
+    }
+    let cs4 = check_status(117004)
+    if cs4 != 3 {
+        panic("pe_ipc_health_monitor FAIL [check_status(117004)] expected=3 got=" + to_string(cs4))
+    }
+    let cs_miss = check_status(9999)
+    if cs_miss != 0 {
+        panic("pe_ipc_health_monitor FAIL [check_status(9999)] expected=0 got=" + to_string(cs_miss))
+    }
+
+    // 8. pihm_stats() = [5, 2, 1, 240]
+    let s = pihm_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_health_monitor FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ipc_health_monitor FAIL [stats check_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_ipc_health_monitor FAIL [stats healthy] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_ipc_health_monitor FAIL [stats unhealthy] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 240 {
+        panic("pe_ipc_health_monitor FAIL [stats max_uptime] expected=240 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_health_monitor_stats",
+        "\"check_count\":" + to_string(s[0])
+        + ",\"healthy\":" + to_string(s[1])
+        + ",\"unhealthy\":" + to_string(s[2])
+        + ",\"max_uptime_s\":" + to_string(s[3])
+        + ",\"total_latency_us\":" + to_string(tl))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ipc_health_monitor FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pihm()
+    let s2 = pihm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_health_monitor FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_health_monitor self_test PASS (checks=" + to_string(s[0])
+        + ", healthy=" + to_string(s[1]) + ", unhealthy=" + to_string(s[2])
+        + ", max_uptime_s=" + to_string(s[3]) + ", total_latency_us=" + to_string(tl)
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pihm_stats()
+            println("check_count\t" + to_string(s[0]))
+            println("healthy_count\t" + to_string(s[1]))
+            println("unhealthy_count\t" + to_string(s[2]))
+            println("max_uptime_s\t" + to_string(s[3]))
+            println("total_latency_us\t" + to_string(total_latency_us()))
+            return
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("check_status\t" + to_string(check_status(cid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_health_monitor.hexa status <check_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let st = to_int(a[3])
+                println("count_by_status\t" + to_string(count_by_status(st)))
+                return
+            }
+            println("usage: hexa run pe_ipc_health_monitor.hexa count <status>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pihm()
+            println("cleaned: " + pihm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pihm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_health_monitor.hexa { self-test | stats | status <check_id> | count <status> | cleanup | dir }")
+}

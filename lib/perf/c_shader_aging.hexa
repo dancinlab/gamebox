@@ -1,0 +1,248 @@
+// lib/perf/c_shader_aging.hexa — M6 C-SHADER-AGING (APBF heat decay)
+//
+// shader cache 의 각 shader 를 시간에 따라 hot → cold 로 추적.
+// APBF (Adaptive Probabilistic Bloom Filter) 원리: 16 buckets, bucket N 의 TTL 은
+// 60 * 2^N 초. shader_used → bucket=0. age_tick 시 (now-last_used) > bucket_ttl
+// 이면 bucket++. bucket >= 15 이면 evict candidate.
+//
+// schema (~10 byte/record, JSONL stored under forge/genomes-gptk-shader-aging.ring):
+//   shader_hash      u32
+//   last_used_ts_sec u32
+//   age_bucket       u8  (0=hot, 15=cold)
+//   size_kb          u16
+//
+// hexa-lang stage1 제약: try/catch 없음, float 깨짐, bit ops 없음 → 2^N 은 loop.
+// 또한 dict literal / any 타입 없음 → record 는 TSV 문자열 ("hash\tlast_used\tbucket\tsize_kb")
+// 로 표현하고 accessor 헬퍼로 필드 추출.
+//
+// upstream candidate: native pow_u, dict literals, struct types, bit ops (APBF 64KB bitset 용).
+//
+// 모드:
+//   self-test
+//   used <hash> <size_kb> <now_sec>
+
+use "./r0_common"
+
+let SHADER_AGING_RING = GAMEBOX_HOME + "/forge/genomes-gptk-shader-aging.ring"
+let MAX_BUCKET = 15
+
+// bucket TTL: 60 * 2^bucket  (loop, no float, no bit ops)
+fn bucket_ttl_sec(bucket: int) -> int {
+    let mut p = 1
+    let mut i = 0
+    while i < bucket {
+        p = p * 2
+        i = i + 1
+    }
+    return 60 * p
+}
+
+// JSONL 한 record 직렬화 (forge/genomes-gptk-shader-aging.ring 에 그대로 저장 가능)
+fn shader_record(hash: int, last_used: int, bucket: int, size_kb: int) -> str {
+    return "{\"shader_hash\":" + to_string(hash)
+        + ",\"last_used_ts_sec\":" + to_string(last_used)
+        + ",\"age_bucket\":" + to_string(bucket)
+        + ",\"size_kb\":" + to_string(size_kb)
+        + "}"
+}
+
+// 내부 record (TSV) helpers ────────────────────────────────────────────────
+fn rec_pack(hash: int, last_used: int, bucket: int, size_kb: int) -> str {
+    return to_string(hash) + "\t" + to_string(last_used) + "\t" + to_string(bucket) + "\t" + to_string(size_kb)
+}
+
+fn rec_hash(r: str) -> int {
+    let parts = r.split("\t")
+    return to_int(parts[0])
+}
+
+fn rec_last_used(r: str) -> int {
+    let parts = r.split("\t")
+    return to_int(parts[1])
+}
+
+fn rec_bucket(r: str) -> int {
+    let parts = r.split("\t")
+    return to_int(parts[2])
+}
+
+fn rec_size_kb(r: str) -> int {
+    let parts = r.split("\t")
+    return to_int(parts[3])
+}
+
+// shader_used: bucket=0 으로 reset, last_used 갱신, "shader_used" 이벤트 emit
+fn shader_used(hash: int, size_kb: int, now_sec: int) -> void {
+    let payload = "\"shader_hash\":" + to_string(hash)
+        + ",\"last_used_ts_sec\":" + to_string(now_sec)
+        + ",\"age_bucket\":0"
+        + ",\"size_kb\":" + to_string(size_kb)
+    r0_emit("shader_used", payload)
+}
+
+// age_tick: 모든 record 순회, (now - last_used) > bucket_ttl(bucket) 이면 bucket++.
+// 새 array 반환 (bucket 만 갱신, last_used 는 유지).
+// records: array of TSV strings (rec_pack 으로 만든).
+fn age_tick(records: array, now_sec: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(records) {
+        let r = records[i]
+        let hash = rec_hash(r)
+        let last_used = rec_last_used(r)
+        let mut bucket = rec_bucket(r)
+        let size_kb = rec_size_kb(r)
+
+        let elapsed = now_sec - last_used
+        // 같은 tick 안에서도 multiple bucket promote 가능 (오래 방치된 shader 가
+        // 한 tick 안에 0→15 으로 점프할 수 있음).
+        while bucket < MAX_BUCKET && elapsed > bucket_ttl_sec(bucket) {
+            bucket = bucket + 1
+        }
+
+        out.push(rec_pack(hash, last_used, bucket, size_kb))
+        i = i + 1
+    }
+    return out
+}
+
+// evict_candidates: bucket >= MAX_BUCKET 인 record 만 추출
+fn evict_candidates(records: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(records) {
+        let r = records[i]
+        if rec_bucket(r) >= MAX_BUCKET {
+            out.push(r)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn self_test() -> void {
+    let sid = "shaderaging-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // === bucket_ttl_sec 검증 ===
+    if bucket_ttl_sec(0) != 60 {
+        panic("c_shader_aging FAIL [ttl bucket=0] expected=60 got=" + to_string(bucket_ttl_sec(0)))
+    }
+    if bucket_ttl_sec(1) != 120 {
+        panic("c_shader_aging FAIL [ttl bucket=1] expected=120 got=" + to_string(bucket_ttl_sec(1)))
+    }
+    if bucket_ttl_sec(2) != 240 {
+        panic("c_shader_aging FAIL [ttl bucket=2] expected=240 got=" + to_string(bucket_ttl_sec(2)))
+    }
+    // bucket 15 = 60 * 32768 = 1966080 (~22.7 days)
+    if bucket_ttl_sec(15) != 1966080 {
+        panic("c_shader_aging FAIL [ttl bucket=15] expected=1966080 got=" + to_string(bucket_ttl_sec(15)))
+    }
+
+    // === shader_record 직렬화 검증 ===
+    let rec = shader_record(305419896, 1714400000, 3, 42)
+    if rec.index_of("\"shader_hash\":305419896") < 0 {
+        panic("c_shader_aging FAIL [record hash] got=" + rec)
+    }
+    if rec.index_of("\"age_bucket\":3") < 0 {
+        panic("c_shader_aging FAIL [record bucket] got=" + rec)
+    }
+    if rec.index_of("\"last_used_ts_sec\":1714400000") < 0 {
+        panic("c_shader_aging FAIL [record last_used] got=" + rec)
+    }
+    if rec.index_of("\"size_kb\":42") < 0 {
+        panic("c_shader_aging FAIL [record size_kb] got=" + rec)
+    }
+
+    // === aging 시나리오 ===
+    // Shader A: used at t=0, bucket=0 → age_tick(t=70)  → bucket=1
+    //                                  → age_tick(t=200) → bucket=2 (200-0 > 60+120=180)
+    // Shader B: used at t=0, re-used at t=50 → bucket stays 0 (immediate post-use)
+    // Shader X: last_used=0, bucket=14 → age_tick(t=10000000) → bucket=15 → evict
+    // Shader Y: last_used=0, bucket=0  → age_tick(t=10000000) → 점진 promote → bucket=15 → evict
+
+    let mut recs = []
+    recs.push(rec_pack(43690,  0, 0,  100))   // A (0xAAAA)
+    recs.push(rec_pack(48059,  0, 0,  200))   // B (0xBBBB) — will be re-used at t=50
+    recs.push(rec_pack(52428,  0, 14, 300))   // X (0xCCCC) — already at bucket 14
+    recs.push(rec_pack(56797,  0, 0,  400))   // Y (0xDDDD)
+    recs.push(rec_pack(61166,  0, 0,  500))   // E (0xEEEE) — filler
+
+    // 1) age_tick at t=70: A(0→1), B(0→1), X(14 stays — 70 < ttl(14)=983040), Y(0→1), E(0→1)
+    let r1 = age_tick(recs, 70)
+    if len(r1) != 5 {
+        panic("c_shader_aging FAIL [r1 len] expected=5 got=" + to_string(len(r1)))
+    }
+    if rec_bucket(r1[0]) != 1 {
+        panic("c_shader_aging FAIL [A@t=70] expected bucket=1 got=" + to_string(rec_bucket(r1[0])))
+    }
+    if rec_bucket(r1[2]) != 14 {
+        panic("c_shader_aging FAIL [X@t=70] expected bucket=14 got=" + to_string(rec_bucket(r1[2])))
+    }
+
+    // 2) Shader B 재사용 — bucket=0, last_used=50 (즉시 post-use 상태 검증)
+    let b_refreshed = rec_pack(48059, 50, 0, 200)
+    if rec_bucket(b_refreshed) != 0 {
+        panic("c_shader_aging FAIL [B re-used] expected bucket=0 got=" + to_string(rec_bucket(b_refreshed)))
+    }
+    if rec_last_used(b_refreshed) != 50 {
+        panic("c_shader_aging FAIL [B last_used] expected=50 got=" + to_string(rec_last_used(b_refreshed)))
+    }
+
+    // 3) age_tick(t=200) on r1: A(bucket=1, last_used=0) → elapsed=200, ttl(1)=120 → 2;
+    //                                                       ttl(2)=240, 200 ≤ 240 → stop=2.
+    let r2 = age_tick(r1, 200)
+    if rec_bucket(r2[0]) != 2 {
+        panic("c_shader_aging FAIL [A@t=200] expected bucket=2 got=" + to_string(rec_bucket(r2[0])))
+    }
+
+    // 4) age_tick(t=10000000): X(bucket=14) → 15, Y(bucket=0) → 점진 promote → 15
+    let mut old_recs = []
+    old_recs.push(rec_pack(52428, 0, 14, 300))  // X
+    old_recs.push(rec_pack(56797, 0, 0,  400))  // Y
+    let r3 = age_tick(old_recs, 10000000)
+    if rec_bucket(r3[0]) != 15 {
+        panic("c_shader_aging FAIL [X@t=10M] expected bucket=15 got=" + to_string(rec_bucket(r3[0])))
+    }
+    if rec_bucket(r3[1]) != 15 {
+        panic("c_shader_aging FAIL [Y@t=10M] expected bucket=15 got=" + to_string(rec_bucket(r3[1])))
+    }
+
+    // 5) evict_candidates
+    let evict = evict_candidates(r3)
+    if len(evict) != 2 {
+        panic("c_shader_aging FAIL [evict count] expected=2 got=" + to_string(len(evict)))
+    }
+    let evict2 = evict_candidates(r2)
+    if len(evict2) != 0 {
+        panic("c_shader_aging FAIL [evict r2] expected=0 got=" + to_string(len(evict2)))
+    }
+
+    // 6) shader_used emit smoke test
+    shader_used(61453, 256, 12345)  // 0xF00D
+    let cnt = r0_session_count(sid)
+    if cnt != 1 {
+        panic("c_shader_aging FAIL [emit count] expected=1 got=" + to_string(cnt))
+    }
+
+    println("  ✅ c_shader_aging self_test PASS (ttl ok, A:0→1→2, B reused stays 0, X/Y→15 evicted, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "used" {
+            if len(a) >= 6 {
+                shader_used(to_int(a[3]), to_int(a[4]), to_int(a[5]))
+                println("emitted shader_used: hash=" + a[3] + " size_kb=" + a[4] + " now=" + a[5])
+                return
+            }
+        }
+    }
+    println("usage: hexa run c_shader_aging.hexa { self-test | used <hash> <size_kb> <now_sec> }")
+}

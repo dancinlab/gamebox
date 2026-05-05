@@ -1,0 +1,338 @@
+// lib/loader/pe_ipc_shared_memory.hexa — stage6 POSIX shm IPC skeleton
+//
+// shm_open + ftruncate + mmap. zero-copy 큰 buffer 공유. semaphore 와 결합
+// 으로 producer/consumer queue 구성.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 shm region tracker — 실 shm_open() / ftruncate() / mmap() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 4 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — shm_regions.tsv):
+//   shm_id<int> \t size_kb<int> \t reader_count<int> \t writer_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pism_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_shared_memory"
+}
+
+fn pism_regions_path() -> str {
+    return pism_dir() + "/shm_regions.tsv"
+}
+
+fn pism_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pism_dir() + "'")
+}
+
+fn cleanup_pism() -> void {
+    pism_ensure_dir()
+    let _ = exec("rm -f '" + pism_regions_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pism_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pism_append_row(path: str, row: str) -> void {
+    pism_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_shm: shm region 1 건 기록 ───
+fn record_shm(shm_id: int, size_kb: int, reader_count: int, writer_count: int) -> void {
+    if shm_id <= 0 {
+        panic("pe_ipc_shared_memory FAIL [record_shm] expected=shm_id>0 got=" + to_string(shm_id))
+    }
+    if size_kb <= 0 {
+        panic("pe_ipc_shared_memory FAIL [record_shm] expected=size_kb>0 got=" + to_string(size_kb))
+    }
+    if reader_count < 0 {
+        panic("pe_ipc_shared_memory FAIL [record_shm] expected=reader_count>=0 got=" + to_string(reader_count))
+    }
+    if writer_count < 0 {
+        panic("pe_ipc_shared_memory FAIL [record_shm] expected=writer_count>=0 got=" + to_string(writer_count))
+    }
+    let row = to_string(shm_id) + "\t" + to_string(size_kb)
+        + "\t" + to_string(reader_count) + "\t" + to_string(writer_count) + "\n"
+    pism_append_row(pism_regions_path(), row)
+}
+
+// ─── shm_count: total shm region 수 ───
+fn shm_count() -> int {
+    let t = pism_read_table(pism_regions_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_kb: 모든 shm region size_kb 합 ───
+fn total_size_kb() -> int {
+    let t = pism_read_table(pism_regions_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_readers: 모든 shm region reader_count 합 ───
+fn total_readers() -> int {
+    let t = pism_read_table(pism_regions_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_writers: 모든 shm region writer_count 합 ───
+fn total_writers() -> int {
+    let t = pism_read_table(pism_regions_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── shm_size: 특정 shm_id 의 size_kb (없으면 0) ───
+fn shm_size(shm_id: int) -> int {
+    let t = pism_read_table(pism_regions_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == shm_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pism_stats: [shm_count, total_size_kb, total_readers, total_writers] ───
+fn pism_stats() -> array {
+    let mut out = []
+    out.push(shm_count())
+    out.push(total_size_kb())
+    out.push(total_readers())
+    out.push(total_writers())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pism-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pism()
+
+    // 2. record 3 shm regions (deterministic synthetic)
+    record_shm(122001, 1024, 2, 1)
+    r0_emit("pe_ipc_shared_memory_record",
+        "\"shm_id\":122001,\"size_kb\":1024,\"reader_count\":2,\"writer_count\":1")
+
+    record_shm(122002, 512, 4, 1)
+    r0_emit("pe_ipc_shared_memory_record",
+        "\"shm_id\":122002,\"size_kb\":512,\"reader_count\":4,\"writer_count\":1")
+
+    record_shm(122003, 4096, 1, 1)
+    r0_emit("pe_ipc_shared_memory_record",
+        "\"shm_id\":122003,\"size_kb\":4096,\"reader_count\":1,\"writer_count\":1")
+
+    // 3. shm_count = 3
+    let c = shm_count()
+    if c != 3 {
+        panic("pe_ipc_shared_memory FAIL [shm_count] expected=3 got=" + to_string(c))
+    }
+
+    // 4. total_size_kb = 5632
+    let ts = total_size_kb()
+    if ts != 5632 {
+        panic("pe_ipc_shared_memory FAIL [total_size_kb] expected=5632 got=" + to_string(ts))
+    }
+
+    // 5. total_readers = 7
+    let tr = total_readers()
+    if tr != 7 {
+        panic("pe_ipc_shared_memory FAIL [total_readers] expected=7 got=" + to_string(tr))
+    }
+
+    // 6. total_writers = 3
+    let tw = total_writers()
+    if tw != 3 {
+        panic("pe_ipc_shared_memory FAIL [total_writers] expected=3 got=" + to_string(tw))
+    }
+
+    // 7. shm_size sanity
+    let s1 = shm_size(122001)
+    if s1 != 1024 {
+        panic("pe_ipc_shared_memory FAIL [shm_size(122001)] expected=1024 got=" + to_string(s1))
+    }
+    let s3 = shm_size(122003)
+    if s3 != 4096 {
+        panic("pe_ipc_shared_memory FAIL [shm_size(122003)] expected=4096 got=" + to_string(s3))
+    }
+    let s_miss = shm_size(9999)
+    if s_miss != 0 {
+        panic("pe_ipc_shared_memory FAIL [shm_size(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pism_stats() = [3, 5632, 7, 3]
+    let s = pism_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_shared_memory FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_ipc_shared_memory FAIL [stats shm_count] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 5632 {
+        panic("pe_ipc_shared_memory FAIL [stats total_size_kb] expected=5632 got=" + to_string(s[1]))
+    }
+    if s[2] != 7 {
+        panic("pe_ipc_shared_memory FAIL [stats total_readers] expected=7 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_ipc_shared_memory FAIL [stats total_writers] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_shared_memory_stats",
+        "\"shm_count\":" + to_string(s[0])
+        + ",\"total_size_kb\":" + to_string(s[1])
+        + ",\"total_readers\":" + to_string(s[2])
+        + ",\"total_writers\":" + to_string(s[3]))
+
+    // 10. emit count >= 4 (3 records + 1 stats = 4)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 4 {
+        panic("pe_ipc_shared_memory FAIL [r0 emit count] expected=>=4 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pism()
+    let s2 = pism_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_shared_memory FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_shared_memory self_test PASS (shm=" + to_string(s[0])
+        + ", size_kb=" + to_string(s[1]) + ", readers=" + to_string(s[2])
+        + ", writers=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pism_stats()
+            println("shm_count\t" + to_string(s[0]))
+            println("total_size_kb\t" + to_string(s[1]))
+            println("total_readers\t" + to_string(s[2]))
+            println("total_writers\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("shm_size\t" + to_string(shm_size(sid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_shared_memory.hexa size <shm_id>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pism()
+            println("cleaned: " + pism_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pism_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_shared_memory.hexa { self-test | stats | size <shm_id> | cleanup | dir }")
+}

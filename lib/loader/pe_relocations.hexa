@@ -1,0 +1,497 @@
+// lib/loader/pe_relocations.hexa — Phase 0b — PE Base Relocations parser
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// Microsoft PE/COFF spec (learn.microsoft.com) 만 참조.
+//
+// 입력: Windows PE32 / PE32+ binary (.exe / .dll) 경로
+// 출력: Base Relocation Table (DataDirectories[5]) 의 모든 block + entries 파싱
+//
+// PE/COFF spec — Base Relocation Table (DataDirectories[5]):
+//   IMAGE_BASE_RELOCATION 블록 array (.reloc section 안에 packed):
+//     VirtualAddress (uint32) at +0  — RVA of 4KB page
+//     SizeOfBlock    (uint32) at +4  — block 전체 size (header 포함)
+//     TypeOffset[]   (uint16) at +8  — entries, count = (SizeOfBlock - 8) / 2
+//       high 4 bits = relocation type
+//         0  IMAGE_REL_BASED_ABSOLUTE  (no-op padding)
+//         3  IMAGE_REL_BASED_HIGHLOW   (32-bit fixup, PE32 보편)
+//         10 IMAGE_REL_BASED_DIR64     (64-bit fixup, PE32+ 보편)
+//       low 12 bits = page 안의 offset
+//
+// stage1 우회 (raw#9 hexa-only):
+//   - bit shift 없음: type   = entry / 4096   (entry >> 12)
+//   - bit AND 없음:   offset = entry % 4096   (entry & 0xFFF)
+//   - per-entry `od` exec 비용 회피:
+//       단일 `dd | od -tu2 | awk` 파이프라인으로 전체 block summary 를 한 번에 추출 후
+//       hexa 가 line-based output 만 파싱 (subprocess fork/exec 부담 ~1 회로 압축).
+//       PE32 의 경우 79k entries × per-call od = OOM/hang — 이 우회 필수.
+
+use "../perf/r0_common"
+
+// ─── 저레벨 byte read 헬퍼 (소량 read 만; 헤더용) ───
+fn read_u16(path: str, offset: int) -> int {
+    let cmd = "od -An -tu2 -N2 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn read_u32(path: str, offset: int) -> int {
+    let cmd = "od -An -tu4 -N4 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+// ─── DOS / FileHeader / OptionalHeader 헬퍼 ───
+fn _read_e_lfanew(path: str) -> int {
+    return read_u32(path, 60)
+}
+
+fn _read_opt_magic(path: str, e_lfanew: int) -> int {
+    return read_u16(path, e_lfanew + 24 + 0)
+}
+
+fn _read_num_sections(path: str, e_lfanew: int) -> int {
+    return read_u16(path, e_lfanew + 4 + 2)
+}
+
+fn _read_size_opt_header(path: str, e_lfanew: int) -> int {
+    return read_u16(path, e_lfanew + 4 + 16)
+}
+
+// ─── DataDirectories[5] = Base Relocation Table ───
+//
+//   PE32:  e_lfanew + 24 + 96  + (5*8) = e_lfanew + 160
+//   PE32+: e_lfanew + 24 + 112 + (5*8) = e_lfanew + 176
+//
+//   8 bytes per entry: RVA (uint32) + Size (uint32)
+fn reloc_dir_info(pe_path: str, e_lfanew: int, opt_magic: int) -> array {
+    let mut dir_off = 0
+    if opt_magic == 267 {  // PE32
+        dir_off = e_lfanew + 24 + 96 + 5 * 8
+    }
+    if opt_magic == 523 {  // PE32+
+        dir_off = e_lfanew + 24 + 112 + 5 * 8
+    }
+    if dir_off == 0 {
+        return [0, 0]
+    }
+    let rva = read_u32(pe_path, dir_off)
+    let size = read_u32(pe_path, dir_off + 4)
+    return [rva, size]
+}
+
+// ─── RVA → file offset 변환 (pe_imports 동상) ───
+fn rva_to_file_offset(pe_path: str, e_lfanew: int, rva: int) -> int {
+    let num_sections = _read_num_sections(pe_path, e_lfanew)
+    let size_opt = _read_size_opt_header(pe_path, e_lfanew)
+    let sect_off = e_lfanew + 24 + size_opt
+
+    let mut i = 0
+    while i < num_sections {
+        let s_base = sect_off + i * 40
+        let vsize = read_u32(pe_path, s_base + 8)
+        let vaddr = read_u32(pe_path, s_base + 12)
+        let raw_size = read_u32(pe_path, s_base + 16)
+        let raw_off = read_u32(pe_path, s_base + 20)
+        let mut span = vsize
+        if raw_size > vsize {
+            span = raw_size
+        }
+        if rva >= vaddr {
+            if rva < vaddr + span {
+                return raw_off + (rva - vaddr)
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── 단일 page block 의 entries 파싱 ───
+//
+//   block_offset = file offset to IMAGE_BASE_RELOCATION header
+//   size         = SizeOfBlock (header 포함)
+//   반환: array of [type, offset]
+//
+//   note: 이 함수는 작은 block 한 개에 대해서만 호출 (소량). 큰 dir 전체는
+//   parse_reloc_blocks() 의 awk 파이프라인으로 처리.
+fn parse_reloc_block_entries(pe_path: str, block_offset: int, size: int) -> array {
+    let mut out = []
+    let entry_count = (size - 8) / 2
+    if entry_count <= 0 {
+        return out
+    }
+    // 작은 block 한 개 — 한 번의 od 로 모든 uint16 dump 후 split.
+    let bytes = entry_count * 2
+    let cmd = "od -An -v -tu2 -j " + to_string(block_offset + 8)
+        + " -N " + to_string(bytes)
+        + " '" + pe_path + "' | tr -s ' \\n' ' '"
+    let raw = exec(cmd).trim()
+    let parts = raw.split(" ")
+    let mut i = 0
+    while i < entry_count {
+        if i < len(parts) {
+            let entry = to_int(parts[i])
+            let t = entry / 4096       // == entry >> 12
+            let off = entry % 4096     // == entry & 0xFFF
+            out.push([t, off])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── 모든 relocation block 파싱 (bulk awk pipeline + tmpfile) ───
+//
+//   반환: array — 단일 element [tmp_file_path, n_blocks].
+//         실제 block 데이터는 tmp_file 에 한 줄당 한 block 으로 저장:
+//           "page_rva entry_count abs highlow dir64 other"
+//         hexa 측 array build 는 최소화 (stage1 의 array.push OOM 회피).
+//
+//   접근 헬퍼:
+//     reloc_blocks_count(blocks) -> int          : block 수
+//     reloc_block_at(blocks, idx) -> array       : [page_rva, count, abs, hl, d64, other]
+//
+//   구현: dd → od -tu2 → awk → tmpfile 파이프라인 한 번. hexa 는 wc -l 로 카운트,
+//   awk -v로 individual line 추출. 79k entries 의 per-call od fork 회피 + 870
+//   block 의 in-memory hexa array 회피 (양쪽 모두 stage1 OOM 유발).
+fn parse_reloc_blocks(pe_path: str) -> array {
+    let mut out = []
+    let e_lfanew = _read_e_lfanew(pe_path)
+    let opt_magic = _read_opt_magic(pe_path, e_lfanew)
+    let dir = reloc_dir_info(pe_path, e_lfanew, opt_magic)
+    let dir_rva = dir[0]
+    let dir_size = dir[1]
+    if dir_rva == 0 {
+        out.push("")
+        out.push(0)
+        return out
+    }
+    if dir_size == 0 {
+        out.push("")
+        out.push(0)
+        return out
+    }
+
+    let base_off = rva_to_file_offset(pe_path, e_lfanew, dir_rva)
+    if base_off < 0 {
+        out.push("")
+        out.push(0)
+        return out
+    }
+
+    let tmp = R0_HOME + "/pe_reloc_blocks.tmp"
+
+    let cmd = "dd if='" + pe_path + "' bs=1 skip=" + to_string(base_off)
+        + " count=" + to_string(dir_size) + " status=none"
+        + " | od -An -v -tu2"
+        + " | awk '"
+        + "{ for (i=1; i<=NF; i++) words[++nw] = $i }"
+        + " END {"
+        + "   i = 1;"
+        + "   while (i + 4 <= nw) {"
+        + "     page_rva = words[i] + words[i+1]*65536;"
+        + "     block_size = words[i+2] + words[i+3]*65536;"
+        + "     if (block_size < 8) break;"
+        + "     entry_count = (block_size - 8) / 2;"
+        + "     if (i + 3 + entry_count > nw) break;"
+        + "     abs_n = 0; hl_n = 0; d64_n = 0; other_n = 0;"
+        + "     for (j = 0; j < entry_count; j++) {"
+        + "       e = words[i + 4 + j];"
+        + "       t = int(e / 4096);"
+        + "       if (t == 0) abs_n++;"
+        + "       else if (t == 3) hl_n++;"
+        + "       else if (t == 10) d64_n++;"
+        + "       else other_n++;"
+        + "     }"
+        + "     printf \"%d %d %d %d %d %d\\n\", page_rva, entry_count, abs_n, hl_n, d64_n, other_n;"
+        + "     i = i + 4 + entry_count;"
+        + "   }"
+        + " }' > '" + tmp + "'"
+
+    let _r = exec(cmd)
+    let n_str = exec("wc -l < '" + tmp + "' | tr -d ' '").trim()
+    let n_blocks = to_int(n_str)
+    out.push(tmp)
+    out.push(n_blocks)
+    return out
+}
+
+// ─── parse_reloc_blocks 결과 헬퍼 ───
+//   blocks[0] = tmpfile path, blocks[1] = n_blocks
+fn reloc_blocks_count(blocks: array) -> int {
+    if len(blocks) < 2 {
+        return 0
+    }
+    return blocks[1]
+}
+
+fn reloc_block_at(blocks: array, idx: int) -> array {
+    let mut out = [0, 0, 0, 0, 0, 0]
+    if len(blocks) < 2 {
+        return out
+    }
+    let tmp = blocks[0]
+    if tmp == "" {
+        return out
+    }
+    let n = blocks[1]
+    if idx < 0 || idx >= n {
+        return out
+    }
+    // sed line N → "rva count abs hl d64 other"
+    let cmd = "sed -n " + to_string(idx + 1) + "p '" + tmp + "'"
+    let line = exec(cmd).trim()
+    if line == "" {
+        return out
+    }
+    let parts = line.split(" ")
+    if len(parts) >= 6 {
+        out = [
+            to_int(parts[0]),
+            to_int(parts[1]),
+            to_int(parts[2]),
+            to_int(parts[3]),
+            to_int(parts[4]),
+            to_int(parts[5])
+        ]
+    }
+    return out
+}
+
+// ─── 한 block 의 type_name → count 요약 array (display 용) ───
+//   block 은 reloc_block_at() 결과: [page_rva, entry_count, abs, hl, d64, other].
+fn reloc_block_summary(block: array) -> array {
+    let mut out = []
+    out.push(["abs", block[2]])
+    out.push(["highlow", block[3]])
+    out.push(["dir64", block[4]])
+    out.push(["other", block[5]])
+    return out
+}
+
+// ─── type 별 합계 ───
+//
+//   반환 (hexa dict 부재): array of [type_name, count]
+//     [["abs", N], ["highlow", N], ["dir64", N], ["other", N], ["total", N]]
+fn reloc_type_counts(pe_path: str) -> array {
+    // 단일 awk 패스 — totals 만 계산 (per-block array building 회피).
+    // hexa stage1 의 nested array push 가 OOM 위험이라 totals 계산은
+    // shell 안에서 끝내고 hexa 는 single-line 결과만 파싱.
+    let mut out = []
+    let e_lfanew = _read_e_lfanew(pe_path)
+    let opt_magic = _read_opt_magic(pe_path, e_lfanew)
+    let dir = reloc_dir_info(pe_path, e_lfanew, opt_magic)
+    let dir_rva = dir[0]
+    let dir_size = dir[1]
+    if dir_rva == 0 || dir_size == 0 {
+        out.push(["abs", 0])
+        out.push(["highlow", 0])
+        out.push(["dir64", 0])
+        out.push(["other", 0])
+        out.push(["total", 0])
+        return out
+    }
+    let base_off = rva_to_file_offset(pe_path, e_lfanew, dir_rva)
+    if base_off < 0 {
+        out.push(["abs", 0])
+        out.push(["highlow", 0])
+        out.push(["dir64", 0])
+        out.push(["other", 0])
+        out.push(["total", 0])
+        return out
+    }
+
+    let cmd = "dd if='" + pe_path + "' bs=1 skip=" + to_string(base_off)
+        + " count=" + to_string(dir_size) + " status=none"
+        + " | od -An -v -tu2"
+        + " | awk '"
+        + "{ for (i=1; i<=NF; i++) words[++nw] = $i }"
+        + " END {"
+        + "   i = 1; total_abs=0; total_hl=0; total_d64=0; total_other=0; total=0;"
+        + "   while (i + 4 <= nw) {"
+        + "     block_size = words[i+2] + words[i+3]*65536;"
+        + "     if (block_size < 8) break;"
+        + "     entry_count = (block_size - 8) / 2;"
+        + "     if (i + 3 + entry_count > nw) break;"
+        + "     for (j = 0; j < entry_count; j++) {"
+        + "       e = words[i + 4 + j];"
+        + "       t = int(e / 4096);"
+        + "       if (t == 0) total_abs++;"
+        + "       else if (t == 3) total_hl++;"
+        + "       else if (t == 10) total_d64++;"
+        + "       else total_other++;"
+        + "     }"
+        + "     total += entry_count;"
+        + "     i = i + 4 + entry_count;"
+        + "   }"
+        + "   printf \"%d %d %d %d %d\\n\", total_abs, total_hl, total_d64, total_other, total;"
+        + " }'"
+
+    let raw = exec(cmd).trim()
+    let parts = raw.split(" ")
+    let mut abs_n = 0
+    let mut hl_n = 0
+    let mut d64_n = 0
+    let mut other_n = 0
+    let mut total = 0
+    if len(parts) >= 5 {
+        abs_n = to_int(parts[0])
+        hl_n = to_int(parts[1])
+        d64_n = to_int(parts[2])
+        other_n = to_int(parts[3])
+        total = to_int(parts[4])
+    }
+    out.push(["abs", abs_n])
+    out.push(["highlow", hl_n])
+    out.push(["dir64", d64_n])
+    out.push(["other", other_n])
+    out.push(["total", total])
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "perel-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    let test_pe = HOME + "/Downloads/gamebox/Battle.net-Setup.exe"
+    let exists = exec("test -f '" + test_pe + "' && echo ok").trim()
+    if exists != "ok" {
+        println("  ⚠ test PE not found at " + test_pe)
+        println("  ⚠ pe_relocations self_test SKIP (PE binary absent)")
+        return
+    }
+
+    // 1. type 별 카운트 (단일 awk 패스, lightweight)
+    let counts = reloc_type_counts(test_pe)
+    let abs_n = counts[0][1]
+    let hl_n = counts[1][1]
+    let d64_n = counts[2][1]
+    let other_n = counts[3][1]
+    let total_n = counts[4][1]
+    r0_emit("pe_reloc_types",
+        "\"abs\":" + to_string(abs_n)
+        + ",\"highlow\":" + to_string(hl_n)
+        + ",\"dir64\":" + to_string(d64_n)
+        + ",\"other\":" + to_string(other_n)
+        + ",\"total\":" + to_string(total_n)
+    )
+
+    // 2. 검증: 재배치 entries 존재
+    if total_n <= 0 {
+        panic("pe_relocations FAIL [total entries] expected=>0 got=" + to_string(total_n))
+    }
+
+    // 3. 모든 block 파싱 (heavier; flat stride-6 int array)
+    let blocks = parse_reloc_blocks(test_pe)
+    let n_blocks = reloc_blocks_count(blocks)
+    r0_emit("pe_reloc_blocks", "\"count\":" + to_string(n_blocks))
+
+    // 4. block 수 sanity
+    if n_blocks <= 0 {
+        panic("pe_relocations FAIL [n_blocks] expected=>0 got=" + to_string(n_blocks))
+    }
+
+    // 5. PE32+ 의 경우 dir64 dominance, PE32 의 경우 highlow dominance — 약식 sanity
+    let e_lfanew = _read_e_lfanew(test_pe)
+    let opt_magic = _read_opt_magic(test_pe, e_lfanew)
+    if opt_magic == 523 {
+        // PE32+ → DIR64 우세 기대 (spec mandate; 실제 PE 따라 약간 다를 수도)
+        if d64_n <= hl_n {
+            panic("pe_relocations FAIL [PE32+ dir64 dominance] expected=dir64>highlow got_dir64=" + to_string(d64_n) + " got_highlow=" + to_string(hl_n))
+        }
+    }
+    if opt_magic == 267 {
+        // PE32 → HIGHLOW 우세 기대 (32-bit fixup only)
+        if hl_n <= d64_n {
+            panic("pe_relocations FAIL [PE32 highlow dominance] expected=highlow>dir64 got_highlow=" + to_string(hl_n) + " got_dir64=" + to_string(d64_n))
+        }
+    }
+
+    // 6. 첫 block 의 page_rva 4KB-aligned 검증
+    if n_blocks > 0 {
+        let first = reloc_block_at(blocks, 0)
+        let page_rva = first[0]
+        if page_rva % 4096 != 0 {
+            panic("pe_relocations FAIL [page_rva alignment] expected=%4096==0 got=" + to_string(page_rva))
+        }
+    }
+
+    // 7. parse_reloc_block_entries round-trip — 첫 block 의 entry list 가
+    //    summary 의 entry_count 와 일치하는지.
+    if n_blocks > 0 {
+        let dir = reloc_dir_info(test_pe, e_lfanew, opt_magic)
+        let base_off = rva_to_file_offset(test_pe, e_lfanew, dir[0])
+        let block_size = read_u32(test_pe, base_off + 4)
+        let entries = parse_reloc_block_entries(test_pe, base_off, block_size)
+        let first = reloc_block_at(blocks, 0)
+        let expected_entries = first[1]
+        if len(entries) != expected_entries {
+            panic("pe_relocations FAIL [block_entries roundtrip] expected=" + to_string(expected_entries) + " got=" + to_string(len(entries)))
+        }
+    }
+
+    // 8. r0 emit 카운트 (own 2 mandate ≥ 1)
+    let sess_cnt = r0_session_count(sid)
+    if sess_cnt < 2 {
+        panic("pe_relocations FAIL [r0 events] expected=>=2 got=" + to_string(sess_cnt))
+    }
+
+    println("  ✅ pe_relocations self_test PASS (" + to_string(n_blocks) + " blocks, " + to_string(total_n) + " total entries, dir64=" + to_string(d64_n) + ", highlow=" + to_string(hl_n) + ", abs=" + to_string(abs_n) + ", sid=" + sid + ")")
+}
+
+// ─── human-readable summary ───
+fn pe_reloc_summary(path: str) -> void {
+    let e_lfanew = _read_e_lfanew(path)
+    let opt_magic = _read_opt_magic(path, e_lfanew)
+    let dir = reloc_dir_info(path, e_lfanew, opt_magic)
+    println("Reloc DataDir[5]: RVA=" + to_string(dir[0]) + " Size=" + to_string(dir[1]))
+    let blocks = parse_reloc_blocks(path)
+    println("Blocks:           " + to_string(reloc_blocks_count(blocks)))
+    let counts = reloc_type_counts(path)
+    println("Type counts:")
+    println("  abs:     " + to_string(counts[0][1]))
+    println("  highlow: " + to_string(counts[1][1]))
+    println("  dir64:   " + to_string(counts[2][1]))
+    println("  other:   " + to_string(counts[3][1]))
+    println("  total:   " + to_string(counts[4][1]))
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "summary" {
+            if len(a) >= 4 {
+                pe_reloc_summary(a[3])
+                return
+            }
+        }
+        if sub == "blocks" {
+            if len(a) >= 4 {
+                let blocks = parse_reloc_blocks(a[3])
+                let n = reloc_blocks_count(blocks)
+                println("blocks: " + to_string(n))
+                // 처음 10 개만 (large PE 의 869 block dump 회피)
+                let limit = 10
+                let mut show = n
+                if show > limit {
+                    show = limit
+                }
+                let mut i = 0
+                while i < show {
+                    let b = reloc_block_at(blocks, i)
+                    println("  [" + to_string(i) + "] page_rva=" + to_string(b[0]) + " entries=" + to_string(b[1]))
+                    i = i + 1
+                }
+                if n > limit {
+                    println("  ... (" + to_string(n - limit) + " more)")
+                }
+                return
+            }
+        }
+    }
+    println("usage: hexa run pe_relocations.hexa { self-test | summary <path> | blocks <path> }")
+}

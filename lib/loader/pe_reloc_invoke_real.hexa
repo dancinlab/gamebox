@@ -1,0 +1,411 @@
+// lib/loader/pe_reloc_invoke_real.hexa — cycle 82 R2 phase 2 base reloc apply → mprotect IPC invoke tracker
+//
+// cycle 80 pe_reloc_applier_real (block walk + delta apply tracker) cross-ref. base reloc 적용 후
+// .text 영역을 RW → RX 로 토글하기 위해 helper.mm 으로 mprotect IPC 를 invoke 하는 추적기.
+// 본 module 은 invoke event tracker — 실 mprotect / IPC syscall 호출 X (helper.mm 가 수행).
+// JIT page (W^X) 환경에서는 jit_write_protect_off / jit_write_protect_on (mac M1 pthread_jit_write_protect_np)
+// toggle 도 동일 채널을 통해 dispatch.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   PE spec + Apple darwin syscall semantics 만 참고 — Wine wineserver mprotect path 인용 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// toggle_kind code:
+//   1 = rw_to_rx                  (.text 코드 영역 finalize — 실행 가능 전환)
+//   2 = rx_to_rw                  (hot patch / debugger write-back 진입)
+//   3 = ro_to_rw                  (.rdata IAT bind 시 일시 쓰기 허용)
+//   4 = jit_write_protect_off     (W^X — current thread JIT write 활성)
+//   5 = jit_write_protect_on      (W^X — current thread JIT execute 복귀)
+//
+// elevated:
+//   0 = unprivileged invoke (ordinary mprotect)
+//   1 = entitlement / task_for_pid 필요한 elevated invoke (helper.mm 권한 분기)
+//
+// persist schema (TSV — invokes.tsv):
+//   invoke_id<int> \t toggle_kind<int> \t region_kb<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn prir_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_reloc_invoke_real"
+}
+
+fn prir_invokes_path() -> str {
+    return prir_dir() + "/invokes.tsv"
+}
+
+fn prir_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + prir_dir() + "'")
+}
+
+fn cleanup_prir() -> void {
+    prir_ensure_dir()
+    let _ = exec("rm -f '" + prir_invokes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prir_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prir_append_row(path: str, row: str) -> void {
+    prir_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_invoke: helper.mm mprotect IPC invoke 1 건 기록 ───
+fn record_invoke(invoke_id: int, toggle_kind: int, region_kb: int, elevated: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_reloc_invoke_real FAIL [record_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if toggle_kind < 1 {
+        panic("pe_reloc_invoke_real FAIL [record_invoke] expected=toggle_kind>=1 got=" + to_string(toggle_kind))
+    }
+    if toggle_kind > 5 {
+        panic("pe_reloc_invoke_real FAIL [record_invoke] expected=toggle_kind<=5 got=" + to_string(toggle_kind))
+    }
+    if region_kb < 0 {
+        panic("pe_reloc_invoke_real FAIL [record_invoke] expected=region_kb>=0 got=" + to_string(region_kb))
+    }
+    if elevated < 0 {
+        panic("pe_reloc_invoke_real FAIL [record_invoke] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_reloc_invoke_real FAIL [record_invoke] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(toggle_kind)
+        + "\t" + to_string(region_kb) + "\t" + to_string(elevated) + "\n"
+    prir_append_row(prir_invokes_path(), row)
+}
+
+// ─── invoke_count: total invoke 수 ───
+fn invoke_count() -> int {
+    let t = prir_read_table(prir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_region_kb: 모든 invoke region_kb 합 ───
+fn total_region_kb() -> int {
+    let t = prir_read_table(prir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_toggle_kind: 특정 toggle_kind 의 invoke 수 ───
+fn count_by_toggle_kind(toggle_kind: int) -> int {
+    let t = prir_read_table(prir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == toggle_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── elevated_count: elevated=1 invoke 수 ───
+fn elevated_count() -> int {
+    let t = prir_read_table(prir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── jit_toggle_count: W^X JIT toggle (kind 4 + 5) 합 ───
+fn jit_toggle_count() -> int {
+    return count_by_toggle_kind(4) + count_by_toggle_kind(5)
+}
+
+// ─── invoke_region_kb: 특정 invoke_id 의 region_kb (없으면 0) ───
+fn invoke_region_kb(invoke_id: int) -> int {
+    let t = prir_read_table(prir_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == invoke_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── prir_stats: [invoke_count, total_region_kb, elevated_count, jit_toggle_count] ───
+fn prir_stats() -> array {
+    let mut out = []
+    out.push(invoke_count())
+    out.push(total_region_kb())
+    out.push(elevated_count())
+    out.push(jit_toggle_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "prir-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prir()
+
+    // 2. record 5 invokes — toggle_kinds {1, 2, 3, 4, 5}, elevated count = 2
+    //    region_kb sum = 64 + 64 + 8 + 4 + 4 = 144
+    record_invoke(820001, 1, 64, 0)
+    r0_emit("pe_reloc_invoke_real_record",
+        "\"invoke_id\":820001,\"toggle_kind\":1,\"region_kb\":64,\"elevated\":0,\"target\":\"rw_to_rx\"")
+
+    record_invoke(820002, 2, 64, 1)
+    r0_emit("pe_reloc_invoke_real_record",
+        "\"invoke_id\":820002,\"toggle_kind\":2,\"region_kb\":64,\"elevated\":1,\"target\":\"rx_to_rw\"")
+
+    record_invoke(820003, 3, 8, 0)
+    r0_emit("pe_reloc_invoke_real_record",
+        "\"invoke_id\":820003,\"toggle_kind\":3,\"region_kb\":8,\"elevated\":0,\"target\":\"ro_to_rw\"")
+
+    record_invoke(820004, 4, 4, 1)
+    r0_emit("pe_reloc_invoke_real_record",
+        "\"invoke_id\":820004,\"toggle_kind\":4,\"region_kb\":4,\"elevated\":1,\"target\":\"jit_write_protect_off\"")
+
+    record_invoke(820005, 5, 4, 0)
+    r0_emit("pe_reloc_invoke_real_record",
+        "\"invoke_id\":820005,\"toggle_kind\":5,\"region_kb\":4,\"elevated\":0,\"target\":\"jit_write_protect_on\"")
+
+    // 3. invoke_count = 5
+    let c = invoke_count()
+    if c != 5 {
+        panic("pe_reloc_invoke_real FAIL [invoke_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_region_kb = 144
+    let tr = total_region_kb()
+    if tr != 144 {
+        panic("pe_reloc_invoke_real FAIL [total_region_kb] expected=144 got=" + to_string(tr))
+    }
+
+    // 5. count_by_toggle_kind sanity
+    let k1 = count_by_toggle_kind(1)
+    if k1 != 1 {
+        panic("pe_reloc_invoke_real FAIL [count_by_toggle_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_toggle_kind(2)
+    if k2 != 1 {
+        panic("pe_reloc_invoke_real FAIL [count_by_toggle_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_toggle_kind(3)
+    if k3 != 1 {
+        panic("pe_reloc_invoke_real FAIL [count_by_toggle_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_toggle_kind(4)
+    if k4 != 1 {
+        panic("pe_reloc_invoke_real FAIL [count_by_toggle_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_toggle_kind(5)
+    if k5 != 1 {
+        panic("pe_reloc_invoke_real FAIL [count_by_toggle_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_toggle_kind(99)
+    if k99 != 0 {
+        panic("pe_reloc_invoke_real FAIL [count_by_toggle_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. elevated_count = 2 (820002, 820004)
+    let ec = elevated_count()
+    if ec != 2 {
+        panic("pe_reloc_invoke_real FAIL [elevated_count] expected=2 got=" + to_string(ec))
+    }
+
+    // 7. jit_toggle_count = 2 (kind 4 + kind 5)
+    let jt = jit_toggle_count()
+    if jt != 2 {
+        panic("pe_reloc_invoke_real FAIL [jit_toggle_count] expected=2 got=" + to_string(jt))
+    }
+
+    // 8. invoke_region_kb sanity
+    let r1 = invoke_region_kb(820001)
+    if r1 != 64 {
+        panic("pe_reloc_invoke_real FAIL [invoke_region_kb(820001)] expected=64 got=" + to_string(r1))
+    }
+    let r3 = invoke_region_kb(820003)
+    if r3 != 8 {
+        panic("pe_reloc_invoke_real FAIL [invoke_region_kb(820003)] expected=8 got=" + to_string(r3))
+    }
+    let r_miss = invoke_region_kb(9999)
+    if r_miss != 0 {
+        panic("pe_reloc_invoke_real FAIL [invoke_region_kb(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 9. prir_stats() = [5, 144, 2, 2]
+    let s = prir_stats()
+    if len(s) != 4 {
+        panic("pe_reloc_invoke_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_reloc_invoke_real FAIL [stats invoke_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 144 {
+        panic("pe_reloc_invoke_real FAIL [stats total_region_kb] expected=144 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_reloc_invoke_real FAIL [stats elevated_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_reloc_invoke_real FAIL [stats jit_toggle_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_reloc_invoke_real_stats",
+        "\"invoke_count\":" + to_string(s[0])
+        + ",\"total_region_kb\":" + to_string(s[1])
+        + ",\"elevated_count\":" + to_string(s[2])
+        + ",\"jit_toggle_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_reloc_invoke_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_prir()
+    let s2 = prir_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_reloc_invoke_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_reloc_invoke_real self_test PASS (invokes=" + to_string(s[0])
+        + ", region_kb=" + to_string(s[1]) + ", elevated=" + to_string(s[2])
+        + ", jit_toggles=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prir_stats()
+            println("invoke_count\t" + to_string(s[0]))
+            println("total_region_kb\t" + to_string(s[1]))
+            println("elevated_count\t" + to_string(s[2]))
+            println("jit_toggle_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "region" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("invoke_region_kb\t" + to_string(invoke_region_kb(iid)))
+                return
+            }
+            println("usage: hexa run pe_reloc_invoke_real.hexa region <invoke_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let tk = to_int(a[3])
+                println("count_by_toggle_kind\t" + to_string(count_by_toggle_kind(tk)))
+                return
+            }
+            println("usage: hexa run pe_reloc_invoke_real.hexa count <toggle_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_prir()
+            println("cleaned: " + prir_dir())
+            return
+        }
+        if sub == "dir" {
+            println(prir_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_reloc_invoke_real.hexa { self-test | stats | region <invoke_id> | count <toggle_kind> | cleanup | dir }")
+}

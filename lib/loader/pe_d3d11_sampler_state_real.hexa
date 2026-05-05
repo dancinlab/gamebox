@@ -1,0 +1,449 @@
+// lib/loader/pe_d3d11_sampler_state_real.hexa — D3D11 CreateSamplerState → MTLSamplerDescriptor routing tracker
+//
+// ID3D11Device::CreateSamplerState 호출의 D3D11_SAMPLER_DESC 매핑 추적기.
+// 본 module 은 sampler state descriptor record/aggregate 만 — 실
+// ID3D11Device::CreateSamplerState / MTLDevice newSamplerStateWithDescriptor
+// (VSSetSamplers / PSSetSamplers binding 포함) 호출은 stage2 native helper
+// (D3DMetal binary 위임) 에서 처리.
+//
+// D3D11_SAMPLER_DESC → MTLSamplerDescriptor:
+//   D3D11_SAMPLER_DESC.Filter            → MTLSamplerDescriptor.minFilter / magFilter / mipFilter
+//                                          (MTLSamplerMinMagFilter point/linear,
+//                                           MTLSamplerMipFilter notMipmapped/nearest/linear)
+//   D3D11_SAMPLER_DESC.AddressU/V/W      → MTLSamplerDescriptor.sAddressMode / tAddressMode / rAddressMode
+//                                          (MTLSamplerAddressMode clampToEdge/repeat/mirrorRepeat/clampToBorderColor)
+//   D3D11_SAMPLER_DESC.MaxAnisotropy     → MTLSamplerDescriptor.maxAnisotropy
+//   D3D11_SAMPLER_DESC.ComparisonFunc    → MTLSamplerDescriptor.compareFunction (filter_kind=4 comparison)
+//   VSSetSamplers / PSSetSamplers        → MTLRenderCommandEncoder setVertexSamplerState / setFragmentSamplerState
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11Device. MoltenVK/DXVK 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// filter_kind code (D3D11_FILTER 축약):
+//   1 = min_mag_mip_point     (MTL: point/point/notMipmapped 또는 nearest)
+//   2 = linear                (MTL: linear/linear/linear)
+//   3 = anisotropic           (MTL: linear/linear/linear + maxAnisotropy>=2)
+//   4 = comparison            (MTL: compareFunction != never)
+//
+// address_u code (D3D11_TEXTURE_ADDRESS_MODE):
+//   1 = wrap    (MTLSamplerAddressMode.repeat)
+//   2 = mirror  (MTLSamplerAddressMode.mirrorRepeat)
+//   3 = clamp   (MTLSamplerAddressMode.clampToEdge)
+//   4 = border  (MTLSamplerAddressMode.clampToBorderColor)
+//
+// persist schema (TSV — states.tsv):
+//   state_id<int> \t filter_kind<int> \t address_u<int> \t max_anisotropy<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdss11_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_sampler_state_real"
+}
+
+fn pdss11_states_path() -> str {
+    return pdss11_dir() + "/states.tsv"
+}
+
+fn pdss11_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdss11_dir() + "'")
+}
+
+fn cleanup_pdss11() -> void {
+    pdss11_ensure_dir()
+    let _ = exec("rm -f '" + pdss11_states_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdss11_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdss11_append_row(path: str, row: str) -> void {
+    pdss11_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_state: sampler state descriptor 1 건 기록 ───
+fn record_state(state_id: int, filter_kind: int, address_u: int, max_anisotropy: int) -> void {
+    if state_id <= 0 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if filter_kind < 1 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=filter_kind>=1 got=" + to_string(filter_kind))
+    }
+    if filter_kind > 4 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=filter_kind<=4 got=" + to_string(filter_kind))
+    }
+    if address_u < 1 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=address_u>=1 got=" + to_string(address_u))
+    }
+    if address_u > 4 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=address_u<=4 got=" + to_string(address_u))
+    }
+    if max_anisotropy < 1 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=max_anisotropy>=1 got=" + to_string(max_anisotropy))
+    }
+    if max_anisotropy > 16 {
+        panic("pe_d3d11_sampler_state_real FAIL [record_state] expected=max_anisotropy<=16 got=" + to_string(max_anisotropy))
+    }
+    let row = to_string(state_id) + "\t" + to_string(filter_kind)
+        + "\t" + to_string(address_u) + "\t" + to_string(max_anisotropy) + "\n"
+    pdss11_append_row(pdss11_states_path(), row)
+}
+
+// ─── state_count: total sampler state 수 ───
+fn state_count() -> int {
+    let t = pdss11_read_table(pdss11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_filter_kind: 특정 filter_kind 의 state 수 ───
+fn count_by_filter_kind(filter_kind: int) -> int {
+    let t = pdss11_read_table(pdss11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == filter_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_address_u: 특정 address_u mode 의 state 수 ───
+fn count_by_address_u(address_u: int) -> int {
+    let t = pdss11_read_table(pdss11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == address_u {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_max_anisotropy: 모든 state 의 max_anisotropy 합 ───
+fn total_max_anisotropy() -> int {
+    let t = pdss11_read_table(pdss11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── anisotropic_count: filter_kind=3 anisotropic state 수 ───
+fn anisotropic_count() -> int {
+    return count_by_filter_kind(3)
+}
+
+// ─── state_max_anisotropy: 특정 state_id 의 max_anisotropy (없으면 0) ───
+fn state_max_anisotropy(state_id: int) -> int {
+    let t = pdss11_read_table(pdss11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == state_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdss11_stats: [state_count, total_max_anisotropy, anisotropic_count, count_by_address_u(1)] ───
+fn pdss11_stats() -> array {
+    let mut out = []
+    out.push(state_count())
+    out.push(total_max_anisotropy())
+    out.push(anisotropic_count())
+    out.push(count_by_address_u(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdss11-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdss11()
+
+    // 2. record 5 states — ≥3 filter_kinds, ≥2 address_u
+    //    s1: point/wrap/aniso=1 (filter_kind=1, address_u=1)
+    record_state(420001, 1, 1, 1)
+    r0_emit("pe_d3d11_sampler_state_real_record",
+        "\"state_id\":420001,\"filter_kind\":1,\"address_u\":1,\"max_anisotropy\":1,\"target\":\"newSamplerStateWithDescriptor\"")
+
+    //    s2: linear/clamp/aniso=1 (filter_kind=2, address_u=3)
+    record_state(420002, 2, 3, 1)
+    r0_emit("pe_d3d11_sampler_state_real_record",
+        "\"state_id\":420002,\"filter_kind\":2,\"address_u\":3,\"max_anisotropy\":1,\"target\":\"newSamplerStateWithDescriptor\"")
+
+    //    s3: anisotropic/wrap/aniso=8 (filter_kind=3, address_u=1)
+    record_state(420003, 3, 1, 8)
+    r0_emit("pe_d3d11_sampler_state_real_record",
+        "\"state_id\":420003,\"filter_kind\":3,\"address_u\":1,\"max_anisotropy\":8,\"target\":\"newSamplerStateWithDescriptor\"")
+
+    //    s4: anisotropic/clamp/aniso=16 (filter_kind=3, address_u=3)
+    record_state(420004, 3, 3, 16)
+    r0_emit("pe_d3d11_sampler_state_real_record",
+        "\"state_id\":420004,\"filter_kind\":3,\"address_u\":3,\"max_anisotropy\":16,\"target\":\"newSamplerStateWithDescriptor\"")
+
+    //    s5: comparison/wrap/aniso=1 (filter_kind=4, address_u=1)
+    record_state(420005, 4, 1, 1)
+    r0_emit("pe_d3d11_sampler_state_real_record",
+        "\"state_id\":420005,\"filter_kind\":4,\"address_u\":1,\"max_anisotropy\":1,\"target\":\"newSamplerStateWithDescriptor\"")
+
+    // 3. state_count = 5
+    let c = state_count()
+    if c != 5 {
+        panic("pe_d3d11_sampler_state_real FAIL [state_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_max_anisotropy = 1+1+8+16+1 = 27
+    let tma = total_max_anisotropy()
+    if tma != 27 {
+        panic("pe_d3d11_sampler_state_real FAIL [total_max_anisotropy] expected=27 got=" + to_string(tma))
+    }
+
+    // 5. count_by_filter_kind sanity
+    //    filter_kind=1 point → s1 = 1
+    let f1 = count_by_filter_kind(1)
+    if f1 != 1 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_filter_kind(1)] expected=1 got=" + to_string(f1))
+    }
+    //    filter_kind=2 linear → s2 = 1
+    let f2 = count_by_filter_kind(2)
+    if f2 != 1 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_filter_kind(2)] expected=1 got=" + to_string(f2))
+    }
+    //    filter_kind=3 anisotropic → s3, s4 = 2
+    let f3 = count_by_filter_kind(3)
+    if f3 != 2 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_filter_kind(3)] expected=2 got=" + to_string(f3))
+    }
+    //    filter_kind=4 comparison → s5 = 1
+    let f4 = count_by_filter_kind(4)
+    if f4 != 1 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_filter_kind(4)] expected=1 got=" + to_string(f4))
+    }
+
+    // 6. anisotropic_count = 2 (== count_by_filter_kind(3))
+    let ac = anisotropic_count()
+    if ac != 2 {
+        panic("pe_d3d11_sampler_state_real FAIL [anisotropic_count] expected=2 got=" + to_string(ac))
+    }
+
+    // 7. count_by_address_u sanity
+    //    address_u=1 wrap → s1, s3, s5 = 3
+    let a1 = count_by_address_u(1)
+    if a1 != 3 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_address_u(1)] expected=3 got=" + to_string(a1))
+    }
+    //    address_u=3 clamp → s2, s4 = 2
+    let a3 = count_by_address_u(3)
+    if a3 != 2 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_address_u(3)] expected=2 got=" + to_string(a3))
+    }
+    //    address_u=2 mirror → none = 0
+    let a2 = count_by_address_u(2)
+    if a2 != 0 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_address_u(2)] expected=0 got=" + to_string(a2))
+    }
+    //    address_u=4 border → none = 0
+    let a4 = count_by_address_u(4)
+    if a4 != 0 {
+        panic("pe_d3d11_sampler_state_real FAIL [count_by_address_u(4)] expected=0 got=" + to_string(a4))
+    }
+
+    // 8. state_max_anisotropy sanity
+    let m3 = state_max_anisotropy(420003)
+    if m3 != 8 {
+        panic("pe_d3d11_sampler_state_real FAIL [state_max_anisotropy(420003)] expected=8 got=" + to_string(m3))
+    }
+    let m4 = state_max_anisotropy(420004)
+    if m4 != 16 {
+        panic("pe_d3d11_sampler_state_real FAIL [state_max_anisotropy(420004)] expected=16 got=" + to_string(m4))
+    }
+    let m_miss = state_max_anisotropy(99999)
+    if m_miss != 0 {
+        panic("pe_d3d11_sampler_state_real FAIL [state_max_anisotropy(99999)] expected=0 got=" + to_string(m_miss))
+    }
+
+    // 9. pdss11_stats() = [5, 27, 2, 3]
+    let s = pdss11_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_sampler_state_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d11_sampler_state_real FAIL [stats state_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 27 {
+        panic("pe_d3d11_sampler_state_real FAIL [stats total_max_anisotropy] expected=27 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_d3d11_sampler_state_real FAIL [stats anisotropic_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_d3d11_sampler_state_real FAIL [stats wrap_address_u] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d11_sampler_state_real_stats",
+        "\"state_count\":" + to_string(s[0])
+        + ",\"total_max_anisotropy\":" + to_string(s[1])
+        + ",\"anisotropic_count\":" + to_string(s[2])
+        + ",\"wrap_address_u\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d11_sampler_state_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdss11()
+    let s2 = pdss11_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_sampler_state_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_sampler_state_real self_test PASS (states=" + to_string(s[0])
+        + ", aniso_sum=" + to_string(s[1]) + ", aniso=" + to_string(s[2])
+        + ", wrap_u=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdss11_stats()
+            println("state_count\t" + to_string(s[0]))
+            println("total_max_anisotropy\t" + to_string(s[1]))
+            println("anisotropic_count\t" + to_string(s[2]))
+            println("wrap_address_u\t" + to_string(s[3]))
+            return
+        }
+        if sub == "aniso" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("state_max_anisotropy\t" + to_string(state_max_anisotropy(sid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_sampler_state_real.hexa aniso <state_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "filter" {
+                    println("count_by_filter_kind\t" + to_string(count_by_filter_kind(val)))
+                    return
+                }
+                if kind == "address" {
+                    println("count_by_address_u\t" + to_string(count_by_address_u(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_sampler_state_real.hexa count { filter <filter_kind> | address <address_u> }")
+                return
+            }
+            println("usage: hexa run pe_d3d11_sampler_state_real.hexa count { filter <filter_kind> | address <address_u> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdss11()
+            println("cleaned: " + pdss11_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdss11_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_sampler_state_real.hexa { self-test | stats | aniso <state_id> | count filter <filter_kind> | count address <address_u> | cleanup | dir }")
+}

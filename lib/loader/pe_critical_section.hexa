@@ -1,0 +1,391 @@
+// lib/loader/pe_critical_section.hexa — Win32 CRITICAL_SECTION → pthread_mutex bridge skeleton
+//
+// CRITICAL_SECTION layout — 24B (i386) / 40B (x64). Win32 CS 는 reentrant
+// mutex (same-thread re-acquire OK, recursion count tracking). EnterCS /
+// LeaveCS / TryEnterCS hot path 추적 — spin_count + wait_us 누적.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 CS op tracker — 실 pthread_mutex_lock() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = enter
+//   2 = leave
+//   3 = try_enter_succeed
+//   4 = try_enter_fail
+//
+// persist schema (TSV — ops.tsv):
+//   cs_id<int> \t op_kind<int> \t spin_count<int> \t wait_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_critical_section"
+}
+
+fn pcs_ops_path() -> str {
+    return pcs_dir() + "/ops.tsv"
+}
+
+fn pcs_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcs_dir() + "'")
+}
+
+fn cleanup_pcs() -> void {
+    pcs_ensure_dir()
+    let _ = exec("rm -f '" + pcs_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcs_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcs_append_row(path: str, row: str) -> void {
+    pcs_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: CS op 1 건 기록 ───
+fn record_op(cs_id: int, op_kind: int, spin_count: int, wait_us: int) -> void {
+    if cs_id <= 0 {
+        panic("pe_critical_section FAIL [record_op] expected=cs_id>0 got=" + to_string(cs_id))
+    }
+    if op_kind < 1 {
+        panic("pe_critical_section FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_critical_section FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if spin_count < 0 {
+        panic("pe_critical_section FAIL [record_op] expected=spin_count>=0 got=" + to_string(spin_count))
+    }
+    if wait_us < 0 {
+        panic("pe_critical_section FAIL [record_op] expected=wait_us>=0 got=" + to_string(wait_us))
+    }
+    let row = to_string(cs_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(spin_count) + "\t" + to_string(wait_us) + "\n"
+    pcs_append_row(pcs_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pcs_read_table(pcs_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_spin_count: 모든 op spin_count 합 ───
+fn total_spin_count() -> int {
+    let t = pcs_read_table(pcs_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_wait_us: 모든 op wait_us 합 ───
+fn total_wait_us() -> int {
+    let t = pcs_read_table(pcs_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pcs_read_table(pcs_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── cs_wait_us: 특정 cs_id 의 wait_us 합 (없으면 0) ───
+fn cs_wait_us(cs_id: int) -> int {
+    let t = pcs_read_table(pcs_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == cs_id {
+                    sum = sum + to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── pcs_stats: [op_count, total_spin_count, total_wait_us, count_by_op_kind(1)] ───
+fn pcs_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_spin_count())
+    out.push(total_wait_us())
+    out.push(count_by_op_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcs()
+
+    // 2. record 6 CS ops across 4 op_kinds (deterministic synthetic)
+    record_op(120001, 1, 0, 12)
+    r0_emit("pe_critical_section_record",
+        "\"cs_id\":120001,\"op_kind\":1,\"spin_count\":0,\"wait_us\":12,\"target\":\"enter\"")
+
+    record_op(120001, 2, 0, 0)
+    r0_emit("pe_critical_section_record",
+        "\"cs_id\":120001,\"op_kind\":2,\"spin_count\":0,\"wait_us\":0,\"target\":\"leave\"")
+
+    record_op(120002, 1, 200, 48)
+    r0_emit("pe_critical_section_record",
+        "\"cs_id\":120002,\"op_kind\":1,\"spin_count\":200,\"wait_us\":48,\"target\":\"enter\"")
+
+    record_op(120002, 3, 50, 4)
+    r0_emit("pe_critical_section_record",
+        "\"cs_id\":120002,\"op_kind\":3,\"spin_count\":50,\"wait_us\":4,\"target\":\"try_enter_succeed\"")
+
+    record_op(120003, 4, 100, 8)
+    r0_emit("pe_critical_section_record",
+        "\"cs_id\":120003,\"op_kind\":4,\"spin_count\":100,\"wait_us\":8,\"target\":\"try_enter_fail\"")
+
+    record_op(120002, 2, 0, 0)
+    r0_emit("pe_critical_section_record",
+        "\"cs_id\":120002,\"op_kind\":2,\"spin_count\":0,\"wait_us\":0,\"target\":\"leave\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_critical_section FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_spin_count = 350
+    let ts = total_spin_count()
+    if ts != 350 {
+        panic("pe_critical_section FAIL [total_spin_count] expected=350 got=" + to_string(ts))
+    }
+
+    // 5. total_wait_us = 72
+    let tw = total_wait_us()
+    if tw != 72 {
+        panic("pe_critical_section FAIL [total_wait_us] expected=72 got=" + to_string(tw))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_critical_section FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_critical_section FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_critical_section FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_critical_section FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_critical_section FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. cs_wait_us sanity
+    let w1 = cs_wait_us(120001)
+    if w1 != 12 {
+        panic("pe_critical_section FAIL [cs_wait_us(120001)] expected=12 got=" + to_string(w1))
+    }
+    let w2 = cs_wait_us(120002)
+    if w2 != 52 {
+        panic("pe_critical_section FAIL [cs_wait_us(120002)] expected=52 got=" + to_string(w2))
+    }
+    let w3 = cs_wait_us(120003)
+    if w3 != 8 {
+        panic("pe_critical_section FAIL [cs_wait_us(120003)] expected=8 got=" + to_string(w3))
+    }
+    let w_miss = cs_wait_us(9999)
+    if w_miss != 0 {
+        panic("pe_critical_section FAIL [cs_wait_us(9999)] expected=0 got=" + to_string(w_miss))
+    }
+
+    // 8. pcs_stats() = [6, 350, 72, 2]
+    let s = pcs_stats()
+    if len(s) != 4 {
+        panic("pe_critical_section FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_critical_section FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 350 {
+        panic("pe_critical_section FAIL [stats total_spin_count] expected=350 got=" + to_string(s[1]))
+    }
+    if s[2] != 72 {
+        panic("pe_critical_section FAIL [stats total_wait_us] expected=72 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_critical_section FAIL [stats count_kind(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_critical_section_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_spin_count\":" + to_string(s[1])
+        + ",\"total_wait_us\":" + to_string(s[2])
+        + ",\"kind_enter\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_critical_section FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pcs()
+    let s2 = pcs_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_critical_section FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_critical_section self_test PASS (ops=" + to_string(s[0])
+        + ", spin=" + to_string(s[1]) + ", wait_us=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcs_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_spin_count\t" + to_string(s[1]))
+            println("total_wait_us\t" + to_string(s[2]))
+            println("count_kind_enter\t" + to_string(s[3]))
+            return
+        }
+        if sub == "wait" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("cs_wait_us\t" + to_string(cs_wait_us(cid)))
+                return
+            }
+            println("usage: hexa run pe_critical_section.hexa wait <cs_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_critical_section.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcs()
+            println("cleaned: " + pcs_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_critical_section.hexa { self-test | stats | wait <cs_id> | count <op_kind> | cleanup | dir }")
+}

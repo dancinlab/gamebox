@@ -1,0 +1,725 @@
+// lib/loader/pe_wine_path_trace_real.hexa — Wine 정확한 PE init path step-by-step 추적기
+//
+// own 1: Hexa pure. Wine / CrossOver / Whisky / GPTK / Box86 / community wrapper 의존 0 줄.
+//        Wine source code (open-source LGPL) 를 spec-level 참고 자료로만 활용 —
+//        본 module 은 reference Win32 PE init path step 의 telemetry 만 기록.
+//        Wine binary / library 호출 X. 우리 자체 loader 의 step-by-step divergence 만 row 로 누적.
+// own 2: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   PE EXE entry → ntdll!_LdrInitializeThunk → LdrpInitializeProcess →
+//   PE section map (text/data/rdata/.reloc) → IAT resolve →
+//   __security_init_cookie / EncodePointer init → TLS callback → WinMain →
+//   user32 RegisterClass / CreateWindow 까지의 step-by-step path.
+//
+//   각 step 마다 우리 loader behavior vs reference Win32 (Wine spec) 비교 →
+//   divergence row + path branch (normal/throw/fast_fail/continue) + fix application
+//   + test outcome 을 별도 table 로 기록.
+//
+// step_name reference (typical PE init path):
+//   ntdll_init           — ntdll.dll first entry (early init)
+//   ldr_init_thunk       — _LdrInitializeThunk (process init dispatcher)
+//   ldrp_init_process    — LdrpInitializeProcess (process-wide init)
+//   pe_section_map       — PE section mmap + protect (text/data/rdata/.reloc)
+//   iat_resolve          — IAT resolve (import descriptor walk → dlsym route)
+//   encode_pointer_init  — EncodePointer/DecodePointer cookie init
+//   tls_callback         — IMAGE_TLS_DIRECTORY callback array dispatch
+//   winmain_call         — _scrt_common_main → WinMain entry call
+//   user32_register_class — user32 RegisterClass(Ex) for main window
+//   user32_create_window  — user32 CreateWindow(Ex) for main window
+//
+// fix_kind reference:
+//   0 = none                — no fix needed (matches reference)
+//   1 = conservative_skip   — 보수적으로 step skip (정확성 일부 포기, 진행 우선)
+//   2 = accurate_stub       — accurate stub 대체 (정확성 유지)
+//   3 = cookie_init         — security cookie / EncodePointer cookie 초기화
+//   4 = mem_protect         — mprotect 정정 (R/RW/RX 상태 sync)
+//
+// branch_kind reference:
+//   0 = normal     — 정상 fall-through
+//   1 = throw      — exception raise (SEH / C++ throw)
+//   2 = fast_fail  — RtlFailFast / __fastfail (immediate process kill)
+//   3 = continue   — recoverable continue (retry / skip alt path)
+//
+// persist schema (TSV — 5 separate tables):
+//   wine_step.tsv:
+//     step_id<int> \t step_name<str> \t eip_hex<str> \t expected_outcome<str>
+//   divergence.tsv:
+//     div_id<int> \t step_id<int> \t our_behavior<str> \t wine_behavior<str> \t fix_kind<int>
+//   path_branch.tsv:
+//     branch_id<int> \t step_id<int> \t branch_kind<int> \t taken<int>
+//   fix_application.tsv:
+//     fix_id<int> \t divergence_id<int> \t applied<int> \t success<int>
+//   test_outcome.tsv:
+//     outcome_id<int> \t step_id<int> \t test_name<str> \t passed<int>
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: step_id / step_name / eip_hex / expected_outcome /
+// div_id / our_behavior / wine_behavior / fix_kind /
+// branch_id / branch_kind / taken /
+// fix_id / divergence_id / applied / success /
+// outcome_id / test_name / passed.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwpt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wine_path_trace_real"
+}
+
+fn pwpt_wine_step_path() -> str {
+    return pwpt_dir() + "/wine_step.tsv"
+}
+
+fn pwpt_divergence_path() -> str {
+    return pwpt_dir() + "/divergence.tsv"
+}
+
+fn pwpt_path_branch_path() -> str {
+    return pwpt_dir() + "/path_branch.tsv"
+}
+
+fn pwpt_fix_application_path() -> str {
+    return pwpt_dir() + "/fix_application.tsv"
+}
+
+fn pwpt_test_outcome_path() -> str {
+    return pwpt_dir() + "/test_outcome.tsv"
+}
+
+fn pwpt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwpt_dir() + "'")
+}
+
+fn cleanup_pwpt() -> void {
+    pwpt_ensure_dir()
+    let _ = exec("rm -f '" + pwpt_wine_step_path() + "' '" + pwpt_divergence_path()
+        + "' '" + pwpt_path_branch_path() + "' '" + pwpt_fix_application_path()
+        + "' '" + pwpt_test_outcome_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwpt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwpt_append_row(path: str, row: str) -> void {
+    pwpt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwpt_count_rows(path: str, min_cols: int) -> int {
+    let t = pwpt_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: step_status_name (eip_hex / outcome 으로부터 status 분류) ───
+fn step_status_name(expected_outcome: str) -> str {
+    if expected_outcome == "" {
+        return "unknown"
+    }
+    if expected_outcome == "ok" {
+        return "ok"
+    }
+    if expected_outcome == "fail" {
+        return "fail"
+    }
+    if expected_outcome == "skip" {
+        return "skip"
+    }
+    if expected_outcome == "stub" {
+        return "stub"
+    }
+    return "custom"
+}
+
+// ─── helper: fix_kind_name ───
+fn fix_kind_name(k: int) -> str {
+    if k == 0 { return "none" }
+    if k == 1 { return "conservative_skip" }
+    if k == 2 { return "accurate_stub" }
+    if k == 3 { return "cookie_init" }
+    if k == 4 { return "mem_protect" }
+    return "unknown"
+}
+
+// ─── helper: branch_kind_name ───
+fn branch_kind_name(k: int) -> str {
+    if k == 0 { return "normal" }
+    if k == 1 { return "throw" }
+    if k == 2 { return "fast_fail" }
+    if k == 3 { return "continue" }
+    return "unknown"
+}
+
+// ─── record_wine_step: PE init path step milestone ───
+fn record_wine_step(step_id: int, step_name: str, eip_hex: str, expected_outcome: str) -> void {
+    if step_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_wine_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if step_name == "" {
+        panic("pe_wine_path_trace_real FAIL [record_wine_step] expected=step_name!=empty got=empty")
+    }
+    if eip_hex == "" {
+        panic("pe_wine_path_trace_real FAIL [record_wine_step] expected=eip_hex!=empty got=empty")
+    }
+    if expected_outcome == "" {
+        panic("pe_wine_path_trace_real FAIL [record_wine_step] expected=expected_outcome!=empty got=empty")
+    }
+    let row = to_string(step_id) + "\t" + step_name + "\t"
+        + eip_hex + "\t" + expected_outcome + "\n"
+    pwpt_append_row(pwpt_wine_step_path(), row)
+}
+
+// ─── record_divergence: 우리 loader 와 reference Win32 (Wine spec) 차이 milestone ───
+fn record_divergence(div_id: int, step_id: int, our_behavior: str, wine_behavior: str, fix_kind: int) -> void {
+    if div_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_divergence] expected=div_id>0 got=" + to_string(div_id))
+    }
+    if step_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_divergence] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if our_behavior == "" {
+        panic("pe_wine_path_trace_real FAIL [record_divergence] expected=our_behavior!=empty got=empty")
+    }
+    if wine_behavior == "" {
+        panic("pe_wine_path_trace_real FAIL [record_divergence] expected=wine_behavior!=empty got=empty")
+    }
+    if fix_kind < 0 {
+        panic("pe_wine_path_trace_real FAIL [record_divergence] expected=fix_kind>=0 got=" + to_string(fix_kind))
+    }
+    if fix_kind > 4 {
+        panic("pe_wine_path_trace_real FAIL [record_divergence] expected=fix_kind<=4 got=" + to_string(fix_kind))
+    }
+    let row = to_string(div_id) + "\t" + to_string(step_id) + "\t"
+        + our_behavior + "\t" + wine_behavior + "\t" + to_string(fix_kind) + "\n"
+    pwpt_append_row(pwpt_divergence_path(), row)
+}
+
+// ─── record_path_branch: control-flow branch milestone (normal/throw/fast_fail/continue) ───
+fn record_path_branch(branch_id: int, step_id: int, branch_kind: int, taken: int) -> void {
+    if branch_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_path_branch] expected=branch_id>0 got=" + to_string(branch_id))
+    }
+    if step_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_path_branch] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if branch_kind < 0 {
+        panic("pe_wine_path_trace_real FAIL [record_path_branch] expected=branch_kind>=0 got=" + to_string(branch_kind))
+    }
+    if branch_kind > 3 {
+        panic("pe_wine_path_trace_real FAIL [record_path_branch] expected=branch_kind<=3 got=" + to_string(branch_kind))
+    }
+    if taken < 0 {
+        panic("pe_wine_path_trace_real FAIL [record_path_branch] expected=taken>=0 got=" + to_string(taken))
+    }
+    if taken > 1 {
+        panic("pe_wine_path_trace_real FAIL [record_path_branch] expected=taken<=1 got=" + to_string(taken))
+    }
+    let row = to_string(branch_id) + "\t" + to_string(step_id) + "\t"
+        + to_string(branch_kind) + "\t" + to_string(taken) + "\n"
+    pwpt_append_row(pwpt_path_branch_path(), row)
+}
+
+// ─── record_fix_application: divergence 에 대한 fix 시도 + 성공 여부 milestone ───
+fn record_fix_application(fix_id: int, divergence_id: int, applied: int, success: int) -> void {
+    if fix_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_fix_application] expected=fix_id>0 got=" + to_string(fix_id))
+    }
+    if divergence_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_fix_application] expected=divergence_id>0 got=" + to_string(divergence_id))
+    }
+    if applied < 0 {
+        panic("pe_wine_path_trace_real FAIL [record_fix_application] expected=applied>=0 got=" + to_string(applied))
+    }
+    if applied > 1 {
+        panic("pe_wine_path_trace_real FAIL [record_fix_application] expected=applied<=1 got=" + to_string(applied))
+    }
+    if success < 0 {
+        panic("pe_wine_path_trace_real FAIL [record_fix_application] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_wine_path_trace_real FAIL [record_fix_application] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(fix_id) + "\t" + to_string(divergence_id) + "\t"
+        + to_string(applied) + "\t" + to_string(success) + "\n"
+    pwpt_append_row(pwpt_fix_application_path(), row)
+}
+
+// ─── record_test_outcome: per-step test (regression / unit / integration) result milestone ───
+fn record_test_outcome(outcome_id: int, step_id: int, test_name: str, passed: int) -> void {
+    if outcome_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_test_outcome] expected=outcome_id>0 got=" + to_string(outcome_id))
+    }
+    if step_id <= 0 {
+        panic("pe_wine_path_trace_real FAIL [record_test_outcome] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if test_name == "" {
+        panic("pe_wine_path_trace_real FAIL [record_test_outcome] expected=test_name!=empty got=empty")
+    }
+    if passed < 0 {
+        panic("pe_wine_path_trace_real FAIL [record_test_outcome] expected=passed>=0 got=" + to_string(passed))
+    }
+    if passed > 1 {
+        panic("pe_wine_path_trace_real FAIL [record_test_outcome] expected=passed<=1 got=" + to_string(passed))
+    }
+    let row = to_string(outcome_id) + "\t" + to_string(step_id) + "\t"
+        + test_name + "\t" + to_string(passed) + "\n"
+    pwpt_append_row(pwpt_test_outcome_path(), row)
+}
+
+// ─── statistics ───
+fn wine_step_count() -> int {
+    return pwpt_count_rows(pwpt_wine_step_path(), 4)
+}
+
+fn divergence_count() -> int {
+    return pwpt_count_rows(pwpt_divergence_path(), 5)
+}
+
+fn path_branch_count() -> int {
+    return pwpt_count_rows(pwpt_path_branch_path(), 4)
+}
+
+fn fix_application_count() -> int {
+    return pwpt_count_rows(pwpt_fix_application_path(), 4)
+}
+
+fn test_outcome_count() -> int {
+    return pwpt_count_rows(pwpt_test_outcome_path(), 4)
+}
+
+// ─── fix_success_count: fix_application 중 success=1 인 row 수 ───
+fn fix_success_count() -> int {
+    let t = pwpt_read_table(pwpt_fix_application_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── test_passed_count: test_outcome 중 passed=1 인 row 수 ───
+fn test_passed_count() -> int {
+    let t = pwpt_read_table(pwpt_test_outcome_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── has_step: 특정 step_name 의 row 존재 여부 ───
+fn has_step(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let t = pwpt_read_table(pwpt_wine_step_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[1] == name {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn pwpt_stats() -> array {
+    let mut out = []
+    out.push(wine_step_count())
+    out.push(divergence_count())
+    out.push(path_branch_count())
+    out.push(fix_application_count())
+    out.push(test_outcome_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwpt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwpt()
+
+    // ─── 1. wine_step × 6 (ntdll_init / ldrp_init_process / pe_section_map / iat_resolve / encode_pointer_init / winmain_call) ───
+    record_wine_step(1, "ntdll_init", "0x77000000", "ok")
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"wine_step\",\"step_id\":1,\"step_name\":\"ntdll_init\",\"eip_hex\":\"0x77000000\",\"expected_outcome\":\"ok\"")
+
+    record_wine_step(2, "ldrp_init_process", "0x77001a40", "ok")
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"wine_step\",\"step_id\":2,\"step_name\":\"ldrp_init_process\",\"eip_hex\":\"0x77001a40\",\"expected_outcome\":\"ok\"")
+
+    record_wine_step(3, "pe_section_map", "0x77002b80", "ok")
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"wine_step\",\"step_id\":3,\"step_name\":\"pe_section_map\",\"eip_hex\":\"0x77002b80\",\"expected_outcome\":\"ok\"")
+
+    record_wine_step(4, "iat_resolve", "0x77003c20", "stub")
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"wine_step\",\"step_id\":4,\"step_name\":\"iat_resolve\",\"eip_hex\":\"0x77003c20\",\"expected_outcome\":\"stub\"")
+
+    record_wine_step(5, "encode_pointer_init", "0x77004d10", "ok")
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"wine_step\",\"step_id\":5,\"step_name\":\"encode_pointer_init\",\"eip_hex\":\"0x77004d10\",\"expected_outcome\":\"ok\"")
+
+    record_wine_step(6, "winmain_call", "0x00401000", "ok")
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"wine_step\",\"step_id\":6,\"step_name\":\"winmain_call\",\"eip_hex\":\"0x00401000\",\"expected_outcome\":\"ok\"")
+
+    // ─── 2. divergence × 4 (각 fix_kind 다른: 1 conservative_skip / 2 accurate_stub / 3 cookie_init / 4 mem_protect) ───
+    record_divergence(1, 4, "iat_resolve_skip_unknown_dll", "iat_resolve_full_chain", 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"divergence\",\"div_id\":1,\"step_id\":4,\"our_behavior\":\"iat_resolve_skip_unknown_dll\",\"wine_behavior\":\"iat_resolve_full_chain\",\"fix_kind\":1,\"fix_kind_name\":\"conservative_skip\"")
+
+    record_divergence(2, 2, "ldrp_init_partial", "ldrp_init_full_teb_peb", 2)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"divergence\",\"div_id\":2,\"step_id\":2,\"our_behavior\":\"ldrp_init_partial\",\"wine_behavior\":\"ldrp_init_full_teb_peb\",\"fix_kind\":2,\"fix_kind_name\":\"accurate_stub\"")
+
+    record_divergence(3, 5, "encode_pointer_zero_cookie", "encode_pointer_random_cookie", 3)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"divergence\",\"div_id\":3,\"step_id\":5,\"our_behavior\":\"encode_pointer_zero_cookie\",\"wine_behavior\":\"encode_pointer_random_cookie\",\"fix_kind\":3,\"fix_kind_name\":\"cookie_init\"")
+
+    record_divergence(4, 3, "section_map_rw_only", "section_map_rx_after_reloc", 4)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"divergence\",\"div_id\":4,\"step_id\":3,\"our_behavior\":\"section_map_rw_only\",\"wine_behavior\":\"section_map_rx_after_reloc\",\"fix_kind\":4,\"fix_kind_name\":\"mem_protect\"")
+
+    // ─── 3. path_branch × 4 (각 branch_kind 다른: 0 normal / 1 throw / 2 fast_fail / 3 continue) ───
+    record_path_branch(1, 1, 0, 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"path_branch\",\"branch_id\":1,\"step_id\":1,\"branch_kind\":0,\"branch_kind_name\":\"normal\",\"taken\":1")
+
+    record_path_branch(2, 4, 1, 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"path_branch\",\"branch_id\":2,\"step_id\":4,\"branch_kind\":1,\"branch_kind_name\":\"throw\",\"taken\":1")
+
+    record_path_branch(3, 2, 2, 0)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"path_branch\",\"branch_id\":3,\"step_id\":2,\"branch_kind\":2,\"branch_kind_name\":\"fast_fail\",\"taken\":0")
+
+    record_path_branch(4, 5, 3, 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"path_branch\",\"branch_id\":4,\"step_id\":5,\"branch_kind\":3,\"branch_kind_name\":\"continue\",\"taken\":1")
+
+    // ─── 4. fix_application × 4 (3 success + 1 fail) ───
+    record_fix_application(1, 1, 1, 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"fix_application\",\"fix_id\":1,\"divergence_id\":1,\"applied\":1,\"success\":1")
+
+    record_fix_application(2, 2, 1, 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"fix_application\",\"fix_id\":2,\"divergence_id\":2,\"applied\":1,\"success\":1")
+
+    record_fix_application(3, 3, 1, 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"fix_application\",\"fix_id\":3,\"divergence_id\":3,\"applied\":1,\"success\":1")
+
+    record_fix_application(4, 4, 1, 0)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"fix_application\",\"fix_id\":4,\"divergence_id\":4,\"applied\":1,\"success\":0")
+
+    // ─── 5. test_outcome × 4 ───
+    record_test_outcome(1, 1, "ntdll_init_smoke", 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"test_outcome\",\"outcome_id\":1,\"step_id\":1,\"test_name\":\"ntdll_init_smoke\",\"passed\":1")
+
+    record_test_outcome(2, 3, "section_map_rx_check", 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"test_outcome\",\"outcome_id\":2,\"step_id\":3,\"test_name\":\"section_map_rx_check\",\"passed\":1")
+
+    record_test_outcome(3, 4, "iat_resolve_unknown_dll_skip", 1)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"test_outcome\",\"outcome_id\":3,\"step_id\":4,\"test_name\":\"iat_resolve_unknown_dll_skip\",\"passed\":1")
+
+    record_test_outcome(4, 6, "winmain_arg_marshal", 0)
+    r0_emit("pe_wine_path_trace_real_record",
+        "\"kind\":\"test_outcome\",\"outcome_id\":4,\"step_id\":6,\"test_name\":\"winmain_arg_marshal\",\"passed\":0")
+
+    // ─── assertions: count ───
+    let ws = wine_step_count()
+    if ws != 6 {
+        panic("pe_wine_path_trace_real FAIL [wine_step_count] expected=6 got=" + to_string(ws))
+    }
+    let dc = divergence_count()
+    if dc != 4 {
+        panic("pe_wine_path_trace_real FAIL [divergence_count] expected=4 got=" + to_string(dc))
+    }
+    let pb = path_branch_count()
+    if pb != 4 {
+        panic("pe_wine_path_trace_real FAIL [path_branch_count] expected=4 got=" + to_string(pb))
+    }
+    let fa = fix_application_count()
+    if fa != 4 {
+        panic("pe_wine_path_trace_real FAIL [fix_application_count] expected=4 got=" + to_string(fa))
+    }
+    let toc = test_outcome_count()
+    if toc != 4 {
+        panic("pe_wine_path_trace_real FAIL [test_outcome_count] expected=4 got=" + to_string(toc))
+    }
+
+    // ─── fix_success_count = 3 (3 success / 1 fail) ───
+    let fsc = fix_success_count()
+    if fsc != 3 {
+        panic("pe_wine_path_trace_real FAIL [fix_success_count] expected=3 got=" + to_string(fsc))
+    }
+
+    // ─── test_passed_count = 3 (3 passed / 1 failed) ───
+    let tpc = test_passed_count()
+    if tpc != 3 {
+        panic("pe_wine_path_trace_real FAIL [test_passed_count] expected=3 got=" + to_string(tpc))
+    }
+
+    // ─── has_step sanity ───
+    let hs_first = has_step("ntdll_init")
+    if !hs_first {
+        panic("pe_wine_path_trace_real FAIL [has_step(ntdll_init)] expected=true got=false")
+    }
+    let hs_iat = has_step("iat_resolve")
+    if !hs_iat {
+        panic("pe_wine_path_trace_real FAIL [has_step(iat_resolve)] expected=true got=false")
+    }
+    let hs_last = has_step("winmain_call")
+    if !hs_last {
+        panic("pe_wine_path_trace_real FAIL [has_step(winmain_call)] expected=true got=false")
+    }
+    let hs_miss = has_step("nonexistent_step")
+    if hs_miss {
+        panic("pe_wine_path_trace_real FAIL [has_step(nonexistent_step)] expected=false got=true")
+    }
+    let hs_empty = has_step("")
+    if hs_empty {
+        panic("pe_wine_path_trace_real FAIL [has_step(empty)] expected=false got=true")
+    }
+
+    // ─── helper name sanity ───
+    if step_status_name("ok") != "ok" {
+        panic("pe_wine_path_trace_real FAIL [step_status_name(ok)]")
+    }
+    if step_status_name("stub") != "stub" {
+        panic("pe_wine_path_trace_real FAIL [step_status_name(stub)]")
+    }
+    if step_status_name("") != "unknown" {
+        panic("pe_wine_path_trace_real FAIL [step_status_name(empty)]")
+    }
+    if fix_kind_name(0) != "none" {
+        panic("pe_wine_path_trace_real FAIL [fix_kind_name(0)]")
+    }
+    if fix_kind_name(1) != "conservative_skip" {
+        panic("pe_wine_path_trace_real FAIL [fix_kind_name(1)]")
+    }
+    if fix_kind_name(2) != "accurate_stub" {
+        panic("pe_wine_path_trace_real FAIL [fix_kind_name(2)]")
+    }
+    if fix_kind_name(3) != "cookie_init" {
+        panic("pe_wine_path_trace_real FAIL [fix_kind_name(3)]")
+    }
+    if fix_kind_name(4) != "mem_protect" {
+        panic("pe_wine_path_trace_real FAIL [fix_kind_name(4)]")
+    }
+    if fix_kind_name(99) != "unknown" {
+        panic("pe_wine_path_trace_real FAIL [fix_kind_name(99)]")
+    }
+    if branch_kind_name(0) != "normal" {
+        panic("pe_wine_path_trace_real FAIL [branch_kind_name(0)]")
+    }
+    if branch_kind_name(1) != "throw" {
+        panic("pe_wine_path_trace_real FAIL [branch_kind_name(1)]")
+    }
+    if branch_kind_name(2) != "fast_fail" {
+        panic("pe_wine_path_trace_real FAIL [branch_kind_name(2)]")
+    }
+    if branch_kind_name(3) != "continue" {
+        panic("pe_wine_path_trace_real FAIL [branch_kind_name(3)]")
+    }
+    if branch_kind_name(99) != "unknown" {
+        panic("pe_wine_path_trace_real FAIL [branch_kind_name(99)]")
+    }
+
+    // ─── stats sanity ───
+    let s = pwpt_stats()
+    if len(s) != 5 {
+        panic("pe_wine_path_trace_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_wine_path_trace_real FAIL [stats wine_step_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_wine_path_trace_real FAIL [stats divergence_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_wine_path_trace_real FAIL [stats path_branch_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_wine_path_trace_real FAIL [stats fix_application_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_wine_path_trace_real FAIL [stats test_outcome_count] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (22 record emit + summary/stats/path = 25 ≥ 14) ───
+    r0_emit("pe_wine_path_trace_real_stats",
+        "\"wine_step_count\":" + to_string(s[0])
+        + ",\"divergence_count\":" + to_string(s[1])
+        + ",\"path_branch_count\":" + to_string(s[2])
+        + ",\"fix_application_count\":" + to_string(s[3])
+        + ",\"test_outcome_count\":" + to_string(s[4])
+        + ",\"fix_success_count\":" + to_string(fsc)
+        + ",\"test_passed_count\":" + to_string(tpc))
+
+    r0_emit("pe_wine_path_trace_real_summary",
+        "\"path\":\"ntdll_init -> ldrp_init_process -> pe_section_map -> iat_resolve -> encode_pointer_init -> winmain_call\",\"total_records\":22,\"divergence_resolved\":3,\"divergence_open\":1")
+
+    r0_emit("pe_wine_path_trace_real_kpi",
+        "\"fix_kinds_covered\":4,\"branch_kinds_covered\":4,\"fix_success_rate_num\":3,\"fix_success_rate_den\":4,\"test_pass_rate_num\":3,\"test_pass_rate_den\":4")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_wine_path_trace_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwpt()
+    let s2 = pwpt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wine_path_trace_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wine_path_trace_real self_test PASS (wine_step="
+        + to_string(s[0]) + ", divergence=" + to_string(s[1])
+        + ", path_branch=" + to_string(s[2]) + ", fix_application=" + to_string(s[3])
+        + ", test_outcome=" + to_string(s[4]) + ", fix_success=" + to_string(fsc)
+        + ", test_passed=" + to_string(tpc)
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwpt_stats()
+            println("wine_step_count\t" + to_string(s[0]))
+            println("divergence_count\t" + to_string(s[1]))
+            println("path_branch_count\t" + to_string(s[2]))
+            println("fix_application_count\t" + to_string(s[3]))
+            println("test_outcome_count\t" + to_string(s[4]))
+            println("fix_success_count\t" + to_string(fix_success_count()))
+            println("test_passed_count\t" + to_string(test_passed_count()))
+            return
+        }
+        if sub == "has-step" {
+            if len(a) >= 4 {
+                let name = a[3]
+                if has_step(name) {
+                    println("has_step\ttrue")
+                } else {
+                    println("has_step\tfalse")
+                }
+                return
+            }
+            println("usage: hexa run pe_wine_path_trace_real.hexa has-step <step_name>")
+            return
+        }
+        if sub == "fix-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fix_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_wine_path_trace_real.hexa fix-kind-name <int>")
+            return
+        }
+        if sub == "branch-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(branch_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_wine_path_trace_real.hexa branch-kind-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwpt()
+            println("cleaned: " + pwpt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwpt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wine_path_trace_real.hexa { self-test | stats | has-step <name> | fix-kind-name <int> | branch-kind-name <int> | cleanup | dir }")
+}

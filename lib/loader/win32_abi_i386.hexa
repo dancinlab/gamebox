@@ -1,0 +1,200 @@
+// lib/loader/win32_abi_i386.hexa — Phase 1b — i386 (32-bit) calling convention shim
+//
+// own 1: Wine 0. Microsoft Win32 ABI spec + Intel SDM 만 참조.
+//   - cdecl:    https://learn.microsoft.com/en-us/cpp/cpp/cdecl
+//   - stdcall:  https://learn.microsoft.com/en-us/cpp/cpp/stdcall
+//   - fastcall: https://learn.microsoft.com/en-us/cpp/cpp/fastcall
+// own 2: r0_emit ≥ 1, self_test, headless, panic format.
+//
+// Battle.net-Setup.exe = i386 PE32. 현재 win32_abi.hexa 는 x86_64 만 — 32-bit
+// calling conventions 별도 처리 필요.
+//
+// 32-bit → ARM64 (Apple Silicon) ABI bridge:
+//   - 32-bit args (eax/edx/ecx) → 64-bit (x0..x7)
+//   - 32-bit return (eax) → 64-bit (x0)
+//   - 32-bit stack pop responsibility (caller vs callee) 변환
+//
+// 4 calling conventions (Win32 i386):
+//   1. cdecl:    args RTL on stack, caller cleanup, name "_func"
+//   2. stdcall:  args RTL on stack, callee cleanup, name "_func@N" (N=byte size)
+//   3. fastcall: first 2 args in ecx/edx, rest stack RTL, callee cleanup, "@func@N"
+//   4. thiscall: this in ecx (Microsoft C++), rest stack
+//
+// arch detect — PE Machine field:
+//   332 (0x14C)  = i386 (32-bit) — 본 ABI
+//   34404 (0x8664) = x86_64 — win32_abi.hexa
+
+use "../perf/r0_common"
+
+// ─── calling convention table ───
+fn convention_table() -> str {
+    let t = ""
+    t = t + "cdecl\tRTL_stack\tcaller\tunderscore_prefix\n"
+    t = t + "stdcall\tRTL_stack\tcallee\tunderscore_at_size\n"
+    t = t + "fastcall\tecx_edx_then_stack\tcallee\tat_func_at_size\n"
+    t = t + "thiscall\tecx_this_rest_stack\tcallee\tno_decoration\n"
+    return t
+}
+
+fn convention_count() -> int {
+    let lines = convention_table().split("\n")
+    let i = 0
+    let count = 0
+    while i < len(lines) {
+        if lines[i] != "" { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── conv lookup ───
+fn lookup_convention(conv: str) -> str {
+    let lines = convention_table().split("\n")
+    let i = 0
+    while i < len(lines) {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= 4 && parts[0] == conv {
+                return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── name mangling — Win32 i386 export name → undecorated ───
+//   "_GetLastError"     → "GetLastError" (cdecl)
+//   "_CreateFileW@28"   → "CreateFileW" (stdcall, 28 bytes args)
+//   "@__divdi3@8"       → "__divdi3" (fastcall)
+fn demangle(name: str) -> str {
+    if name == "" { return "" }
+    let s = name
+    // strip leading _ or @
+    let first = s.substr(0, 1)
+    if first == "_" || first == "@" {
+        s = s.substr(1, len(s) - 1)
+    }
+    // strip trailing @N
+    if s.contains("@") {
+        let parts = s.split("@")
+        if len(parts) >= 1 {
+            s = parts[0]
+        }
+    }
+    return s
+}
+
+// ─── infer convention from decoration ───
+fn infer_convention(name: str) -> str {
+    if name == "" { return "unknown" }
+    let first = name.substr(0, 1)
+    if first == "@" { return "fastcall" }
+    if first == "_" {
+        if name.contains("@") {
+            return "stdcall"
+        }
+        return "cdecl"
+    }
+    return "thiscall"
+}
+
+// ─── arch detect from PE Machine field ───
+fn arch_from_machine(machine: int) -> str {
+    if machine == 332 { return "i386" }      // 0x14C
+    if machine == 34404 { return "x86_64" }  // 0x8664
+    if machine == 43620 { return "arm64" }   // 0xAA64
+    return "unknown"
+}
+
+// ─── stack arg size 계산 (stdcall@N decoration 으로부터) ───
+fn stack_arg_size(name: str) -> int {
+    if !name.contains("@") { return 0 }
+    let parts = name.split("@")
+    let n = len(parts)
+    if n < 2 { return 0 }
+    // last part = N (stdcall) or middle (fastcall)
+    let last = parts[n - 1]
+    if last == "" { return 0 }
+    return to_int(last)
+}
+
+fn self_test() -> void {
+    let sid = "abi_i386_test-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // convention table size
+    let cnt_conv = convention_count()
+    if cnt_conv != 4 { panic("win32_abi_i386 FAIL [conv count] expected=4 got=" + to_string(cnt_conv)) }
+
+    // lookup each
+    let cdecl = lookup_convention("cdecl")
+    if !cdecl.contains("caller") { panic("win32_abi_i386 FAIL [cdecl cleanup]") }
+    let stdcall = lookup_convention("stdcall")
+    if !stdcall.contains("callee") { panic("win32_abi_i386 FAIL [stdcall cleanup]") }
+    let fast = lookup_convention("fastcall")
+    if !fast.contains("ecx_edx") { panic("win32_abi_i386 FAIL [fastcall regs]") }
+
+    let unk = lookup_convention("nonconvention")
+    if unk != "" { panic("win32_abi_i386 FAIL [unknown conv]") }
+
+    // demangle
+    let d_cdecl = demangle("_GetLastError")
+    if d_cdecl != "GetLastError" { panic("win32_abi_i386 FAIL [demangle cdecl] got=" + d_cdecl) }
+    let d_std = demangle("_CreateFileW@28")
+    if d_std != "CreateFileW" { panic("win32_abi_i386 FAIL [demangle stdcall] got=" + d_std) }
+    let d_fast = demangle("@__divdi3@8")
+    if d_fast != "__divdi3" { panic("win32_abi_i386 FAIL [demangle fastcall] got=" + d_fast) }
+    let d_empty = demangle("")
+    if d_empty != "" { panic("win32_abi_i386 FAIL [demangle empty]") }
+
+    // infer convention
+    let i_cdecl = infer_convention("_GetLastError")
+    if i_cdecl != "cdecl" { panic("win32_abi_i386 FAIL [infer cdecl] got=" + i_cdecl) }
+    let i_std = infer_convention("_CreateFileW@28")
+    if i_std != "stdcall" { panic("win32_abi_i386 FAIL [infer stdcall] got=" + i_std) }
+    let i_fast = infer_convention("@__divdi3@8")
+    if i_fast != "fastcall" { panic("win32_abi_i386 FAIL [infer fastcall] got=" + i_fast) }
+    let i_this = infer_convention("MyClass_method")
+    if i_this != "thiscall" { panic("win32_abi_i386 FAIL [infer thiscall] got=" + i_this) }
+
+    // arch detect
+    if arch_from_machine(332) != "i386" { panic("win32_abi_i386 FAIL [arch i386]") }
+    if arch_from_machine(34404) != "x86_64" { panic("win32_abi_i386 FAIL [arch x86_64]") }
+    if arch_from_machine(43620) != "arm64" { panic("win32_abi_i386 FAIL [arch arm64]") }
+    if arch_from_machine(99999) != "unknown" { panic("win32_abi_i386 FAIL [arch unknown]") }
+
+    // stack size
+    let s_28 = stack_arg_size("_CreateFileW@28")
+    if s_28 != 28 { panic("win32_abi_i386 FAIL [stack size 28] got=" + to_string(s_28)) }
+    let s_0 = stack_arg_size("_GetLastError")
+    if s_0 != 0 { panic("win32_abi_i386 FAIL [stack size 0]") }
+
+    r0_emit("abi_i386_lookup", "\"convention\":\"stdcall\",\"cleanup\":\"" + lookup_convention("stdcall") + "\"")
+    r0_emit("abi_i386_demangle", "\"input\":\"_CreateFileW@28\",\"output\":\"" + d_std + "\",\"convention\":\"stdcall\"")
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("win32_abi_i386 FAIL [emit count]") }
+
+    println("  ✅ win32_abi_i386 self_test PASS (4 conventions, demangle/infer/arch OK, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "demangle" && len(a) >= 4 {
+            let d = demangle(a[3])
+            let conv = infer_convention(a[3])
+            println("name=" + d + " convention=" + conv)
+            return
+        }
+        if sub == "arch" && len(a) >= 4 {
+            println(arch_from_machine(to_int(a[3])))
+            return
+        }
+        if sub == "table" { println(convention_table()); return }
+    }
+    println("usage: hexa run win32_abi_i386.hexa { self-test | demangle <name> | arch <machine_int> | table }")
+}

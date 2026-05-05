@@ -1,0 +1,233 @@
+// lib/perf/c_metal_capture_auto.hexa — CN-151 skeleton manjeom 14/15 (B=4)
+//
+// MTLCaptureManager 자동 capture 추적 — anomaly trigger (frametime hitch /
+// GPU hang risk / memory spike) 시 programmatic capture 를 실행하여 그 spike
+// frame 을 .gputrace 로 저장 → 사후 GPU frame 분석 가능. capture 자체가 비싼
+// 작업이므로 매 frame 동작은 X — anomaly trigger 시에만 한정 활성. (B=4 사유:
+// 게임 플레이 anomaly 발생 시점 한정 동작 → B 1점 감점, A=5, C=5.)
+//
+// 시나리오: D4 가 frametime spike (>50ms) 발생하면 자동으로 MTLCaptureManager
+// 가 그 spike frame 캡처 → 추후 PSB cycle 분석용 GPU trace 확보.
+//
+// 무기: session × trigger_kind × capture_size_mb × hitch_us 4-key 로그.
+// 효과: D4 plays 중 frame anomaly 자동 캡처 → post-mortem GPU trace 확보.
+
+use "./r0_common"
+
+let MCA_DIR = GAMEBOX_HOME + "/persist/metal_capture_auto"
+let SESSION_LOG = MCA_DIR + "/sessions.tsv"
+
+fn mca_dir() -> str { return MCA_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + MCA_DIR + "'")
+}
+
+// ─── session 등록 ───
+//   session_id (capture session 고유 id),
+//   trigger_kind (1=frametime_hitch / 2=gpu_hang_risk / 3=memory_spike),
+//   capture_size_mb (저장된 .gputrace 크기 MB),
+//   hitch_us (anomaly 발생 frame 의 frametime µs).
+fn record_session(session_id: int, trigger_kind: int, capture_size_mb: int, hitch_us: int) -> void {
+    ensure_dir()
+    let line = to_string(session_id) + "\t" + to_string(trigger_kind) + "\t" + to_string(capture_size_mb) + "\t" + to_string(hitch_us)
+    let tmp = SESSION_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SESSION_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("metal_capture_record", "\"session\":" + to_string(session_id) + ",\"trigger\":" + to_string(trigger_kind) + ",\"size_mb\":" + to_string(capture_size_mb) + ",\"hitch_us\":" + to_string(hitch_us))
+}
+
+// ─── session_count — 등록된 capture session 행 수 ───
+fn session_count() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + SESSION_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_capture_size_mb — 모든 session capture_size_mb 합 ───
+fn total_capture_size_mb() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_hitch_us — 모든 session hitch_us 합 ───
+fn total_hitch_us() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── count_by_trigger — 그 trigger_kind 의 session 수 ───
+//   1=frametime_hitch / 2=gpu_hang_risk / 3=memory_spike.
+fn count_by_trigger(kind: int) -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v k=" + to_string(kind) + " '$2==k {c++} END{print c+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_capture_size_mb — total_size / session_count (0-guard) ───
+fn avg_capture_size_mb() -> int {
+    let sc = session_count()
+    if sc == 0 { return 0 }
+    let tm = total_capture_size_mb()
+    return tm / sc
+}
+
+// ─── session_hitch_us — 특정 session 의 hitch_us (미등록 0) ───
+fn session_hitch_us(session_id: int) -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v sid=" + to_string(session_id) + " '$1==sid {print $4; exit}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── mca_stats — [session_count, total_capture_size_mb, total_hitch_us, avg_capture_size_mb] ───
+fn mca_stats() -> array {
+    return [session_count(), total_capture_size_mb(), total_hitch_us(), avg_capture_size_mb()]
+}
+
+fn cleanup_mca() -> void {
+    let _ = exec("rm -rf '" + MCA_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "mca-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_mca()
+
+    // 합성 capture session 3 종:
+    //   8001 — frametime_hitch  : 24 MB / 58000 µs (≈ 58 ms hitch)
+    //   8002 — gpu_hang_risk    : 48 MB / 120000 µs (≈ 120 ms hang risk)
+    //   8003 — frametime_hitch  : 18 MB / 52000 µs (≈ 52 ms hitch)
+    record_session(8001, 1, 24, 58000)
+    record_session(8002, 2, 48, 120000)
+    record_session(8003, 1, 18, 52000)
+
+    // session_count = 3
+    let sc = session_count()
+    if sc != 3 { panic("c_metal_capture_auto FAIL [session_count] expected=3 got=" + to_string(sc)) }
+
+    // total_capture_size_mb = 24+48+18 = 90
+    let tm = total_capture_size_mb()
+    if tm != 90 { panic("c_metal_capture_auto FAIL [total_capture_size_mb] expected=90 got=" + to_string(tm)) }
+
+    // total_hitch_us = 58000+120000+52000 = 230000
+    let th = total_hitch_us()
+    if th != 230000 { panic("c_metal_capture_auto FAIL [total_hitch_us] expected=230000 got=" + to_string(th)) }
+
+    // count_by_trigger:
+    //   1=frametime_hitch → 2
+    //   2=gpu_hang_risk   → 1
+    //   3=memory_spike    → 0
+    let c1 = count_by_trigger(1)
+    if c1 != 2 { panic("c_metal_capture_auto FAIL [count_by_trigger 1] expected=2 got=" + to_string(c1)) }
+    let c2 = count_by_trigger(2)
+    if c2 != 1 { panic("c_metal_capture_auto FAIL [count_by_trigger 2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_trigger(3)
+    if c3 != 0 { panic("c_metal_capture_auto FAIL [count_by_trigger 3] expected=0 got=" + to_string(c3)) }
+
+    // avg_capture_size_mb = 90 / 3 = 30
+    let avg = avg_capture_size_mb()
+    if avg != 30 { panic("c_metal_capture_auto FAIL [avg_capture_size_mb] expected=30 got=" + to_string(avg)) }
+
+    // session_hitch_us:
+    //   8001 → 58000, 8002 → 120000, 8003 → 52000, 9999 (미등록) → 0
+    let h1 = session_hitch_us(8001)
+    if h1 != 58000 { panic("c_metal_capture_auto FAIL [hitch 8001] expected=58000 got=" + to_string(h1)) }
+    let h2 = session_hitch_us(8002)
+    if h2 != 120000 { panic("c_metal_capture_auto FAIL [hitch 8002] expected=120000 got=" + to_string(h2)) }
+    let h3 = session_hitch_us(8003)
+    if h3 != 52000 { panic("c_metal_capture_auto FAIL [hitch 8003] expected=52000 got=" + to_string(h3)) }
+    let h4 = session_hitch_us(9999)
+    if h4 != 0 { panic("c_metal_capture_auto FAIL [hitch unknown] expected=0 got=" + to_string(h4)) }
+
+    let stats = mca_stats()
+    if stats[0] != 3 { panic("c_metal_capture_auto FAIL [stats sessions] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 90 { panic("c_metal_capture_auto FAIL [stats size_mb] expected=90 got=" + to_string(stats[1])) }
+    if stats[2] != 230000 { panic("c_metal_capture_auto FAIL [stats hitch_us] expected=230000 got=" + to_string(stats[2])) }
+    if stats[3] != 30 { panic("c_metal_capture_auto FAIL [stats avg_mb] expected=30 got=" + to_string(stats[3])) }
+
+    r0_emit("metal_capture_summary", "\"sessions\":" + to_string(stats[0]) + ",\"size_mb\":" + to_string(stats[1]) + ",\"hitch_us\":" + to_string(stats[2]) + ",\"avg_mb\":" + to_string(stats[3]) + ",\"frametime_hitch\":" + to_string(c1) + ",\"gpu_hang_risk\":" + to_string(c2))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_metal_capture_auto FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic MTLCaptureManager state machine round-trip (cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track AP mission: D2R/D4 cond.3 (Apple Metal layer) 측 evidence augment.
+    // cond.3 측 status `partial` 영구 유지 — D3DMetal binary licence transitive
+    // (loader_dx blk.1) 측 영구 외부 의존, met 승격 X. Apple-native scaffold.
+    //
+    // (a) synthetic MTLCaptureManager 4-phase capture lifecycle —
+    //     idle → trigger → capture → flush_to_gputrace state machine:
+    //     phase_count               4                   (idle/trigger/capture/flush)
+    //     capture_obj_off           0x180010000         (synthetic CaptureManager RVA)
+    //     capture_kind              "synthetic_inline"  (실 MTLCaptureManager 호출 X)
+    //
+    // (b) synthetic trigger × scope 12-slot dispatch matrix —
+    //     3 trigger_kind × 4 scope = 12 slot walk:
+    //     slot_total                12                  (3 trigger × 4 scope)
+    //     dispatched_slot_count     5                   (frametime+hang+memory active)
+    //     matrix_kind               "synthetic_inline"  (실 .gputrace flush X)
+    //
+    // round-trip = synthesize_capture_phase(scaffold) → walk_trigger_scope_matrix(scaffold).
+    //              hexa-native loop only — 실 MTLCaptureManager.startCapture() 0,
+    //              real .gputrace 파일 0 byte.
+    //
+    // synthetic capture phase emit
+    r0_emit("c_metal_capture_auto_synthetic_phase",
+        "\"stage\":\"capture_phase\",\"phase_count\":4,\"capture_obj_off\":\"0x180010000\",\"capture_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"d3dmetal_gap\":\"permanent — D3DMetal binary licence transitive (loader_dx blk.1)\"")
+    println("__METAL_CAPTURE__ PARTIAL capture_phase")
+
+    // synthetic trigger × scope dispatch matrix emit
+    r0_emit("c_metal_capture_auto_synthetic_matrix",
+        "\"stage\":\"trigger_scope_matrix\",\"slot_total\":12,\"dispatched_slot_count\":5,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"d3dmetal_gap\":\"permanent — D3DMetal binary licence transitive (loader_dx blk.1)\"")
+    println("__METAL_CAPTURE__ PARTIAL trigger_scope_matrix")
+
+    cleanup_mca()
+
+    println("  ✅ c_metal_capture_auto self_test PASS (3 sessions, 90 MB, 230000 µs hitch, avg=30 MB, frametime_hitch=" + to_string(c1) + ", gpu_hang_risk=" + to_string(c2) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = mca_stats()
+            println("sessions=" + to_string(s[0]) + " size_mb=" + to_string(s[1]) + " hitch_us=" + to_string(s[2]) + " avg_mb=" + to_string(s[3]))
+            return
+        }
+        if sub == "hitch" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                let us = session_hitch_us(sid)
+                println(to_string(us))
+                return
+            }
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                let c = count_by_trigger(k)
+                println(to_string(c))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_mca(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_metal_capture_auto.hexa { self-test | stats | hitch <session_id> | count <trigger_kind> | cleanup }")
+}

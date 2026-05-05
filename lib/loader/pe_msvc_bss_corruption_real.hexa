@@ -1,0 +1,591 @@
+// lib/loader/pe_msvc_bss_corruption_real.hexa — .bss 영역 EIP corruption / uninit data jump 추적기
+//
+// 배경 (wave 9 종료 시 재현):
+//   instructions=17002, halt EIP=0x80147B (.bss 영역) — EIP 가 .text 코드 영역을
+//   완전히 벗어나 .bss / uninit data 영역으로 분기. MSVC 빌드 PE binary 의 흔한
+//   panic path 인 "uninit fn ptr 호출" — _initterm 이후 dispatch table 의 fn ptr
+//   slot 이 .bss 의 zero 또는 garbage 값을 그대로 분기 대상으로 사용한다.
+//
+// 본 module 은 그 분기들을 i386 interpreter 가 인식하고 (corrupt EIP, target 영역
+// 종류, 회복 시도 결과, uninit 메모리 read 의 값) hexa 측 persist 에 흘려 보내는
+// instrumentation tracker. 실 corruption 회복은 native 측 결정 — 본 모듈은 결과
+// 만 record_*() API 로 받아 적재한다.
+//
+// 추적 대상:
+//   1. EIP corruption — .text 영역 외부 EIP 값 등장 + 어느 분기 종류였는지
+//      (source_kind 0=indirect_call / 1=ret / 2=jmp_indirect / 3=table_jmp / 4=unknown)
+//   2. .bss / uninit data 영역 정의 — VA range + 영역 종류
+//      (kind 0=uninit / 1=zero_filled / 2=cookie / 3=heap_meta)
+//   3. invalid jump target — corrupt EIP 가 어떤 영역에 있었는지
+//      (reason_kind 0=outside_text / 1=in_data / 2=in_bss / 3=null_zero)
+//   4. 회복 시도 — invalid_target 을 어떻게 회피했는지
+//      (action_kind: skip / fake_zero / unwind / halt 등을 단순 int 로 받아 적재)
+//   5. uninit data read — VA 의 expected_kind 와 실제 읽힌 actual_value
+//      (expected_kind 0=fn_ptr / 1=cookie / 2=ref_count / 3=string_ptr)
+//
+// own 1 enforcement: Wine / CrossOver / Box86 / GPTK / Whisky / Hangover / FEX / community 0 줄.
+//   - Wine ntdll/loader.c (.bss zero-fill 처리) 인용 X
+//   - Wine dlls/msvcrt/crt_initterm.c (initterm walk) 인용 X
+//   - Box86 dynarec_arm64_emit_indirect.c 인용 X
+//   - QEMU target/i386/translate.c (indirect jmp) 인용 X
+//   - Microsoft 공식 docs (PE/COFF spec, MSVC __scrt_common_main) 자체 구현만 OK
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   eip_corruption.tsv : corrupt_id<int> \t eip<int>     \t source_kind<int> \t prior_eip<int>
+//   bss_region.tsv     : region_id<int>  \t va_start<int> \t va_end<int>     \t kind<int>
+//   invalid_target.tsv : target_id<int>  \t eip<int>     \t reason_kind<int>
+//   recovery.tsv       : attempt_id<int> \t target_id<int> \t action_kind<int> \t success<int>
+//   uninit_read.tsv    : read_id<int>    \t va<int>      \t expected_kind<int> \t actual_value<int>
+//
+// Hexa 예약어 회피: type/mod/resume/handle/match 등 단독 identifier 금지.
+//   식별자: corrupt_id / eip / source_kind / prior_eip
+//           region_id / va_start / va_end / kind
+//           target_id / reason_kind
+//           attempt_id / action_kind / success
+//           read_id / va / expected_kind / actual_value
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmbcr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_bss_corruption_real"
+}
+
+fn pmbcr_corrupt_path() -> str {
+    return pmbcr_dir() + "/eip_corruption.tsv"
+}
+
+fn pmbcr_region_path() -> str {
+    return pmbcr_dir() + "/bss_region.tsv"
+}
+
+fn pmbcr_target_path() -> str {
+    return pmbcr_dir() + "/invalid_target.tsv"
+}
+
+fn pmbcr_recovery_path() -> str {
+    return pmbcr_dir() + "/recovery.tsv"
+}
+
+fn pmbcr_uninit_path() -> str {
+    return pmbcr_dir() + "/uninit_read.tsv"
+}
+
+fn pmbcr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmbcr_dir() + "'")
+}
+
+fn cleanup_pmbcr() -> void {
+    pmbcr_ensure_dir()
+    let _ = exec("rm -f '" + pmbcr_corrupt_path()
+        + "' '" + pmbcr_region_path()
+        + "' '" + pmbcr_target_path()
+        + "' '" + pmbcr_recovery_path()
+        + "' '" + pmbcr_uninit_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmbcr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmbcr_append_row(path: str, row: str) -> void {
+    pmbcr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int (no 0x prefix) ───
+fn pmbcr_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_bss_corruption_real FAIL [pmbcr_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── source_kind_name: 0..4 → indirect_call / ret / jmp_indirect / table_jmp / unknown ───
+fn source_kind_name(k: int) -> str {
+    if k == 0 { return "indirect_call" }
+    if k == 1 { return "ret"           }
+    if k == 2 { return "jmp_indirect"  }
+    if k == 3 { return "table_jmp"     }
+    if k == 4 { return "unknown"       }
+    return ""
+}
+
+// ─── reason_kind_name: 0..3 → outside_text / in_data / in_bss / null_zero ───
+fn reason_kind_name(k: int) -> str {
+    if k == 0 { return "outside_text" }
+    if k == 1 { return "in_data"      }
+    if k == 2 { return "in_bss"       }
+    if k == 3 { return "null_zero"    }
+    return ""
+}
+
+// ─── record_eip_corruption: corrupt EIP 분기 1 건 ───
+//   source_kind 0=indirect_call / 1=ret / 2=jmp_indirect / 3=table_jmp / 4=unknown
+fn record_eip_corruption(corrupt_id: int, eip_hex: str, source_kind: int, prior_eip_hex: str) -> void {
+    if corrupt_id <= 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_eip_corruption] expected=corrupt_id>0 got=" + to_string(corrupt_id))
+    }
+    let eip = pmbcr_hex_to_int(eip_hex)
+    if eip < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_eip_corruption] expected=eip>=0 got=" + to_string(eip))
+    }
+    if source_kind < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_eip_corruption] expected=source_kind>=0 got=" + to_string(source_kind))
+    }
+    if source_kind > 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_eip_corruption] expected=source_kind<=4 got=" + to_string(source_kind))
+    }
+    let prior_eip = pmbcr_hex_to_int(prior_eip_hex)
+    if prior_eip < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_eip_corruption] expected=prior_eip>=0 got=" + to_string(prior_eip))
+    }
+    let row = to_string(corrupt_id) + "\t" + to_string(eip) + "\t"
+        + to_string(source_kind) + "\t" + to_string(prior_eip) + "\n"
+    pmbcr_append_row(pmbcr_corrupt_path(), row)
+}
+
+// ─── record_bss_region: .bss / uninit data 영역 정의 ───
+//   kind 0=uninit / 1=zero_filled / 2=cookie / 3=heap_meta
+fn record_bss_region(region_id: int, va_start_hex: str, va_end_hex: str, kind: int) -> void {
+    if region_id <= 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_bss_region] expected=region_id>0 got=" + to_string(region_id))
+    }
+    let va_start = pmbcr_hex_to_int(va_start_hex)
+    if va_start < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_bss_region] expected=va_start>=0 got=" + to_string(va_start))
+    }
+    let va_end = pmbcr_hex_to_int(va_end_hex)
+    if va_end < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_bss_region] expected=va_end>=0 got=" + to_string(va_end))
+    }
+    if va_end <= va_start {
+        panic("pe_msvc_bss_corruption_real FAIL [record_bss_region] expected=va_end>va_start got_start=" + to_string(va_start) + " got_end=" + to_string(va_end))
+    }
+    if kind < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_bss_region] expected=kind>=0 got=" + to_string(kind))
+    }
+    if kind > 3 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_bss_region] expected=kind<=3 got=" + to_string(kind))
+    }
+    let row = to_string(region_id) + "\t" + to_string(va_start) + "\t"
+        + to_string(va_end) + "\t" + to_string(kind) + "\n"
+    pmbcr_append_row(pmbcr_region_path(), row)
+}
+
+// ─── record_invalid_target: corrupt EIP 가 어떤 영역에 있었는지 ───
+//   reason_kind 0=outside_text / 1=in_data / 2=in_bss / 3=null_zero
+fn record_invalid_target(target_id: int, eip_hex: str, reason_kind: int) -> void {
+    if target_id <= 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_invalid_target] expected=target_id>0 got=" + to_string(target_id))
+    }
+    let eip = pmbcr_hex_to_int(eip_hex)
+    if eip < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_invalid_target] expected=eip>=0 got=" + to_string(eip))
+    }
+    if reason_kind < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_invalid_target] expected=reason_kind>=0 got=" + to_string(reason_kind))
+    }
+    if reason_kind > 3 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_invalid_target] expected=reason_kind<=3 got=" + to_string(reason_kind))
+    }
+    let row = to_string(target_id) + "\t" + to_string(eip) + "\t"
+        + to_string(reason_kind) + "\n"
+    pmbcr_append_row(pmbcr_target_path(), row)
+}
+
+// ─── record_recovery_attempt: invalid_target 회복 시도 ───
+//   action_kind: skip / fake_zero / unwind / halt 등 (>=0)
+//   success 0=실패 / 1=성공
+fn record_recovery_attempt(attempt_id: int, target_id: int, action_kind: int, success: int) -> void {
+    if attempt_id <= 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_recovery_attempt] expected=attempt_id>0 got=" + to_string(attempt_id))
+    }
+    if target_id <= 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_recovery_attempt] expected=target_id>0 got=" + to_string(target_id))
+    }
+    if action_kind < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_recovery_attempt] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 7 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_recovery_attempt] expected=action_kind<=7 got=" + to_string(action_kind))
+    }
+    if success < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_recovery_attempt] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_recovery_attempt] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(attempt_id) + "\t" + to_string(target_id) + "\t"
+        + to_string(action_kind) + "\t" + to_string(success) + "\n"
+    pmbcr_append_row(pmbcr_recovery_path(), row)
+}
+
+// ─── record_uninit_read: uninit data read 1 건 (VA + 기대 종류 + 실제 값) ───
+fn record_uninit_read(read_id: int, va_hex: str, expected_kind: int, actual_value_hex: str) -> void {
+    if read_id <= 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_uninit_read] expected=read_id>0 got=" + to_string(read_id))
+    }
+    let va = pmbcr_hex_to_int(va_hex)
+    if va < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_uninit_read] expected=va>=0 got=" + to_string(va))
+    }
+    if expected_kind < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_uninit_read] expected=expected_kind>=0 got=" + to_string(expected_kind))
+    }
+    if expected_kind > 7 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_uninit_read] expected=expected_kind<=7 got=" + to_string(expected_kind))
+    }
+    let actual_value = pmbcr_hex_to_int(actual_value_hex)
+    if actual_value < 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [record_uninit_read] expected=actual_value>=0 got=" + to_string(actual_value))
+    }
+    let row = to_string(read_id) + "\t" + to_string(va) + "\t"
+        + to_string(expected_kind) + "\t" + to_string(actual_value) + "\n"
+    pmbcr_append_row(pmbcr_uninit_path(), row)
+}
+
+// ─── 통계 헬퍼 ───
+fn pmbcr_count_rows(path: str, min_cols: int) -> int {
+    let t = pmbcr_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn corruption_count() -> int {
+    return pmbcr_count_rows(pmbcr_corrupt_path(), 4)
+}
+
+fn bss_region_count() -> int {
+    return pmbcr_count_rows(pmbcr_region_path(), 4)
+}
+
+fn invalid_target_count() -> int {
+    return pmbcr_count_rows(pmbcr_target_path(), 3)
+}
+
+fn recovery_attempt_count() -> int {
+    return pmbcr_count_rows(pmbcr_recovery_path(), 4)
+}
+
+fn uninit_read_count() -> int {
+    return pmbcr_count_rows(pmbcr_uninit_path(), 4)
+}
+
+// ─── pmbcr_stats: [corruption, bss_region, invalid_target, recovery_attempt, uninit_read] ───
+fn pmbcr_stats() -> array {
+    let mut out = []
+    out.push(corruption_count())
+    out.push(bss_region_count())
+    out.push(invalid_target_count())
+    out.push(recovery_attempt_count())
+    out.push(uninit_read_count())
+    return out
+}
+
+// ─── self_test (≥ 12 record + ≥ 14 r0 emit) ───
+fn self_test() -> void {
+    let sid = "pmbcr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmbcr()
+
+    // 2. record_eip_corruption 4종 (4 source_kind: indirect_call / ret / jmp_indirect / table_jmp)
+    //    실제 wave 9 재현 시 halt EIP=0x80147B (.bss) — corrupt_id=1 에 반영
+    //    corrupt_id=1: indirect_call → 0x0080147B (prior 0x004023A0)
+    //    corrupt_id=2: ret           → 0x00802000 (prior 0x004056F8)
+    //    corrupt_id=3: jmp_indirect  → 0x00800010 (prior 0x00407BCD)
+    //    corrupt_id=4: table_jmp     → 0x00803344 (prior 0x004099AA)
+    record_eip_corruption(1, "0080147B", 0, "004023A0")
+    r0_emit("pe_msvc_bss_corruption_real_record_eip_corruption",
+        "\"corrupt_id\":1,\"eip\":\"0x0080147B\",\"source_kind\":0,\"source_name\":\"indirect_call\",\"prior_eip\":\"0x004023A0\"")
+
+    record_eip_corruption(2, "00802000", 1, "004056F8")
+    r0_emit("pe_msvc_bss_corruption_real_record_eip_corruption",
+        "\"corrupt_id\":2,\"eip\":\"0x00802000\",\"source_kind\":1,\"source_name\":\"ret\",\"prior_eip\":\"0x004056F8\"")
+
+    record_eip_corruption(3, "00800010", 2, "00407BCD")
+    r0_emit("pe_msvc_bss_corruption_real_record_eip_corruption",
+        "\"corrupt_id\":3,\"eip\":\"0x00800010\",\"source_kind\":2,\"source_name\":\"jmp_indirect\",\"prior_eip\":\"0x00407BCD\"")
+
+    record_eip_corruption(4, "00803344", 3, "004099AA")
+    r0_emit("pe_msvc_bss_corruption_real_record_eip_corruption",
+        "\"corrupt_id\":4,\"eip\":\"0x00803344\",\"source_kind\":3,\"source_name\":\"table_jmp\",\"prior_eip\":\"0x004099AA\"")
+
+    // 3. record_bss_region 4종 (uninit / zero_filled / cookie / heap_meta)
+    //    region_id=1: .bss uninit 0x00800000 ~ 0x00810000
+    //    region_id=2: zero_filled  0x00810000 ~ 0x00811000
+    //    region_id=3: cookie page  0x00820000 ~ 0x00820100
+    //    region_id=4: heap_meta    0x00900000 ~ 0x00900800
+    record_bss_region(1, "00800000", "00810000", 0)
+    r0_emit("pe_msvc_bss_corruption_real_record_bss_region",
+        "\"region_id\":1,\"va_start\":\"0x00800000\",\"va_end\":\"0x00810000\",\"kind\":0,\"kind_name\":\"uninit\"")
+
+    record_bss_region(2, "00810000", "00811000", 1)
+    r0_emit("pe_msvc_bss_corruption_real_record_bss_region",
+        "\"region_id\":2,\"va_start\":\"0x00810000\",\"va_end\":\"0x00811000\",\"kind\":1,\"kind_name\":\"zero_filled\"")
+
+    record_bss_region(3, "00820000", "00820100", 2)
+    r0_emit("pe_msvc_bss_corruption_real_record_bss_region",
+        "\"region_id\":3,\"va_start\":\"0x00820000\",\"va_end\":\"0x00820100\",\"kind\":2,\"kind_name\":\"cookie\"")
+
+    record_bss_region(4, "00900000", "00900800", 3)
+    r0_emit("pe_msvc_bss_corruption_real_record_bss_region",
+        "\"region_id\":4,\"va_start\":\"0x00900000\",\"va_end\":\"0x00900800\",\"kind\":3,\"kind_name\":\"heap_meta\"")
+
+    // 4. record_invalid_target 4종 (4 reason_kind: outside_text / in_data / in_bss / null_zero)
+    //    target_id=1: outside_text — EIP=0x90000000 (image 외부)
+    //    target_id=2: in_data      — EIP=0x00405000 (.data 영역)
+    //    target_id=3: in_bss       — EIP=0x0080147B (wave 9 재현 EIP)
+    //    target_id=4: null_zero    — EIP=0x00000000
+    record_invalid_target(1, "90000000", 0)
+    r0_emit("pe_msvc_bss_corruption_real_record_invalid_target",
+        "\"target_id\":1,\"eip\":\"0x90000000\",\"reason_kind\":0,\"reason_name\":\"outside_text\"")
+
+    record_invalid_target(2, "00405000", 1)
+    r0_emit("pe_msvc_bss_corruption_real_record_invalid_target",
+        "\"target_id\":2,\"eip\":\"0x00405000\",\"reason_kind\":1,\"reason_name\":\"in_data\"")
+
+    record_invalid_target(3, "0080147B", 2)
+    r0_emit("pe_msvc_bss_corruption_real_record_invalid_target",
+        "\"target_id\":3,\"eip\":\"0x0080147B\",\"reason_kind\":2,\"reason_name\":\"in_bss\"")
+
+    record_invalid_target(4, "0", 3)
+    r0_emit("pe_msvc_bss_corruption_real_record_invalid_target",
+        "\"target_id\":4,\"eip\":\"0x0\",\"reason_kind\":3,\"reason_name\":\"null_zero\"")
+
+    // 5. record_recovery_attempt 2종 (success / fail)
+    //    attempt_id=1: target_id=3 (in_bss) → action_kind=0 (skip) success
+    //    attempt_id=2: target_id=4 (null_zero) → action_kind=3 (halt) fail
+    record_recovery_attempt(1, 3, 0, 1)
+    r0_emit("pe_msvc_bss_corruption_real_record_recovery_attempt",
+        "\"attempt_id\":1,\"target_id\":3,\"action_kind\":0,\"success\":1")
+
+    record_recovery_attempt(2, 4, 3, 0)
+    r0_emit("pe_msvc_bss_corruption_real_record_recovery_attempt",
+        "\"attempt_id\":2,\"target_id\":4,\"action_kind\":3,\"success\":0")
+
+    // 6. record_uninit_read 2종
+    //    read_id=1: VA=0x00800400 expected=0(fn_ptr) actual=0x00000000 (uninit zero)
+    //    read_id=2: VA=0x008204D0 expected=1(cookie) actual=0xBB40E64E (cookie)
+    record_uninit_read(1, "00800400", 0, "0")
+    r0_emit("pe_msvc_bss_corruption_real_record_uninit_read",
+        "\"read_id\":1,\"va\":\"0x00800400\",\"expected_kind\":0,\"actual_value\":\"0x0\"")
+
+    record_uninit_read(2, "008204D0", 1, "BB40E64E")
+    r0_emit("pe_msvc_bss_corruption_real_record_uninit_read",
+        "\"read_id\":2,\"va\":\"0x008204D0\",\"expected_kind\":1,\"actual_value\":\"0xBB40E64E\"")
+
+    // 7. corruption_count == 4
+    let cc = corruption_count()
+    if cc != 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [corruption_count] expected=4 got=" + to_string(cc))
+    }
+
+    // 8. bss_region_count == 4
+    let brc = bss_region_count()
+    if brc != 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [bss_region_count] expected=4 got=" + to_string(brc))
+    }
+
+    // 9. invalid_target_count == 4
+    let itc = invalid_target_count()
+    if itc != 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [invalid_target_count] expected=4 got=" + to_string(itc))
+    }
+
+    // 10. recovery_attempt_count == 2
+    let rac = recovery_attempt_count()
+    if rac != 2 {
+        panic("pe_msvc_bss_corruption_real FAIL [recovery_attempt_count] expected=2 got=" + to_string(rac))
+    }
+
+    // 11. uninit_read_count == 2
+    let urc = uninit_read_count()
+    if urc != 2 {
+        panic("pe_msvc_bss_corruption_real FAIL [uninit_read_count] expected=2 got=" + to_string(urc))
+    }
+
+    // 12. source_kind_name sanity (0..4 + invalid)
+    if source_kind_name(0) != "indirect_call" {
+        panic("pe_msvc_bss_corruption_real FAIL [source_kind_name(0)] expected=indirect_call got=" + source_kind_name(0))
+    }
+    if source_kind_name(1) != "ret" {
+        panic("pe_msvc_bss_corruption_real FAIL [source_kind_name(1)] expected=ret got=" + source_kind_name(1))
+    }
+    if source_kind_name(2) != "jmp_indirect" {
+        panic("pe_msvc_bss_corruption_real FAIL [source_kind_name(2)] expected=jmp_indirect got=" + source_kind_name(2))
+    }
+    if source_kind_name(3) != "table_jmp" {
+        panic("pe_msvc_bss_corruption_real FAIL [source_kind_name(3)] expected=table_jmp got=" + source_kind_name(3))
+    }
+    if source_kind_name(4) != "unknown" {
+        panic("pe_msvc_bss_corruption_real FAIL [source_kind_name(4)] expected=unknown got=" + source_kind_name(4))
+    }
+    if source_kind_name(5) != "" {
+        panic("pe_msvc_bss_corruption_real FAIL [source_kind_name(5)] expected=empty got=" + source_kind_name(5))
+    }
+
+    // 13. reason_kind_name sanity (0..3 + invalid)
+    if reason_kind_name(0) != "outside_text" {
+        panic("pe_msvc_bss_corruption_real FAIL [reason_kind_name(0)] expected=outside_text got=" + reason_kind_name(0))
+    }
+    if reason_kind_name(1) != "in_data" {
+        panic("pe_msvc_bss_corruption_real FAIL [reason_kind_name(1)] expected=in_data got=" + reason_kind_name(1))
+    }
+    if reason_kind_name(2) != "in_bss" {
+        panic("pe_msvc_bss_corruption_real FAIL [reason_kind_name(2)] expected=in_bss got=" + reason_kind_name(2))
+    }
+    if reason_kind_name(3) != "null_zero" {
+        panic("pe_msvc_bss_corruption_real FAIL [reason_kind_name(3)] expected=null_zero got=" + reason_kind_name(3))
+    }
+    if reason_kind_name(4) != "" {
+        panic("pe_msvc_bss_corruption_real FAIL [reason_kind_name(4)] expected=empty got=" + reason_kind_name(4))
+    }
+
+    // 14. hex parser sanity — wave 9 의 halt EIP 검증
+    let h_eip = pmbcr_hex_to_int("0080147B")
+    if h_eip != 8393851 {
+        panic("pe_msvc_bss_corruption_real FAIL [pmbcr_hex_to_int(0080147B)] expected=8393851 got=" + to_string(h_eip))
+    }
+    let h_zero = pmbcr_hex_to_int("0")
+    if h_zero != 0 {
+        panic("pe_msvc_bss_corruption_real FAIL [pmbcr_hex_to_int(0)] expected=0 got=" + to_string(h_zero))
+    }
+
+    // 15. pmbcr_stats() = [4, 4, 4, 2, 2]
+    let s = pmbcr_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_bss_corruption_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [stats corruption_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [stats bss_region_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_bss_corruption_real FAIL [stats invalid_target_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_bss_corruption_real FAIL [stats recovery_attempt_count] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_bss_corruption_real FAIL [stats uninit_read_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 16. emit stats summary
+    r0_emit("pe_msvc_bss_corruption_real_stats",
+        "\"corruption_count\":" + to_string(s[0])
+        + ",\"bss_region_count\":" + to_string(s[1])
+        + ",\"invalid_target_count\":" + to_string(s[2])
+        + ",\"recovery_attempt_count\":" + to_string(s[3])
+        + ",\"uninit_read_count\":" + to_string(s[4]))
+
+    // 17. r0 emit count assertion (≥ 14)
+    //     실제 emit: 4 corruption + 4 region + 4 target + 2 recovery + 2 uninit + 1 stats = 17
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_bss_corruption_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 18. cleanup → stats 모두 0
+    cleanup_pmbcr()
+    let s2 = pmbcr_stats()
+    let mut j = 0
+    while j < len(s2) {
+        if s2[j] != 0 {
+            panic("pe_msvc_bss_corruption_real FAIL [cleanup stats[" + to_string(j)
+                + "]] expected=0 got=" + to_string(s2[j]))
+        }
+        j = j + 1
+    }
+
+    println("  ✅ pe_msvc_bss_corruption_real self_test PASS (corruption=" + to_string(s[0])
+        + ", bss_region=" + to_string(s[1]) + ", invalid_target=" + to_string(s[2])
+        + ", recovery=" + to_string(s[3]) + ", uninit_read=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmbcr_stats()
+            println("corruption_count\t" + to_string(s[0]))
+            println("bss_region_count\t" + to_string(s[1]))
+            println("invalid_target_count\t" + to_string(s[2]))
+            println("recovery_attempt_count\t" + to_string(s[3]))
+            println("uninit_read_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmbcr()
+            println("cleaned: " + pmbcr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmbcr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_bss_corruption_real.hexa { self-test | stats | cleanup | dir }")
+}

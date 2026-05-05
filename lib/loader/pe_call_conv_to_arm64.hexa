@@ -1,0 +1,383 @@
+// lib/loader/pe_call_conv_to_arm64.hexa — Win64 → arm64 AAPCS bridge translation telemetry
+//
+// PE host 가 Windows calling convention (stdcall / cdecl / fastcall / vectorcall /
+// x64_ms) 을 macOS arm64 AAPCS 로 shuffle 할 때 발생하는 bridge 비용을 기록.
+// 본 module 은 telemetry skeleton — 실제 register/stack shuffle 코드 생성은
+// stage6 native trampoline 영역 (own 1: Wine/CrossOver/GPTK/Whisky 0 줄).
+//
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// source_conv code:
+//   1 = stdcall      (Win32 callee-clean)
+//   2 = cdecl        (Win32 caller-clean)
+//   3 = fastcall     (ECX/EDX + stack)
+//   4 = vectorcall   (XMM0-5 + HVA)
+//   5 = x64_ms       (RCX/RDX/R8/R9 + shadow space)
+//
+// persist schema (TSV — bridges.tsv):
+//   bridge_id<int> \t source_conv<int> \t param_count<int> \t shuffle_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcca_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_call_conv_to_arm64"
+}
+
+fn pcca_bridges_path() -> str {
+    return pcca_dir() + "/bridges.tsv"
+}
+
+fn pcca_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcca_dir() + "'")
+}
+
+fn cleanup_pcca() -> void {
+    pcca_ensure_dir()
+    let _ = exec("rm -f '" + pcca_bridges_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcca_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcca_append_row(path: str, row: str) -> void {
+    pcca_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_bridge: bridge 1 건 기록 ───
+fn record_bridge(bridge_id: int, source_conv: int, param_count: int, shuffle_us: int) -> void {
+    if bridge_id <= 0 {
+        panic("pe_call_conv_to_arm64 FAIL [record_bridge] expected=bridge_id>0 got=" + to_string(bridge_id))
+    }
+    if source_conv < 1 {
+        panic("pe_call_conv_to_arm64 FAIL [record_bridge] expected=source_conv>=1 got=" + to_string(source_conv))
+    }
+    if source_conv > 5 {
+        panic("pe_call_conv_to_arm64 FAIL [record_bridge] expected=source_conv<=5 got=" + to_string(source_conv))
+    }
+    if param_count < 0 {
+        panic("pe_call_conv_to_arm64 FAIL [record_bridge] expected=param_count>=0 got=" + to_string(param_count))
+    }
+    if shuffle_us < 0 {
+        panic("pe_call_conv_to_arm64 FAIL [record_bridge] expected=shuffle_us>=0 got=" + to_string(shuffle_us))
+    }
+    let row = to_string(bridge_id) + "\t" + to_string(source_conv)
+        + "\t" + to_string(param_count) + "\t" + to_string(shuffle_us) + "\n"
+    pcca_append_row(pcca_bridges_path(), row)
+}
+
+// ─── bridge_count: 총 bridge 수 ───
+fn bridge_count() -> int {
+    let t = pcca_read_table(pcca_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_shuffle_us: 모든 bridge shuffle_us 합 ───
+fn total_shuffle_us() -> int {
+    let t = pcca_read_table(pcca_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_params: 모든 bridge param_count 합 ───
+fn total_params() -> int {
+    let t = pcca_read_table(pcca_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_source_conv: 특정 source_conv bridge 수 ───
+fn count_by_source_conv(source_conv: int) -> int {
+    let t = pcca_read_table(pcca_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == source_conv {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── bridge_shuffle_us: 특정 bridge_id 의 shuffle_us (없으면 0) ───
+fn bridge_shuffle_us(bridge_id: int) -> int {
+    let t = pcca_read_table(pcca_bridges_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == bridge_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pcca_stats: [bridge_count, total_shuffle_us, total_params, count_by_source_conv(5)] ───
+fn pcca_stats() -> array {
+    let mut out = []
+    out.push(bridge_count())
+    out.push(total_shuffle_us())
+    out.push(total_params())
+    out.push(count_by_source_conv(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcca-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcca()
+
+    // 2. record 5 bridges spanning ≥3 source_conv values
+    //    conv 1=stdcall, 2=cdecl, 3=fastcall, 5=x64_ms (4개 conv 사용)
+    record_bridge(680001, 1, 3, 12)
+    r0_emit("pe_call_conv_to_arm64_record",
+        "\"bridge_id\":680001,\"source_conv\":1,\"param_count\":3,\"shuffle_us\":12,\"target\":\"stdcall\"")
+
+    record_bridge(680002, 2, 4, 18)
+    r0_emit("pe_call_conv_to_arm64_record",
+        "\"bridge_id\":680002,\"source_conv\":2,\"param_count\":4,\"shuffle_us\":18,\"target\":\"cdecl\"")
+
+    record_bridge(680003, 3, 2, 9)
+    r0_emit("pe_call_conv_to_arm64_record",
+        "\"bridge_id\":680003,\"source_conv\":3,\"param_count\":2,\"shuffle_us\":9,\"target\":\"fastcall\"")
+
+    record_bridge(680004, 5, 6, 27)
+    r0_emit("pe_call_conv_to_arm64_record",
+        "\"bridge_id\":680004,\"source_conv\":5,\"param_count\":6,\"shuffle_us\":27,\"target\":\"x64_ms\"")
+
+    record_bridge(680005, 5, 8, 34)
+    r0_emit("pe_call_conv_to_arm64_record",
+        "\"bridge_id\":680005,\"source_conv\":5,\"param_count\":8,\"shuffle_us\":34,\"target\":\"x64_ms\"")
+
+    // 3. bridge_count = 5
+    let c = bridge_count()
+    if c != 5 {
+        panic("pe_call_conv_to_arm64 FAIL [bridge_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_shuffle_us = 12+18+9+27+34 = 100
+    let ts = total_shuffle_us()
+    if ts != 100 {
+        panic("pe_call_conv_to_arm64 FAIL [total_shuffle_us] expected=100 got=" + to_string(ts))
+    }
+
+    // 5. total_params = 3+4+2+6+8 = 23
+    let tp = total_params()
+    if tp != 23 {
+        panic("pe_call_conv_to_arm64 FAIL [total_params] expected=23 got=" + to_string(tp))
+    }
+
+    // 6. count_by_source_conv sanity
+    let c1 = count_by_source_conv(1)
+    if c1 != 1 {
+        panic("pe_call_conv_to_arm64 FAIL [count_by_source_conv(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_source_conv(2)
+    if c2 != 1 {
+        panic("pe_call_conv_to_arm64 FAIL [count_by_source_conv(2)] expected=1 got=" + to_string(c2))
+    }
+    let c3 = count_by_source_conv(3)
+    if c3 != 1 {
+        panic("pe_call_conv_to_arm64 FAIL [count_by_source_conv(3)] expected=1 got=" + to_string(c3))
+    }
+    let c4 = count_by_source_conv(4)
+    if c4 != 0 {
+        panic("pe_call_conv_to_arm64 FAIL [count_by_source_conv(4)] expected=0 got=" + to_string(c4))
+    }
+    let c5 = count_by_source_conv(5)
+    if c5 != 2 {
+        panic("pe_call_conv_to_arm64 FAIL [count_by_source_conv(5)] expected=2 got=" + to_string(c5))
+    }
+
+    // 7. bridge_shuffle_us sanity
+    let s2 = bridge_shuffle_us(680002)
+    if s2 != 18 {
+        panic("pe_call_conv_to_arm64 FAIL [bridge_shuffle_us(680002)] expected=18 got=" + to_string(s2))
+    }
+    let s4 = bridge_shuffle_us(680004)
+    if s4 != 27 {
+        panic("pe_call_conv_to_arm64 FAIL [bridge_shuffle_us(680004)] expected=27 got=" + to_string(s4))
+    }
+    let s_miss = bridge_shuffle_us(9999)
+    if s_miss != 0 {
+        panic("pe_call_conv_to_arm64 FAIL [bridge_shuffle_us(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pcca_stats() = [5, 100, 23, 2]
+    let s = pcca_stats()
+    if len(s) != 4 {
+        panic("pe_call_conv_to_arm64 FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_call_conv_to_arm64 FAIL [stats bridge_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 100 {
+        panic("pe_call_conv_to_arm64 FAIL [stats total_shuffle_us] expected=100 got=" + to_string(s[1]))
+    }
+    if s[2] != 23 {
+        panic("pe_call_conv_to_arm64 FAIL [stats total_params] expected=23 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_call_conv_to_arm64 FAIL [stats count_x64_ms] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_call_conv_to_arm64_stats",
+        "\"bridge_count\":" + to_string(s[0])
+        + ",\"total_shuffle_us\":" + to_string(s[1])
+        + ",\"total_params\":" + to_string(s[2])
+        + ",\"conv_x64_ms\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_call_conv_to_arm64 FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pcca()
+    let s_post = pcca_stats()
+    let i = 0
+    while i < len(s_post) {
+        if s_post[i] != 0 {
+            panic("pe_call_conv_to_arm64 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s_post[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_call_conv_to_arm64 self_test PASS (bridges=" + to_string(s[0])
+        + ", shuffle_us=" + to_string(s[1]) + ", params=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcca_stats()
+            println("bridge_count\t" + to_string(s[0]))
+            println("total_shuffle_us\t" + to_string(s[1]))
+            println("total_params\t" + to_string(s[2]))
+            println("count_x64_ms\t" + to_string(s[3]))
+            return
+        }
+        if sub == "shuffle" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                println("bridge_shuffle_us\t" + to_string(bridge_shuffle_us(bid)))
+                return
+            }
+            println("usage: hexa run pe_call_conv_to_arm64.hexa shuffle <bridge_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let conv = to_int(a[3])
+                println("count_by_source_conv\t" + to_string(count_by_source_conv(conv)))
+                return
+            }
+            println("usage: hexa run pe_call_conv_to_arm64.hexa count <source_conv>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcca()
+            println("cleaned: " + pcca_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcca_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_call_conv_to_arm64.hexa { self-test | stats | shuffle <bridge_id> | count <source_conv> | cleanup | dir }")
+}

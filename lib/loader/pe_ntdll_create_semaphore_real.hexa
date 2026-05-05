@@ -1,0 +1,407 @@
+// lib/loader/pe_ntdll_create_semaphore_real.hexa — NTDLL NtCreateSemaphore/NtReleaseSemaphore/NtOpenSemaphore 실 호출 추적
+//
+// NTDLL semaphore 실 호출 → POSIX sem_t bridge:
+//   NtCreateSemaphore(out SemHandle, DesiredAccess, OBJECT_ATTRIBUTES*, InitialCount, MaximumCount)
+//     → POSIX sem_init(initial_count) + handle table entry
+//   NtReleaseSemaphore(SemHandle, ReleaseCount, *PreviousCount)
+//     → sem_post N times (N = release_count)
+//   NtOpenSemaphore(out SemHandle, DesiredAccess, OBJECT_ATTRIBUTES*)
+//     → 기존 named sem 의 sem_open() lookup
+//   NtClose(SemHandle) → sem_destroy()
+// own1: NTDLL spec + Apple POSIX sem. Wine 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NT semaphore API call tracker — 실 sem_init() 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = NtCreateSemaphore   → sem_init(initial_count)
+//   2 = NtReleaseSemaphore  → sem_post N (N = release count, encoded into initial_count column)
+//   3 = NtOpenSemaphore     → sem_open lookup (existing named sem)
+//   4 = NtClose             → sem_destroy
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t initial_count<int> \t maximum_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pncsr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_create_semaphore_real"
+}
+
+fn pncsr_ops_path() -> str {
+    return pncsr_dir() + "/ops.tsv"
+}
+
+fn pncsr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pncsr_dir() + "'")
+}
+
+fn cleanup_pncsr() -> void {
+    pncsr_ensure_dir()
+    let _ = exec("rm -f '" + pncsr_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pncsr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pncsr_append_row(path: str, row: str) -> void {
+    pncsr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: NT semaphore API op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, initial_count: int, maximum_count: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_create_semaphore_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_ntdll_create_semaphore_real FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if initial_count < 0 {
+        panic("pe_ntdll_create_semaphore_real FAIL [record_op] expected=initial_count>=0 got=" + to_string(initial_count))
+    }
+    if maximum_count < 0 {
+        panic("pe_ntdll_create_semaphore_real FAIL [record_op] expected=maximum_count>=0 got=" + to_string(maximum_count))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(initial_count) + "\t" + to_string(maximum_count) + "\n"
+    pncsr_append_row(pncsr_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pncsr_read_table(pncsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pncsr_read_table(pncsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_initial_count: initial_count 합 ───
+fn total_initial_count() -> int {
+    let t = pncsr_read_table(pncsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut total = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                total = total + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ─── total_maximum_count: maximum_count 합 ───
+fn total_maximum_count() -> int {
+    let t = pncsr_read_table(pncsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut total = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                total = total + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ─── release_count: NtReleaseSemaphore op 수 (op_kind == 2) ───
+fn release_count() -> int {
+    return count_by_op_kind(2)
+}
+
+// ─── op_initial_count: 특정 op_id 의 initial_count (없으면 -1) ───
+fn op_initial_count(op_id: int) -> int {
+    let t = pncsr_read_table(pncsr_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pncsr_stats: [op_count, release_count, count_by_op_kind(1), total_maximum_count] ───
+fn pncsr_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(release_count())
+    out.push(count_by_op_kind(1))
+    out.push(total_maximum_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pncsr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pncsr()
+
+    // 2. record 5 ops — covers ≥3 op_kinds (1=create, 2=release, 3=open, 4=close)
+    //    NtCreateSemaphore initial=0 max=1 (mutex-like)
+    record_op(140001, 1, 0, 1)
+    r0_emit("pe_ntdll_create_semaphore_real_record",
+        "\"op_id\":140001,\"op_kind\":1,\"initial_count\":0,\"maximum_count\":1,\"target\":\"NtCreateSemaphore\"")
+
+    //    NtCreateSemaphore initial=2 max=8 (resource pool)
+    record_op(140002, 1, 2, 8)
+    r0_emit("pe_ntdll_create_semaphore_real_record",
+        "\"op_id\":140002,\"op_kind\":1,\"initial_count\":2,\"maximum_count\":8,\"target\":\"NtCreateSemaphore\"")
+
+    //    NtReleaseSemaphore release=3 (encoded as initial_count=3)
+    record_op(140003, 2, 3, 0)
+    r0_emit("pe_ntdll_create_semaphore_real_record",
+        "\"op_id\":140003,\"op_kind\":2,\"initial_count\":3,\"maximum_count\":0,\"target\":\"NtReleaseSemaphore\"")
+
+    //    NtOpenSemaphore (named sem lookup)
+    record_op(140004, 3, 0, 0)
+    r0_emit("pe_ntdll_create_semaphore_real_record",
+        "\"op_id\":140004,\"op_kind\":3,\"initial_count\":0,\"maximum_count\":0,\"target\":\"NtOpenSemaphore\"")
+
+    //    NtClose (sem_destroy)
+    record_op(140005, 4, 0, 0)
+    r0_emit("pe_ntdll_create_semaphore_real_record",
+        "\"op_id\":140005,\"op_kind\":4,\"initial_count\":0,\"maximum_count\":0,\"target\":\"NtClose\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_ntdll_create_semaphore_real FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (≥3 op_kinds covered: 1,2,3,4)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_ntdll_create_semaphore_real FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ntdll_create_semaphore_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. release_count == count_by_op_kind(2) == 1
+    let rc = release_count()
+    if rc != 1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [release_count] expected=1 got=" + to_string(rc))
+    }
+
+    // 6. total_initial_count = 0 + 2 + 3 + 0 + 0 = 5
+    let ti = total_initial_count()
+    if ti != 5 {
+        panic("pe_ntdll_create_semaphore_real FAIL [total_initial_count] expected=5 got=" + to_string(ti))
+    }
+
+    // 7. total_maximum_count = 1 + 8 + 0 + 0 + 0 = 9
+    let tm = total_maximum_count()
+    if tm != 9 {
+        panic("pe_ntdll_create_semaphore_real FAIL [total_maximum_count] expected=9 got=" + to_string(tm))
+    }
+
+    // 8. op_initial_count sanity
+    let ic2 = op_initial_count(140002)
+    if ic2 != 2 {
+        panic("pe_ntdll_create_semaphore_real FAIL [op_initial_count(140002)] expected=2 got=" + to_string(ic2))
+    }
+    let ic3 = op_initial_count(140003)
+    if ic3 != 3 {
+        panic("pe_ntdll_create_semaphore_real FAIL [op_initial_count(140003)] expected=3 got=" + to_string(ic3))
+    }
+    let ic_miss = op_initial_count(9999)
+    if ic_miss != -1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [op_initial_count(9999)] expected=-1 got=" + to_string(ic_miss))
+    }
+
+    // 9. pncsr_stats() = [5, 1, 2, 9]
+    let s = pncsr_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_create_semaphore_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ntdll_create_semaphore_real FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_ntdll_create_semaphore_real FAIL [stats release_count] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_ntdll_create_semaphore_real FAIL [stats op_kind(1)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 9 {
+        panic("pe_ntdll_create_semaphore_real FAIL [stats total_maximum_count] expected=9 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (6th r0_emit)
+    r0_emit("pe_ntdll_create_semaphore_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"release_count\":" + to_string(s[1])
+        + ",\"create_count\":" + to_string(s[2])
+        + ",\"total_maximum_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ntdll_create_semaphore_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pncsr()
+    let s2 = pncsr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_create_semaphore_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_create_semaphore_real self_test PASS (ops=" + to_string(s[0])
+        + ", release=" + to_string(s[1]) + ", create=" + to_string(s[2])
+        + ", total_max=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pncsr_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("release_count\t" + to_string(s[1]))
+            println("count_op_kind_create\t" + to_string(s[2]))
+            println("total_maximum_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "initial" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_initial_count\t" + to_string(op_initial_count(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_create_semaphore_real.hexa initial <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "kind" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_create_semaphore_real.hexa count kind <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pncsr()
+            println("cleaned: " + pncsr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pncsr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_create_semaphore_real.hexa { self-test | stats | initial <op_id> | count kind <op_kind> | cleanup | dir }")
+}

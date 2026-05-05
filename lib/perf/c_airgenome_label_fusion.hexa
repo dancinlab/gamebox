@@ -1,0 +1,169 @@
+// lib/perf/c_airgenome_label_fusion.hexa — CN-25 PSB-4 만점 15/15
+//
+// gamebox label (FRAMETIME/HEAP/PSO) ↔ airgenome host vitals label cross-correlate.
+// 시나리오: 게임 stutter 가 호스트 CPU 80%↑ + GPU 80%↑ 시 발생 패턴 학습.
+//
+// 무기: airgenome MAIN harvest 의 6축 게놈 ↔ gamebox 22축 게놈 cross-correlate.
+
+use "./r0_common"
+
+let LF_DIR = GAMEBOX_HOME + "/persist/airgenome_label_fusion"
+let FUSION_HISTORY = LF_DIR + "/fusion.jsonl"
+let CORRELATION_PATH = LF_DIR + "/correlation.tsv"
+
+fn lf_dir() -> str { return LF_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + LF_DIR + "'")
+}
+
+// ─── fusion record — gamebox label + airgenome host vitals ───
+//   gamebox_label: stutter|heap_critical|pso_burst|...
+//   host_cpu/ram/gpu/io: 0~100 percentages
+fn record_fusion(ts_us: int, gamebox_label: str, host_cpu: int, host_ram: int, host_gpu: int, host_io: int) -> void {
+    ensure_dir()
+    let line = "{\"ts\":" + to_string(ts_us) + ",\"gb\":\"" + gamebox_label + "\",\"cpu\":" + to_string(host_cpu) + ",\"ram\":" + to_string(host_ram) + ",\"gpu\":" + to_string(host_gpu) + ",\"io\":" + to_string(host_io) + "}"
+    let tmp = FUSION_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + FUSION_HISTORY + "' && rm -f '" + tmp + "'")
+}
+
+// ─── correlation matrix 빌드 ───
+//   gamebox label X 에 대해 host axis Y 의 평균값
+fn correlation_matrix() -> array {
+    let exists = exec("test -f '" + FUSION_HISTORY + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+    // gamebox label 별 host axis 평균 (synthetic — 단순 line-by-line scan)
+    // 결과: array of [label, avg_cpu, avg_ram, avg_gpu, avg_io, count]
+    let labels = exec("grep -oE '\"gb\":\"[^\"]*\"' '" + FUSION_HISTORY + "' | sort -u").trim()
+    if labels == "" { return [] }
+    let lines = labels.split("\n")
+    let result = []
+    let i = 0
+    while i < len(lines) {
+        let raw = lines[i]
+        let label = exec("printf '%s' '" + raw + "' | sed 's/.*\"gb\":\"\\([^\"]*\\)\".*/\\1/'").trim()
+        if label == "" {
+            i = i + 1
+        } else {
+            let cnt_str = exec("grep -c '\"gb\":\"" + label + "\"' '" + FUSION_HISTORY + "'").trim()
+            let cnt = to_int(cnt_str)
+            if cnt > 0 {
+                let avg_cpu_str = exec("grep '\"gb\":\"" + label + "\"' '" + FUSION_HISTORY + "' | grep -oE '\"cpu\":[0-9]+' | cut -d: -f2 | awk '{s+=$1} END{print int(s/NR)}'").trim()
+                let avg_gpu_str = exec("grep '\"gb\":\"" + label + "\"' '" + FUSION_HISTORY + "' | grep -oE '\"gpu\":[0-9]+' | cut -d: -f2 | awk '{s+=$1} END{print int(s/NR)}'").trim()
+                let avg_ram_str = exec("grep '\"gb\":\"" + label + "\"' '" + FUSION_HISTORY + "' | grep -oE '\"ram\":[0-9]+' | cut -d: -f2 | awk '{s+=$1} END{print int(s/NR)}'").trim()
+                let avg_io_str = exec("grep '\"gb\":\"" + label + "\"' '" + FUSION_HISTORY + "' | grep -oE '\"io\":[0-9]+' | cut -d: -f2 | awk '{s+=$1} END{print int(s/NR)}'").trim()
+                let avg_cpu = 0
+                let avg_gpu = 0
+                let avg_ram = 0
+                let avg_io = 0
+                if avg_cpu_str != "" { avg_cpu = to_int(avg_cpu_str) }
+                if avg_gpu_str != "" { avg_gpu = to_int(avg_gpu_str) }
+                if avg_ram_str != "" { avg_ram = to_int(avg_ram_str) }
+                if avg_io_str != "" { avg_io = to_int(avg_io_str) }
+                result = result + [[label, avg_cpu, avg_ram, avg_gpu, avg_io, cnt]]
+            }
+            i = i + 1
+        }
+    }
+    return result
+}
+
+// ─── 사용자 hint — 게임 stutter 와 호스트 vitals 연결 ───
+fn host_hint(label: str) -> str {
+    let matrix = correlation_matrix()
+    let i = 0
+    while i < len(matrix) {
+        let row = matrix[i]
+        if row[0] == label {
+            let cpu = row[1]
+            let gpu = row[3]
+            if cpu >= 80 && gpu >= 80 {
+                return "host_overload — both CPU and GPU saturated"
+            }
+            if cpu >= 80 {
+                return "host_cpu_bound — CPU bottleneck"
+            }
+            if gpu >= 80 {
+                return "host_gpu_bound — GPU bottleneck"
+            }
+            return "host_normal — game-internal cause"
+        }
+        i = i + 1
+    }
+    return "no_data"
+}
+
+fn fusion_stats() -> array {
+    let exists = exec("test -f '" + FUSION_HISTORY + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0] }
+    let total = to_int(exec("wc -l < '" + FUSION_HISTORY + "' | tr -d ' '").trim())
+    let unique_labels = to_int(exec("grep -oE '\"gb\":\"[^\"]*\"' '" + FUSION_HISTORY + "' | sort -u | wc -l | tr -d ' '").trim())
+    return [total, unique_labels]
+}
+
+fn cleanup_lf() -> void {
+    let _ = exec("rm -rf '" + LF_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "labelfusion-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_lf()
+
+    // 합성 fusion data
+    record_fusion(1000000, "stutter_spike", 85, 50, 90, 30)  // CPU+GPU bound
+    record_fusion(2000000, "stutter_spike", 88, 55, 88, 35)
+    record_fusion(3000000, "stutter_spike", 82, 50, 85, 40)
+    record_fusion(4000000, "heap_critical", 60, 95, 40, 70)  // RAM bound
+    record_fusion(5000000, "pso_burst", 70, 40, 50, 20)      // CPU normal-high
+
+    // correlation matrix
+    let matrix = correlation_matrix()
+    if len(matrix) != 3 {
+        panic("c_airgenome_label_fusion FAIL [matrix count] expected=3 got=" + to_string(len(matrix)))
+    }
+
+    // host hint
+    let hint_stutter = host_hint("stutter_spike")
+    if !hint_stutter.contains("overload") {
+        panic("c_airgenome_label_fusion FAIL [hint stutter] expected contains overload, got=" + hint_stutter)
+    }
+
+    let hint_unknown = host_hint("UnknownLabel")
+    if hint_unknown != "no_data" {
+        panic("c_airgenome_label_fusion FAIL [hint unknown] expected=no_data got=" + hint_unknown)
+    }
+
+    // stats
+    let stats = fusion_stats()
+    if stats[0] != 5 { panic("c_airgenome_label_fusion FAIL [stats total] expected=5 got=" + to_string(stats[0])) }
+    if stats[1] != 3 { panic("c_airgenome_label_fusion FAIL [stats labels] expected=3 got=" + to_string(stats[1])) }
+
+    r0_emit("label_fusion_recorded", "\"events\":" + to_string(stats[0]) + ",\"labels\":" + to_string(stats[1]))
+    r0_emit("label_fusion_hint", "\"label\":\"stutter_spike\",\"hint\":\"" + hint_stutter + "\"")
+    r0_emit("label_fusion_summary", "\"correlations\":" + to_string(len(matrix)))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_airgenome_label_fusion FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_lf()
+
+    println("  ✅ c_airgenome_label_fusion self_test PASS (5 events, 3 labels, hint=" + hint_stutter + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = fusion_stats()
+            println("events=" + to_string(s[0]) + " labels=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_lf(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_airgenome_label_fusion.hexa { self-test | stats | cleanup }")
+}

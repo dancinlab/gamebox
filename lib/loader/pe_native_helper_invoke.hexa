@@ -1,0 +1,392 @@
+// lib/loader/pe_native_helper_invoke.hexa — stage4 native helper invocation skeleton
+//
+// docker 안 hexa → host native helper (Objective-C/.mm) IPC gate. 어떤
+// macOS API call (mmap/dlopen/pthread_create 등) 이 dispatch 되는지 추적.
+// 실 IPC 는 stage5 (XPC 또는 socket 또는 stdin/stdout pipe).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 helper invocation gate — 실 helper binary 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// target_kind code:
+//   1 = mmap
+//   2 = dlopen
+//   3 = dlsym
+//   4 = pthread_create
+//   5 = mprotect
+//   6 = Metal_device
+//   7 = NSObject_alloc
+//   8 = other
+//
+// persist schema (TSV — invoke_history.tsv):
+//   invoke_id<int> \t target_kind<int> \t payload_bytes<int> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnhi_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_helper_invoke"
+}
+
+fn pnhi_history_path() -> str {
+    return pnhi_dir() + "/invoke_history.tsv"
+}
+
+fn pnhi_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnhi_dir() + "'")
+}
+
+fn cleanup_pnhi() -> void {
+    pnhi_ensure_dir()
+    let _ = exec("rm -f '" + pnhi_history_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnhi_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnhi_append_row(path: str, row: str) -> void {
+    pnhi_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_invoke: helper dispatch 1 건 기록 ───
+fn record_invoke(invoke_id: int, target_kind: int, payload_bytes: int, elapsed_us: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_native_helper_invoke FAIL [record_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if target_kind < 1 {
+        panic("pe_native_helper_invoke FAIL [record_invoke] expected=target_kind>=1 got=" + to_string(target_kind))
+    }
+    if target_kind > 8 {
+        panic("pe_native_helper_invoke FAIL [record_invoke] expected=target_kind<=8 got=" + to_string(target_kind))
+    }
+    if payload_bytes < 0 {
+        panic("pe_native_helper_invoke FAIL [record_invoke] expected=payload_bytes>=0 got=" + to_string(payload_bytes))
+    }
+    if elapsed_us < 0 {
+        panic("pe_native_helper_invoke FAIL [record_invoke] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(target_kind)
+        + "\t" + to_string(payload_bytes) + "\t" + to_string(elapsed_us) + "\n"
+    pnhi_append_row(pnhi_history_path(), row)
+}
+
+// ─── invoke_count: total invocation 수 ───
+fn invoke_count() -> int {
+    let t = pnhi_read_table(pnhi_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_payload_bytes: 모든 invocation payload 합 ───
+fn total_payload_bytes() -> int {
+    let t = pnhi_read_table(pnhi_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_elapsed_us: 모든 invocation elapsed 합 ───
+fn total_elapsed_us() -> int {
+    let t = pnhi_read_table(pnhi_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_target_kind: 특정 target_kind 의 invocation 수 ───
+fn count_by_target_kind(kind: int) -> int {
+    let t = pnhi_read_table(pnhi_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── invoke_elapsed: 특정 invoke_id 의 elapsed_us (없으면 0) ───
+fn invoke_elapsed(invoke_id: int) -> int {
+    let t = pnhi_read_table(pnhi_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == invoke_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pnhi_stats: [invoke_count, total_payload_bytes, count_by_target_kind(1), count_by_target_kind(2)] ───
+fn pnhi_stats() -> array {
+    let mut out = []
+    out.push(invoke_count())
+    out.push(total_payload_bytes())
+    out.push(count_by_target_kind(1))
+    out.push(count_by_target_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnhi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnhi()
+
+    // 2. record 5 invokes (deterministic synthetic)
+    record_invoke(96001, 1, 8192, 240)
+    r0_emit("pe_native_helper_invoke_record",
+        "\"invoke_id\":96001,\"target_kind\":1,\"payload_bytes\":8192,\"elapsed_us\":240,\"target\":\"mmap\"")
+
+    record_invoke(96002, 2, 256, 180)
+    r0_emit("pe_native_helper_invoke_record",
+        "\"invoke_id\":96002,\"target_kind\":2,\"payload_bytes\":256,\"elapsed_us\":180,\"target\":\"dlopen\"")
+
+    record_invoke(96003, 3, 64, 80)
+    r0_emit("pe_native_helper_invoke_record",
+        "\"invoke_id\":96003,\"target_kind\":3,\"payload_bytes\":64,\"elapsed_us\":80,\"target\":\"dlsym\"")
+
+    record_invoke(96004, 4, 1024, 320)
+    r0_emit("pe_native_helper_invoke_record",
+        "\"invoke_id\":96004,\"target_kind\":4,\"payload_bytes\":1024,\"elapsed_us\":320,\"target\":\"pthread_create\"")
+
+    record_invoke(96005, 5, 4096, 60)
+    r0_emit("pe_native_helper_invoke_record",
+        "\"invoke_id\":96005,\"target_kind\":5,\"payload_bytes\":4096,\"elapsed_us\":60,\"target\":\"mprotect\"")
+
+    // 3. invoke_count = 5
+    let c = invoke_count()
+    if c != 5 {
+        panic("pe_native_helper_invoke FAIL [invoke_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_payload_bytes = 13632
+    let tp = total_payload_bytes()
+    if tp != 13632 {
+        panic("pe_native_helper_invoke FAIL [total_payload_bytes] expected=13632 got=" + to_string(tp))
+    }
+
+    // 5. total_elapsed_us = 880
+    let te = total_elapsed_us()
+    if te != 880 {
+        panic("pe_native_helper_invoke FAIL [total_elapsed_us] expected=880 got=" + to_string(te))
+    }
+
+    // 6. count_by_target_kind sanity
+    let k1 = count_by_target_kind(1)
+    if k1 != 1 {
+        panic("pe_native_helper_invoke FAIL [count_by_target_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_target_kind(2)
+    if k2 != 1 {
+        panic("pe_native_helper_invoke FAIL [count_by_target_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_target_kind(3)
+    if k3 != 1 {
+        panic("pe_native_helper_invoke FAIL [count_by_target_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_target_kind(4)
+    if k4 != 1 {
+        panic("pe_native_helper_invoke FAIL [count_by_target_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_target_kind(5)
+    if k5 != 1 {
+        panic("pe_native_helper_invoke FAIL [count_by_target_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k8 = count_by_target_kind(8)
+    if k8 != 0 {
+        panic("pe_native_helper_invoke FAIL [count_by_target_kind(8)] expected=0 got=" + to_string(k8))
+    }
+
+    // 7. invoke_elapsed sanity
+    let e1 = invoke_elapsed(96001)
+    if e1 != 240 {
+        panic("pe_native_helper_invoke FAIL [invoke_elapsed(96001)] expected=240 got=" + to_string(e1))
+    }
+    let e5 = invoke_elapsed(96005)
+    if e5 != 60 {
+        panic("pe_native_helper_invoke FAIL [invoke_elapsed(96005)] expected=60 got=" + to_string(e5))
+    }
+    let e_miss = invoke_elapsed(9999)
+    if e_miss != 0 {
+        panic("pe_native_helper_invoke FAIL [invoke_elapsed(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 8. pnhi_stats() = [5, 13632, 1, 1]
+    let s = pnhi_stats()
+    if len(s) != 4 {
+        panic("pe_native_helper_invoke FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_native_helper_invoke FAIL [stats invoke_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 13632 {
+        panic("pe_native_helper_invoke FAIL [stats total_payload_bytes] expected=13632 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_native_helper_invoke FAIL [stats count_kind(1)] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_native_helper_invoke FAIL [stats count_kind(2)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_native_helper_invoke_stats",
+        "\"invoke_count\":" + to_string(s[0])
+        + ",\"total_payload_bytes\":" + to_string(s[1])
+        + ",\"total_elapsed_us\":" + to_string(te)
+        + ",\"kind_mmap\":" + to_string(s[2])
+        + ",\"kind_dlopen\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_native_helper_invoke FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pnhi()
+    let s2 = pnhi_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_native_helper_invoke FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_helper_invoke self_test PASS (invokes=" + to_string(s[0])
+        + ", payload=" + to_string(s[1]) + ", elapsed=" + to_string(te)
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnhi_stats()
+            println("invoke_count\t" + to_string(s[0]))
+            println("total_payload_bytes\t" + to_string(s[1]))
+            println("total_elapsed_us\t" + to_string(total_elapsed_us()))
+            println("count_kind_mmap\t" + to_string(s[2]))
+            println("count_kind_dlopen\t" + to_string(s[3]))
+            return
+        }
+        if sub == "elapsed" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("invoke_elapsed\t" + to_string(invoke_elapsed(iid)))
+                return
+            }
+            println("usage: hexa run pe_native_helper_invoke.hexa elapsed <invoke_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_target_kind\t" + to_string(count_by_target_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_native_helper_invoke.hexa count <target_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnhi()
+            println("cleaned: " + pnhi_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnhi_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_helper_invoke.hexa { self-test | stats | elapsed <invoke_id> | count <target_kind> | cleanup | dir }")
+}

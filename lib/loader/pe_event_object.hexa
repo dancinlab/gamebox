@@ -1,0 +1,407 @@
+// lib/loader/pe_event_object.hexa — cycle 71 Win32 Event → pthread_cond bridge skeleton
+//
+// Win32 Event object (CreateEvent / SetEvent / ResetEvent / PulseEvent) →
+// posix pthread_cond_t + mutex bridge. manual-reset 와 auto-reset 양쪽 지원.
+//   - manual-reset (reset_kind=1): SetEvent → 모든 waiter 깨움, ResetEvent 까지 signaled 유지
+//   - auto-reset (reset_kind=2): SetEvent → 한 waiter 만 깨움 + 자동 reset
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 event op tracker — 실 pthread_cond_init / signal / broadcast 호출 X (cycle 다음 단계).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// reset_kind code:
+//   1 = manual-reset
+//   2 = auto-reset
+//
+// op_kind code:
+//   1 = create
+//   2 = set
+//   3 = reset
+//   4 = pulse
+//
+// persist schema (TSV — ops.tsv):
+//   event_id<int> \t reset_kind<int> \t op_kind<int> \t waiters_woken<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn peo_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_event_object"
+}
+
+fn peo_ops_path() -> str {
+    return peo_dir() + "/ops.tsv"
+}
+
+fn peo_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + peo_dir() + "'")
+}
+
+fn cleanup_peo() -> void {
+    peo_ensure_dir()
+    let _ = exec("rm -f '" + peo_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn peo_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn peo_append_row(path: str, row: str) -> void {
+    peo_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: event op 1 건 기록 ───
+fn record_op(event_id: int, reset_kind: int, op_kind: int, waiters_woken: int) -> void {
+    if event_id <= 0 {
+        panic("pe_event_object FAIL [record_op] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if reset_kind < 1 {
+        panic("pe_event_object FAIL [record_op] expected=reset_kind>=1 got=" + to_string(reset_kind))
+    }
+    if reset_kind > 2 {
+        panic("pe_event_object FAIL [record_op] expected=reset_kind<=2 got=" + to_string(reset_kind))
+    }
+    if op_kind < 1 {
+        panic("pe_event_object FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_event_object FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if waiters_woken < 0 {
+        panic("pe_event_object FAIL [record_op] expected=waiters_woken>=0 got=" + to_string(waiters_woken))
+    }
+    let row = to_string(event_id) + "\t" + to_string(reset_kind)
+        + "\t" + to_string(op_kind) + "\t" + to_string(waiters_woken) + "\n"
+    peo_append_row(peo_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = peo_read_table(peo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_waiters_woken: 모든 op waiters_woken 합 ───
+fn total_waiters_woken() -> int {
+    let t = peo_read_table(peo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_reset_kind: 특정 reset_kind 의 op 수 ───
+fn count_by_reset_kind(kind: int) -> int {
+    let t = peo_read_table(peo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = peo_read_table(peo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── event_waiters_woken: 특정 event_id 의 waiters_woken 합 ───
+fn event_waiters_woken(event_id: int) -> int {
+    let t = peo_read_table(peo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == event_id {
+                    sum = sum + to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── peo_stats: [op_count, total_waiters_woken, count_by_reset_kind(2), count_by_op_kind(2)] ───
+fn peo_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_waiters_woken())
+    out.push(count_by_reset_kind(2))
+    out.push(count_by_op_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "peo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_peo()
+
+    // 2. record 6 event ops (manual + auto, ≥3 op_kinds)
+    //    event 71001 = manual-reset; event 71002 = auto-reset
+    record_op(71001, 1, 1, 0)
+    r0_emit("pe_event_object_record",
+        "\"event_id\":71001,\"reset_kind\":1,\"op_kind\":1,\"waiters_woken\":0,\"target\":\"create_manual\"")
+
+    record_op(71001, 1, 2, 5)
+    r0_emit("pe_event_object_record",
+        "\"event_id\":71001,\"reset_kind\":1,\"op_kind\":2,\"waiters_woken\":5,\"target\":\"set_manual\"")
+
+    record_op(71001, 1, 3, 0)
+    r0_emit("pe_event_object_record",
+        "\"event_id\":71001,\"reset_kind\":1,\"op_kind\":3,\"waiters_woken\":0,\"target\":\"reset_manual\"")
+
+    record_op(71002, 2, 1, 0)
+    r0_emit("pe_event_object_record",
+        "\"event_id\":71002,\"reset_kind\":2,\"op_kind\":1,\"waiters_woken\":0,\"target\":\"create_auto\"")
+
+    record_op(71002, 2, 2, 1)
+    r0_emit("pe_event_object_record",
+        "\"event_id\":71002,\"reset_kind\":2,\"op_kind\":2,\"waiters_woken\":1,\"target\":\"set_auto\"")
+
+    record_op(71002, 2, 4, 1)
+    r0_emit("pe_event_object_record",
+        "\"event_id\":71002,\"reset_kind\":2,\"op_kind\":4,\"waiters_woken\":1,\"target\":\"pulse_auto\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_event_object FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_waiters_woken = 5+1+1 = 7
+    let tw = total_waiters_woken()
+    if tw != 7 {
+        panic("pe_event_object FAIL [total_waiters_woken] expected=7 got=" + to_string(tw))
+    }
+
+    // 5. count_by_reset_kind sanity
+    let r1 = count_by_reset_kind(1)
+    if r1 != 3 {
+        panic("pe_event_object FAIL [count_by_reset_kind(1)] expected=3 got=" + to_string(r1))
+    }
+    let r2 = count_by_reset_kind(2)
+    if r2 != 3 {
+        panic("pe_event_object FAIL [count_by_reset_kind(2)] expected=3 got=" + to_string(r2))
+    }
+    let r99 = count_by_reset_kind(99)
+    if r99 != 0 {
+        panic("pe_event_object FAIL [count_by_reset_kind(99)] expected=0 got=" + to_string(r99))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_event_object FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_event_object FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_event_object FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_event_object FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_event_object FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. event_waiters_woken sanity
+    let w1 = event_waiters_woken(71001)
+    if w1 != 5 {
+        panic("pe_event_object FAIL [event_waiters_woken(71001)] expected=5 got=" + to_string(w1))
+    }
+    let w2 = event_waiters_woken(71002)
+    if w2 != 2 {
+        panic("pe_event_object FAIL [event_waiters_woken(71002)] expected=2 got=" + to_string(w2))
+    }
+    let w_miss = event_waiters_woken(9999)
+    if w_miss != 0 {
+        panic("pe_event_object FAIL [event_waiters_woken(9999)] expected=0 got=" + to_string(w_miss))
+    }
+
+    // 8. peo_stats() = [6, 7, 3, 2]
+    let s = peo_stats()
+    if len(s) != 4 {
+        panic("pe_event_object FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_event_object FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 7 {
+        panic("pe_event_object FAIL [stats total_waiters_woken] expected=7 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_event_object FAIL [stats count_reset(2)] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_event_object FAIL [stats count_op(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_event_object_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_waiters_woken\":" + to_string(s[1])
+        + ",\"count_reset_auto\":" + to_string(s[2])
+        + ",\"count_op_set\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_event_object FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_peo()
+    let s2 = peo_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_event_object FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_event_object self_test PASS (ops=" + to_string(s[0])
+        + ", waiters=" + to_string(s[1]) + ", auto=" + to_string(s[2])
+        + ", set=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = peo_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_waiters_woken\t" + to_string(s[1]))
+            println("count_reset_auto\t" + to_string(s[2]))
+            println("count_op_set\t" + to_string(s[3]))
+            return
+        }
+        if sub == "waiters" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println("event_waiters_woken\t" + to_string(event_waiters_woken(eid)))
+                return
+            }
+            println("usage: hexa run pe_event_object.hexa waiters <event_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_event_object.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_peo()
+            println("cleaned: " + peo_dir())
+            return
+        }
+        if sub == "dir" {
+            println(peo_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_event_object.hexa { self-test | stats | waiters <event_id> | count <op_kind> | cleanup | dir }")
+}

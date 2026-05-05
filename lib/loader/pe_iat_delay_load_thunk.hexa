@@ -1,0 +1,448 @@
+// lib/loader/pe_iat_delay_load_thunk.hexa — cycle 81 R3 phase 2 IAT delay-load thunk
+//
+// IMAGE_DELAYLOAD_DESCRIPTOR thunk lifecycle (5 phases):
+//   1. first_call_trampoline: __delayLoadHelper2 hook (compiler-emitted thunk stub)
+//   2. load_helper_invoke: LoadLibrary(DLL) — DLL 첫 매핑 또는 cached LDR_MODULE
+//   3. resolve_addr: GetProcAddress(handle, name) → function pointer
+//   4. patch_iat: caller IAT slot 에 absolute addr 쓰기 (다음 호출은 trampoline 우회)
+//   5. unload_helper: __FUnloadDelayLoadedDLL2 (선택적, 실 unload 제어)
+//   Bound IAT timestamp mismatch 시 normal resolve fallback (cycle 80 pe_iat_forwarder_chain_real cross-ref)
+// own1: PE delayload spec (Microsoft) + Apple Foundation. Wine delayload.c 인용 X
+//
+// own 2 mandate:
+//   - r0_emit ≥ 6 (5 record_thunk + 1 stats summary)
+//   - fn self_test() + main() dispatch
+//   - headless (exec/cat/test/mkdir/rm only)
+//   - panic("pe_iat_delay_load_thunk FAIL [<sub>] expected=X got=Y")
+//
+// persist schema (TSV — thunks.tsv):
+//   thunk_id<int> \t phase_kind<int> \t dll_loaded<int> \t unload_pending<int>
+//
+// phase_kind code:
+//   1 = first_call_trampoline
+//   2 = load_helper_invoke
+//   3 = resolve_addr
+//   4 = patch_iat
+//   5 = unload_helper
+//
+// cross-ref: cycle 62 pe_delay_load_imports.hexa (descriptor table aggregator).
+// 본 module 은 individual thunk lifecycle tracker — 실 LoadLibrary / GetProcAddress
+// 호출 X (stage real native dispatch).
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pidlt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_iat_delay_load_thunk"
+}
+
+fn pidlt_thunks_path() -> str {
+    return pidlt_dir() + "/thunks.tsv"
+}
+
+fn pidlt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pidlt_dir() + "'")
+}
+
+fn cleanup_pidlt() -> void {
+    pidlt_ensure_dir()
+    let _ = exec("rm -f '" + pidlt_thunks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pidlt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pidlt_append_row(path: str, row: str) -> void {
+    pidlt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_thunk: thunk 1 건 기록 ───
+fn record_thunk(thunk_id: int, phase_kind: int, dll_loaded: int, unload_pending: int) -> void {
+    if thunk_id <= 0 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 5 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=phase_kind<=5 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if unload_pending < 0 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=unload_pending>=0 got=" + to_string(unload_pending))
+    }
+    if unload_pending > 1 {
+        panic("pe_iat_delay_load_thunk FAIL [record_thunk] expected=unload_pending<=1 got=" + to_string(unload_pending))
+    }
+    let row = to_string(thunk_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(unload_pending) + "\n"
+    pidlt_append_row(pidlt_thunks_path(), row)
+}
+
+// ─── thunk_count: total thunk row 수 ───
+fn thunk_count() -> int {
+    let t = pidlt_read_table(pidlt_thunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 thunk 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pidlt_read_table(pidlt_thunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded == 1 인 thunk 수 ───
+fn loaded_count() -> int {
+    let t = pidlt_read_table(pidlt_thunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── unload_pending_count: unload_pending == 1 인 thunk 수 ───
+fn unload_pending_count() -> int {
+    let t = pidlt_read_table(pidlt_thunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── complete_count: phase_kind == 4 (patch_iat) AND dll_loaded == 1 ───
+fn complete_count() -> int {
+    let t = pidlt_read_table(pidlt_thunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == 4 {
+                    if to_int(parts[2]) == 1 {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── thunk_dll_loaded: 특정 thunk_id 의 dll_loaded 값 (없으면 0) ───
+fn thunk_dll_loaded(thunk_id: int) -> int {
+    let t = pidlt_read_table(pidlt_thunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == thunk_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pidlt_stats: [thunk_count, loaded_count, unload_pending_count, complete_count] ───
+fn pidlt_stats() -> array {
+    let mut out = []
+    out.push(thunk_count())
+    out.push(loaded_count())
+    out.push(unload_pending_count())
+    out.push(complete_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pidlt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pidlt()
+
+    // 2. record 5 thunks covering all 5 phase_kinds
+    //    delay-load lifecycle for CRYPT32!CryptStringToBinaryW (Battle.net)
+    //      thunk 810001: first_call_trampoline (DLL not yet loaded)
+    //      thunk 810002: load_helper_invoke (LoadLibrary success → dll_loaded=1)
+    //      thunk 810003: resolve_addr (GetProcAddress, dll_loaded=1)
+    //      thunk 810004: patch_iat (IAT slot patched, dll_loaded=1) ← complete
+    //      thunk 810005: unload_helper (FUnloadDelayLoadedDLL2 pending)
+    record_thunk(810001, 1, 0, 0)
+    r0_emit("pe_iat_delay_load_thunk_record",
+        "\"thunk_id\":810001,\"phase_kind\":1,\"dll_loaded\":0,\"unload_pending\":0,\"target\":\"first_call_trampoline\"")
+
+    record_thunk(810002, 2, 1, 0)
+    r0_emit("pe_iat_delay_load_thunk_record",
+        "\"thunk_id\":810002,\"phase_kind\":2,\"dll_loaded\":1,\"unload_pending\":0,\"target\":\"load_helper_invoke\"")
+
+    record_thunk(810003, 3, 1, 0)
+    r0_emit("pe_iat_delay_load_thunk_record",
+        "\"thunk_id\":810003,\"phase_kind\":3,\"dll_loaded\":1,\"unload_pending\":0,\"target\":\"resolve_addr\"")
+
+    record_thunk(810004, 4, 1, 0)
+    r0_emit("pe_iat_delay_load_thunk_record",
+        "\"thunk_id\":810004,\"phase_kind\":4,\"dll_loaded\":1,\"unload_pending\":0,\"target\":\"patch_iat\"")
+
+    record_thunk(810005, 5, 1, 1)
+    r0_emit("pe_iat_delay_load_thunk_record",
+        "\"thunk_id\":810005,\"phase_kind\":5,\"dll_loaded\":1,\"unload_pending\":1,\"target\":\"unload_helper\"")
+
+    // 3. thunk_count = 5
+    let c = thunk_count()
+    if c != 5 {
+        panic("pe_iat_delay_load_thunk FAIL [thunk_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity (1 each)
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_iat_delay_load_thunk FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (810002, 810003, 810004, 810005)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_iat_delay_load_thunk FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. unload_pending_count = 1 (810005)
+    let upc = unload_pending_count()
+    if upc != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [unload_pending_count] expected=1 got=" + to_string(upc))
+    }
+
+    // 7. complete_count = 1 (810004 — patch_iat AND dll_loaded=1)
+    let cc = complete_count()
+    if cc != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [complete_count] expected=1 got=" + to_string(cc))
+    }
+
+    // 8. thunk_dll_loaded sanity
+    let dl1 = thunk_dll_loaded(810001)
+    if dl1 != 0 {
+        panic("pe_iat_delay_load_thunk FAIL [thunk_dll_loaded(810001)] expected=0 got=" + to_string(dl1))
+    }
+    let dl4 = thunk_dll_loaded(810004)
+    if dl4 != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [thunk_dll_loaded(810004)] expected=1 got=" + to_string(dl4))
+    }
+    let dl_miss = thunk_dll_loaded(9999)
+    if dl_miss != 0 {
+        panic("pe_iat_delay_load_thunk FAIL [thunk_dll_loaded(9999)] expected=0 got=" + to_string(dl_miss))
+    }
+
+    // 9. pidlt_stats() = [5, 4, 1, 1]
+    let s = pidlt_stats()
+    if len(s) != 4 {
+        panic("pe_iat_delay_load_thunk FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_iat_delay_load_thunk FAIL [stats thunk_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_iat_delay_load_thunk FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [stats unload_pending_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_iat_delay_load_thunk FAIL [stats complete_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats summary
+    r0_emit("pe_iat_delay_load_thunk_stats",
+        "\"thunk_count\":" + to_string(s[0])
+        + ",\"loaded\":" + to_string(s[1])
+        + ",\"unload_pending\":" + to_string(s[2])
+        + ",\"complete\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_iat_delay_load_thunk FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pidlt()
+    let s2 = pidlt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_iat_delay_load_thunk FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_iat_delay_load_thunk self_test PASS (thunks=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", unload_pending=" + to_string(s[2])
+        + ", complete=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pidlt_stats()
+            println("thunk_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("unload_pending_count\t" + to_string(s[2]))
+            println("complete_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "loaded" {
+            if len(a) >= 4 {
+                let tid = to_int(a[3])
+                println("thunk_dll_loaded\t" + to_string(thunk_dll_loaded(tid)))
+                return
+            }
+            println("usage: hexa run pe_iat_delay_load_thunk.hexa loaded <thunk_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_iat_delay_load_thunk.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pidlt()
+            println("cleaned: " + pidlt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pidlt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_iat_delay_load_thunk.hexa { self-test | stats | loaded <thunk_id> | count <phase_kind> | cleanup | dir }")
+}

@@ -1,0 +1,438 @@
+// lib/loader/pe_dcomp_core.hexa — DCOMP.dll DirectComposition window composition + animation (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine dcomp source 인용 0.
+//       dcomp.dll 직접 binding 0. macOS CoreAnimation CALayer / CAMetalLayer / CAAnimation /
+//       CATransform3D / CATransaction / CAMediaTimingFunction / NSAnimationContext 직접 binding 0.
+//       NOTE: DCOMP 측 IDCompositionDevice ↔ IDCompositionTarget ↔ IDCompositionVisual 측
+//       window composition tree pattern + IDCompositionAnimation cubic bezier
+//       round-trip baseline (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BL3 — DCOMP DirectComposition surface 11 fn skeleton-tier (device/visual/animation).
+// cycle 57 374/435 (~85.98%) → cycle 58 ~385/435 (~88.51%) (+11 fn, BL bundled part 3/4).
+//
+// 대상 fn (11 fn — 3 group, fn_kind 0..10):
+//   DEVICE      (4): DCompositionCreateDevice(0) /
+//                    IDCompositionDevice_CreateTargetForHwnd(1) /
+//                    IDCompositionDevice_CreateVisual(2) /
+//                    IDCompositionDevice_Commit(3)
+//   VISUAL      (4): IDCompositionVisual_SetContent(4) /
+//                    IDCompositionVisual_SetTransform(5) /
+//                    IDCompositionVisual_AddVisual(6) /
+//                    IDCompositionVisual_SetEffect(7)
+//   ANIMATION   (3): IDCompositionAnimation_AddCubic(8) /
+//                    IDCompositionAnimation_Reset(9) /
+//                    IDCompositionDevice_CreateAnimation(10)
+//
+// synthetic struct families:
+//   IDCompositionDevice 0xF0010100 / IDCompositionTarget 0xF0020100 /
+//   IDCompositionVisual 0xF0030100 / IDCompositionAnimation 0xF0040100 opaque (synthetic).
+//   D2D_MATRIX_3X2_F 24B identity 1_0_0_1_0_0 + scale_2x_0_0_2_0_0 + translate_0_0_1_1_100_50.
+//   DCOMPOSITION_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR_0 + LINEAR_1.
+//   DCOMPOSITION_FRAME_STATISTICS 80B currentTime synthetic_qpc.
+//   IDCompositionEffect synth (gaussian blur stdDeviation 8.0 / drop shadow offset 4_4).
+//   Cubic bezier polynomial constantCoefficient 0.0 linearCoefficient 1.0
+//                          quadraticCoefficient 0.0 cubicCoefficient 0.0 → linear ramp.
+//
+// persist schema (TSV — 4 table):
+//   syscall_invoke / device_event / visual_event / animation_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn put_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_dcomp_core"
+}
+
+fn put_syscall_invoke_path() -> str {
+    return put_dir() + "/syscall_invoke.tsv"
+}
+
+fn put_device_event_path() -> str {
+    return put_dir() + "/device_event.tsv"
+}
+
+fn put_visual_event_path() -> str {
+    return put_dir() + "/visual_event.tsv"
+}
+
+fn put_animation_event_path() -> str {
+    return put_dir() + "/animation_event.tsv"
+}
+
+fn put_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + put_dir() + "'")
+}
+
+fn cleanup_put() -> void {
+    put_ensure_dir()
+    let _ = exec("rm -f '" + put_syscall_invoke_path() + "' '" + put_device_event_path()
+        + "' '" + put_visual_event_path() + "' '" + put_animation_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn put_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn put_append_row(path: str, row: str) -> void {
+    put_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn put_count_rows(path: str, min_cols: int) -> int {
+    let t = put_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (11 fn coverage, fn_kind 0..10) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "DCompositionCreateDevice" }
+    if k == 1 { return "IDCompositionDevice_CreateTargetForHwnd" }
+    if k == 2 { return "IDCompositionDevice_CreateVisual" }
+    if k == 3 { return "IDCompositionDevice_Commit" }
+    if k == 4 { return "IDCompositionVisual_SetContent" }
+    if k == 5 { return "IDCompositionVisual_SetTransform" }
+    if k == 6 { return "IDCompositionVisual_AddVisual" }
+    if k == 7 { return "IDCompositionVisual_SetEffect" }
+    if k == 8 { return "IDCompositionAnimation_AddCubic" }
+    if k == 9 { return "IDCompositionAnimation_Reset" }
+    if k == 10 { return "IDCompositionDevice_CreateAnimation" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (3 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "device"
+        }
+    }
+    if k >= 4 {
+        if k <= 7 {
+            return "visual"
+        }
+    }
+    if k >= 8 {
+        if k <= 10 {
+            return "animation"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: DCOMP fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_dcomp_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_dcomp_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 10 {
+        panic("pe_dcomp_core FAIL [record_syscall_invoke] expected=fn_kind<=10 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_dcomp_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_dcomp_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    put_append_row(put_syscall_invoke_path(), row)
+}
+
+// ─── record_device_event: DCompositionCreateDevice/CreateTargetForHwnd/CreateVisual/Commit row ───
+fn record_device_event(evt_id: int, d_kind: str, dev_synth: str, target_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_dcomp_core FAIL [record_device_event] evt_id<=0") }
+    if d_kind == "" { panic("pe_dcomp_core FAIL [record_device_event] d_kind=empty") }
+    if dev_synth == "" { panic("pe_dcomp_core FAIL [record_device_event] dev_synth=empty") }
+    if target_synth == "" { panic("pe_dcomp_core FAIL [record_device_event] target_synth=empty") }
+    if status == "" { panic("pe_dcomp_core FAIL [record_device_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + d_kind + "\t" + dev_synth + "\t" + target_synth + "\t" + status + "\n"
+    put_append_row(put_device_event_path(), row)
+}
+
+// ─── record_visual_event: SetContent/SetTransform/AddVisual/SetEffect row ───
+fn record_visual_event(evt_id: int, v_kind: str, visual_synth: str, transform_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_dcomp_core FAIL [record_visual_event] evt_id<=0") }
+    if v_kind == "" { panic("pe_dcomp_core FAIL [record_visual_event] v_kind=empty") }
+    if visual_synth == "" { panic("pe_dcomp_core FAIL [record_visual_event] visual_synth=empty") }
+    if transform_synth == "" { panic("pe_dcomp_core FAIL [record_visual_event] transform_synth=empty") }
+    if status == "" { panic("pe_dcomp_core FAIL [record_visual_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + v_kind + "\t" + visual_synth + "\t" + transform_synth + "\t" + status + "\n"
+    put_append_row(put_visual_event_path(), row)
+}
+
+// ─── record_animation_event: AddCubic/Reset/CreateAnimation row ───
+fn record_animation_event(evt_id: int, a_kind: str, anim_synth: str, curve_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_dcomp_core FAIL [record_animation_event] evt_id<=0") }
+    if a_kind == "" { panic("pe_dcomp_core FAIL [record_animation_event] a_kind=empty") }
+    if anim_synth == "" { panic("pe_dcomp_core FAIL [record_animation_event] anim_synth=empty") }
+    if curve_synth == "" { panic("pe_dcomp_core FAIL [record_animation_event] curve_synth=empty") }
+    if status == "" { panic("pe_dcomp_core FAIL [record_animation_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + a_kind + "\t" + anim_synth + "\t" + curve_synth + "\t" + status + "\n"
+    put_append_row(put_animation_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return put_count_rows(put_syscall_invoke_path(), 4)
+}
+
+fn device_event_count() -> int {
+    return put_count_rows(put_device_event_path(), 5)
+}
+
+fn visual_event_count() -> int {
+    return put_count_rows(put_visual_event_path(), 5)
+}
+
+fn animation_event_count() -> int {
+    return put_count_rows(put_animation_event_path(), 5)
+}
+
+fn put_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(device_event_count())
+    out.push(visual_event_count())
+    out.push(animation_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "put-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_put()
+
+    // ─── 1. syscall_invoke × 11 (one per fn, 3 group coverage) ───
+    //   DEVICE group (4)
+    record_syscall_invoke(1, 0, "DCompositionCreateDevice", "PARTIAL")
+    println("__DCOMP__ PARTIAL DCompositionCreateDevice")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"DCompositionCreateDevice\",\"fn_group\":\"device\",\"status\":\"PARTIAL\",\"dxgiDevice\":\"0xE0050100_IDXGIDevice_synth\",\"iid\":\"IID_IDCompositionDevice\",\"out_dcompositionDevice\":\"0xF0010100_IDCompositionDevice\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(2, 1, "IDCompositionDevice_CreateTargetForHwnd", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionDevice_CreateTargetForHwnd")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"IDCompositionDevice_CreateTargetForHwnd\",\"fn_group\":\"device\",\"status\":\"PARTIAL\",\"this\":\"0xF0010100\",\"hwnd\":\"0xA0020100_HWND_d2r_d4_launcher\",\"topmost\":\"TRUE_1\",\"out_target\":\"0xF0020100_IDCompositionTarget\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(3, 2, "IDCompositionDevice_CreateVisual", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionDevice_CreateVisual")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"IDCompositionDevice_CreateVisual\",\"fn_group\":\"device\",\"status\":\"PARTIAL\",\"this\":\"0xF0010100\",\"out_visual\":\"0xF0030100_IDCompositionVisual\",\"battle_net_root_visual\":true,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(4, 3, "IDCompositionDevice_Commit", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionDevice_Commit")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"IDCompositionDevice_Commit\",\"fn_group\":\"device\",\"status\":\"PARTIAL\",\"this\":\"0xF0010100\",\"return_hresult\":\"S_OK_0\",\"composition_tree_committed\":true,\"frame_present_synth\":\"qpc_synth_60Hz\"")
+
+    //   VISUAL group (4)
+    record_syscall_invoke(5, 4, "IDCompositionVisual_SetContent", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionVisual_SetContent")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"IDCompositionVisual_SetContent\",\"fn_group\":\"visual\",\"status\":\"PARTIAL\",\"this\":\"0xF0030100\",\"content\":\"0xE0060100_IDXGISwapChain1_synth\",\"d4_d3d12_swapchain_baseline\":true,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(6, 5, "IDCompositionVisual_SetTransform", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionVisual_SetTransform")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"IDCompositionVisual_SetTransform\",\"fn_group\":\"visual\",\"status\":\"PARTIAL\",\"this\":\"0xF0030100\",\"matrix\":\"D2D_MATRIX_3X2_F_24B_translate_0_0_1_1_100_50\",\"struct_bytes\":24,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(7, 6, "IDCompositionVisual_AddVisual", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionVisual_AddVisual")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"IDCompositionVisual_AddVisual\",\"fn_group\":\"visual\",\"status\":\"PARTIAL\",\"this\":\"0xF0030100_root\",\"visual\":\"0xF0030200_child_avatar_overlay\",\"insertAbove\":\"FALSE_0\",\"referenceVisual\":0,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(8, 7, "IDCompositionVisual_SetEffect", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionVisual_SetEffect")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"IDCompositionVisual_SetEffect\",\"fn_group\":\"visual\",\"status\":\"PARTIAL\",\"this\":\"0xF0030100\",\"effect\":\"0xF0050100_IDCompositionEffect_gaussian_blur\",\"stdDeviation\":8.0,\"return_hresult\":\"S_OK_0\"")
+
+    //   ANIMATION group (3)
+    record_syscall_invoke(9, 8, "IDCompositionAnimation_AddCubic", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionAnimation_AddCubic")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"IDCompositionAnimation_AddCubic\",\"fn_group\":\"animation\",\"status\":\"PARTIAL\",\"this\":\"0xF0040100\",\"beginOffset\":0.0,\"constantCoefficient\":0.0,\"linearCoefficient\":1.0,\"quadraticCoefficient\":0.0,\"cubicCoefficient\":0.0,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(10, 9, "IDCompositionAnimation_Reset", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionAnimation_Reset")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"IDCompositionAnimation_Reset\",\"fn_group\":\"animation\",\"status\":\"PARTIAL\",\"this\":\"0xF0040100\",\"return_hresult\":\"S_OK_0\",\"animation_state\":\"reset_clean\"")
+    record_syscall_invoke(11, 10, "IDCompositionDevice_CreateAnimation", "PARTIAL")
+    println("__DCOMP__ PARTIAL IDCompositionDevice_CreateAnimation")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"IDCompositionDevice_CreateAnimation\",\"fn_group\":\"animation\",\"status\":\"PARTIAL\",\"this\":\"0xF0010100\",\"out_animation\":\"0xF0040100_IDCompositionAnimation\",\"return_hresult\":\"S_OK_0\"")
+
+    // ─── 2. device_event × 4 (create_device/target_hwnd/create_visual/commit) ───
+    record_device_event(1, "create_device_dxgi", "0xF0010100_IDCompositionDevice", "0xE0050100_IDXGIDevice", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"device_event\",\"evt_id\":1,\"d_kind\":\"create_device_dxgi\",\"dev_synth\":\"0xF0010100_IDCompositionDevice\",\"target_synth\":\"0xE0050100_IDXGIDevice\",\"return_hresult\":\"S_OK_0\",\"d4_d3d12_compositor_baseline\":true,\"status\":\"PARTIAL\"")
+    record_device_event(2, "target_for_hwnd_d2r_d4_launcher", "0xF0020100_IDCompositionTarget", "0xA0020100_HWND_d2r_d4_launcher", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"device_event\",\"evt_id\":2,\"d_kind\":\"target_for_hwnd_d2r_d4_launcher\",\"dev_synth\":\"0xF0020100_IDCompositionTarget\",\"target_synth\":\"0xA0020100_HWND_d2r_d4_launcher\",\"topmost\":\"TRUE_1\",\"d2r_d4_launcher_window_baseline\":true,\"status\":\"PARTIAL\"")
+    record_device_event(3, "create_root_visual_battle_net", "0xF0030100_root_visual", "battle_net_overlay_root", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"device_event\",\"evt_id\":3,\"d_kind\":\"create_root_visual_battle_net\",\"dev_synth\":\"0xF0030100_root_visual\",\"target_synth\":\"battle_net_overlay_root\",\"battle_net_overlay_baseline\":true,\"status\":\"PARTIAL\"")
+    record_device_event(4, "commit_60hz_present", "0xF0010100", "qpc_synth_60Hz_frame", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"device_event\",\"evt_id\":4,\"d_kind\":\"commit_60hz_present\",\"dev_synth\":\"0xF0010100\",\"target_synth\":\"qpc_synth_60Hz_frame\",\"composition_tree_committed\":true,\"frame_statistics_synth\":\"DCOMPOSITION_FRAME_STATISTICS_80B\",\"status\":\"PARTIAL\"")
+
+    // ─── 3. visual_event × 4 (set_content/set_transform/add_visual/set_effect) ───
+    record_visual_event(1, "set_content_d4_swapchain", "0xF0030100_root", "0xE0060100_IDXGISwapChain1_synth", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"visual_event\",\"evt_id\":1,\"v_kind\":\"set_content_d4_swapchain\",\"visual_synth\":\"0xF0030100_root\",\"transform_synth\":\"0xE0060100_IDXGISwapChain1_synth\",\"d4_d3d12_swapchain_baseline\":true,\"status\":\"PARTIAL\"")
+    record_visual_event(2, "set_transform_translate_100_50", "0xF0030200_child", "D2D_MATRIX_3X2_F_24B_1_0_0_1_100_50", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"visual_event\",\"evt_id\":2,\"v_kind\":\"set_transform_translate_100_50\",\"visual_synth\":\"0xF0030200_child\",\"transform_synth\":\"D2D_MATRIX_3X2_F_24B_1_0_0_1_100_50\",\"struct_bytes\":24,\"status\":\"PARTIAL\"")
+    record_visual_event(3, "add_visual_avatar_overlay", "0xF0030100_root", "0xF0030200_child_avatar_overlay", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"visual_event\",\"evt_id\":3,\"v_kind\":\"add_visual_avatar_overlay\",\"visual_synth\":\"0xF0030100_root\",\"transform_synth\":\"0xF0030200_child_avatar_overlay\",\"battle_net_avatar_overlay_baseline\":true,\"status\":\"PARTIAL\"")
+    record_visual_event(4, "set_effect_gaussian_blur_8", "0xF0030100_root", "0xF0050100_IDCompositionEffect_gaussian_blur_stdDev_8", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"visual_event\",\"evt_id\":4,\"v_kind\":\"set_effect_gaussian_blur_8\",\"visual_synth\":\"0xF0030100_root\",\"transform_synth\":\"0xF0050100_IDCompositionEffect_gaussian_blur_stdDev_8\",\"stdDeviation\":8.0,\"battle_net_blur_dialog_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── 4. animation_event × 3 (cubic/reset/create) ───
+    record_animation_event(1, "cubic_linear_ramp", "0xF0040100_anim", "constantC_0_linearC_1_quadC_0_cubicC_0_linear_ramp", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"animation_event\",\"evt_id\":1,\"a_kind\":\"cubic_linear_ramp\",\"anim_synth\":\"0xF0040100_anim\",\"curve_synth\":\"constantC_0_linearC_1_quadC_0_cubicC_0_linear_ramp\",\"beginOffset\":0.0,\"d4_fade_in_baseline\":true,\"status\":\"PARTIAL\"")
+    record_animation_event(2, "reset_clean_state", "0xF0040100_anim", "all_segments_cleared", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"animation_event\",\"evt_id\":2,\"a_kind\":\"reset_clean_state\",\"anim_synth\":\"0xF0040100_anim\",\"curve_synth\":\"all_segments_cleared\",\"animation_state\":\"reset_clean\",\"status\":\"PARTIAL\"")
+    record_animation_event(3, "create_animation_d2r_overlay_alpha", "0xF0040100_IDCompositionAnimation", "alpha_0_to_1_over_500ms", "PARTIAL")
+    r0_emit("pe_dcomp_core_record", "\"kind\":\"animation_event\",\"evt_id\":3,\"a_kind\":\"create_animation_d2r_overlay_alpha\",\"anim_synth\":\"0xF0040100_IDCompositionAnimation\",\"curve_synth\":\"alpha_0_to_1_over_500ms\",\"d2r_overlay_alpha_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 11 {
+        panic("pe_dcomp_core FAIL [syscall_invoke_count] expected=11 got=" + to_string(si))
+    }
+    let de = device_event_count()
+    if de != 4 {
+        panic("pe_dcomp_core FAIL [device_event_count] expected=4 got=" + to_string(de))
+    }
+    let ve = visual_event_count()
+    if ve != 4 {
+        panic("pe_dcomp_core FAIL [visual_event_count] expected=4 got=" + to_string(ve))
+    }
+    let ae = animation_event_count()
+    if ae != 3 {
+        panic("pe_dcomp_core FAIL [animation_event_count] expected=3 got=" + to_string(ae))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "DCompositionCreateDevice" { panic("pe_dcomp_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "IDCompositionDevice_CreateVisual" { panic("pe_dcomp_core FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "IDCompositionVisual_SetContent" { panic("pe_dcomp_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(8) != "IDCompositionAnimation_AddCubic" { panic("pe_dcomp_core FAIL [fn_kind_name(8)]") }
+    if fn_kind_name(10) != "IDCompositionDevice_CreateAnimation" { panic("pe_dcomp_core FAIL [fn_kind_name(10)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_dcomp_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "device" { panic("pe_dcomp_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "visual" { panic("pe_dcomp_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(8) != "animation" { panic("pe_dcomp_core FAIL [fn_group_name(8)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_dcomp_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = put_stats()
+    if len(s) != 4 { panic("pe_dcomp_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 11 { panic("pe_dcomp_core FAIL [stats syscall_invoke_count] expected=11 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_dcomp_core FAIL [stats device_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_dcomp_core FAIL [stats visual_event_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_dcomp_core FAIL [stats animation_event_count] expected=3 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_dcomp_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"device_event_count\":" + to_string(s[1])
+        + ",\"visual_event_count\":" + to_string(s[2])
+        + ",\"animation_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_dcomp_core_summary",
+        "\"target\":\"DCOMP.dll\",\"fn_total\":11,\"fn_emit_partial\":11,\"groups\":[\"device\",\"visual\",\"animation\"],\"device_synth\":\"0xF0010100\",\"target_synth\":\"0xF0020100\",\"visual_synth\":\"0xF0030100\",\"animation_synth\":\"0xF0040100\",\"d2d_matrix_3x2_bytes\":24,\"frame_statistics_bytes\":80,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_dcomp_core_kpi",
+        "\"device_emits\":4,\"visual_emits\":4,\"animation_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"d2r_d4_launcher_compositor_baseline\":true,\"battle_net_overlay_baseline\":true,\"battle_net_blur_dialog_baseline\":true,\"calayer_cametallayer_binding\":false,\"caanimation_camediatimingfunction_binding\":false")
+
+    // ─── cycle 57 → 58 DCOMP coverage progression evidence emit ───
+    r0_emit("pe_dcomp_core_coverage_progression",
+        "\"surface\":\"DCOMP_full_435_fn\",\"cycle_57_count\":374,\"cycle_58_count\":385,\"delta\":11,\"cycle_57_percent\":85.98,\"cycle_58_percent\":88.51,\"cycle_58_module\":\"pe_dcomp_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bl3_cycle_increment\":11,\"track_bl_bundled_part_3_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_dcomp_core_round_trip_matrix",
+        "\"surface\":\"DCOMP_core_11_fn\",\"fn_partial\":11,\"fn_groups\":3,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.2\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real DCompositionCreateDevice + IDCompositionVisual::SetContent + IDCompositionAnimation::AddCubic = CALayer init + CAMetalLayer setContents + CAAnimation CABasicAnimation + CAMediaTimingFunction functionWithControlPoints + CATransaction begin/commit bridge pending separate cycle (long-horizon window composition pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BL3 expansion emit (cycle 58, DCOMP +11 fn) ───
+    r0_emit("pe_dcomp_core_bl3_expansion",
+        "\"track\":\"BL3\",\"cycle\":58,\"surface\":\"DCOMP_new\",\"new_fn\":11,\"groups\":[\"device\",\"visual\",\"animation\"],\"device_count\":4,\"visual_count\":4,\"animation_count\":3,\"emit_format\":\"__DCOMP__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_2_evidence_augment\":true,\"track_bl_bundled_part_3_of_4\":true,\"window_composition_animation_family\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_dcomp_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_put()
+    let s2 = put_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_dcomp_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_dcomp_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", device_event=" + to_string(s[1])
+        + ", visual_event=" + to_string(s[2]) + ", animation_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = put_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("device_event_count\t" + to_string(s[1]))
+            println("visual_event_count\t" + to_string(s[2]))
+            println("animation_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_dcomp_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_dcomp_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_put()
+            println("cleaned: " + put_dir())
+            return
+        }
+        if sub == "dir" {
+            println(put_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_dcomp_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

@@ -1,0 +1,339 @@
+// lib/loader/pe_seh_stage2.hexa — stage2 SEH (Structured Exception Handling) skeleton
+//
+// i386: FS:[0] linked-list of EXCEPTION_REGISTRATION_RECORD. x86_64: PDATA
+// table-based unwind. 본 파일은 architecture × frame_count 추적.
+//
+// 참조 only — Microsoft 공식 SEH spec:
+//   - i386 SEH (FS:[0] chain):
+//       https://learn.microsoft.com/en-us/windows/win32/debug/structured-exception-handling
+//   - x86_64 PDATA / table-based unwind (RUNTIME_FUNCTION):
+//       https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
+//
+// own 1: Wine / community SEH 구현 0 줄. 자체 spec 기반 record-only stub.
+// own 2: r0_emit ≥ 4 + headless + awk only (no shasum/git/openssl) +
+//        reserved keyword `type`/`mod`/`resume`/`handle` 회피 (`arch` OK).
+// panic format: "pe_seh_stage2 FAIL [<sub>] expected=X got=Y".
+//
+// arch encoding:
+//   1 = i386     (FS:[0] linked-list of EXCEPTION_REGISTRATION_RECORD; per-frame)
+//   2 = x86_64   (PDATA table-based unwind; RUNTIME_FUNCTION entries × N bytes)
+//
+// Schema (TSV): pe_id<int> \t arch<int> \t frame_count<int> \t table_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist dir ───
+fn psehs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_seh_stage2"
+}
+
+fn psehs_table_path() -> str {
+    return psehs_dir() + "/seh_records.tsv"
+}
+
+fn ensure_psehs_dir() -> void {
+    let _ = exec("mkdir -p '" + psehs_dir() + "'")
+}
+
+fn cleanup_psehs() -> void {
+    ensure_psehs_dir()
+    let _ = exec("rm -f '" + psehs_table_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psehs_read_table() -> str {
+    let path = psehs_table_path()
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psehs_append_row(row: str) -> void {
+    ensure_psehs_dir()
+    let tmp = psehs_table_path() + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + psehs_table_path() + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_seh: append 1 row ───
+//   pe_id<int> | arch<int> | frame_count<int> | table_size_bytes<int>
+fn record_seh(pe_id: int, arch: int, frame_count: int, table_size_bytes: int) -> void {
+    let row = to_string(pe_id) + "\t" + to_string(arch)
+        + "\t" + to_string(frame_count)
+        + "\t" + to_string(table_size_bytes) + "\n"
+    psehs_append_row(row)
+}
+
+// ─── seh_record_count: 비어있지 않은 row 수 ───
+fn seh_record_count() -> int {
+    let t = psehs_read_table()
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── count_by_arch ───
+fn count_by_arch(arch: int) -> int {
+    let t = psehs_read_table()
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    let key = to_string(arch)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[1] == key { c = c + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total_frames: 모든 row 의 frame_count 합 ───
+fn total_frames() -> int {
+    let t = psehs_read_table()
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_table_bytes: 모든 row 의 table_size_bytes 합 ───
+fn total_table_bytes() -> int {
+    let t = psehs_read_table()
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── pe_frame_count: pe_id → frame_count (없으면 0) ───
+fn pe_frame_count(pe_id: int) -> int {
+    let t = psehs_read_table()
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(pe_id)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psehs_stats: [seh_record_count, total_frames, count_by_arch(1), count_by_arch(2)] ───
+fn psehs_stats() -> array {
+    let mut out = []
+    out.push(seh_record_count())
+    out.push(total_frames())
+    out.push(count_by_arch(1))
+    out.push(count_by_arch(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psehs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psehs()
+
+    // 2. record 3 PEs
+    //    - 78001: Battle.net-Setup.exe (i386, 12 frames × 8 bytes/record = 96)
+    //    - 78002: D2R.exe (x86_64, 240 PDATA × 80 bytes = 19200)
+    //    - 78003: D4.exe (x86_64, 480 PDATA × 80 bytes = 38400)
+    record_seh(78001, 1, 12, 96)
+    r0_emit("psehs_record",
+        "\"pe_id\":78001,\"arch\":1,\"frame_count\":12,\"table_size_bytes\":96")
+
+    record_seh(78002, 2, 240, 19200)
+    r0_emit("psehs_record",
+        "\"pe_id\":78002,\"arch\":2,\"frame_count\":240,\"table_size_bytes\":19200")
+
+    record_seh(78003, 2, 480, 38400)
+    r0_emit("psehs_record",
+        "\"pe_id\":78003,\"arch\":2,\"frame_count\":480,\"table_size_bytes\":38400")
+
+    // 3. seh_record_count == 3
+    let rc = seh_record_count()
+    if rc != 3 {
+        panic("pe_seh_stage2 FAIL [seh_record_count] expected=3 got=" + to_string(rc))
+    }
+
+    // 4. count_by_arch(1) == 1, count_by_arch(2) == 2, count_by_arch(99) == 0
+    let c1 = count_by_arch(1)
+    if c1 != 1 {
+        panic("pe_seh_stage2 FAIL [count_by_arch(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_arch(2)
+    if c2 != 2 {
+        panic("pe_seh_stage2 FAIL [count_by_arch(2)] expected=2 got=" + to_string(c2))
+    }
+    let c99 = count_by_arch(99)
+    if c99 != 0 {
+        panic("pe_seh_stage2 FAIL [count_by_arch(99)] expected=0 got=" + to_string(c99))
+    }
+
+    // 5. total_frames == 12 + 240 + 480 = 732
+    let tf = total_frames()
+    if tf != 732 {
+        panic("pe_seh_stage2 FAIL [total_frames] expected=732 got=" + to_string(tf))
+    }
+
+    // 6. total_table_bytes == 96 + 19200 + 38400 = 57696
+    let tb = total_table_bytes()
+    if tb != 57696 {
+        panic("pe_seh_stage2 FAIL [total_table_bytes] expected=57696 got=" + to_string(tb))
+    }
+
+    // 7. pe_frame_count
+    let f1 = pe_frame_count(78001)
+    if f1 != 12 {
+        panic("pe_seh_stage2 FAIL [pe_frame_count(78001)] expected=12 got=" + to_string(f1))
+    }
+    let f2 = pe_frame_count(78002)
+    if f2 != 240 {
+        panic("pe_seh_stage2 FAIL [pe_frame_count(78002)] expected=240 got=" + to_string(f2))
+    }
+    let f3 = pe_frame_count(78003)
+    if f3 != 480 {
+        panic("pe_seh_stage2 FAIL [pe_frame_count(78003)] expected=480 got=" + to_string(f3))
+    }
+    let f_unk = pe_frame_count(9999)
+    if f_unk != 0 {
+        panic("pe_seh_stage2 FAIL [pe_frame_count(9999)] expected=0 got=" + to_string(f_unk))
+    }
+
+    // 8. psehs_stats() == [3, 732, 1, 2]
+    let s = psehs_stats()
+    if len(s) != 4 {
+        panic("pe_seh_stage2 FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_seh_stage2 FAIL [stats[0]] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 732 {
+        panic("pe_seh_stage2 FAIL [stats[1]] expected=732 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_seh_stage2 FAIL [stats[2]] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_seh_stage2 FAIL [stats[3]] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. r0_emit aggregate (4번째 emit — psehs_stats)
+    r0_emit("psehs_stats",
+        "\"records\":" + to_string(s[0])
+        + ",\"total_frames\":" + to_string(s[1])
+        + ",\"i386\":" + to_string(s[2])
+        + ",\"x86_64\":" + to_string(s[3])
+        + ",\"total_table_bytes\":" + to_string(tb))
+
+    // 10. emit count >= 4 (실제 4 — record × 3 + stats × 1)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 4 {
+        panic("pe_seh_stage2 FAIL [emit count] expected=>=4 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → 모두 0
+    cleanup_psehs()
+    if seh_record_count() != 0 {
+        panic("pe_seh_stage2 FAIL [cleanup record_count] expected=0 got="
+            + to_string(seh_record_count()))
+    }
+    if total_frames() != 0 {
+        panic("pe_seh_stage2 FAIL [cleanup total_frames] expected=0 got="
+            + to_string(total_frames()))
+    }
+    if total_table_bytes() != 0 {
+        panic("pe_seh_stage2 FAIL [cleanup total_table_bytes] expected=0 got="
+            + to_string(total_table_bytes()))
+    }
+
+    // 12. PASS
+    println("  ✅ pe_seh_stage2 self_test PASS (3 PEs, 732 frames, "
+        + to_string(tb) + " table bytes, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psehs_stats()
+            println("records\t" + to_string(s[0]))
+            println("total_frames\t" + to_string(s[1]))
+            println("i386\t" + to_string(s[2]))
+            println("x86_64\t" + to_string(s[3]))
+            println("total_table_bytes\t" + to_string(total_table_bytes()))
+            return
+        }
+        if sub == "frames" && len(a) >= 4 {
+            println(to_string(pe_frame_count(to_int(a[3]))))
+            return
+        }
+        if sub == "count" && len(a) >= 4 {
+            println(to_string(count_by_arch(to_int(a[3]))))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psehs()
+            println("cleaned: " + psehs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_seh_stage2.hexa { self-test | stats | frames <pe_id> | count <arch> | cleanup }")
+}

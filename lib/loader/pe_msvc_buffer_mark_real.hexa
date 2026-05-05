@@ -1,0 +1,655 @@
+// lib/loader/pe_msvc_buffer_mark_real.hexa
+// — MSVC byte-scan FF (fast-forward) buffer mark 보강 추적
+//
+// pe_msvc_byte_scan_loop_real 의 fast_forward (cap_clamp / zero_set / skip)
+// 가 large iter byte-scan loop 를 단축시킨 후, "skip 한 byte 들 사이에 어떤
+// buffer mark 가 남아야 caller (CRT 상위 함수) 가 정상 진행 하는가?" 를 별도
+// hexa 가 추적해야 한다. 본 hexa 는 byte-scan FF 가 발동된 loop 에 대해
+// 5 종 record 로 buffer mark + caller assumption + partial init 회피 action
+// + loop kind 분류 를 기록한다.
+//
+//   1. byte_scan_loop          : loop_id + back-branch eip + counter register +
+//                                total_iter + ff_triggered flag
+//   2. buffer_mark             : mark_id + loop_id + buffer VA + mark size +
+//                                mark value (0=zero, 0xFF=fill, 기타 magic)
+//   3. caller_assumption       : assumption_id + loop_id + caller eip +
+//                                expected field offset + expected value
+//                                (caller 가 의존하는 buffer 내부 sentinel)
+//   4. partial_init_avoidance  : action_id + loop_id + action_kind
+//                                (full_buffer_fill / cap_clamp / skip / halt)
+//   5. loop_kind_classification: class_id + loop_id + loop_kind
+//                                (memcpy / memset / vector_init / hash /
+//                                 enumeration / other)
+//
+// own 1 enforcement: Wine ntdll/heap.c / Wine msvcrt/string.c 0 줄.
+//                    MSDN CRT memcpy/memset/strncpy_s doc + Microsoft VC
+//                    runtime header 만 참조. hexa pure (native bridge 호출 0).
+//                    타사 Wine/CrossOver/GPTK/Whisky 추천/언급 X.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// docker runner constraints:
+//   - bash 미설치 → sh -c 만 사용 (process substitution 금지)
+//   - shasum / git / sha256sum 미설치 → 본 hexa 는 hash 의존 없음
+//   - awk + cat + mkdir + rm + date 만 사용
+//
+// persist schema (TSV 5 종):
+//   byte_scan_loops.tsv          : loop_id<int> \t eip_back_branch_hex<str>
+//                                  \t counter_register<int> \t total_iter<int>
+//                                  \t ff_triggered<int>
+//   buffer_marks.tsv             : mark_id<int> \t loop_id<int>
+//                                  \t buffer_va_hex<str> \t mark_size_bytes<int>
+//                                  \t mark_value<int>
+//   caller_assumptions.tsv       : assumption_id<int> \t loop_id<int>
+//                                  \t caller_eip_hex<str>
+//                                  \t expected_field_offset<int>
+//                                  \t expected_value<int>
+//   partial_init_avoidance.tsv   : action_id<int> \t loop_id<int>
+//                                  \t action_kind<int>
+//   loop_kind_classification.tsv : class_id<int> \t loop_id<int>
+//                                  \t loop_kind<int>
+//
+// counter_register code (byte_scan_loop):
+//   0 = eax  1 = ecx  2 = edx  3 = ebx  4 = esp  5 = ebp  6 = esi  7 = edi
+//
+// action_kind code (partial_init_avoidance):
+//   0 = full_buffer_fill   (skip 대신 mark_value 로 buffer 전체를 채워 완료)
+//   1 = cap_clamp          (counter clamp 후 partial fill — caller 가 받아들임)
+//   2 = skip               (mark 없이 단순 jump — caller 가 무시 가능한 경우)
+//   3 = halt               (caller assumption 위반 risk → 안전 fallback)
+//
+// loop_kind code (loop_kind_classification):
+//   0 = memcpy        1 = memset       2 = vector_init
+//   3 = hash          4 = enumeration  5 = other
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → kind / k /
+//                   counter_register / action_kind / loop_kind / mark_value.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmbm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_buffer_mark_real"
+}
+
+fn pmbm_byte_scan_loops_path() -> str {
+    return pmbm_dir() + "/byte_scan_loops.tsv"
+}
+
+fn pmbm_buffer_marks_path() -> str {
+    return pmbm_dir() + "/buffer_marks.tsv"
+}
+
+fn pmbm_caller_assumptions_path() -> str {
+    return pmbm_dir() + "/caller_assumptions.tsv"
+}
+
+fn pmbm_partial_init_avoidance_path() -> str {
+    return pmbm_dir() + "/partial_init_avoidance.tsv"
+}
+
+fn pmbm_loop_kind_classification_path() -> str {
+    return pmbm_dir() + "/loop_kind_classification.tsv"
+}
+
+fn pmbm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmbm_dir() + "'")
+}
+
+fn cleanup_pmbm() -> void {
+    pmbm_ensure_dir()
+    let _ = exec("rm -f '" + pmbm_byte_scan_loops_path()
+        + "' '" + pmbm_buffer_marks_path()
+        + "' '" + pmbm_caller_assumptions_path()
+        + "' '" + pmbm_partial_init_avoidance_path()
+        + "' '" + pmbm_loop_kind_classification_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmbm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmbm_append_row(path: str, row: str) -> void {
+    pmbm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_byte_scan_loop ───
+//   counter_register: 0=eax 1=ecx 2=edx 3=ebx 4=esp 5=ebp 6=esi 7=edi
+//   ff_triggered: 0=normal completion, 1=fast_forward 발동
+fn record_byte_scan_loop(loop_id: int, eip_back_branch_hex: str, counter_register: int, total_iter: int, ff_triggered: int) -> void {
+    if loop_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if eip_back_branch_hex == "" {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=eip_back_branch_hex!=empty got=empty")
+    }
+    if counter_register < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=counter_register>=0 got=" + to_string(counter_register))
+    }
+    if counter_register > 7 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=counter_register<=7 got=" + to_string(counter_register))
+    }
+    if total_iter < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=total_iter>=0 got=" + to_string(total_iter))
+    }
+    if ff_triggered < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=ff_triggered>=0 got=" + to_string(ff_triggered))
+    }
+    if ff_triggered > 1 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_byte_scan_loop] expected=ff_triggered<=1 got=" + to_string(ff_triggered))
+    }
+    let row = to_string(loop_id) + "\t" + eip_back_branch_hex
+        + "\t" + to_string(counter_register) + "\t" + to_string(total_iter)
+        + "\t" + to_string(ff_triggered) + "\n"
+    pmbm_append_row(pmbm_byte_scan_loops_path(), row)
+}
+
+// ─── record_buffer_mark ───
+//   mark_size_bytes: byte count (0 < size <= total_iter 권장)
+//   mark_value: 0..255 (0xFF=255, 0x00=0, magic 등 — caller assumption 과 짝)
+fn record_buffer_mark(mark_id: int, loop_id: int, buffer_va_hex: str, mark_size_bytes: int, mark_value: int) -> void {
+    if mark_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_buffer_mark] expected=mark_id>0 got=" + to_string(mark_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_buffer_mark] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if buffer_va_hex == "" {
+        panic("pe_msvc_buffer_mark_real FAIL [record_buffer_mark] expected=buffer_va_hex!=empty got=empty")
+    }
+    if mark_size_bytes <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_buffer_mark] expected=mark_size_bytes>0 got=" + to_string(mark_size_bytes))
+    }
+    if mark_value < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_buffer_mark] expected=mark_value>=0 got=" + to_string(mark_value))
+    }
+    if mark_value > 255 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_buffer_mark] expected=mark_value<=255 got=" + to_string(mark_value))
+    }
+    let row = to_string(mark_id) + "\t" + to_string(loop_id) + "\t" + buffer_va_hex
+        + "\t" + to_string(mark_size_bytes) + "\t" + to_string(mark_value) + "\n"
+    pmbm_append_row(pmbm_buffer_marks_path(), row)
+}
+
+// ─── record_caller_assumption ───
+//   caller (CRT 상위 함수) 가 byte-scan loop 종료 후 buffer 의 특정 offset 에서
+//   특정 value 를 읽기로 가정 — fast_forward 가 그 sentinel 을 채워야 함.
+fn record_caller_assumption(assumption_id: int, loop_id: int, caller_eip_hex: str, expected_field_offset: int, expected_value: int) -> void {
+    if assumption_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_caller_assumption] expected=assumption_id>0 got=" + to_string(assumption_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_caller_assumption] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if caller_eip_hex == "" {
+        panic("pe_msvc_buffer_mark_real FAIL [record_caller_assumption] expected=caller_eip_hex!=empty got=empty")
+    }
+    if expected_field_offset < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_caller_assumption] expected=expected_field_offset>=0 got=" + to_string(expected_field_offset))
+    }
+    if expected_value < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_caller_assumption] expected=expected_value>=0 got=" + to_string(expected_value))
+    }
+    let row = to_string(assumption_id) + "\t" + to_string(loop_id) + "\t" + caller_eip_hex
+        + "\t" + to_string(expected_field_offset) + "\t" + to_string(expected_value) + "\n"
+    pmbm_append_row(pmbm_caller_assumptions_path(), row)
+}
+
+// ─── record_partial_init_avoidance ───
+//   action_kind: 0=full_buffer_fill 1=cap_clamp 2=skip 3=halt
+fn record_partial_init_avoidance(action_id: int, loop_id: int, action_kind: int) -> void {
+    if action_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_partial_init_avoidance] expected=action_id>0 got=" + to_string(action_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_partial_init_avoidance] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if action_kind < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_partial_init_avoidance] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 3 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_partial_init_avoidance] expected=action_kind<=3 got=" + to_string(action_kind))
+    }
+    let row = to_string(action_id) + "\t" + to_string(loop_id) + "\t" + to_string(action_kind) + "\n"
+    pmbm_append_row(pmbm_partial_init_avoidance_path(), row)
+}
+
+// ─── record_loop_kind_classification ───
+//   loop_kind: 0=memcpy 1=memset 2=vector_init 3=hash 4=enumeration 5=other
+fn record_loop_kind_classification(class_id: int, loop_id: int, loop_kind: int) -> void {
+    if class_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_loop_kind_classification] expected=class_id>0 got=" + to_string(class_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_loop_kind_classification] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if loop_kind < 0 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_loop_kind_classification] expected=loop_kind>=0 got=" + to_string(loop_kind))
+    }
+    if loop_kind > 5 {
+        panic("pe_msvc_buffer_mark_real FAIL [record_loop_kind_classification] expected=loop_kind<=5 got=" + to_string(loop_kind))
+    }
+    let row = to_string(class_id) + "\t" + to_string(loop_id) + "\t" + to_string(loop_kind) + "\n"
+    pmbm_append_row(pmbm_loop_kind_classification_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmbm_count_rows(path: str, min_fields: int) -> int {
+    let t = pmbm_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn byte_scan_loop_count() -> int {
+    return pmbm_count_rows(pmbm_byte_scan_loops_path(), 5)
+}
+
+fn buffer_mark_count() -> int {
+    return pmbm_count_rows(pmbm_buffer_marks_path(), 5)
+}
+
+fn caller_assumption_count() -> int {
+    return pmbm_count_rows(pmbm_caller_assumptions_path(), 5)
+}
+
+fn partial_init_avoidance_count() -> int {
+    return pmbm_count_rows(pmbm_partial_init_avoidance_path(), 3)
+}
+
+fn loop_kind_count() -> int {
+    return pmbm_count_rows(pmbm_loop_kind_classification_path(), 3)
+}
+
+// ─── helper: counter_register name (0..7) ───
+fn counter_reg_name(k: int) -> str {
+    if k == 0 {
+        return "eax"
+    }
+    if k == 1 {
+        return "ecx"
+    }
+    if k == 2 {
+        return "edx"
+    }
+    if k == 3 {
+        return "ebx"
+    }
+    if k == 4 {
+        return "esp"
+    }
+    if k == 5 {
+        return "ebp"
+    }
+    if k == 6 {
+        return "esi"
+    }
+    if k == 7 {
+        return "edi"
+    }
+    panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name] expected=0..7 got=" + to_string(k))
+}
+
+// ─── helper: action_kind name (0..3) ───
+fn action_kind_name(k: int) -> str {
+    if k == 0 {
+        return "full_buffer_fill"
+    }
+    if k == 1 {
+        return "cap_clamp"
+    }
+    if k == 2 {
+        return "skip"
+    }
+    if k == 3 {
+        return "halt"
+    }
+    panic("pe_msvc_buffer_mark_real FAIL [action_kind_name] expected=0..3 got=" + to_string(k))
+}
+
+// ─── helper: loop_kind name (0..5) ───
+fn loop_kind_name(k: int) -> str {
+    if k == 0 {
+        return "memcpy"
+    }
+    if k == 1 {
+        return "memset"
+    }
+    if k == 2 {
+        return "vector_init"
+    }
+    if k == 3 {
+        return "hash"
+    }
+    if k == 4 {
+        return "enumeration"
+    }
+    if k == 5 {
+        return "other"
+    }
+    panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name] expected=0..5 got=" + to_string(k))
+}
+
+// ─── pmbm_stats: [byte_scan_loop, buffer_mark, caller_assumption, partial_init_avoidance, loop_kind] ───
+fn pmbm_stats() -> array {
+    let mut out = []
+    out.push(byte_scan_loop_count())
+    out.push(buffer_mark_count())
+    out.push(caller_assumption_count())
+    out.push(partial_init_avoidance_count())
+    out.push(loop_kind_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmbm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmbm()
+
+    // 2. record_byte_scan_loop x3 — memcpy / memset / vector_init
+    //    loop 1: memcpy back-branch at 0x004B2210, counter=ECX(1), total=65536, ff_triggered=1
+    //    loop 2: memset back-branch at 0x004B2380, counter=EDI(7), total=131072, ff_triggered=1
+    //    loop 3: vector_init back-branch at 0x004B2510, counter=ESI(6), total=8192, ff_triggered=1
+    record_byte_scan_loop(1, "0x004B2210", 1, 65536, 1)
+    r0_emit("pe_msvc_buffer_mark_real_record_byte_scan_loop",
+        "\"loop_id\":1,\"eip_back_branch_hex\":\"0x004B2210\""
+        + ",\"counter_register\":1,\"counter_reg_name\":\"" + counter_reg_name(1) + "\""
+        + ",\"total_iter\":65536,\"ff_triggered\":1"
+        + ",\"target\":\"crt_memcpy_rep_movsb\"")
+
+    record_byte_scan_loop(2, "0x004B2380", 7, 131072, 1)
+    r0_emit("pe_msvc_buffer_mark_real_record_byte_scan_loop",
+        "\"loop_id\":2,\"eip_back_branch_hex\":\"0x004B2380\""
+        + ",\"counter_register\":7,\"counter_reg_name\":\"" + counter_reg_name(7) + "\""
+        + ",\"total_iter\":131072,\"ff_triggered\":1"
+        + ",\"target\":\"crt_memset_rep_stosb\"")
+
+    record_byte_scan_loop(3, "0x004B2510", 6, 8192, 1)
+    r0_emit("pe_msvc_buffer_mark_real_record_byte_scan_loop",
+        "\"loop_id\":3,\"eip_back_branch_hex\":\"0x004B2510\""
+        + ",\"counter_register\":6,\"counter_reg_name\":\"" + counter_reg_name(6) + "\""
+        + ",\"total_iter\":8192,\"ff_triggered\":1"
+        + ",\"target\":\"crt_vector_init_inline\"")
+
+    // 3. record_buffer_mark x4 — mark_value 0xFF / 0x00 / 0xCD / 0xFF
+    //    mark 1: loop 1 buffer @ 0x10240000, size=65536, value=0xFF (255)
+    //    mark 2: loop 2 buffer @ 0x10260000, size=131072, value=0x00 (0)
+    //    mark 3: loop 3 buffer @ 0x10280000, size=8192, value=0xCD (205) — uninit magic
+    //    mark 4: loop 1 buffer tail @ 0x1024FFF8, size=8, value=0xFF — sentinel
+    record_buffer_mark(1, 1, "0x10240000", 65536, 255)
+    r0_emit("pe_msvc_buffer_mark_real_record_buffer_mark",
+        "\"mark_id\":1,\"loop_id\":1,\"buffer_va_hex\":\"0x10240000\""
+        + ",\"mark_size_bytes\":65536,\"mark_value\":255,\"hex\":\"0xFF\"")
+
+    record_buffer_mark(2, 2, "0x10260000", 131072, 0)
+    r0_emit("pe_msvc_buffer_mark_real_record_buffer_mark",
+        "\"mark_id\":2,\"loop_id\":2,\"buffer_va_hex\":\"0x10260000\""
+        + ",\"mark_size_bytes\":131072,\"mark_value\":0,\"hex\":\"0x00\"")
+
+    record_buffer_mark(3, 3, "0x10280000", 8192, 205)
+    r0_emit("pe_msvc_buffer_mark_real_record_buffer_mark",
+        "\"mark_id\":3,\"loop_id\":3,\"buffer_va_hex\":\"0x10280000\""
+        + ",\"mark_size_bytes\":8192,\"mark_value\":205,\"hex\":\"0xCD\"")
+
+    record_buffer_mark(4, 1, "0x1024FFF8", 8, 255)
+    r0_emit("pe_msvc_buffer_mark_real_record_buffer_mark",
+        "\"mark_id\":4,\"loop_id\":1,\"buffer_va_hex\":\"0x1024FFF8\""
+        + ",\"mark_size_bytes\":8,\"mark_value\":255,\"hex\":\"0xFF\",\"role\":\"sentinel\"")
+
+    // 4. record_caller_assumption x4 — caller 가 byte-scan 종료 후 sentinel 읽음
+    //    a 1: caller @ 0x004B22C0 reads buffer[0]    expects 0xFF (255) — memcpy fill check
+    //    a 2: caller @ 0x004B23F0 reads buffer[0]    expects 0x00 (0)   — memset zero check
+    //    a 3: caller @ 0x004B2580 reads buffer[100]  expects 0xCD (205) — vector_init magic
+    //    a 4: caller @ 0x004B22C8 reads buffer[65528] expects 0xFF (255) — tail sentinel
+    record_caller_assumption(1, 1, "0x004B22C0", 0, 255)
+    r0_emit("pe_msvc_buffer_mark_real_record_caller_assumption",
+        "\"assumption_id\":1,\"loop_id\":1,\"caller_eip_hex\":\"0x004B22C0\""
+        + ",\"expected_field_offset\":0,\"expected_value\":255,\"check\":\"memcpy_fill\"")
+
+    record_caller_assumption(2, 2, "0x004B23F0", 0, 0)
+    r0_emit("pe_msvc_buffer_mark_real_record_caller_assumption",
+        "\"assumption_id\":2,\"loop_id\":2,\"caller_eip_hex\":\"0x004B23F0\""
+        + ",\"expected_field_offset\":0,\"expected_value\":0,\"check\":\"memset_zero\"")
+
+    record_caller_assumption(3, 3, "0x004B2580", 100, 205)
+    r0_emit("pe_msvc_buffer_mark_real_record_caller_assumption",
+        "\"assumption_id\":3,\"loop_id\":3,\"caller_eip_hex\":\"0x004B2580\""
+        + ",\"expected_field_offset\":100,\"expected_value\":205,\"check\":\"vector_init_magic\"")
+
+    record_caller_assumption(4, 1, "0x004B22C8", 65528, 255)
+    r0_emit("pe_msvc_buffer_mark_real_record_caller_assumption",
+        "\"assumption_id\":4,\"loop_id\":1,\"caller_eip_hex\":\"0x004B22C8\""
+        + ",\"expected_field_offset\":65528,\"expected_value\":255,\"check\":\"tail_sentinel\"")
+
+    // 5. record_partial_init_avoidance x4 — full_buffer_fill / cap_clamp / skip / halt
+    //    act 1: loop 1 → full_buffer_fill (0)  — caller 가 전체 buffer 가정 → 안전 fill
+    //    act 2: loop 2 → cap_clamp (1)         — caller 가 zero head 만 검사 → cap 후 진행
+    //    act 3: loop 3 → skip (2)              — caller 가 magic 무시 가능 → 단순 jump
+    //    act 4: loop 2 → halt (3)              — secondary path: assumption 위반 risk → halt
+    record_partial_init_avoidance(1, 1, 0)
+    r0_emit("pe_msvc_buffer_mark_real_record_partial_init_avoidance",
+        "\"action_id\":1,\"loop_id\":1,\"action_kind\":0,\"name\":\"" + action_kind_name(0) + "\"")
+
+    record_partial_init_avoidance(2, 2, 1)
+    r0_emit("pe_msvc_buffer_mark_real_record_partial_init_avoidance",
+        "\"action_id\":2,\"loop_id\":2,\"action_kind\":1,\"name\":\"" + action_kind_name(1) + "\"")
+
+    record_partial_init_avoidance(3, 3, 2)
+    r0_emit("pe_msvc_buffer_mark_real_record_partial_init_avoidance",
+        "\"action_id\":3,\"loop_id\":3,\"action_kind\":2,\"name\":\"" + action_kind_name(2) + "\"")
+
+    record_partial_init_avoidance(4, 2, 3)
+    r0_emit("pe_msvc_buffer_mark_real_record_partial_init_avoidance",
+        "\"action_id\":4,\"loop_id\":2,\"action_kind\":3,\"name\":\"" + action_kind_name(3) + "\"")
+
+    // 6. record_loop_kind_classification x3 — memcpy / memset / vector_init
+    record_loop_kind_classification(1, 1, 0)
+    r0_emit("pe_msvc_buffer_mark_real_record_loop_kind_classification",
+        "\"class_id\":1,\"loop_id\":1,\"loop_kind\":0,\"name\":\"" + loop_kind_name(0) + "\"")
+
+    record_loop_kind_classification(2, 2, 1)
+    r0_emit("pe_msvc_buffer_mark_real_record_loop_kind_classification",
+        "\"class_id\":2,\"loop_id\":2,\"loop_kind\":1,\"name\":\"" + loop_kind_name(1) + "\"")
+
+    record_loop_kind_classification(3, 3, 2)
+    r0_emit("pe_msvc_buffer_mark_real_record_loop_kind_classification",
+        "\"class_id\":3,\"loop_id\":3,\"loop_kind\":2,\"name\":\"" + loop_kind_name(2) + "\"")
+
+    // 7. assertion: byte_scan_loop == 3
+    let bsl = byte_scan_loop_count()
+    if bsl != 3 {
+        panic("pe_msvc_buffer_mark_real FAIL [byte_scan_loop_count] expected=3 got=" + to_string(bsl))
+    }
+
+    // 8. assertion: buffer_mark == 4
+    let bm = buffer_mark_count()
+    if bm != 4 {
+        panic("pe_msvc_buffer_mark_real FAIL [buffer_mark_count] expected=4 got=" + to_string(bm))
+    }
+
+    // 9. assertion: caller_assumption == 4
+    let ca = caller_assumption_count()
+    if ca != 4 {
+        panic("pe_msvc_buffer_mark_real FAIL [caller_assumption_count] expected=4 got=" + to_string(ca))
+    }
+
+    // 10. assertion: partial_init_avoidance == 4
+    let pia = partial_init_avoidance_count()
+    if pia != 4 {
+        panic("pe_msvc_buffer_mark_real FAIL [partial_init_avoidance_count] expected=4 got=" + to_string(pia))
+    }
+
+    // 11. assertion: loop_kind == 3
+    let lk = loop_kind_count()
+    if lk != 3 {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_count] expected=3 got=" + to_string(lk))
+    }
+
+    // 12. counter_reg_name sanity (0..7)
+    if counter_reg_name(0) != "eax" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(0)] expected=eax got=" + counter_reg_name(0))
+    }
+    if counter_reg_name(1) != "ecx" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(1)] expected=ecx got=" + counter_reg_name(1))
+    }
+    if counter_reg_name(2) != "edx" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(2)] expected=edx got=" + counter_reg_name(2))
+    }
+    if counter_reg_name(3) != "ebx" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(3)] expected=ebx got=" + counter_reg_name(3))
+    }
+    if counter_reg_name(4) != "esp" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(4)] expected=esp got=" + counter_reg_name(4))
+    }
+    if counter_reg_name(5) != "ebp" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(5)] expected=ebp got=" + counter_reg_name(5))
+    }
+    if counter_reg_name(6) != "esi" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(6)] expected=esi got=" + counter_reg_name(6))
+    }
+    if counter_reg_name(7) != "edi" {
+        panic("pe_msvc_buffer_mark_real FAIL [counter_reg_name(7)] expected=edi got=" + counter_reg_name(7))
+    }
+
+    // 13. action_kind_name sanity (0..3)
+    if action_kind_name(0) != "full_buffer_fill" {
+        panic("pe_msvc_buffer_mark_real FAIL [action_kind_name(0)] expected=full_buffer_fill got=" + action_kind_name(0))
+    }
+    if action_kind_name(1) != "cap_clamp" {
+        panic("pe_msvc_buffer_mark_real FAIL [action_kind_name(1)] expected=cap_clamp got=" + action_kind_name(1))
+    }
+    if action_kind_name(2) != "skip" {
+        panic("pe_msvc_buffer_mark_real FAIL [action_kind_name(2)] expected=skip got=" + action_kind_name(2))
+    }
+    if action_kind_name(3) != "halt" {
+        panic("pe_msvc_buffer_mark_real FAIL [action_kind_name(3)] expected=halt got=" + action_kind_name(3))
+    }
+
+    // 14. loop_kind_name sanity (0..5)
+    if loop_kind_name(0) != "memcpy" {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name(0)] expected=memcpy got=" + loop_kind_name(0))
+    }
+    if loop_kind_name(1) != "memset" {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name(1)] expected=memset got=" + loop_kind_name(1))
+    }
+    if loop_kind_name(2) != "vector_init" {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name(2)] expected=vector_init got=" + loop_kind_name(2))
+    }
+    if loop_kind_name(3) != "hash" {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name(3)] expected=hash got=" + loop_kind_name(3))
+    }
+    if loop_kind_name(4) != "enumeration" {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name(4)] expected=enumeration got=" + loop_kind_name(4))
+    }
+    if loop_kind_name(5) != "other" {
+        panic("pe_msvc_buffer_mark_real FAIL [loop_kind_name(5)] expected=other got=" + loop_kind_name(5))
+    }
+
+    // 15. pmbm_stats() == [3, 4, 4, 4, 3]
+    let s = pmbm_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_buffer_mark_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_msvc_buffer_mark_real FAIL [stats byte_scan_loop] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_buffer_mark_real FAIL [stats buffer_mark] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_buffer_mark_real FAIL [stats caller_assumption] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_buffer_mark_real FAIL [stats partial_init_avoidance] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_buffer_mark_real FAIL [stats loop_kind] expected=3 got=" + to_string(s[4]))
+    }
+
+    // 16. emit stats summary
+    r0_emit("pe_msvc_buffer_mark_real_stats",
+        "\"byte_scan_loop\":" + to_string(s[0])
+        + ",\"buffer_mark\":" + to_string(s[1])
+        + ",\"caller_assumption\":" + to_string(s[2])
+        + ",\"partial_init_avoidance\":" + to_string(s[3])
+        + ",\"loop_kind\":" + to_string(s[4]))
+
+    // 17. emit count >= 14 — 3 byte_scan_loop + 4 buffer_mark + 4 caller_assumption +
+    //     4 partial_init_avoidance + 3 loop_kind + 1 stats = 19
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_buffer_mark_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 18. cleanup → stats 모두 0
+    cleanup_pmbm()
+    let s2 = pmbm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_buffer_mark_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_buffer_mark_real self_test PASS (byte_scan_loop=" + to_string(s[0])
+        + ", buffer_mark=" + to_string(s[1]) + ", caller_assumption=" + to_string(s[2])
+        + ", partial_init_avoidance=" + to_string(s[3]) + ", loop_kind=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmbm_stats()
+            println("byte_scan_loop_count\t" + to_string(s[0]))
+            println("buffer_mark_count\t" + to_string(s[1]))
+            println("caller_assumption_count\t" + to_string(s[2]))
+            println("partial_init_avoidance_count\t" + to_string(s[3]))
+            println("loop_kind_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmbm()
+            println("cleaned: " + pmbm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmbm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_buffer_mark_real.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,616 @@
+// lib/loader/win32_user32_stage1.hexa — Phase 4a 실제 implementation (window + message queue, headless)
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft 공식 user32 API spec:
+//     - Window:   https://learn.microsoft.com/en-us/windows/win32/api/winuser/
+//     - Message:  https://learn.microsoft.com/en-us/windows/win32/api/winuser/
+//     - Dialog:   https://learn.microsoft.com/en-us/windows/win32/api/winuser/
+//   Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 4 (실제: u32_create_window + u32_show + u32_msg + u32_msgbox + u32_destroy)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만 — GUI 없이 NSWindow 시뮬레이션)
+//   - panic("win32_user32_stage1 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 4a 실제 동작 — headless simulation):
+//   skeleton mapping table (win32_user32.hexa) 와 달리 *실제 lifecycle 추적* 수행.
+//   CreateWindowExW → synthetic HWND 발급 → handle table 에 (class, title, w, h, state) 기록.
+//   ShowWindow → state 변경 ("hidden" → "visible").
+//   DestroyWindow → state 변경 ("visible" → "destroyed").
+//   PostMessage / GetMessage → file-backed 합성 message queue.
+//   MessageBoxW → headless stdout (own 2 (c) — GUI 안 띄움).
+//
+// handle table:
+//   각 행 = "<hwnd>\t<class>\t<title>\t<width>\t<height>\t<state>\t<created_ts>"
+//   파일 위치: ~/.airgenome/gamebox/persist/u32_handles/windows.tsv
+//   다음 hwnd = 가장 큰 hwnd + 1 (없으면 1000 부터 시작 — k32 (100~) 영역과 분리).
+//
+// message queue:
+//   각 행 = "<hwnd>\t<msg>\t<wparam>\t<lparam>\t<seq>"
+//   파일 위치: ~/.airgenome/gamebox/persist/u32_handles/queue.tsv
+//   FIFO: get_message → 첫 매칭 행 pop. 빈 큐 → [-1, 0, 0].
+
+use "../perf/r0_common"
+
+// ─── handle / queue 경로 ───
+fn handle_table_dir() -> str {
+    return GAMEBOX_HOME + "/persist/u32_handles"
+}
+
+fn handle_table_path() -> str {
+    return handle_table_dir() + "/windows.tsv"
+}
+
+fn message_queue_path() -> str {
+    return handle_table_dir() + "/queue.tsv"
+}
+
+fn ensure_handle_dirs() -> void {
+    let _ = exec("mkdir -p '" + handle_table_dir() + "'")
+}
+
+// ─── window table 읽기 / 쓰기 ───
+fn read_window_table() -> str {
+    let p = handle_table_path()
+    let exists = exec("test -f '" + p + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    let s = exec("cat '" + p + "' 2>/dev/null")
+    return s
+}
+
+fn write_window_table(content: str) -> void {
+    ensure_handle_dirs()
+    write_file(handle_table_path(), content)
+}
+
+// ─── message queue 읽기 / 쓰기 ───
+fn read_queue() -> str {
+    let p = message_queue_path()
+    let exists = exec("test -f '" + p + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    let s = exec("cat '" + p + "' 2>/dev/null")
+    return s
+}
+
+fn write_queue(content: str) -> void {
+    ensure_handle_dirs()
+    write_file(message_queue_path(), content)
+}
+
+// ─── cleanup (self-test 시작 / 종료) ───
+fn cleanup_handle_table() -> void {
+    ensure_handle_dirs()
+    let _ = exec("rm -f '" + handle_table_path() + "' '" + message_queue_path() + "'")
+}
+
+// ─── 다음 hwnd id (table 의 max + 1; empty → 1000) ───
+fn next_hwnd_id() -> int {
+    let t = read_window_table()
+    if t == "" {
+        return 1000
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let max_h = 999
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                let h = to_int(parts[0])
+                if h > max_h {
+                    max_h = h
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_h + 1
+}
+
+// ─── window row 추가 ───
+fn append_window_row(hwnd: int, class_name: str, title: str, width: int, height: int, state: str) -> void {
+    ensure_handle_dirs()
+    let ts = exec("date +%s").trim()
+    let row = to_string(hwnd) + "\t" + class_name + "\t" + title
+        + "\t" + to_string(width) + "\t" + to_string(height)
+        + "\t" + state + "\t" + ts + "\n"
+    let tmp = handle_table_path() + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + handle_table_path() + "' && rm -f '" + tmp + "'")
+}
+
+// ─── window row 검색 → "class\ttitle\twidth\theight\tstate\tts" 또는 "" ───
+fn lookup_window(hwnd: int) -> str {
+    let t = read_window_table()
+    if t == "" {
+        return ""
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hwnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 7 {
+                if parts[0] == key {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+                        + "\t" + parts[4] + "\t" + parts[5] + "\t" + parts[6]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── window state 변경 (in-place rewrite) ───
+fn set_window_state(hwnd: int, new_state: str) -> bool {
+    let t = read_window_table()
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hwnd)
+    let mut out = ""
+    let mut found = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 7 {
+                if parts[0] == key {
+                    let new_row = parts[0] + "\t" + parts[1] + "\t" + parts[2]
+                        + "\t" + parts[3] + "\t" + parts[4]
+                        + "\t" + new_state + "\t" + parts[6]
+                    out = out + new_row + "\n"
+                    found = true
+                } else {
+                    out = out + line + "\n"
+                }
+            }
+        }
+        i = i + 1
+    }
+    write_window_table(out)
+    return found
+}
+
+// ─── CreateWindowExW(class, title, w, h) → synthetic HWND ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createwindowexw
+//   초기 state = "hidden" (Win32 default — ShowWindow 호출 전).
+fn create_window_ex_w(class_name: str, title: str, width: int, height: int) -> int {
+    ensure_handle_dirs()
+    if width <= 0 {
+        return -1
+    }
+    if height <= 0 {
+        return -1
+    }
+    let h = next_hwnd_id()
+    append_window_row(h, class_name, title, width, height, "hidden")
+    return h
+}
+
+// ─── ShowWindow(hwnd, cmd) → state="visible" (cmd != 0) / "hidden" (cmd == 0) ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow
+//   cmd: SW_HIDE=0, SW_SHOWNORMAL=1, SW_SHOW=5, etc.
+//   destroyed window 에 대한 ShowWindow → false.
+fn show_window(hwnd: int, cmd: int) -> bool {
+    let row = lookup_window(hwnd)
+    if row == "" {
+        return false
+    }
+    let p = row.split("\t")
+    if len(p) < 6 {
+        return false
+    }
+    let cur_state = p[4]
+    if cur_state == "destroyed" {
+        return false
+    }
+    let mut new_state = "visible"
+    if cmd == 0 {
+        new_state = "hidden"
+    }
+    return set_window_state(hwnd, new_state)
+}
+
+// ─── DestroyWindow(hwnd) → state="destroyed" ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroywindow
+//   row 자체는 유지 (state 만 destroyed) — Win32 spec: HWND 는 invalid 화 되지만 추적 가능.
+fn destroy_window(hwnd: int) -> bool {
+    let row = lookup_window(hwnd)
+    if row == "" {
+        return false
+    }
+    let p = row.split("\t")
+    if len(p) < 6 {
+        return false
+    }
+    if p[4] == "destroyed" {
+        return false
+    }
+    return set_window_state(hwnd, "destroyed")
+}
+
+// ─── window state lookup ───
+fn window_state(hwnd: int) -> str {
+    let row = lookup_window(hwnd)
+    if row == "" {
+        return ""
+    }
+    let p = row.split("\t")
+    if len(p) < 6 {
+        return ""
+    }
+    return p[4]
+}
+
+// ─── window count (전체 row 수, destroyed 포함) ───
+fn window_count() -> int {
+    let t = read_window_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut count = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 7 {
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── 다음 message sequence (queue 의 max seq + 1) ───
+fn next_msg_seq() -> int {
+    let q = read_queue()
+    if q == "" {
+        return 1
+    }
+    let lines = q.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut max_seq = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 5 {
+                let s = to_int(parts[4])
+                if s > max_seq {
+                    max_seq = s
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_seq + 1
+}
+
+// ─── PostMessage(hwnd, msg, wparam, lparam) → enqueue ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postmessagew
+//   destroyed window 에 post → false.
+fn post_message(hwnd: int, msg: int, wparam: int, lparam: int) -> bool {
+    let st = window_state(hwnd)
+    if st == "" {
+        return false
+    }
+    if st == "destroyed" {
+        return false
+    }
+    ensure_handle_dirs()
+    let seq = next_msg_seq()
+    let row = to_string(hwnd) + "\t" + to_string(msg)
+        + "\t" + to_string(wparam) + "\t" + to_string(lparam)
+        + "\t" + to_string(seq) + "\n"
+    let tmp = message_queue_path() + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + message_queue_path() + "' && rm -f '" + tmp + "'")
+    return true
+}
+
+// ─── GetMessage(hwnd) → [msg, wparam, lparam] (FIFO pop) 또는 [-1, 0, 0] ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessage
+//   hwnd 매칭 첫 row pop. 빈 큐 또는 매칭 없음 → [-1, 0, 0].
+fn get_message(hwnd: int) -> array {
+    let mut empty = []
+    empty.push(-1)
+    empty.push(0)
+    empty.push(0)
+
+    let q = read_queue()
+    if q == "" {
+        return empty
+    }
+
+    let lines = q.split("\n")
+    let n = len(lines)
+    let key = to_string(hwnd)
+    let mut popped = empty
+    let mut found = false
+    let mut out = ""
+    let i = 0
+    let mut idx = 0
+    while idx < n {
+        let line = lines[idx]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 5 {
+                if !found {
+                    if parts[0] == key {
+                        let mut tmp = []
+                        tmp.push(to_int(parts[1]))
+                        tmp.push(to_int(parts[2]))
+                        tmp.push(to_int(parts[3]))
+                        popped = tmp
+                        found = true
+                    } else {
+                        out = out + line + "\n"
+                    }
+                } else {
+                    out = out + line + "\n"
+                }
+            }
+        }
+        idx = idx + 1
+    }
+    if found {
+        write_queue(out)
+        return popped
+    }
+    return empty
+}
+
+// ─── DispatchMessage(msg) → noop placeholder ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dispatchmessage
+//   stage1 은 message routing 미수행 (Phase 4a 후속에서 WindowProc binding).
+//   return value = 0 (Win32 spec: "The return value specifies the value returned by the window procedure").
+fn dispatch_message(msg: array) -> int {
+    return 0
+}
+
+// ─── MessageBoxW(text, caption) → headless stdout (return IDOK=1) ───
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messageboxw
+//   own 2 (c) headless mandate: GUI 안 띄움. stdout 으로만 출력.
+//   IDOK = 1 (winuser.h MessageBox return values).
+fn message_box_w(text: str, caption: str) -> int {
+    println("[MessageBoxW headless] caption=\"" + caption + "\" text=\"" + text + "\"")
+    return 1
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "u32s1-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_handle_table()
+
+    // 2. CreateWindowExW
+    let hwnd1 = create_window_ex_w("MainClass", "TestApp", 800, 600)
+    if hwnd1 <= 0 {
+        panic("win32_user32_stage1 FAIL [create_window_ex_w] expected=>0 got=" + to_string(hwnd1))
+    }
+    if hwnd1 < 1000 {
+        panic("win32_user32_stage1 FAIL [hwnd range] expected=>=1000 got=" + to_string(hwnd1))
+    }
+
+    // 2b. 초기 state = "hidden"
+    let st0 = window_state(hwnd1)
+    if st0 != "hidden" {
+        panic("win32_user32_stage1 FAIL [initial state] expected=hidden got=" + st0)
+    }
+
+    // 3. r0_emit "u32_create_window"
+    r0_emit("u32_create_window",
+        "\"hwnd\":" + to_string(hwnd1)
+        + ",\"class\":\"MainClass\""
+        + ",\"title\":\"TestApp\""
+        + ",\"width\":800,\"height\":600")
+
+    // 4. ShowWindow(hwnd1, 1) → true
+    let sw = show_window(hwnd1, 1)
+    if !sw {
+        panic("win32_user32_stage1 FAIL [show_window] expected=true got=false")
+    }
+
+    // 5. window_state == "visible"
+    let st1 = window_state(hwnd1)
+    if st1 != "visible" {
+        panic("win32_user32_stage1 FAIL [state visible] expected=visible got=" + st1)
+    }
+
+    // 5b. r0_emit "u32_show"
+    r0_emit("u32_show",
+        "\"hwnd\":" + to_string(hwnd1)
+        + ",\"cmd\":1,\"state\":\"" + st1 + "\"")
+
+    // 6. PostMessage(hwnd1, WM_COMMAND=273, 100, 0)
+    let pm = post_message(hwnd1, 273, 100, 0)
+    if !pm {
+        panic("win32_user32_stage1 FAIL [post_message] expected=true got=false")
+    }
+
+    // 7. GetMessage(hwnd1) → [273, 100, 0]
+    let msg = get_message(hwnd1)
+    if len(msg) < 3 {
+        panic("win32_user32_stage1 FAIL [get_message len] expected=>=3 got=" + to_string(len(msg)))
+    }
+    if msg[0] != 273 {
+        panic("win32_user32_stage1 FAIL [msg[0]] expected=273 got=" + to_string(msg[0]))
+    }
+    if msg[1] != 100 {
+        panic("win32_user32_stage1 FAIL [msg[1]] expected=100 got=" + to_string(msg[1]))
+    }
+    if msg[2] != 0 {
+        panic("win32_user32_stage1 FAIL [msg[2]] expected=0 got=" + to_string(msg[2]))
+    }
+
+    // 7b. DispatchMessage (noop)
+    let dr = dispatch_message(msg)
+    if dr != 0 {
+        panic("win32_user32_stage1 FAIL [dispatch_message] expected=0 got=" + to_string(dr))
+    }
+
+    // 8. GetMessage(hwnd1) → [-1, 0, 0] (queue empty)
+    let msg2 = get_message(hwnd1)
+    if len(msg2) < 3 {
+        panic("win32_user32_stage1 FAIL [get_message empty len] expected=>=3 got=" + to_string(len(msg2)))
+    }
+    if msg2[0] != -1 {
+        panic("win32_user32_stage1 FAIL [msg2[0] empty] expected=-1 got=" + to_string(msg2[0]))
+    }
+    if msg2[1] != 0 {
+        panic("win32_user32_stage1 FAIL [msg2[1] empty] expected=0 got=" + to_string(msg2[1]))
+    }
+    if msg2[2] != 0 {
+        panic("win32_user32_stage1 FAIL [msg2[2] empty] expected=0 got=" + to_string(msg2[2]))
+    }
+
+    // 8b. r0_emit "u32_msg"
+    r0_emit("u32_msg",
+        "\"hwnd\":" + to_string(hwnd1)
+        + ",\"msg\":273,\"wparam\":100,\"lparam\":0,\"empty_after\":true")
+
+    // 9. message_box_w → 1 (IDOK)
+    let mb = message_box_w("Hello", "Test")
+    if mb != 1 {
+        panic("win32_user32_stage1 FAIL [message_box_w] expected=1 got=" + to_string(mb))
+    }
+
+    // 9b. r0_emit "u32_msgbox"
+    r0_emit("u32_msgbox",
+        "\"text\":\"Hello\",\"caption\":\"Test\",\"result\":" + to_string(mb))
+
+    // 10. DestroyWindow(hwnd1) → true
+    let dw = destroy_window(hwnd1)
+    if !dw {
+        panic("win32_user32_stage1 FAIL [destroy_window] expected=true got=false")
+    }
+
+    // 11. window_state == "destroyed"
+    let st2 = window_state(hwnd1)
+    if st2 != "destroyed" {
+        panic("win32_user32_stage1 FAIL [state destroyed] expected=destroyed got=" + st2)
+    }
+
+    // 11b. destroy 후 재 destroy → false
+    let dw2 = destroy_window(hwnd1)
+    if dw2 {
+        panic("win32_user32_stage1 FAIL [double destroy] expected=false got=true")
+    }
+
+    // 11c. destroy 후 ShowWindow → false (Win32 spec: invalid HWND)
+    let sw_dead = show_window(hwnd1, 1)
+    if sw_dead {
+        panic("win32_user32_stage1 FAIL [show_window on destroyed] expected=false got=true")
+    }
+
+    // 11d. destroy 후 PostMessage → false
+    let pm_dead = post_message(hwnd1, 273, 0, 0)
+    if pm_dead {
+        panic("win32_user32_stage1 FAIL [post_message on destroyed] expected=false got=true")
+    }
+
+    // 12. window_count — destroyed 포함 (= 1)
+    let wc = window_count()
+    if wc != 1 {
+        panic("win32_user32_stage1 FAIL [window_count] expected=1 got=" + to_string(wc))
+    }
+
+    // 12b. r0_emit "u32_destroy"
+    r0_emit("u32_destroy",
+        "\"hwnd\":" + to_string(hwnd1)
+        + ",\"final_state\":\"" + st2 + "\""
+        + ",\"window_count\":" + to_string(wc))
+
+    // 13. unknown hwnd lookup → "" / false
+    let lk_unknown = lookup_window(99999)
+    if lk_unknown != "" {
+        panic("win32_user32_stage1 FAIL [unknown lookup] expected=empty got=" + lk_unknown)
+    }
+    let st_unknown = window_state(99999)
+    if st_unknown != "" {
+        panic("win32_user32_stage1 FAIL [unknown state] expected=empty got=" + st_unknown)
+    }
+
+    // 14. emit count >= 4 검증 (실제: 5 events)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 4 {
+        panic("win32_user32_stage1 FAIL [r0 emit count] expected=>=4 got=" + to_string(emit_n))
+    }
+
+    // 15. cleanup
+    cleanup_handle_table()
+
+    println("  ✅ win32_user32_stage1 self_test PASS (window lifecycle + msg queue + headless mb, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "table-path" {
+            println(handle_table_path())
+            return
+        }
+        if sub == "queue-path" {
+            println(message_queue_path())
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_handle_table()
+            println("cleaned: " + handle_table_path())
+            return
+        }
+        if sub == "count" {
+            println(to_string(window_count()))
+            return
+        }
+        if sub == "state" {
+            if len(a) >= 4 {
+                let h = to_int(a[3])
+                let s = window_state(h)
+                if s == "" {
+                    println("(not found)")
+                } else {
+                    println(s)
+                }
+                return
+            }
+        }
+        if sub == "messagebox" {
+            let text = "test"
+            let caption = "title"
+            if len(a) >= 4 { text = a[3] }
+            if len(a) >= 5 { caption = a[4] }
+            let rc = message_box_w(text, caption)
+            println("rc=" + to_string(rc))
+            return
+        }
+    }
+    println("usage: hexa run win32_user32_stage1.hexa { self-test | table-path | queue-path | cleanup | count | state <hwnd> | messagebox [text] [caption] }")
+}

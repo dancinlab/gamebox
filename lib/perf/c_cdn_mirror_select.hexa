@@ -1,0 +1,177 @@
+// lib/perf/c_cdn_mirror_select.hexa — CN-66 Phase 2 만점 15/15
+//
+// CDN mirror latency benchmark + best select (us/eu/kr).
+// Battle.net 의 region 선택을 자동화 — 다중 CDN 중 가장 빠른 mirror 자동 선택.
+//
+// 무기: latency 측정 (synthetic ping) + columnar (mirror × time × latency).
+// 효과: download throughput 최적화 (region 차이 ~3-10×).
+
+use "./r0_common"
+
+let CDN_DIR = GAMEBOX_HOME + "/persist/cdn_mirror_select"
+let LATENCY_LOG = CDN_DIR + "/latencies.tsv"
+let SELECT_HISTORY = CDN_DIR + "/selects.jsonl"
+
+fn cdn_dir() -> str { return CDN_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CDN_DIR + "'")
+}
+
+// ─── known mirror endpoints ───
+fn mirror_endpoints() -> array {
+    return [
+        ["us-east", "us.cdn.blizzard.com"],
+        ["us-west", "us-west.cdn.blizzard.com"],
+        ["eu", "eu.cdn.blizzard.com"],
+        ["kr", "kr.cdn.blizzard.com"],
+        ["cn", "cn.cdn.blizzard.com"]
+    ]
+}
+
+// ─── latency 측정 (synthetic — 실 ping 은 후속) ───
+//   region, latency_ms 입력
+fn record_latency(region: str, latency_ms: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = ts + "\t" + region + "\t" + to_string(latency_ms)
+    let tmp = LATENCY_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + LATENCY_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── region 별 평균 latency ───
+fn avg_latency(region: str) -> int {
+    let exists = exec("test -f '" + LATENCY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v r='" + region + "' '$2==r {n++; s+=$3} END {if(n>0) print int(s/n); else print 0}' '" + LATENCY_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── 가장 낮은 평균 latency mirror ───
+fn select_best() -> str {
+    let exists = exec("test -f '" + LATENCY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return "" }
+    let cmd = "awk -F'\\t' '{n[$2]++; s[$2]+=$3} END {best=\"\"; bv=99999999; for(r in n) {avg=s[r]/n[r]; if(avg<bv){bv=avg; best=r}}; print best}' '" + LATENCY_LOG + "'"
+    let r = exec(cmd).trim()
+    return r
+}
+
+// ─── select 결과 기록 ───
+fn record_select(region: str, latency: int, alternative_count: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"region\":\"" + region + "\",\"latency_ms\":" + to_string(latency) + ",\"alternatives\":" + to_string(alternative_count) + "}"
+    let tmp = SELECT_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SELECT_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("cdn_select", "\"region\":\"" + region + "\",\"latency_ms\":" + to_string(latency))
+}
+
+fn cdn_stats() -> array {
+    let exists_l = exec("test -f '" + LATENCY_LOG + "' && echo ok").trim()
+    let measurements = 0
+    if exists_l == "ok" {
+        measurements = to_int(exec("wc -l < '" + LATENCY_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_s = exec("test -f '" + SELECT_HISTORY + "' && echo ok").trim()
+    let selects = 0
+    if exists_s == "ok" {
+        selects = to_int(exec("wc -l < '" + SELECT_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [measurements, selects]
+}
+
+fn cleanup_cdn() -> void {
+    let _ = exec("rm -rf '" + CDN_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cdn-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cdn()
+
+    // mirror endpoints
+    let mirrors = mirror_endpoints()
+    if len(mirrors) != 5 { panic("c_cdn_mirror_select FAIL [mirror count] got=" + to_string(len(mirrors))) }
+
+    // 합성 latency 측정 — kr 사용자 가정 (kr 가장 빠름, us 중간, eu 느림)
+    record_latency("us-east", 180)
+    record_latency("us-east", 200)
+    record_latency("us-east", 190)
+    record_latency("us-west", 150)
+    record_latency("us-west", 160)
+    record_latency("us-west", 155)
+    record_latency("eu", 280)
+    record_latency("eu", 290)
+    record_latency("kr", 30)
+    record_latency("kr", 25)
+    record_latency("kr", 28)
+    record_latency("cn", 100)
+    record_latency("cn", 110)
+
+    // average per region
+    let avg_kr = avg_latency("kr")
+    if avg_kr < 25 || avg_kr > 35 { panic("c_cdn_mirror_select FAIL [avg kr] got=" + to_string(avg_kr)) }
+
+    let avg_eu = avg_latency("eu")
+    if avg_eu < 280 || avg_eu > 290 { panic("c_cdn_mirror_select FAIL [avg eu] got=" + to_string(avg_eu)) }
+
+    let avg_unknown = avg_latency("nonexistent")
+    if avg_unknown != 0 { panic("c_cdn_mirror_select FAIL [avg unknown]") }
+
+    // select best — kr 가장 빠름
+    let best = select_best()
+    if best != "kr" { panic("c_cdn_mirror_select FAIL [best] expected=kr got=" + best) }
+
+    record_select(best, avg_kr, 4)
+
+    // stats
+    let stats = cdn_stats()
+    if stats[0] != 13 { panic("c_cdn_mirror_select FAIL [stats meas] expected=13 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_cdn_mirror_select FAIL [stats selects] expected=1 got=" + to_string(stats[1])) }
+
+    r0_emit("cdn_summary", "\"measurements\":" + to_string(stats[0]) + ",\"selects\":" + to_string(stats[1]) + ",\"best\":\"" + best + "\",\"latency_ms\":" + to_string(avg_kr))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_cdn_mirror_select FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_cdn()
+
+    println("  ✅ c_cdn_mirror_select self_test PASS (5 mirrors, 13 measurements, best=kr@" + to_string(avg_kr) + "ms vs eu@" + to_string(avg_eu) + "ms, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "best" {
+            let b = select_best()
+            if b == "" { println("no_data") } else { println(b) }
+            return
+        }
+        if sub == "avg" && len(a) >= 4 {
+            println(to_string(avg_latency(a[3])))
+            return
+        }
+        if sub == "mirrors" {
+            let m = mirror_endpoints()
+            let i = 0
+            while i < len(m) {
+                println(m[i][0] + "\t" + m[i][1])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "stats" {
+            let s = cdn_stats()
+            println("measurements=" + to_string(s[0]) + " selects=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_cdn(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_cdn_mirror_select.hexa { self-test | best | avg <region> | mirrors | stats | cleanup }")
+}

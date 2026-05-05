@@ -1,0 +1,639 @@
+// lib/loader/pe_msvc_thread_sync_polling_real.hexa
+// — Battle.net Setup polling spin loop (0x5C6F64 영역) thread sync 패턴 추적기
+//
+// Battle.net Setup.exe 의 main thread 는 다른 worker thread 가 신호 (event /
+// mutex / semaphore / critical_section) 를 set 할 때까지 polling spin loop
+// (예: 0x5C6F64 의 cmp [global_flag], 0 / je back / loop) 를 도는 구조를
+// 갖는다. 본 hexa 는 5 종 record 로 그 패턴을 추적한다:
+//
+//   1. polling_loop      : EIP range + iter_count + broken
+//   2. sync_object       : handle_hex + kind (mutex/event/semaphore/cs/thread)
+//   3. wait_call         : WaitForSingle / WaitForMulti / EnterCS / Sleep
+//   4. signal_call       : SetEvent / ResetEvent / ReleaseMutex / LeaveCS
+//   5. break_strategy    : mem_write_signal / reg_set / force_advance / func_exit / halt
+//
+// own 1 enforcement: Wine ntdll/sync.c source 0 줄. Wine kernel32 sync 0 줄.
+//                    MSDN Synchronization Functions doc 만 참조. hexa pure
+//                    (native bridge 호출 0). 타사 Wine/CrossOver/GPTK/Whisky
+//                    추천/언급 X.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   polling_loops.tsv     : loop_id<int>     \t eip_range_start_hex<str>
+//                           \t eip_range_end_hex<str> \t iter_count<int>
+//                           \t broken<int>
+//   sync_objects.tsv      : obj_id<int>      \t handle_hex<str>  \t kind<int>
+//   wait_calls.tsv        : wait_id<int>     \t fn_kind<int>     \t handle_hex<str>
+//                           \t timeout_ms<int> \t returned<int>
+//   signal_calls.tsv      : signal_id<int>   \t fn_kind<int>     \t handle_hex<str>
+//   break_strategies.tsv  : strategy_id<int> \t loop_id<int>     \t action_kind<int>
+//                           \t success<int>
+//
+// kind code (sync_object):
+//   0 = mutex                       (CreateMutexA/W)
+//   1 = event                       (CreateEventA/W)
+//   2 = semaphore                   (CreateSemaphoreA/W)
+//   3 = critical_section            (InitializeCriticalSection)
+//   4 = thread                      (CreateThread / CreateRemoteThread)
+//
+// fn_kind code (wait_call):
+//   0 = WaitForSingle               (WaitForSingleObject / WaitForSingleObjectEx)
+//   1 = WaitForMulti                (WaitForMultipleObjects / WaitForMultipleObjectsEx)
+//   2 = EnterCS                     (EnterCriticalSection / TryEnterCriticalSection)
+//   3 = Sleep                       (Sleep / SleepEx)
+//
+// fn_kind code (signal_call):
+//   0 = SetEvent                    (SetEvent)
+//   1 = ResetEvent                  (ResetEvent)
+//   2 = ReleaseMutex                (ReleaseMutex / ReleaseSemaphore)
+//   3 = LeaveCS                     (LeaveCriticalSection)
+//
+// action_kind code (break_strategy):
+//   0 = mem_write_signal            (poll target memory 직접 write 로 신호 전달)
+//   1 = reg_set                     (eax/ZF flag patch 로 즉시 분기)
+//   2 = force_advance               (eip += branch_offset 강제 진행)
+//   3 = func_exit                   (caller 의 ret 강제 — RET stack value reuse)
+//   4 = halt                        (interpreter halt — 단순 추적만)
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → kind / k / fn_kind /
+//                   action_kind / handle_hex.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmtsp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_thread_sync_polling_real"
+}
+
+fn pmtsp_polling_loops_path() -> str {
+    return pmtsp_dir() + "/polling_loops.tsv"
+}
+
+fn pmtsp_sync_objects_path() -> str {
+    return pmtsp_dir() + "/sync_objects.tsv"
+}
+
+fn pmtsp_wait_calls_path() -> str {
+    return pmtsp_dir() + "/wait_calls.tsv"
+}
+
+fn pmtsp_signal_calls_path() -> str {
+    return pmtsp_dir() + "/signal_calls.tsv"
+}
+
+fn pmtsp_break_strategies_path() -> str {
+    return pmtsp_dir() + "/break_strategies.tsv"
+}
+
+fn pmtsp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmtsp_dir() + "'")
+}
+
+fn cleanup_pmtsp() -> void {
+    pmtsp_ensure_dir()
+    let _ = exec("rm -f '" + pmtsp_polling_loops_path()
+        + "' '" + pmtsp_sync_objects_path()
+        + "' '" + pmtsp_wait_calls_path()
+        + "' '" + pmtsp_signal_calls_path()
+        + "' '" + pmtsp_break_strategies_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmtsp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmtsp_append_row(path: str, row: str) -> void {
+    pmtsp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_polling_loop ───
+fn record_polling_loop(loop_id: int, eip_range_start_hex: str, eip_range_end_hex: str, iter_count: int, broken: int) -> void {
+    if loop_id <= 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_polling_loop] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if eip_range_start_hex == "" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_polling_loop] expected=eip_range_start_hex!=empty got=empty")
+    }
+    if eip_range_end_hex == "" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_polling_loop] expected=eip_range_end_hex!=empty got=empty")
+    }
+    if iter_count < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_polling_loop] expected=iter_count>=0 got=" + to_string(iter_count))
+    }
+    if broken < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_polling_loop] expected=broken>=0 got=" + to_string(broken))
+    }
+    if broken > 1 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_polling_loop] expected=broken<=1 got=" + to_string(broken))
+    }
+    let row = to_string(loop_id) + "\t" + eip_range_start_hex + "\t" + eip_range_end_hex
+        + "\t" + to_string(iter_count) + "\t" + to_string(broken) + "\n"
+    pmtsp_append_row(pmtsp_polling_loops_path(), row)
+}
+
+// ─── record_sync_object ───
+//   kind: 0=mutex 1=event 2=semaphore 3=critical_section 4=thread
+fn record_sync_object(obj_id: int, handle_hex: str, kind: int) -> void {
+    if obj_id <= 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_sync_object] expected=obj_id>0 got=" + to_string(obj_id))
+    }
+    if handle_hex == "" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_sync_object] expected=handle_hex!=empty got=empty")
+    }
+    if kind < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_sync_object] expected=kind>=0 got=" + to_string(kind))
+    }
+    if kind > 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_sync_object] expected=kind<=4 got=" + to_string(kind))
+    }
+    let row = to_string(obj_id) + "\t" + handle_hex + "\t" + to_string(kind) + "\n"
+    pmtsp_append_row(pmtsp_sync_objects_path(), row)
+}
+
+// ─── record_wait_call ───
+//   fn_kind: 0=WaitForSingle 1=WaitForMulti 2=EnterCS 3=Sleep
+fn record_wait_call(wait_id: int, fn_kind: int, handle_hex: str, timeout_ms: int, returned: int) -> void {
+    if wait_id <= 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_wait_call] expected=wait_id>0 got=" + to_string(wait_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_wait_call] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 3 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_wait_call] expected=fn_kind<=3 got=" + to_string(fn_kind))
+    }
+    if handle_hex == "" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_wait_call] expected=handle_hex!=empty got=empty")
+    }
+    if timeout_ms < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_wait_call] expected=timeout_ms>=0 got=" + to_string(timeout_ms))
+    }
+    let row = to_string(wait_id) + "\t" + to_string(fn_kind) + "\t" + handle_hex
+        + "\t" + to_string(timeout_ms) + "\t" + to_string(returned) + "\n"
+    pmtsp_append_row(pmtsp_wait_calls_path(), row)
+}
+
+// ─── record_signal_call ───
+//   fn_kind: 0=SetEvent 1=ResetEvent 2=ReleaseMutex 3=LeaveCS
+fn record_signal_call(signal_id: int, fn_kind: int, handle_hex: str) -> void {
+    if signal_id <= 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_signal_call] expected=signal_id>0 got=" + to_string(signal_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_signal_call] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 3 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_signal_call] expected=fn_kind<=3 got=" + to_string(fn_kind))
+    }
+    if handle_hex == "" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_signal_call] expected=handle_hex!=empty got=empty")
+    }
+    let row = to_string(signal_id) + "\t" + to_string(fn_kind) + "\t" + handle_hex + "\n"
+    pmtsp_append_row(pmtsp_signal_calls_path(), row)
+}
+
+// ─── record_break_strategy ───
+//   action_kind: 0=mem_write_signal 1=reg_set 2=force_advance 3=func_exit 4=halt
+fn record_break_strategy(strategy_id: int, loop_id: int, action_kind: int, success: int) -> void {
+    if strategy_id <= 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_break_strategy] expected=strategy_id>0 got=" + to_string(strategy_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_break_strategy] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if action_kind < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_break_strategy] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_break_strategy] expected=action_kind<=4 got=" + to_string(action_kind))
+    }
+    if success < 0 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_break_strategy] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [record_break_strategy] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(strategy_id) + "\t" + to_string(loop_id) + "\t" + to_string(action_kind)
+        + "\t" + to_string(success) + "\n"
+    pmtsp_append_row(pmtsp_break_strategies_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmtsp_count_rows(path: str, min_fields: int) -> int {
+    let t = pmtsp_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn polling_loop_count() -> int {
+    return pmtsp_count_rows(pmtsp_polling_loops_path(), 5)
+}
+
+fn sync_object_count() -> int {
+    return pmtsp_count_rows(pmtsp_sync_objects_path(), 3)
+}
+
+fn wait_call_count() -> int {
+    return pmtsp_count_rows(pmtsp_wait_calls_path(), 5)
+}
+
+fn signal_call_count() -> int {
+    return pmtsp_count_rows(pmtsp_signal_calls_path(), 3)
+}
+
+fn break_strategy_count() -> int {
+    return pmtsp_count_rows(pmtsp_break_strategies_path(), 4)
+}
+
+// ─── helper: sync_object kind name (0..4) ───
+fn sync_object_kind_name(k: int) -> str {
+    if k == 0 {
+        return "mutex"
+    }
+    if k == 1 {
+        return "event"
+    }
+    if k == 2 {
+        return "semaphore"
+    }
+    if k == 3 {
+        return "critical_section"
+    }
+    if k == 4 {
+        return "thread"
+    }
+    panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_kind_name] expected=0..4 got=" + to_string(k))
+}
+
+// ─── helper: wait_call fn_kind name (0..3) ───
+fn wait_fn_kind_name(k: int) -> str {
+    if k == 0 {
+        return "WaitForSingle"
+    }
+    if k == 1 {
+        return "WaitForMulti"
+    }
+    if k == 2 {
+        return "EnterCS"
+    }
+    if k == 3 {
+        return "Sleep"
+    }
+    panic("pe_msvc_thread_sync_polling_real FAIL [wait_fn_kind_name] expected=0..3 got=" + to_string(k))
+}
+
+// ─── helper: signal_call fn_kind name (0..3) ───
+fn signal_fn_kind_name(k: int) -> str {
+    if k == 0 {
+        return "SetEvent"
+    }
+    if k == 1 {
+        return "ResetEvent"
+    }
+    if k == 2 {
+        return "ReleaseMutex"
+    }
+    if k == 3 {
+        return "LeaveCS"
+    }
+    panic("pe_msvc_thread_sync_polling_real FAIL [signal_fn_kind_name] expected=0..3 got=" + to_string(k))
+}
+
+// ─── helper: break_strategy action_kind name (0..4) ───
+fn break_action_name(k: int) -> str {
+    if k == 0 {
+        return "mem_write_signal"
+    }
+    if k == 1 {
+        return "reg_set"
+    }
+    if k == 2 {
+        return "force_advance"
+    }
+    if k == 3 {
+        return "func_exit"
+    }
+    if k == 4 {
+        return "halt"
+    }
+    panic("pe_msvc_thread_sync_polling_real FAIL [break_action_name] expected=0..4 got=" + to_string(k))
+}
+
+// ─── pmtsp_stats: [polling_loop, sync_object, wait_call, signal_call, break_strategy] ───
+fn pmtsp_stats() -> array {
+    let mut out = []
+    out.push(polling_loop_count())
+    out.push(sync_object_count())
+    out.push(wait_call_count())
+    out.push(signal_call_count())
+    out.push(break_strategy_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmtsp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmtsp()
+
+    // 2. record_polling_loop x2
+    //    loop 1: 0x5C6F64 영역 (Battle.net Setup main thread polling spin loop)
+    //            iter_count=8192, broken=1 (mem_write_signal 으로 탈출 성공)
+    //    loop 2: 0x468B2C 영역 (secondary worker poll), iter_count=512, broken=1 (force_advance)
+    record_polling_loop(1, "0x5C6F64", "0x5C6F8C", 8192, 1)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_polling_loop",
+        "\"loop_id\":1,\"eip_range_start_hex\":\"0x5C6F64\""
+        + ",\"eip_range_end_hex\":\"0x5C6F8C\",\"iter_count\":8192,\"broken\":1"
+        + ",\"target\":\"battle_net_setup_main_poll\"")
+
+    record_polling_loop(2, "0x468B2C", "0x468B40", 512, 1)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_polling_loop",
+        "\"loop_id\":2,\"eip_range_start_hex\":\"0x468B2C\""
+        + ",\"eip_range_end_hex\":\"0x468B40\",\"iter_count\":512,\"broken\":1"
+        + ",\"target\":\"battle_net_setup_worker_poll\"")
+
+    // 3. record_sync_object x4 — mutex / event / semaphore / critical_section
+    record_sync_object(1, "0xDEADBE00", 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_sync_object",
+        "\"obj_id\":1,\"handle_hex\":\"0xDEADBE00\",\"kind\":0,\"name\":\""
+        + sync_object_kind_name(0) + "\"")
+
+    record_sync_object(2, "0xDEADBE01", 1)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_sync_object",
+        "\"obj_id\":2,\"handle_hex\":\"0xDEADBE01\",\"kind\":1,\"name\":\""
+        + sync_object_kind_name(1) + "\"")
+
+    record_sync_object(3, "0xDEADBE02", 2)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_sync_object",
+        "\"obj_id\":3,\"handle_hex\":\"0xDEADBE02\",\"kind\":2,\"name\":\""
+        + sync_object_kind_name(2) + "\"")
+
+    record_sync_object(4, "0xDEADBE03", 3)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_sync_object",
+        "\"obj_id\":4,\"handle_hex\":\"0xDEADBE03\",\"kind\":3,\"name\":\""
+        + sync_object_kind_name(3) + "\"")
+
+    // 4. record_wait_call x4 — fn_kind 0..3
+    record_wait_call(1, 0, "0xDEADBE01", 5000, 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_wait_call",
+        "\"wait_id\":1,\"fn_kind\":0,\"handle_hex\":\"0xDEADBE01\",\"timeout_ms\":5000,\"returned\":0"
+        + ",\"name\":\"" + wait_fn_kind_name(0) + "\"")
+
+    record_wait_call(2, 1, "0xDEADBE00", 10000, 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_wait_call",
+        "\"wait_id\":2,\"fn_kind\":1,\"handle_hex\":\"0xDEADBE00\",\"timeout_ms\":10000,\"returned\":0"
+        + ",\"name\":\"" + wait_fn_kind_name(1) + "\"")
+
+    record_wait_call(3, 2, "0xDEADBE03", 0, 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_wait_call",
+        "\"wait_id\":3,\"fn_kind\":2,\"handle_hex\":\"0xDEADBE03\",\"timeout_ms\":0,\"returned\":0"
+        + ",\"name\":\"" + wait_fn_kind_name(2) + "\"")
+
+    record_wait_call(4, 3, "0x00000000", 100, 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_wait_call",
+        "\"wait_id\":4,\"fn_kind\":3,\"handle_hex\":\"0x00000000\",\"timeout_ms\":100,\"returned\":0"
+        + ",\"name\":\"" + wait_fn_kind_name(3) + "\"")
+
+    // 5. record_signal_call x4 — fn_kind 0..3
+    record_signal_call(1, 0, "0xDEADBE01")
+    r0_emit("pe_msvc_thread_sync_polling_real_record_signal_call",
+        "\"signal_id\":1,\"fn_kind\":0,\"handle_hex\":\"0xDEADBE01\",\"name\":\""
+        + signal_fn_kind_name(0) + "\"")
+
+    record_signal_call(2, 1, "0xDEADBE01")
+    r0_emit("pe_msvc_thread_sync_polling_real_record_signal_call",
+        "\"signal_id\":2,\"fn_kind\":1,\"handle_hex\":\"0xDEADBE01\",\"name\":\""
+        + signal_fn_kind_name(1) + "\"")
+
+    record_signal_call(3, 2, "0xDEADBE00")
+    r0_emit("pe_msvc_thread_sync_polling_real_record_signal_call",
+        "\"signal_id\":3,\"fn_kind\":2,\"handle_hex\":\"0xDEADBE00\",\"name\":\""
+        + signal_fn_kind_name(2) + "\"")
+
+    record_signal_call(4, 3, "0xDEADBE03")
+    r0_emit("pe_msvc_thread_sync_polling_real_record_signal_call",
+        "\"signal_id\":4,\"fn_kind\":3,\"handle_hex\":\"0xDEADBE03\",\"name\":\""
+        + signal_fn_kind_name(3) + "\"")
+
+    // 6. record_break_strategy x4 — action_kind 0..3 against loop 1
+    //    + 1 for action_kind=4 against loop 2 (5 total → covers 0..4)
+    record_break_strategy(1, 1, 0, 1)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_break_strategy",
+        "\"strategy_id\":1,\"loop_id\":1,\"action_kind\":0,\"success\":1,\"name\":\""
+        + break_action_name(0) + "\"")
+
+    record_break_strategy(2, 1, 1, 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_break_strategy",
+        "\"strategy_id\":2,\"loop_id\":1,\"action_kind\":1,\"success\":0,\"name\":\""
+        + break_action_name(1) + "\"")
+
+    record_break_strategy(3, 2, 2, 1)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_break_strategy",
+        "\"strategy_id\":3,\"loop_id\":2,\"action_kind\":2,\"success\":1,\"name\":\""
+        + break_action_name(2) + "\"")
+
+    record_break_strategy(4, 1, 3, 0)
+    r0_emit("pe_msvc_thread_sync_polling_real_record_break_strategy",
+        "\"strategy_id\":4,\"loop_id\":1,\"action_kind\":3,\"success\":0,\"name\":\""
+        + break_action_name(3) + "\"")
+
+    // 7. assertion: polling_loop == 2
+    let pl = polling_loop_count()
+    if pl != 2 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [polling_loop_count] expected=2 got=" + to_string(pl))
+    }
+
+    // 8. assertion: sync_object == 4
+    let so = sync_object_count()
+    if so != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_count] expected=4 got=" + to_string(so))
+    }
+
+    // 9. assertion: wait_call == 4
+    let wc = wait_call_count()
+    if wc != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [wait_call_count] expected=4 got=" + to_string(wc))
+    }
+
+    // 10. assertion: signal_call == 4
+    let sc = signal_call_count()
+    if sc != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [signal_call_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 11. assertion: break_strategy == 4
+    let bs = break_strategy_count()
+    if bs != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [break_strategy_count] expected=4 got=" + to_string(bs))
+    }
+
+    // 12. sync_object_kind_name sanity (0..4)
+    if sync_object_kind_name(0) != "mutex" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_kind_name(0)] expected=mutex got=" + sync_object_kind_name(0))
+    }
+    if sync_object_kind_name(1) != "event" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_kind_name(1)] expected=event got=" + sync_object_kind_name(1))
+    }
+    if sync_object_kind_name(2) != "semaphore" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_kind_name(2)] expected=semaphore got=" + sync_object_kind_name(2))
+    }
+    if sync_object_kind_name(3) != "critical_section" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_kind_name(3)] expected=critical_section got=" + sync_object_kind_name(3))
+    }
+    if sync_object_kind_name(4) != "thread" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [sync_object_kind_name(4)] expected=thread got=" + sync_object_kind_name(4))
+    }
+
+    // 13. wait_fn_kind_name sanity (0..3)
+    if wait_fn_kind_name(0) != "WaitForSingle" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [wait_fn_kind_name(0)] expected=WaitForSingle got=" + wait_fn_kind_name(0))
+    }
+    if wait_fn_kind_name(1) != "WaitForMulti" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [wait_fn_kind_name(1)] expected=WaitForMulti got=" + wait_fn_kind_name(1))
+    }
+    if wait_fn_kind_name(2) != "EnterCS" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [wait_fn_kind_name(2)] expected=EnterCS got=" + wait_fn_kind_name(2))
+    }
+    if wait_fn_kind_name(3) != "Sleep" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [wait_fn_kind_name(3)] expected=Sleep got=" + wait_fn_kind_name(3))
+    }
+
+    // 14. signal_fn_kind_name sanity (0..3)
+    if signal_fn_kind_name(0) != "SetEvent" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [signal_fn_kind_name(0)] expected=SetEvent got=" + signal_fn_kind_name(0))
+    }
+    if signal_fn_kind_name(1) != "ResetEvent" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [signal_fn_kind_name(1)] expected=ResetEvent got=" + signal_fn_kind_name(1))
+    }
+    if signal_fn_kind_name(2) != "ReleaseMutex" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [signal_fn_kind_name(2)] expected=ReleaseMutex got=" + signal_fn_kind_name(2))
+    }
+    if signal_fn_kind_name(3) != "LeaveCS" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [signal_fn_kind_name(3)] expected=LeaveCS got=" + signal_fn_kind_name(3))
+    }
+
+    // 15. break_action_name sanity (0..4)
+    if break_action_name(0) != "mem_write_signal" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [break_action_name(0)] expected=mem_write_signal got=" + break_action_name(0))
+    }
+    if break_action_name(1) != "reg_set" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [break_action_name(1)] expected=reg_set got=" + break_action_name(1))
+    }
+    if break_action_name(2) != "force_advance" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [break_action_name(2)] expected=force_advance got=" + break_action_name(2))
+    }
+    if break_action_name(3) != "func_exit" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [break_action_name(3)] expected=func_exit got=" + break_action_name(3))
+    }
+    if break_action_name(4) != "halt" {
+        panic("pe_msvc_thread_sync_polling_real FAIL [break_action_name(4)] expected=halt got=" + break_action_name(4))
+    }
+
+    // 16. pmtsp_stats() == [2, 4, 4, 4, 4]
+    let s = pmtsp_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [stats polling_loop] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [stats sync_object] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [stats wait_call] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [stats signal_call] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [stats break_strategy] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 17. emit stats summary
+    r0_emit("pe_msvc_thread_sync_polling_real_stats",
+        "\"polling_loop\":" + to_string(s[0])
+        + ",\"sync_object\":" + to_string(s[1])
+        + ",\"wait_call\":" + to_string(s[2])
+        + ",\"signal_call\":" + to_string(s[3])
+        + ",\"break_strategy\":" + to_string(s[4]))
+
+    // 18. emit count >= 14 — 2 loop + 4 obj + 4 wait + 4 signal + 4 strategy + 1 stats = 19
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_thread_sync_polling_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 19. cleanup → stats 모두 0
+    cleanup_pmtsp()
+    let s2 = pmtsp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_thread_sync_polling_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_thread_sync_polling_real self_test PASS (polling_loop=" + to_string(s[0])
+        + ", sync_object=" + to_string(s[1]) + ", wait_call=" + to_string(s[2])
+        + ", signal_call=" + to_string(s[3]) + ", break_strategy=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmtsp_stats()
+            println("polling_loop_count\t" + to_string(s[0]))
+            println("sync_object_count\t" + to_string(s[1]))
+            println("wait_call_count\t" + to_string(s[2]))
+            println("signal_call_count\t" + to_string(s[3]))
+            println("break_strategy_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmtsp()
+            println("cleaned: " + pmtsp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmtsp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_thread_sync_polling_real.hexa { self-test | stats | cleanup | dir }")
+}

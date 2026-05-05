@@ -1,0 +1,496 @@
+// lib/loader/pe_i386_disasm.hexa — i386 instruction coverage table + Battle.net entry sequence tracker.
+//
+// shim 측 (R3-1) 에서 i386 disasm 한 결과를 hexa side 가 받아 coverage / progress 추적.
+// hexa-only skeleton — Apple SDK 호출 X, hexa lib 외부 의존 X (own1 정합).
+//
+// 추적 대상 (Intel SDM Vol 2 + PE32 .text section):
+//   - opcode 별 출현 빈도 (push 0x50.., pop 0x58.., mov 0x88../0x89../0x8B../0xB8.., sub 0x83/EC, call 0xE8)
+//   - ModR/M mod field 분포 (mod 0=indirect, 1=disp8, 2=disp32, 3=register-direct)
+//   - 명령어 길이 분포 (1~15 bytes per Intel SDM Vol 2 §2.2)
+//   - 미지원 opcode 추적 (offset + opcode hex)
+//   - Battle.net-Setup.exe entry 0x107767 (8A6 = 8B 6) 부터 첫 32 instruction sample
+//
+// own 1 enforcement: Wine/Box86/QEMU/Bochs/community 0줄. Intel SDM 참조 OK.
+//   - Wine wine/programs/winedbg 인용 X
+//   - Box86 의 dynarec 인용 X
+//   - capstone 의 disasm 인용 X
+// own 2 mandate: r0_emit ≥ 8 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 4 종 — coverage.tsv + modrm.tsv + length.tsv + unknown.tsv + entry.tsv):
+//   coverage.tsv : opcode_hex<str>  \t mnemonic<str> \t count<int>
+//   modrm.tsv    : modrm_mode<int> \t count<int>
+//   length.tsv   : inst_length<int> \t count<int>
+//   unknown.tsv  : opcode_hex<str>  \t byte_offset<int>
+//   entry.tsv    : va_hex<str>      \t mnemonic<str> \t inst_length<int>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → modrm_mode / inst_length / mnemonic.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pi386d_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_disasm"
+}
+
+fn pi386d_table_path() -> str {
+    return pi386d_dir() + "/coverage.tsv"
+}
+
+fn pi386d_modrm_path() -> str {
+    return pi386d_dir() + "/modrm.tsv"
+}
+
+fn pi386d_length_path() -> str {
+    return pi386d_dir() + "/length.tsv"
+}
+
+fn pi386d_unknown_path() -> str {
+    return pi386d_dir() + "/unknown.tsv"
+}
+
+fn pi386d_entry_path() -> str {
+    return pi386d_dir() + "/entry.tsv"
+}
+
+fn pi386d_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pi386d_dir() + "'")
+}
+
+fn cleanup_pi386d() -> void {
+    pi386d_ensure_dir()
+    let _ = exec("rm -f '" + pi386d_table_path() + "' '" + pi386d_modrm_path()
+        + "' '" + pi386d_length_path() + "' '" + pi386d_unknown_path()
+        + "' '" + pi386d_entry_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pi386d_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pi386d_append_row(path: str, row: str) -> void {
+    pi386d_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_opcode: opcode-별 출현 빈도 1 건 ───
+fn record_opcode(opcode_hex: str, mnemonic: str, count: int) -> void {
+    if opcode_hex == "" {
+        panic("pe_i386_disasm FAIL [record_opcode] expected=opcode_hex!=empty got=empty")
+    }
+    if mnemonic == "" {
+        panic("pe_i386_disasm FAIL [record_opcode] expected=mnemonic!=empty got=empty")
+    }
+    if count <= 0 {
+        panic("pe_i386_disasm FAIL [record_opcode] expected=count>0 got=" + to_string(count))
+    }
+    let row = opcode_hex + "\t" + mnemonic + "\t" + to_string(count) + "\n"
+    pi386d_append_row(pi386d_table_path(), row)
+}
+
+// ─── record_modrm_mode: ModR/M mod field 분포 ───
+fn record_modrm_mode(modrm_mode: int, count: int) -> void {
+    if modrm_mode < 0 {
+        panic("pe_i386_disasm FAIL [record_modrm_mode] expected=modrm_mode>=0 got=" + to_string(modrm_mode))
+    }
+    if modrm_mode > 3 {
+        panic("pe_i386_disasm FAIL [record_modrm_mode] expected=modrm_mode<=3 got=" + to_string(modrm_mode))
+    }
+    if count <= 0 {
+        panic("pe_i386_disasm FAIL [record_modrm_mode] expected=count>0 got=" + to_string(count))
+    }
+    let row = to_string(modrm_mode) + "\t" + to_string(count) + "\n"
+    pi386d_append_row(pi386d_modrm_path(), row)
+}
+
+// ─── record_inst_length: 명령어 길이 분포 (Intel SDM: 1..15 bytes) ───
+fn record_inst_length(length: int, count: int) -> void {
+    if length <= 0 {
+        panic("pe_i386_disasm FAIL [record_inst_length] expected=length>0 got=" + to_string(length))
+    }
+    if length > 15 {
+        panic("pe_i386_disasm FAIL [record_inst_length] expected=length<=15 got=" + to_string(length))
+    }
+    if count <= 0 {
+        panic("pe_i386_disasm FAIL [record_inst_length] expected=count>0 got=" + to_string(count))
+    }
+    let row = to_string(length) + "\t" + to_string(count) + "\n"
+    pi386d_append_row(pi386d_length_path(), row)
+}
+
+// ─── record_unknown: 미지원 opcode 추적 ───
+fn record_unknown(opcode_hex: str, byte_offset: int) -> void {
+    if opcode_hex == "" {
+        panic("pe_i386_disasm FAIL [record_unknown] expected=opcode_hex!=empty got=empty")
+    }
+    if byte_offset < 0 {
+        panic("pe_i386_disasm FAIL [record_unknown] expected=byte_offset>=0 got=" + to_string(byte_offset))
+    }
+    let row = opcode_hex + "\t" + to_string(byte_offset) + "\n"
+    pi386d_append_row(pi386d_unknown_path(), row)
+}
+
+// ─── record_entry_sample: Battle.net entry 첫 32 instruction sample 1 건 ───
+fn record_entry_sample(va_hex: str, mnemonic: str, length: int) -> void {
+    if va_hex == "" {
+        panic("pe_i386_disasm FAIL [record_entry_sample] expected=va_hex!=empty got=empty")
+    }
+    if mnemonic == "" {
+        panic("pe_i386_disasm FAIL [record_entry_sample] expected=mnemonic!=empty got=empty")
+    }
+    if length <= 0 {
+        panic("pe_i386_disasm FAIL [record_entry_sample] expected=length>0 got=" + to_string(length))
+    }
+    if length > 15 {
+        panic("pe_i386_disasm FAIL [record_entry_sample] expected=length<=15 got=" + to_string(length))
+    }
+    let row = va_hex + "\t" + mnemonic + "\t" + to_string(length) + "\n"
+    pi386d_append_row(pi386d_entry_path(), row)
+}
+
+// ─── opcode_count: total opcode record 수 ───
+fn opcode_count() -> int {
+    let t = pi386d_read_table(pi386d_table_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── unknown_count: total unknown record 수 ───
+fn unknown_count() -> int {
+    let t = pi386d_read_table(pi386d_unknown_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 2 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── entry_sample_count: Battle.net entry sample 수 ───
+fn entry_sample_count() -> int {
+    let t = pi386d_read_table(pi386d_entry_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── coverage_pct: known/total %  (정수 percent — 소수점 절사) ───
+fn coverage_pct(known_total: int, total: int) -> int {
+    if known_total < 0 {
+        panic("pe_i386_disasm FAIL [coverage_pct] expected=known_total>=0 got=" + to_string(known_total))
+    }
+    if total <= 0 {
+        panic("pe_i386_disasm FAIL [coverage_pct] expected=total>0 got=" + to_string(total))
+    }
+    if known_total > total {
+        panic("pe_i386_disasm FAIL [coverage_pct] expected=known_total<=total got="
+            + to_string(known_total) + ">" + to_string(total))
+    }
+    return (known_total * 100) / total
+}
+
+// ─── top_mnemonic: 가장 빈번한 mnemonic (count 최댓값) ───
+fn top_mnemonic() -> str {
+    let t = pi386d_read_table(pi386d_table_path())
+    if t == "" {
+        return ""
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut best = ""
+    let mut best_count = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                let c = to_int(parts[2])
+                if c > best_count {
+                    best_count = c
+                    best = parts[1]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── pi386d_stats: [opcode_count, unknown_count, entry_sample_count] ───
+fn pi386d_stats() -> array {
+    let mut out = []
+    out.push(opcode_count())
+    out.push(unknown_count())
+    out.push(entry_sample_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pi386d-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pi386d()
+
+    // 2. record opcode 5종 (push/pop/mov/sub/call) — Intel SDM Vol 2 reference opcodes
+    record_opcode("50", "push", 12)
+    r0_emit("pe_i386_disasm_record_opcode",
+        "\"opcode_hex\":\"50\",\"mnemonic\":\"push\",\"count\":12")
+
+    record_opcode("58", "pop", 9)
+    r0_emit("pe_i386_disasm_record_opcode",
+        "\"opcode_hex\":\"58\",\"mnemonic\":\"pop\",\"count\":9")
+
+    record_opcode("8B", "mov", 24)
+    r0_emit("pe_i386_disasm_record_opcode",
+        "\"opcode_hex\":\"8B\",\"mnemonic\":\"mov\",\"count\":24")
+
+    record_opcode("83", "sub", 4)
+    r0_emit("pe_i386_disasm_record_opcode",
+        "\"opcode_hex\":\"83\",\"mnemonic\":\"sub\",\"count\":4")
+
+    record_opcode("E8", "call", 7)
+    r0_emit("pe_i386_disasm_record_opcode",
+        "\"opcode_hex\":\"E8\",\"mnemonic\":\"call\",\"count\":7")
+
+    // 3. record modrm_mode 4종 (mod 0/1/2/3 분포)
+    record_modrm_mode(0, 6)
+    r0_emit("pe_i386_disasm_record_modrm",
+        "\"modrm_mode\":0,\"count\":6,\"target\":\"indirect\"")
+
+    record_modrm_mode(1, 11)
+    r0_emit("pe_i386_disasm_record_modrm",
+        "\"modrm_mode\":1,\"count\":11,\"target\":\"disp8\"")
+
+    record_modrm_mode(2, 5)
+    r0_emit("pe_i386_disasm_record_modrm",
+        "\"modrm_mode\":2,\"count\":5,\"target\":\"disp32\"")
+
+    record_modrm_mode(3, 14)
+    r0_emit("pe_i386_disasm_record_modrm",
+        "\"modrm_mode\":3,\"count\":14,\"target\":\"register-direct\"")
+
+    // 4. record inst_length 1-7 (Intel SDM: i386 단일 명령어 분포 1~15)
+    record_inst_length(1, 21)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":1,\"count\":21")
+
+    record_inst_length(2, 18)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":2,\"count\":18")
+
+    record_inst_length(3, 9)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":3,\"count\":9")
+
+    record_inst_length(4, 6)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":4,\"count\":6")
+
+    record_inst_length(5, 5)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":5,\"count\":5")
+
+    record_inst_length(6, 3)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":6,\"count\":3")
+
+    record_inst_length(7, 2)
+    r0_emit("pe_i386_disasm_record_length",
+        "\"inst_length\":7,\"count\":2")
+
+    // 5. record unknown 2종 (미지원 opcode 추적)
+    record_unknown("0F38", 4096)
+    r0_emit("pe_i386_disasm_record_unknown",
+        "\"opcode_hex\":\"0F38\",\"byte_offset\":4096,\"target\":\"three-byte-prefix-SSSE3\"")
+
+    record_unknown("0F3A", 4112)
+    r0_emit("pe_i386_disasm_record_unknown",
+        "\"opcode_hex\":\"0F3A\",\"byte_offset\":4112,\"target\":\"three-byte-prefix-SSE4\"")
+
+    // 6. record entry_sample 5종 — Battle.net-Setup.exe entry RVA 0x107767+offset 0x8A6
+    //    typical i386 prologue: push ebp / mov ebp,esp / sub esp,N / push ebx / push esi
+    record_entry_sample("0x107767", "push ebp", 1)
+    r0_emit("pe_i386_disasm_record_entry",
+        "\"va_hex\":\"0x107767\",\"mnemonic\":\"push ebp\",\"inst_length\":1,\"target\":\"prologue.0\"")
+
+    record_entry_sample("0x107768", "mov ebp,esp", 2)
+    r0_emit("pe_i386_disasm_record_entry",
+        "\"va_hex\":\"0x107768\",\"mnemonic\":\"mov ebp,esp\",\"inst_length\":2,\"target\":\"prologue.1\"")
+
+    record_entry_sample("0x10776A", "sub esp,0x40", 3)
+    r0_emit("pe_i386_disasm_record_entry",
+        "\"va_hex\":\"0x10776A\",\"mnemonic\":\"sub esp,0x40\",\"inst_length\":3,\"target\":\"prologue.2\"")
+
+    record_entry_sample("0x10776D", "push ebx", 1)
+    r0_emit("pe_i386_disasm_record_entry",
+        "\"va_hex\":\"0x10776D\",\"mnemonic\":\"push ebx\",\"inst_length\":1,\"target\":\"prologue.3\"")
+
+    record_entry_sample("0x10776E", "push esi", 1)
+    r0_emit("pe_i386_disasm_record_entry",
+        "\"va_hex\":\"0x10776E\",\"mnemonic\":\"push esi\",\"inst_length\":1,\"target\":\"prologue.4\"")
+
+    // 7. assertion: opcode_count == 5
+    let oc = opcode_count()
+    if oc != 5 {
+        panic("pe_i386_disasm FAIL [opcode_count] expected=5 got=" + to_string(oc))
+    }
+
+    // 8. assertion: unknown_count == 2
+    let uc = unknown_count()
+    if uc != 2 {
+        panic("pe_i386_disasm FAIL [unknown_count] expected=2 got=" + to_string(uc))
+    }
+
+    // 9. assertion: entry_sample_count == 5
+    let ec = entry_sample_count()
+    if ec != 5 {
+        panic("pe_i386_disasm FAIL [entry_sample_count] expected=5 got=" + to_string(ec))
+    }
+
+    // 10. coverage_pct sanity (known=5, total=7 → 71)
+    let pct = coverage_pct(5, 7)
+    if pct != 71 {
+        panic("pe_i386_disasm FAIL [coverage_pct(5,7)] expected=71 got=" + to_string(pct))
+    }
+    let pct100 = coverage_pct(10, 10)
+    if pct100 != 100 {
+        panic("pe_i386_disasm FAIL [coverage_pct(10,10)] expected=100 got=" + to_string(pct100))
+    }
+    let pct0 = coverage_pct(0, 5)
+    if pct0 != 0 {
+        panic("pe_i386_disasm FAIL [coverage_pct(0,5)] expected=0 got=" + to_string(pct0))
+    }
+
+    // 11. top_mnemonic — mov(24) 가 최댓값
+    let top = top_mnemonic()
+    if top != "mov" {
+        panic("pe_i386_disasm FAIL [top_mnemonic] expected=mov got=" + top)
+    }
+
+    // 12. pi386d_stats() = [5, 2, 5]
+    let s = pi386d_stats()
+    if len(s) != 3 {
+        panic("pe_i386_disasm FAIL [stats len] expected=3 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_i386_disasm FAIL [stats opcode_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_i386_disasm FAIL [stats unknown_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_i386_disasm FAIL [stats entry_sample_count] expected=5 got=" + to_string(s[2]))
+    }
+
+    // 13. emit stats
+    r0_emit("pe_i386_disasm_stats",
+        "\"opcode_count\":" + to_string(s[0])
+        + ",\"unknown_count\":" + to_string(s[1])
+        + ",\"entry_sample_count\":" + to_string(s[2])
+        + ",\"top_mnemonic\":\"" + top + "\""
+        + ",\"coverage_pct\":" + to_string(pct))
+
+    // 14. emit count >= 8 (5 opcode + 4 modrm + 7 length + 2 unknown + 5 entry + 1 stats = 24)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 8 {
+        panic("pe_i386_disasm FAIL [r0 emit count] expected=>=8 got=" + to_string(emit_n))
+    }
+
+    // 15. cleanup → stats 모두 0
+    cleanup_pi386d()
+    let s2 = pi386d_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_disasm FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_disasm self_test PASS (opcodes=" + to_string(s[0])
+        + ", unknown=" + to_string(s[1]) + ", entry_samples=" + to_string(s[2])
+        + ", top=" + top + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pi386d_stats()
+            println("opcode_count\t" + to_string(s[0]))
+            println("unknown_count\t" + to_string(s[1]))
+            println("entry_sample_count\t" + to_string(s[2]))
+            let top = top_mnemonic()
+            println("top_mnemonic\t" + top)
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pi386d()
+            println("cleaned: " + pi386d_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pi386d_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_disasm.hexa { self-test | stats | cleanup | dir }")
+}

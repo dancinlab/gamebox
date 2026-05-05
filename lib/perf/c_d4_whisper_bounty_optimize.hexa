@@ -1,0 +1,226 @@
+// lib/perf/c_d4_whisper_bounty_optimize.hexa — CN-195 skeleton manjeom 15/15
+//
+// D4 Whisper of the Dead bounty 최적화 추적 — Tree of Whispers 보상.
+// D4 Tree of Whispers 의 Whisper bounty (10 Grim Favor 모으면 cache 보상) 를
+// bounty × region × grim_favor × completion_us 4-key 단위로 추적해 가장
+// 효율적인 region/bounty 조합을 예측한다. 본 모듈은 bounty 단위 columnar
+// 로그와 region/favor 집계만 담당 — 실제 bounty pickup 은 host 측 책임.
+//
+// 무기: bounty × region × favor × completion 4-key columnar log + sum/avg.
+// 효과: D4 Whisper farming 효율 정량화 → grim_favor 당 평균 소요 us 산출,
+//       region 별 bounty 분포로 가장 빠른 cache 회전 region 식별.
+
+use "./r0_common"
+
+let DWBO_DIR = GAMEBOX_HOME + "/persist/d4_whisper_bounty_optimize"
+let BOUNTY_LOG = DWBO_DIR + "/bounties.tsv"
+
+fn dwbo_dir() -> str { return DWBO_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DWBO_DIR + "'")
+}
+
+// ─── bounty 등록 ───
+//   bounty_id (Whisper bounty 의 logical id),
+//   region_id (1=Fractured, 2=Hawezar, 3=Kehjistan, 4=Scosglen, 5=Dry_Steppes),
+//   grim_favor (이 bounty 완료 시 획득 favor 점수, 보통 3~5),
+//   completion_us (bounty pickup → complete 까지 소요 us, host 측 측정).
+fn record_bounty(bounty_id: int, region_id: int, grim_favor: int, completion_us: int) -> void {
+    ensure_dir()
+    let line = to_string(bounty_id) + "\t" + to_string(region_id) + "\t" + to_string(grim_favor) + "\t" + to_string(completion_us)
+    let tmp = BOUNTY_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + BOUNTY_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("d4_whisper_bounty_record", "\"bounty\":" + to_string(bounty_id) + ",\"region\":" + to_string(region_id) + ",\"favor\":" + to_string(grim_favor) + ",\"completion_us\":" + to_string(completion_us))
+}
+
+// ─── bounty_count — 등록된 bounty 행 수 ───
+fn bounty_count() -> int {
+    let exists = exec("test -f '" + BOUNTY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + BOUNTY_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_grim_favor — 모든 bounty grim_favor 합 ───
+fn total_grim_favor() -> int {
+    let exists = exec("test -f '" + BOUNTY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + BOUNTY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_completion_us — 모든 bounty completion 합 (us) ───
+fn total_completion_us() -> int {
+    let exists = exec("test -f '" + BOUNTY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + BOUNTY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── count_by_region — 특정 region_id bounty 행 수 ───
+fn count_by_region(region_id: int) -> int {
+    let exists = exec("test -f '" + BOUNTY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v r=" + to_string(region_id) + " '$2==r {c+=1} END{print c+0}' '" + BOUNTY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_completion_per_favor — total_completion / total_grim_favor ───
+//   total_grim_favor == 0 이면 0 반환 (divide-by-zero guard).
+fn avg_completion_per_favor() -> int {
+    let tgf = total_grim_favor()
+    if tgf == 0 { return 0 }
+    let tcu = total_completion_us()
+    return tcu / tgf
+}
+
+// ─── bounty_completion_us — 특정 bounty_id completion 합 (us) ───
+//   bounty_id 미등록이면 0.
+fn bounty_completion_us(bounty_id: int) -> int {
+    let exists = exec("test -f '" + BOUNTY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v b=" + to_string(bounty_id) + " '$1==b {s+=$4} END{print s+0}' '" + BOUNTY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── dwbo_stats — [bounty_count, total_grim_favor, total_completion_us, count_by_region(1)] ───
+fn dwbo_stats() -> array {
+    return [bounty_count(), total_grim_favor(), total_completion_us(), count_by_region(1)]
+}
+
+fn cleanup_dwbo() -> void {
+    let _ = exec("rm -rf '" + DWBO_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dwbo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dwbo()
+
+    // 합성 bounty 3 종:
+    //   49001 Fractured Peaks kill 25         — region=1, favor=5, completion=180000000 us
+    //   49002 Hawezar collect 15 hearts       — region=2, favor=3, completion=240000000 us
+    //   49003 Kehjistan event participate     — region=3, favor=4, completion=120000000 us
+    record_bounty(49001, 1, 5, 180000000)
+    record_bounty(49002, 2, 3, 240000000)
+    record_bounty(49003, 3, 4, 120000000)
+
+    // bounty_count = 3
+    let bc = bounty_count()
+    if bc != 3 { panic("c_d4_whisper_bounty_optimize FAIL [bounty_count] expected=3 got=" + to_string(bc)) }
+
+    // total_grim_favor = 5+3+4 = 12
+    let tgf = total_grim_favor()
+    if tgf != 12 { panic("c_d4_whisper_bounty_optimize FAIL [total_grim_favor] expected=12 got=" + to_string(tgf)) }
+
+    // total_completion_us = 180000000+240000000+120000000 = 540000000
+    let tcu = total_completion_us()
+    if tcu != 540000000 { panic("c_d4_whisper_bounty_optimize FAIL [total_completion_us] expected=540000000 got=" + to_string(tcu)) }
+
+    // count_by_region: 1→1, 2→1, 3→1, 99→0
+    let r1 = count_by_region(1)
+    if r1 != 1 { panic("c_d4_whisper_bounty_optimize FAIL [count_by_region 1] expected=1 got=" + to_string(r1)) }
+    let r2 = count_by_region(2)
+    if r2 != 1 { panic("c_d4_whisper_bounty_optimize FAIL [count_by_region 2] expected=1 got=" + to_string(r2)) }
+    let r3 = count_by_region(3)
+    if r3 != 1 { panic("c_d4_whisper_bounty_optimize FAIL [count_by_region 3] expected=1 got=" + to_string(r3)) }
+    let r99 = count_by_region(99)
+    if r99 != 0 { panic("c_d4_whisper_bounty_optimize FAIL [count_by_region 99] expected=0 got=" + to_string(r99)) }
+
+    // avg_completion_per_favor = 540000000 / 12 = 45000000
+    let avg = avg_completion_per_favor()
+    if avg != 45000000 { panic("c_d4_whisper_bounty_optimize FAIL [avg_completion_per_favor] expected=45000000 got=" + to_string(avg)) }
+
+    // bounty_completion_us:
+    //   49001 → 180000000
+    //   49002 → 240000000
+    //   49003 → 120000000
+    //   9999  → 0 (unknown)
+    let b1 = bounty_completion_us(49001)
+    if b1 != 180000000 { panic("c_d4_whisper_bounty_optimize FAIL [bounty_completion_us 49001] expected=180000000 got=" + to_string(b1)) }
+    let b2 = bounty_completion_us(49002)
+    if b2 != 240000000 { panic("c_d4_whisper_bounty_optimize FAIL [bounty_completion_us 49002] expected=240000000 got=" + to_string(b2)) }
+    let b3 = bounty_completion_us(49003)
+    if b3 != 120000000 { panic("c_d4_whisper_bounty_optimize FAIL [bounty_completion_us 49003] expected=120000000 got=" + to_string(b3)) }
+    let b4 = bounty_completion_us(9999)
+    if b4 != 0 { panic("c_d4_whisper_bounty_optimize FAIL [bounty_completion_us 9999] expected=0 got=" + to_string(b4)) }
+
+    let stats = dwbo_stats()
+    if stats[0] != 3 { panic("c_d4_whisper_bounty_optimize FAIL [stats bounty_count] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 12 { panic("c_d4_whisper_bounty_optimize FAIL [stats total_grim_favor] expected=12 got=" + to_string(stats[1])) }
+    if stats[2] != 540000000 { panic("c_d4_whisper_bounty_optimize FAIL [stats total_completion_us] expected=540000000 got=" + to_string(stats[2])) }
+    if stats[3] != 1 { panic("c_d4_whisper_bounty_optimize FAIL [stats count_by_region(1)] expected=1 got=" + to_string(stats[3])) }
+
+    r0_emit("d4_whisper_bounty_summary", "\"bounties\":" + to_string(stats[0]) + ",\"favor\":" + to_string(stats[1]) + ",\"completion_us\":" + to_string(stats[2]) + ",\"region1\":" + to_string(stats[3]) + ",\"avg_us_per_favor\":" + to_string(avg))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_d4_whisper_bounty_optimize FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic D4 economy retired_intentional posture annotation (Track BA) ───
+    //
+    // Track BA mission: extend Track V (7) + Track AJ (6) + Track AL (6) D4 retired_
+    // intentional posture annotation to 6 additional c_d4_* modules. cumulative
+    // coverage 25/27 = ~92.6%. .roadmap.diablo4 blk.1 status_enum_adopted = retired_
+    // intentional (Track A2 land 2026-05-03). 본 module 측 Tree of Whispers grim
+    // favor bounty optimizer = synthetic build analyzer — production live game state
+    // 측정 X (D4 always-online live session 진입 X, DRM bypass 0, Battle.net launcher
+    // 통과 X). cond.3 status `partial` 영구 유지 (retired_intentional posture per
+    // blk.1 영구 lock). pattern reference: lib/perf/c_d4_aspect_imprint_track.hexa
+    // (Track AL predecessor, identical schema).
+    //
+    // synthetic posture row column header:
+    //     domain                "whisper_bounty_optimize"
+    //     posture               "retired_intentional"  (NOT pass / NOT partial / NOT fail)
+    //     production_smoke      "no_attempt"           (no live game state acquire)
+    //     drm_bypass            "0"                    (own1 Wine 0 / no evasion)
+    //     always_online_evade   "0"                    (own1 honest acknowledgment)
+    //     blocker_ref           "diablo4.blk.1"        (always_online_drm)
+    //     adoption_iso          "2026-05-03"           (Track A2 retired_intentional adopt)
+    r0_emit("c_d4_whisper_bounty_optimize_retired_intentional",
+        "\"stage\":\"d4_economy_synthetic\",\"domain\":\"whisper_bounty_optimize\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"always_online_evade\":0,\"blocker_ref\":\"diablo4.blk.1\",\"blocker_class\":\"always_online_drm\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"diablo4.cond.3\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\",\"track\":\"BA\"")
+    println("__D4_WHISPER_BOUNTY__ RETIRED_INTENTIONAL d4_economy_synthetic")
+
+    cleanup_dwbo()
+
+    println("  ✅ c_d4_whisper_bounty_optimize self_test PASS (3 bounties, favor=12, completion=540000000 us, region1=1, avg_per_favor=45000000 us, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = dwbo_stats()
+            println("bounties=" + to_string(s[0]) + " favor=" + to_string(s[1]) + " completion_us=" + to_string(s[2]) + " region1=" + to_string(s[3]))
+            return
+        }
+        if sub == "completion" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                let us = bounty_completion_us(bid)
+                println(to_string(us))
+                return
+            }
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                let c = count_by_region(rid)
+                println(to_string(c))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_dwbo(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_d4_whisper_bounty_optimize.hexa { self-test | stats | completion <bounty_id> | count <region_id> | cleanup }")
+}

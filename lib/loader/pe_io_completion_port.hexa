@@ -1,0 +1,401 @@
+// lib/loader/pe_io_completion_port.hexa — cycle 71 Win32 I/O Completion Port skeleton
+//
+// Win32 IOCP (CreateIoCompletionPort / GetQueuedCompletionStatus /
+// PostQueuedCompletionStatus) → kqueue EVFILT_READ + dispatch_io bridge.
+// High-perf async I/O — completion key + bytes_transferred 회수.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 IOCP op tracker — 실 CreateIoCompletionPort() / kqueue() 호출 X (later).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = create     (CreateIoCompletionPort — new port)
+//   2 = associate  (CreateIoCompletionPort — bind handle)
+//   3 = post       (PostQueuedCompletionStatus)
+//   4 = dequeue    (GetQueuedCompletionStatus)
+//   5 = close      (CloseHandle on IOCP)
+//
+// persist schema (TSV — ops.tsv):
+//   iocp_id<int> \t op_kind<int> \t bytes_transferred<int> \t completion_key<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piocp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_io_completion_port"
+}
+
+fn piocp_ops_path() -> str {
+    return piocp_dir() + "/ops.tsv"
+}
+
+fn piocp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piocp_dir() + "'")
+}
+
+fn cleanup_piocp() -> void {
+    piocp_ensure_dir()
+    let _ = exec("rm -f '" + piocp_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piocp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piocp_append_row(path: str, row: str) -> void {
+    piocp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: IOCP op 1 건 기록 ───
+fn record_op(iocp_id: int, op_kind: int, bytes_transferred: int, completion_key: int) -> void {
+    if iocp_id <= 0 {
+        panic("pe_io_completion_port FAIL [record_op] expected=iocp_id>0 got=" + to_string(iocp_id))
+    }
+    if op_kind < 1 {
+        panic("pe_io_completion_port FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 5 {
+        panic("pe_io_completion_port FAIL [record_op] expected=op_kind<=5 got=" + to_string(op_kind))
+    }
+    if bytes_transferred < 0 {
+        panic("pe_io_completion_port FAIL [record_op] expected=bytes_transferred>=0 got=" + to_string(bytes_transferred))
+    }
+    if completion_key < 0 {
+        panic("pe_io_completion_port FAIL [record_op] expected=completion_key>=0 got=" + to_string(completion_key))
+    }
+    let row = to_string(iocp_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(bytes_transferred) + "\t" + to_string(completion_key) + "\n"
+    piocp_append_row(piocp_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = piocp_read_table(piocp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes_transferred: 모든 op bytes_transferred 합 ───
+fn total_bytes_transferred() -> int {
+    let t = piocp_read_table(piocp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = piocp_read_table(piocp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_completion_keys: 고유 completion_key 수 ───
+fn distinct_completion_keys() -> int {
+    let t = piocp_read_table(piocp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let key = to_int(parts[3])
+                let mut found = 0
+                let mut j = 0
+                while j < len(seen) {
+                    if seen[j] == key {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(key)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── iocp_bytes: 특정 iocp_id 의 누적 bytes_transferred ───
+fn iocp_bytes(iocp_id: int) -> int {
+    let t = piocp_read_table(piocp_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == iocp_id {
+                    sum = sum + to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── piocp_stats: [op_count, total_bytes_transferred, distinct_completion_keys, count_by_op_kind(4)] ───
+fn piocp_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_bytes_transferred())
+    out.push(distinct_completion_keys())
+    out.push(count_by_op_kind(4))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piocp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_piocp()
+
+    // 2. record 6 IOCP ops (deterministic synthetic)
+    //    ≥3 op_kinds (1=create, 2=associate, 3=post, 4=dequeue, 5=close)
+    //    ≥2 distinct completion_keys (777, 888)
+    record_op(710001, 1, 0, 0)
+    r0_emit("pe_io_completion_port_record",
+        "\"iocp_id\":710001,\"op_kind\":1,\"bytes_transferred\":0,\"completion_key\":0,\"target\":\"create\"")
+
+    record_op(710001, 2, 0, 777)
+    r0_emit("pe_io_completion_port_record",
+        "\"iocp_id\":710001,\"op_kind\":2,\"bytes_transferred\":0,\"completion_key\":777,\"target\":\"associate\"")
+
+    record_op(710001, 3, 512, 777)
+    r0_emit("pe_io_completion_port_record",
+        "\"iocp_id\":710001,\"op_kind\":3,\"bytes_transferred\":512,\"completion_key\":777,\"target\":\"post\"")
+
+    record_op(710001, 4, 512, 777)
+    r0_emit("pe_io_completion_port_record",
+        "\"iocp_id\":710001,\"op_kind\":4,\"bytes_transferred\":512,\"completion_key\":777,\"target\":\"dequeue\"")
+
+    record_op(710001, 4, 1024, 888)
+    r0_emit("pe_io_completion_port_record",
+        "\"iocp_id\":710001,\"op_kind\":4,\"bytes_transferred\":1024,\"completion_key\":888,\"target\":\"dequeue\"")
+
+    record_op(710001, 5, 0, 0)
+    r0_emit("pe_io_completion_port_record",
+        "\"iocp_id\":710001,\"op_kind\":5,\"bytes_transferred\":0,\"completion_key\":0,\"target\":\"close\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_io_completion_port FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_bytes_transferred = 2048
+    let tb = total_bytes_transferred()
+    if tb != 2048 {
+        panic("pe_io_completion_port FAIL [total_bytes_transferred] expected=2048 got=" + to_string(tb))
+    }
+
+    // 5. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_io_completion_port FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_io_completion_port FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_io_completion_port FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 2 {
+        panic("pe_io_completion_port FAIL [count_by_op_kind(4)] expected=2 got=" + to_string(k4))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 1 {
+        panic("pe_io_completion_port FAIL [count_by_op_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_io_completion_port FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_completion_keys = 3 (0, 777, 888)
+    let dk = distinct_completion_keys()
+    if dk != 3 {
+        panic("pe_io_completion_port FAIL [distinct_completion_keys] expected=3 got=" + to_string(dk))
+    }
+
+    // 7. iocp_bytes sanity
+    let ib = iocp_bytes(710001)
+    if ib != 2048 {
+        panic("pe_io_completion_port FAIL [iocp_bytes(710001)] expected=2048 got=" + to_string(ib))
+    }
+    let ib_miss = iocp_bytes(9999)
+    if ib_miss != 0 {
+        panic("pe_io_completion_port FAIL [iocp_bytes(9999)] expected=0 got=" + to_string(ib_miss))
+    }
+
+    // 8. piocp_stats() = [6, 2048, 3, 2]
+    let s = piocp_stats()
+    if len(s) != 4 {
+        panic("pe_io_completion_port FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_io_completion_port FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2048 {
+        panic("pe_io_completion_port FAIL [stats total_bytes] expected=2048 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_io_completion_port FAIL [stats distinct_keys] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_io_completion_port FAIL [stats count_dequeue] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_io_completion_port_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_bytes\":" + to_string(s[1])
+        + ",\"distinct_keys\":" + to_string(s[2])
+        + ",\"kind_dequeue\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_io_completion_port FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_piocp()
+    let s2 = piocp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_io_completion_port FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_io_completion_port self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", keys=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piocp_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_bytes_transferred\t" + to_string(s[1]))
+            println("distinct_completion_keys\t" + to_string(s[2]))
+            println("count_kind_dequeue\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("iocp_bytes\t" + to_string(iocp_bytes(iid)))
+                return
+            }
+            println("usage: hexa run pe_io_completion_port.hexa bytes <iocp_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_io_completion_port.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piocp()
+            println("cleaned: " + piocp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piocp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_io_completion_port.hexa { self-test | stats | bytes <iocp_id> | count <op_kind> | cleanup | dir }")
+}

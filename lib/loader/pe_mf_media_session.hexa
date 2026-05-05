@@ -1,0 +1,386 @@
+// lib/loader/pe_mf_media_session.hexa — cycle 77 IMFMediaSession state machine telemetry skeleton
+//
+// Windows Media Foundation IMFMediaSession 의 state machine event 를 추적해서
+// macOS AVFoundation AVPlayer state (waitingToPlay / playing / paused / stopped /
+// ended / failed) 로 bridge 하기 위한 telemetry tracker.
+// 본 module 은 event 기록/집계만 — 실제 IMFMediaSession 호출 / AVPlayer 호출 X (stage 후속).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   IMFMediaSession state 표는 Microsoft public docs 기반으로만 작성.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// event_kind code:
+//   1 = topology_set
+//   2 = session_started
+//   3 = session_paused
+//   4 = session_stopped
+//   5 = session_ended
+//   6 = error
+//
+// elevated:
+//   0 = standard
+//   1 = elevated (admin / kernel transition required)
+//
+// persist schema (TSV — events.tsv):
+//   event_id<int> \t event_kind<int> \t stream_count<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pms_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_mf_media_session"
+}
+
+fn pms_events_path() -> str {
+    return pms_dir() + "/events.tsv"
+}
+
+fn pms_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pms_dir() + "'")
+}
+
+fn cleanup_pms() -> void {
+    pms_ensure_dir()
+    let _ = exec("rm -f '" + pms_events_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pms_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pms_append_row(path: str, row: str) -> void {
+    pms_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_event: media session event 1 건 기록 ───
+fn record_event(event_id: int, event_kind: int, stream_count: int, elevated: int) -> void {
+    if event_id <= 0 {
+        panic("pe_mf_media_session FAIL [record_event] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if event_kind < 1 {
+        panic("pe_mf_media_session FAIL [record_event] expected=event_kind>=1 got=" + to_string(event_kind))
+    }
+    if event_kind > 6 {
+        panic("pe_mf_media_session FAIL [record_event] expected=event_kind<=6 got=" + to_string(event_kind))
+    }
+    if stream_count < 0 {
+        panic("pe_mf_media_session FAIL [record_event] expected=stream_count>=0 got=" + to_string(stream_count))
+    }
+    if elevated < 0 {
+        panic("pe_mf_media_session FAIL [record_event] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_mf_media_session FAIL [record_event] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(event_id) + "\t" + to_string(event_kind)
+        + "\t" + to_string(stream_count) + "\t" + to_string(elevated) + "\n"
+    pms_append_row(pms_events_path(), row)
+}
+
+// ─── event_count: total event 수 ───
+fn event_count() -> int {
+    let t = pms_read_table(pms_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_streams: 모든 event stream_count 합 ───
+fn total_streams() -> int {
+    let t = pms_read_table(pms_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_event_kind: 특정 event_kind 의 event 수 ───
+fn count_by_event_kind(kind: int) -> int {
+    let t = pms_read_table(pms_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── error_count: event_kind == 6 인 event 수 ───
+fn error_count() -> int {
+    return count_by_event_kind(6)
+}
+
+// ─── event_streams: 특정 event_id 의 stream_count (없으면 0) ───
+fn event_streams(event_id: int) -> int {
+    let t = pms_read_table(pms_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == event_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pms_stats: [event_count, total_streams, error_count, count_by_event_kind(2)] ───
+fn pms_stats() -> array {
+    let mut out = []
+    out.push(event_count())
+    out.push(total_streams())
+    out.push(error_count())
+    out.push(count_by_event_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pms-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pms()
+
+    // 2. record 6 events across ≥4 event_kinds (with ≥1 error)
+    record_event(770001, 1, 2, 0)
+    r0_emit("pe_mf_media_session_record",
+        "\"event_id\":770001,\"event_kind\":1,\"stream_count\":2,\"elevated\":0,\"target\":\"topology_set\"")
+
+    record_event(770002, 2, 2, 0)
+    r0_emit("pe_mf_media_session_record",
+        "\"event_id\":770002,\"event_kind\":2,\"stream_count\":2,\"elevated\":0,\"target\":\"session_started\"")
+
+    record_event(770003, 3, 2, 0)
+    r0_emit("pe_mf_media_session_record",
+        "\"event_id\":770003,\"event_kind\":3,\"stream_count\":2,\"elevated\":0,\"target\":\"session_paused\"")
+
+    record_event(770004, 2, 3, 1)
+    r0_emit("pe_mf_media_session_record",
+        "\"event_id\":770004,\"event_kind\":2,\"stream_count\":3,\"elevated\":1,\"target\":\"session_started\"")
+
+    record_event(770005, 6, 0, 0)
+    r0_emit("pe_mf_media_session_record",
+        "\"event_id\":770005,\"event_kind\":6,\"stream_count\":0,\"elevated\":0,\"target\":\"error\"")
+
+    record_event(770006, 5, 3, 0)
+    r0_emit("pe_mf_media_session_record",
+        "\"event_id\":770006,\"event_kind\":5,\"stream_count\":3,\"elevated\":0,\"target\":\"session_ended\"")
+
+    // 3. event_count = 6
+    let c = event_count()
+    if c != 6 {
+        panic("pe_mf_media_session FAIL [event_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_streams = 2 + 2 + 2 + 3 + 0 + 3 = 12
+    let ts = total_streams()
+    if ts != 12 {
+        panic("pe_mf_media_session FAIL [total_streams] expected=12 got=" + to_string(ts))
+    }
+
+    // 5. count_by_event_kind sanity
+    let k1 = count_by_event_kind(1)
+    if k1 != 1 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_event_kind(2)
+    if k2 != 2 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_event_kind(3)
+    if k3 != 1 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_event_kind(4)
+    if k4 != 0 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k5 = count_by_event_kind(5)
+    if k5 != 1 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_event_kind(6)
+    if k6 != 1 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k99 = count_by_event_kind(99)
+    if k99 != 0 {
+        panic("pe_mf_media_session FAIL [count_by_event_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. error_count = 1
+    let ec = error_count()
+    if ec != 1 {
+        panic("pe_mf_media_session FAIL [error_count] expected=1 got=" + to_string(ec))
+    }
+
+    // 7. event_streams sanity
+    let s2 = event_streams(770002)
+    if s2 != 2 {
+        panic("pe_mf_media_session FAIL [event_streams(770002)] expected=2 got=" + to_string(s2))
+    }
+    let s4 = event_streams(770004)
+    if s4 != 3 {
+        panic("pe_mf_media_session FAIL [event_streams(770004)] expected=3 got=" + to_string(s4))
+    }
+    let s_miss = event_streams(9999)
+    if s_miss != 0 {
+        panic("pe_mf_media_session FAIL [event_streams(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pms_stats() = [6, 12, 1, 2]
+    let s = pms_stats()
+    if len(s) != 4 {
+        panic("pe_mf_media_session FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_mf_media_session FAIL [stats event_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 12 {
+        panic("pe_mf_media_session FAIL [stats total_streams] expected=12 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_mf_media_session FAIL [stats error_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_mf_media_session FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_mf_media_session_stats",
+        "\"event_count\":" + to_string(s[0])
+        + ",\"total_streams\":" + to_string(s[1])
+        + ",\"error_count\":" + to_string(s[2])
+        + ",\"kind_started\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_mf_media_session FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pms()
+    let z = pms_stats()
+    let i = 0
+    while i < len(z) {
+        if z[i] != 0 {
+            panic("pe_mf_media_session FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(z[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_mf_media_session self_test PASS (events=" + to_string(s[0])
+        + ", streams=" + to_string(s[1]) + ", errors=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pms_stats()
+            println("event_count\t" + to_string(s[0]))
+            println("total_streams\t" + to_string(s[1]))
+            println("error_count\t" + to_string(s[2]))
+            println("count_kind_started\t" + to_string(s[3]))
+            return
+        }
+        if sub == "streams" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println("event_streams\t" + to_string(event_streams(eid)))
+                return
+            }
+            println("usage: hexa run pe_mf_media_session.hexa streams <event_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_event_kind\t" + to_string(count_by_event_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_mf_media_session.hexa count <event_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pms()
+            println("cleaned: " + pms_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pms_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_mf_media_session.hexa { self-test | stats | streams <event_id> | count <event_kind> | cleanup | dir }")
+}

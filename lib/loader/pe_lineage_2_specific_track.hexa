@@ -1,0 +1,462 @@
+// lib/loader/pe_lineage_2_specific_track.hexa — Lineage 2 (NCSOFT, 2003+) 전용 entry/loader 추적.
+//
+// Lineage 2 launch chain (own2 자체 추적):
+//   process_attach        — l2.exe entry, NT TLS_CALLBACK array fire
+//   unreal_engine_init    — Unreal 2 engine boot (Core.dll, Engine.dll, Render.dll, DX9 device)
+//   gameguard_init        — nProtect GameGuard (GameGuard.des, npggNT.des) anti-cheat boot
+//   login_to_l2authd      — LineAge2.ini account → L2AuthD login + protocol handshake
+//   server_select         — world list 수신 + 서버 선택
+//   character_select      — character list 수신 + slot 선택
+//   world_load            — region map + npctable + itemdata 로드
+//   first_frame           — DX9 Present 첫 호출 (게임 화면 first paint)
+//   각 phase 가 R1/R2/R3/R5 의 sub-system 의존
+// own1: Lineage 2 공개 정보 + binary observation. Wine NCWest wrapper 인용 X
+// docstring: Lineage 2 = Unreal 2 engine + DX9 + GameGuard.
+//   Live server (NCSOFT/NCWest) = GameGuard 차단.
+//   Private server (l2j-server) = GameGuard 우회 — closure path B 가능.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 Lineage 2-specific phase tracker — 실 l2.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 9 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = process_attach       (l2.exe entry + TLS_CALLBACK)
+//   2 = unreal_engine_init   (Unreal 2 Core/Engine/Render + DX9 device)
+//   3 = gameguard_init       (nProtect GameGuard anti-cheat)
+//   4 = login_to_l2authd     (LineAge2.ini → L2AuthD login)
+//   5 = server_select        (world list + server pick)
+//   6 = character_select     (character list + slot)
+//   7 = world_load           (region map + npctable + itemdata)
+//   8 = first_frame          (DX9 Present first call)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t dll_loaded<int> \t private_server<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pl2t_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_lineage_2_specific_track"
+}
+
+fn pl2t_steps_path() -> str {
+    return pl2t_dir() + "/steps.tsv"
+}
+
+fn pl2t_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pl2t_dir() + "'")
+}
+
+fn cleanup_pl2t() -> void {
+    pl2t_ensure_dir()
+    let _ = exec("rm -f '" + pl2t_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pl2t_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pl2t_append_row(path: str, row: str) -> void {
+    pl2t_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: Lineage 2 launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, dll_loaded: int, private_server: int) -> void {
+    if step_id <= 0 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 8 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=phase_kind<=8 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if private_server < 0 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=private_server>=0 got=" + to_string(private_server))
+    }
+    if private_server > 1 {
+        panic("pe_lineage_2_specific_track FAIL [record_step] expected=private_server<=1 got=" + to_string(private_server))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(private_server) + "\n"
+    pl2t_append_row(pl2t_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = pl2t_read_table(pl2t_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pl2t_read_table(pl2t_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = pl2t_read_table(pl2t_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── private_server_count: private_server=1 인 step 수 ───
+fn private_server_count() -> int {
+    let t = pl2t_read_table(pl2t_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── gameguard_count: phase_kind=3 (gameguard_init) step 수 ───
+fn gameguard_count() -> int {
+    return count_by_phase_kind(3)
+}
+
+// ─── step_dll_loaded: 특정 step_id 의 dll_loaded (없으면 0) ───
+fn step_dll_loaded(step_id: int) -> int {
+    let t = pl2t_read_table(pl2t_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pl2t_stats: [step_count, loaded_count, private_server_count, gameguard_count, count_by_phase_kind(8)] ───
+fn pl2t_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(private_server_count())
+    out.push(gameguard_count())
+    out.push(count_by_phase_kind(8))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pl2t-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pl2t()
+
+    // 2. record 8 steps — Lineage 2 launch chain 전체, phase_kind 1..8 각 1건
+    //   id 140001: phase 1 process_attach     dll=0 priv=0  (l2.exe entry, TLS_CALLBACK)
+    //   id 140002: phase 2 unreal_engine_init dll=1 priv=0  (Core/Engine/Render + DX9)
+    //   id 140003: phase 3 gameguard_init     dll=1 priv=0  (nProtect GameGuard live)
+    //   id 140004: phase 4 login_to_l2authd   dll=1 priv=1  (l2j private server login)
+    //   id 140005: phase 5 server_select      dll=0 priv=1  (l2j world list)
+    //   id 140006: phase 6 character_select   dll=0 priv=0  (NCSOFT char list)
+    //   id 140007: phase 7 world_load         dll=1 priv=0  (region map + npctable)
+    //   id 140008: phase 8 first_frame        dll=0 priv=0  (DX9 Present first)
+    //   sums: steps=8, loaded=4, private_server=2, gameguard=1, count_kind(8)=1
+    record_step(140001, 1, 0, 0)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140001,\"phase_kind\":1,\"dll_loaded\":0,\"private_server\":0,\"target\":\"process_attach\"")
+
+    record_step(140002, 2, 1, 0)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140002,\"phase_kind\":2,\"dll_loaded\":1,\"private_server\":0,\"target\":\"unreal_engine_init\"")
+
+    record_step(140003, 3, 1, 0)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140003,\"phase_kind\":3,\"dll_loaded\":1,\"private_server\":0,\"target\":\"gameguard_init\"")
+
+    record_step(140004, 4, 1, 1)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140004,\"phase_kind\":4,\"dll_loaded\":1,\"private_server\":1,\"target\":\"login_to_l2authd\"")
+
+    record_step(140005, 5, 0, 1)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140005,\"phase_kind\":5,\"dll_loaded\":0,\"private_server\":1,\"target\":\"server_select\"")
+
+    record_step(140006, 6, 0, 0)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140006,\"phase_kind\":6,\"dll_loaded\":0,\"private_server\":0,\"target\":\"character_select\"")
+
+    record_step(140007, 7, 1, 0)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140007,\"phase_kind\":7,\"dll_loaded\":1,\"private_server\":0,\"target\":\"world_load\"")
+
+    record_step(140008, 8, 0, 0)
+    r0_emit("pe_lineage_2_specific_track_record",
+        "\"step_id\":140008,\"phase_kind\":8,\"dll_loaded\":0,\"private_server\":0,\"target\":\"first_frame\"")
+
+    // 3. step_count = 8
+    let c = step_count()
+    if c != 8 {
+        panic("pe_lineage_2_specific_track FAIL [step_count] expected=8 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..8 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p8 = count_by_phase_kind(8)
+    if p8 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(p8))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_lineage_2_specific_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (140002, 140003, 140004, 140007)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_lineage_2_specific_track FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. private_server_count = 2 (140004, 140005)
+    let ps = private_server_count()
+    if ps != 2 {
+        panic("pe_lineage_2_specific_track FAIL [private_server_count] expected=2 got=" + to_string(ps))
+    }
+
+    // 7. gameguard_count = 1 (140003)
+    let gg = gameguard_count()
+    if gg != 1 {
+        panic("pe_lineage_2_specific_track FAIL [gameguard_count] expected=1 got=" + to_string(gg))
+    }
+
+    // 8. step_dll_loaded sanity
+    let d2 = step_dll_loaded(140002)
+    if d2 != 1 {
+        panic("pe_lineage_2_specific_track FAIL [step_dll_loaded(140002)] expected=1 got=" + to_string(d2))
+    }
+    let d6 = step_dll_loaded(140006)
+    if d6 != 0 {
+        panic("pe_lineage_2_specific_track FAIL [step_dll_loaded(140006)] expected=0 got=" + to_string(d6))
+    }
+    let d_miss = step_dll_loaded(9999)
+    if d_miss != 0 {
+        panic("pe_lineage_2_specific_track FAIL [step_dll_loaded(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 9. pl2t_stats() = [8, 4, 2, 1, 1]
+    let s = pl2t_stats()
+    if len(s) != 5 {
+        panic("pe_lineage_2_specific_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_lineage_2_specific_track FAIL [stats step_count] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_lineage_2_specific_track FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_lineage_2_specific_track FAIL [stats private_server_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_lineage_2_specific_track FAIL [stats gameguard_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_lineage_2_specific_track FAIL [stats count_first_frame] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_lineage_2_specific_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"private_server_count\":" + to_string(s[2])
+        + ",\"gameguard_count\":" + to_string(s[3])
+        + ",\"count_first_frame\":" + to_string(s[4]))
+
+    // 11. emit count >= 9 (8 records + 1 stats = 9)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 9 {
+        panic("pe_lineage_2_specific_track FAIL [r0 emit count] expected=>=9 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pl2t()
+    let s2 = pl2t_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_lineage_2_specific_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_lineage_2_specific_track self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", private_server=" + to_string(s[2])
+        + ", gameguard=" + to_string(s[3]) + ", first_frame=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pl2t_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("private_server_count\t" + to_string(s[2]))
+            println("gameguard_count\t" + to_string(s[3]))
+            println("count_first_frame\t" + to_string(s[4]))
+            return
+        }
+        if sub == "loaded" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_dll_loaded\t" + to_string(step_dll_loaded(sid)))
+                return
+            }
+            println("usage: hexa run pe_lineage_2_specific_track.hexa loaded <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_lineage_2_specific_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pl2t()
+            println("cleaned: " + pl2t_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pl2t_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_lineage_2_specific_track.hexa { self-test | stats | loaded <step_id> | count <phase_kind> | cleanup | dir }")
+}

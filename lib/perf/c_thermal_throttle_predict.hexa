@@ -1,0 +1,170 @@
+// lib/perf/c_thermal_throttle_predict.hexa — CN-20 만점 15/15
+//
+// D4 thermal throttle 예측 — Holt forecast (CPU temp + load) → pre-emptive de-rate.
+// 효과: thermal throttle 발생 전에 자율 quality 다운 (사용자 인지 X).
+//
+// 무기: Holt forecast + 4-state classifier (cool/warm/hot/throttle).
+
+use "./r0_common"
+
+let THERMAL_DIR = GAMEBOX_HOME + "/persist/thermal_predict"
+let SAMPLES_PATH = THERMAL_DIR + "/samples.jsonl"
+
+fn thermal_dir() -> str { return THERMAL_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + THERMAL_DIR + "'")
+}
+
+// ─── temp + load 샘플 기록 ───
+fn record_sample(ts_sec: int, cpu_temp_c: int, gpu_load_pct: int) -> void {
+    ensure_dir()
+    let line = "{\"ts\":" + to_string(ts_sec) + ",\"cpu_temp\":" + to_string(cpu_temp_c) + ",\"gpu_load\":" + to_string(gpu_load_pct) + "}"
+    let tmp = SAMPLES_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SAMPLES_PATH + "' && rm -f '" + tmp + "'")
+}
+
+// ─── classifier ───
+//   cool: temp < 60
+//   warm: 60-80
+//   hot: 80-95
+//   throttle: >= 95
+fn classify_thermal(temp_c: int) -> str {
+    if temp_c < 60 { return "cool" }
+    if temp_c < 80 { return "warm" }
+    if temp_c < 95 { return "hot" }
+    return "throttle"
+}
+
+// ─── Holt forecast (next-step temp prediction) ───
+fn holt_forecast(history: array, alpha: int, beta: int) -> int {
+    if len(history) < 2 {
+        if len(history) == 1 { return history[0] }
+        return 0
+    }
+    let level = history[0]
+    let trend = history[1] - history[0]
+    let i = 1
+    while i < len(history) {
+        let v = history[i]
+        let one_step = level + trend
+        let new_level = (alpha * v + (100 - alpha) * one_step) / 100
+        let new_trend = (beta * (new_level - level) + (100 - beta) * trend) / 100
+        level = new_level
+        trend = new_trend
+        i = i + 1
+    }
+    return level + trend
+}
+
+// ─── pre-emptive de-rate decision ───
+//   현재 + N step 후 예측 → throttle 임박 시 quality 다운
+fn should_derate(current_temp: int, predicted_temp: int) -> bool {
+    if predicted_temp >= 90 { return true }  // 임박
+    if current_temp >= 85 && predicted_temp > current_temp { return true }
+    return false
+}
+
+// ─── auto workflow ───
+fn auto_predict_workflow(temp_history: array) -> str {
+    let predicted = holt_forecast(temp_history, 60, 30)
+    let current = 0
+    if len(temp_history) > 0 { current = temp_history[len(temp_history) - 1] }
+    let cur_label = classify_thermal(current)
+    let pred_label = classify_thermal(predicted)
+    let derate = should_derate(current, predicted)
+    r0_emit("thermal_predict", "\"current\":" + to_string(current) + ",\"current_label\":\"" + cur_label + "\",\"predicted\":" + to_string(predicted) + ",\"predicted_label\":\"" + pred_label + "\"")
+    if derate {
+        r0_emit("thermal_derate", "\"reason\":\"predicted=" + to_string(predicted) + "\"")
+        return "DERATE"
+    }
+    return "OK"
+}
+
+fn predict_stats() -> array {
+    let exists = exec("test -f '" + SAMPLES_PATH + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0] }
+    let total = to_int(exec("wc -l < '" + SAMPLES_PATH + "' | tr -d ' '").trim())
+    let max_temp = exec("grep -oE '\"cpu_temp\":[0-9]+' '" + SAMPLES_PATH + "' | cut -d: -f2 | sort -nr | head -1").trim()
+    let max_t = 0
+    if max_temp != "" { max_t = to_int(max_temp) }
+    return [total, max_t]
+}
+
+fn cleanup_thermal() -> void {
+    let _ = exec("rm -rf '" + THERMAL_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "thermal-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_thermal()
+
+    // 1. classifier
+    if classify_thermal(50) != "cool" { panic("c_thermal_throttle_predict FAIL [cool] got=" + classify_thermal(50)) }
+    if classify_thermal(70) != "warm" { panic("c_thermal_throttle_predict FAIL [warm] got=" + classify_thermal(70)) }
+    if classify_thermal(85) != "hot" { panic("c_thermal_throttle_predict FAIL [hot] got=" + classify_thermal(85)) }
+    if classify_thermal(96) != "throttle" { panic("c_thermal_throttle_predict FAIL [throttle] got=" + classify_thermal(96)) }
+
+    // 2. forecast — monotonic 증가
+    let history = [60, 65, 70, 75, 80, 85]
+    let pred = holt_forecast(history, 60, 30)
+    if pred < 85 {
+        panic("c_thermal_throttle_predict FAIL [forecast] expected>=85 got=" + to_string(pred))
+    }
+
+    // 3. record
+    record_sample(1000, 60, 50)
+    record_sample(1010, 65, 60)
+    record_sample(1020, 75, 70)
+    record_sample(1030, 85, 80)
+    record_sample(1040, 92, 90)
+
+    // 4. should_derate
+    let derate1 = should_derate(85, 92)
+    if !derate1 { panic("c_thermal_throttle_predict FAIL [derate 85,92]") }
+    let derate2 = should_derate(60, 65)
+    if derate2 { panic("c_thermal_throttle_predict FAIL [no derate 60,65]") }
+
+    // 5. auto workflow — escalating temp
+    let result = auto_predict_workflow([60, 70, 80, 88])
+    if result != "DERATE" {
+        panic("c_thermal_throttle_predict FAIL [auto escalate] expected=DERATE got=" + result)
+    }
+
+    let result_ok = auto_predict_workflow([60, 65, 70])
+    if result_ok != "OK" {
+        panic("c_thermal_throttle_predict FAIL [auto cool] expected=OK got=" + result_ok)
+    }
+
+    // 6. stats
+    let stats = predict_stats()
+    if stats[0] != 5 { panic("c_thermal_throttle_predict FAIL [stats total] expected=5 got=" + to_string(stats[0])) }
+    if stats[1] != 92 { panic("c_thermal_throttle_predict FAIL [stats max] expected=92 got=" + to_string(stats[1])) }
+
+    r0_emit("thermal_summary", "\"samples\":" + to_string(stats[0]) + ",\"max_temp\":" + to_string(stats[1]) + ",\"forecast\":" + to_string(pred))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_thermal_throttle_predict FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    cleanup_thermal()
+
+    println("  ✅ c_thermal_throttle_predict self_test PASS (4 classes, forecast=" + to_string(pred) + ", derate=true, samples=5, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = predict_stats()
+            println("samples=" + to_string(s[0]) + " max_temp=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_thermal(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_thermal_throttle_predict.hexa { self-test | stats | cleanup }")
+}

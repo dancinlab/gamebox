@@ -1,0 +1,198 @@
+// lib/perf/c_heap.hexa — M3 C-HEAP: Metal heap genome (5-axis, 13 byte/record)
+//
+// BRAINSTORM § 4.3 C-HEAP — Metal heap state vector (tex_active/tex_evicted/
+// buf_active/frag_pct/peak_mb) 30Hz 샘플 + 4 anomaly label + ring 누적.
+//
+// 4 anomaly:
+//   - OOM_imminent    : (tex_active + buf_active) * 100 / heap_size > 92
+//   - frag_critical   : frag_pct > 35
+//   - eviction_storm  : tex_evicted Δ > 100 MB/sec (vs prev sample)
+//   - thrashing       : tex_active volatility > 2σ (int 근사: Δ > 2 * mean_delta)
+//
+// Ring file: ~/.airgenome/gamebox/forge/genomes-gptk-heap.ring (JSONL)
+// Pre-evict hint: ~/.airgenome/gamebox/hints/pre_evict.txt
+//
+// upstream candidate: native float arith (현재 int * 100 / heap_size 우회),
+//                     bit-packed 13B 직렬화 (현재 JSONL 우회).
+
+use "./r0_common"
+
+let FORGE_HOME = GAMEBOX_HOME + "/forge"
+let HEAP_RING = FORGE_HOME + "/genomes-gptk-heap.ring"
+let HINTS_HOME = GAMEBOX_HOME + "/hints"
+let PRE_EVICT_HINT = HINTS_HOME + "/pre_evict.txt"
+
+fn c_heap_ensure_dirs() -> void {
+    let _ = exec("mkdir -p '" + FORGE_HOME + "' '" + HINTS_HOME + "'")
+}
+
+// ---------------------------------------------------------------------------
+// classify_heap — 4-label heap anomaly classifier
+//
+// 우선순위 (높은 순): OOM_imminent > frag_critical > eviction_storm > thrashing.
+// 매칭 없으면 "" 반환.
+//
+// args:
+//   tex_active                — 현재 텍스처 active MB
+//   tex_evicted               — 현재 누적 evicted MB
+//   buf_active                — 현재 buffer active MB
+//   frag_pct                  — fragmentation % (0..100)
+//   peak_mb                   — peak MB (참조)
+//   heap_size_mb              — heap 총 크기 MB
+//   prev_tex_evicted          — 직전 sample 의 tex_evicted
+//   prev_tex_active_delta_mean — 직전 N sample 의 tex_active Δ 평균 (MB/sec)
+fn classify_heap(tex_active: int, tex_evicted: int, buf_active: int, frag_pct: int, peak_mb: int, heap_size_mb: int, prev_tex_evicted: int, prev_tex_active_delta_mean: int) -> str {
+    // OOM_imminent: int math — (tex+buf) * 100 / heap > 92
+    if heap_size_mb > 0 {
+        let used_pct = (tex_active + buf_active) * 100 / heap_size_mb
+        if used_pct > 92 {
+            return "OOM_imminent"
+        }
+    }
+    // frag_critical
+    if frag_pct > 35 {
+        return "frag_critical"
+    }
+    // eviction_storm: Δ > 100 (MB/sec, prev 가 직전 1초 sample 가정)
+    let evict_delta = tex_evicted - prev_tex_evicted
+    if evict_delta > 100 {
+        return "eviction_storm"
+    }
+    // thrashing: int 근사 — Δ > 2 * mean_delta (mean 이 0 이면 비활성).
+    // 호출자가 *현재* tex_active Δ 를 직접 못 주므로 peak vs active gap 으로 근사.
+    // 추가 guard: peak 가 active 의 2배 이상 (recent burst 흔적) 일 때만 trigger —
+    // baseline (peak ≈ active+small overhead) 에서 false positive 차단.
+    if prev_tex_active_delta_mean > 0 {
+        let gap = peak_mb - tex_active
+        if gap < 0 {
+            gap = 0 - gap
+        }
+        if peak_mb > tex_active * 2 {
+            if gap > 2 * prev_tex_active_delta_mean {
+                return "thrashing"
+            }
+        }
+    }
+    return ""
+}
+
+// ---------------------------------------------------------------------------
+// append_heap — emit JSONL event + ring 누적
+fn append_heap(tex_active: int, tex_evicted: int, buf_active: int, frag_pct: int, peak_mb: int) -> void {
+    c_heap_ensure_dirs()
+    let payload = "\"tex_active_mb\":" + to_string(tex_active) + ",\"tex_evicted_mb\":" + to_string(tex_evicted) + ",\"buf_active_mb\":" + to_string(buf_active) + ",\"frag_pct\":" + to_string(frag_pct) + ",\"peak_mb\":" + to_string(peak_mb)
+    // session emit (정상 R0 흐름)
+    r0_emit("c_heap_genome", payload)
+    // ring 별도 누적 — JSONL line
+    let ts = r0_ts_iso()
+    let line = "{\"ts\":\"" + ts + "\"," + payload + "}"
+    r0_append_line(HEAP_RING, line)
+}
+
+// ---------------------------------------------------------------------------
+// pre_evict_signal — placeholder hint writer (downstream consumer 가 읽음)
+fn pre_evict_signal(label: str) -> void {
+    c_heap_ensure_dirs()
+    let ts = r0_ts_iso()
+    let body = "{\"ts\":\"" + ts + "\",\"label\":\"" + label + "\",\"action\":\"pre_evict_hint\"}\n"
+    // append (overwrite-safe: hint 파일은 markers 누적)
+    let tmp = PRE_EVICT_HINT + ".tmp"
+    write_file(tmp, body)
+    let _ = exec("cat '" + tmp + "' >> '" + PRE_EVICT_HINT + "' && rm -f '" + tmp + "'")
+}
+
+// ---------------------------------------------------------------------------
+// self_test — 9 synthetic snapshots covering 4 labels + OK + edges
+//
+// 라벨 정확도 >= 90% 요구 (>= 9 중 8 일치).
+fn self_test() -> void {
+    let sid = "cheap-" + exec("date +%s").trim()
+    r0_session_set(sid)
+    c_heap_ensure_dirs()
+
+    // 케이스: (tex, evict, buf, frag, peak, heap, prev_evict, prev_dmean, expected)
+    let pass = 0
+    let total = 9
+    let fails = ""
+
+    // 1. OK baseline
+    let l1 = classify_heap(1000, 0, 200, 5, 1300, 8000, 0, 50)
+    if l1 == "" { pass = pass + 1 } else { fails = fails + " [1:" + l1 + "!=\"\"]" }
+
+    // 2. OOM_imminent — (7500+500)*100/8000 = 100 > 92
+    let l2 = classify_heap(7500, 0, 500, 5, 8000, 8000, 0, 50)
+    if l2 == "OOM_imminent" { pass = pass + 1 } else { fails = fails + " [2:" + l2 + "!=OOM_imminent]" }
+
+    // 3. frag_critical — frag=40 > 35
+    let l3 = classify_heap(1000, 0, 200, 40, 1500, 8000, 0, 50)
+    if l3 == "frag_critical" { pass = pass + 1 } else { fails = fails + " [3:" + l3 + "!=frag_critical]" }
+
+    // 4. eviction_storm — Δevict = 200-50 = 150 > 100
+    let l4 = classify_heap(500, 200, 100, 10, 700, 8000, 50, 50)
+    if l4 == "eviction_storm" { pass = pass + 1 } else { fails = fails + " [4:" + l4 + "!=eviction_storm]" }
+
+    // 5. OK steady-state
+    let l5 = classify_heap(1000, 0, 200, 10, 1200, 8000, 0, 50)
+    if l5 == "" { pass = pass + 1 } else { fails = fails + " [5:" + l5 + "!=\"\"]" }
+
+    // 6. thrashing — peak(3000) - tex(1000) = 2000 > 2 * mean(50) = 100
+    let l6 = classify_heap(1000, 0, 200, 10, 3000, 8000, 0, 50)
+    if l6 == "thrashing" { pass = pass + 1 } else { fails = fails + " [6:" + l6 + "!=thrashing]" }
+
+    // 7. edge OOM boundary — used_pct = 92 (정확히) → OK (>92 strict)
+    //    (4416+3000)*100/8000 = 92 → not >92
+    let l7 = classify_heap(4416, 0, 3000, 5, 7500, 8000, 0, 0)
+    if l7 == "" { pass = pass + 1 } else { fails = fails + " [7:" + l7 + "!=\"\"@boundary]" }
+
+    // 8. edge frag boundary — frag=35 → OK (>35 strict)
+    let l8 = classify_heap(1000, 0, 200, 35, 1300, 8000, 0, 0)
+    if l8 == "" { pass = pass + 1 } else { fails = fails + " [8:" + l8 + "!=\"\"@fragboundary]" }
+
+    // 9. edge eviction boundary — Δ=100 → OK (>100 strict)
+    let l9 = classify_heap(500, 150, 100, 10, 700, 8000, 50, 0)
+    if l9 == "" { pass = pass + 1 } else { fails = fails + " [9:" + l9 + "!=\"\"@evictboundary]" }
+
+    // append_heap 동작 확인 — 한 번 emit + ring 누적
+    let ring_before = exec("wc -l < '" + HEAP_RING + "' 2>/dev/null | tr -d ' '").trim()
+    let rb = 0
+    if ring_before != "" { rb = to_int(ring_before) }
+    append_heap(1000, 0, 200, 5, 1300)
+    let ring_after = exec("wc -l < '" + HEAP_RING + "' 2>/dev/null | tr -d ' '").trim()
+    let ra = 0
+    if ring_after != "" { ra = to_int(ring_after) }
+    if ra != rb + 1 {
+        panic("c_heap FAIL [ring write] before=" + to_string(rb) + " after=" + to_string(ra))
+    }
+
+    // pre_evict_signal 동작 확인
+    pre_evict_signal("OOM_imminent")
+    let hint_ok = exec("test -s '" + PRE_EVICT_HINT + "' && echo ok").trim()
+    if hint_ok != "ok" {
+        panic("c_heap FAIL [pre_evict hint missing]")
+    }
+
+    // session emit count (append_heap → 1 event)
+    let ev = r0_session_count(sid)
+    if ev < 1 {
+        panic("c_heap FAIL [session emit] expected>=1 got=" + to_string(ev))
+    }
+
+    // 정확도 임계값: >= 90% (9/9 → 100%, 8/9 → 88.9% < 90% → FAIL)
+    let pct = pass * 100 / total
+    if pct < 90 {
+        panic("c_heap FAIL [classify accuracy] " + to_string(pass) + "/" + to_string(total) + " = " + to_string(pct) + "%" + fails)
+    }
+    println("  ✅ c_heap self_test PASS (" + to_string(pass) + "/" + to_string(total) + " labels, ring+1, hint ok, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+    }
+    println("usage: hexa run c_heap.hexa self-test")
+}

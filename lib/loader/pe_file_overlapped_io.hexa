@@ -1,0 +1,422 @@
+// lib/loader/pe_file_overlapped_io.hexa — cycle 73 Win32 OVERLAPPED async I/O telemetry skeleton
+//
+// ReadFileEx / WriteFileEx / GetOverlappedResult tracker — async file handle
+// operations + completion routine 추적. async overlapped I/O 의 lifecycle
+// (request → pending → success / cancelled / error) 을 TSV 로 기록.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 op tracker — 실 ReadFileEx / WriteFileEx 호출 X.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = read
+//   2 = write
+//   3 = read_ex
+//   4 = write_ex
+//
+// status_kind code:
+//   1 = success
+//   2 = pending
+//   3 = cancelled
+//   4 = error
+//
+// persist schema (TSV — ops.tsv):
+//   io_id<int> \t op_kind<int> \t bytes_transferred<int> \t status_kind<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pfoi_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_file_overlapped_io"
+}
+
+fn pfoi_ops_path() -> str {
+    return pfoi_dir() + "/ops.tsv"
+}
+
+fn pfoi_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pfoi_dir() + "'")
+}
+
+fn cleanup_pfoi() -> void {
+    pfoi_ensure_dir()
+    let _ = exec("rm -f '" + pfoi_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pfoi_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pfoi_append_row(path: str, row: str) -> void {
+    pfoi_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: overlapped op 1 건 기록 ───
+fn record_op(io_id: int, op_kind: int, bytes_transferred: int, status_kind: int) -> void {
+    if io_id <= 0 {
+        panic("pe_file_overlapped_io FAIL [record_op] expected=io_id>0 got=" + to_string(io_id))
+    }
+    if op_kind < 1 {
+        panic("pe_file_overlapped_io FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_file_overlapped_io FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if bytes_transferred < 0 {
+        panic("pe_file_overlapped_io FAIL [record_op] expected=bytes_transferred>=0 got=" + to_string(bytes_transferred))
+    }
+    if status_kind < 1 {
+        panic("pe_file_overlapped_io FAIL [record_op] expected=status_kind>=1 got=" + to_string(status_kind))
+    }
+    if status_kind > 4 {
+        panic("pe_file_overlapped_io FAIL [record_op] expected=status_kind<=4 got=" + to_string(status_kind))
+    }
+    let row = to_string(io_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(bytes_transferred) + "\t" + to_string(status_kind) + "\n"
+    pfoi_append_row(pfoi_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pfoi_read_table(pfoi_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes: 모든 op bytes_transferred 합 ───
+fn total_bytes() -> int {
+    let t = pfoi_read_table(pfoi_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pfoi_read_table(pfoi_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_status_kind: 특정 status_kind 의 op 수 ───
+fn count_by_status_kind(kind: int) -> int {
+    let t = pfoi_read_table(pfoi_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pending_count: status_kind=2 (pending) 인 op 수 ───
+fn pending_count() -> int {
+    return count_by_status_kind(2)
+}
+
+// ─── op_bytes: 특정 io_id 의 bytes_transferred (없으면 0) ───
+fn op_bytes(io_id: int) -> int {
+    let t = pfoi_read_table(pfoi_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == io_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pfoi_stats: [op_count, total_bytes, pending_count, count_by_op_kind(3)] ───
+fn pfoi_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_bytes())
+    out.push(pending_count())
+    out.push(count_by_op_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pfoi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pfoi()
+
+    // 2. record 6 overlapped ops — ≥3 op_kinds, ≥3 status_kinds
+    //    op_kinds used: 1 (read), 2 (write), 3 (read_ex), 4 (write_ex)
+    //    status_kinds used: 1 (success), 2 (pending), 3 (cancelled), 4 (error)
+    record_op(220001, 1, 512, 1)
+    r0_emit("pe_file_overlapped_io_record",
+        "\"io_id\":220001,\"op_kind\":1,\"bytes_transferred\":512,\"status_kind\":1,\"target\":\"read/success\"")
+
+    record_op(220002, 3, 1024, 1)
+    r0_emit("pe_file_overlapped_io_record",
+        "\"io_id\":220002,\"op_kind\":3,\"bytes_transferred\":1024,\"status_kind\":1,\"target\":\"read_ex/success\"")
+
+    record_op(220003, 4, 0, 2)
+    r0_emit("pe_file_overlapped_io_record",
+        "\"io_id\":220003,\"op_kind\":4,\"bytes_transferred\":0,\"status_kind\":2,\"target\":\"write_ex/pending\"")
+
+    record_op(220004, 2, 256, 3)
+    r0_emit("pe_file_overlapped_io_record",
+        "\"io_id\":220004,\"op_kind\":2,\"bytes_transferred\":256,\"status_kind\":3,\"target\":\"write/cancelled\"")
+
+    record_op(220005, 3, 2048, 1)
+    r0_emit("pe_file_overlapped_io_record",
+        "\"io_id\":220005,\"op_kind\":3,\"bytes_transferred\":2048,\"status_kind\":1,\"target\":\"read_ex/success\"")
+
+    record_op(220006, 4, 0, 4)
+    r0_emit("pe_file_overlapped_io_record",
+        "\"io_id\":220006,\"op_kind\":4,\"bytes_transferred\":0,\"status_kind\":4,\"target\":\"write_ex/error\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_file_overlapped_io FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_bytes = 512+1024+0+256+2048+0 = 3840
+    let tb = total_bytes()
+    if tb != 3840 {
+        panic("pe_file_overlapped_io FAIL [total_bytes] expected=3840 got=" + to_string(tb))
+    }
+
+    // 5. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_file_overlapped_io FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_file_overlapped_io FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 2 {
+        panic("pe_file_overlapped_io FAIL [count_by_op_kind(3)] expected=2 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 2 {
+        panic("pe_file_overlapped_io FAIL [count_by_op_kind(4)] expected=2 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_file_overlapped_io FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. count_by_status_kind sanity
+    let s1 = count_by_status_kind(1)
+    if s1 != 3 {
+        panic("pe_file_overlapped_io FAIL [count_by_status_kind(1)] expected=3 got=" + to_string(s1))
+    }
+    let s2 = count_by_status_kind(2)
+    if s2 != 1 {
+        panic("pe_file_overlapped_io FAIL [count_by_status_kind(2)] expected=1 got=" + to_string(s2))
+    }
+    let s3 = count_by_status_kind(3)
+    if s3 != 1 {
+        panic("pe_file_overlapped_io FAIL [count_by_status_kind(3)] expected=1 got=" + to_string(s3))
+    }
+    let s4 = count_by_status_kind(4)
+    if s4 != 1 {
+        panic("pe_file_overlapped_io FAIL [count_by_status_kind(4)] expected=1 got=" + to_string(s4))
+    }
+
+    // 7. pending_count = 1
+    let pc = pending_count()
+    if pc != 1 {
+        panic("pe_file_overlapped_io FAIL [pending_count] expected=1 got=" + to_string(pc))
+    }
+
+    // 8. op_bytes sanity
+    let b2 = op_bytes(220002)
+    if b2 != 1024 {
+        panic("pe_file_overlapped_io FAIL [op_bytes(220002)] expected=1024 got=" + to_string(b2))
+    }
+    let b5 = op_bytes(220005)
+    if b5 != 2048 {
+        panic("pe_file_overlapped_io FAIL [op_bytes(220005)] expected=2048 got=" + to_string(b5))
+    }
+    let b_miss = op_bytes(9999)
+    if b_miss != 0 {
+        panic("pe_file_overlapped_io FAIL [op_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 9. pfoi_stats() = [6, 3840, 1, 2]
+    let s = pfoi_stats()
+    if len(s) != 4 {
+        panic("pe_file_overlapped_io FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_file_overlapped_io FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3840 {
+        panic("pe_file_overlapped_io FAIL [stats total_bytes] expected=3840 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_file_overlapped_io FAIL [stats pending_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_file_overlapped_io FAIL [stats kind_read_ex] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_file_overlapped_io_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_bytes\":" + to_string(s[1])
+        + ",\"pending_count\":" + to_string(s[2])
+        + ",\"kind_read_ex\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_file_overlapped_io FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pfoi()
+    let s2_after = pfoi_stats()
+    let i = 0
+    while i < len(s2_after) {
+        if s2_after[i] != 0 {
+            panic("pe_file_overlapped_io FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2_after[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_file_overlapped_io self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", pending=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pfoi_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_bytes\t" + to_string(s[1]))
+            println("pending_count\t" + to_string(s[2]))
+            println("count_kind_read_ex\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_bytes\t" + to_string(op_bytes(oid)))
+                return
+            }
+            println("usage: hexa run pe_file_overlapped_io.hexa bytes <io_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_file_overlapped_io.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pfoi()
+            println("cleaned: " + pfoi_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pfoi_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_file_overlapped_io.hexa { self-test | stats | bytes <io_id> | count <op_kind> | cleanup | dir }")
+}

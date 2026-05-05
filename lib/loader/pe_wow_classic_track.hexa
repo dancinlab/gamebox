@@ -1,0 +1,457 @@
+// lib/loader/pe_wow_classic_track.hexa — World of Warcraft Classic (Blizzard, 2019 reissue) entry/loader 추적.
+//
+// WoW Classic launch chain (own2 자체 추적):
+//   Wow.exe        — DX12 client + Lua engine (1.x reissue, Lineage 2 Classic 와 비슷한 reissue 개념)
+//   Battle.net     — Agent.exe / Battle.net.exe IPC + token (D2R/D4 와 동일 prereq chain)
+//   Warden         — user-mode anti-cheat, memory scan + module enumeration
+//                    (EAC 와 다른 형태 — kernel driver 없음. Apple 차단도 부분적)
+//   DX12           — D3D12 swapchain, Wow.exe 가 native DX12 backend
+//   character/world — Battle.net token → realm select → character select → world load
+//
+// own1: WoW 공개 정보 + Battle.net Agent IPC observation 만. Wine 인용 X.
+//
+// own 1 enforcement: 타사 wrapper / community 코드 0 줄.
+//   본 module 은 WoW Classic-specific phase tracker — 실 Wow.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 9 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = process_attach         (Wow.exe entry + TLS_CALLBACK)
+//   2 = blizzard_engine_init   (DX12 + Lua engine + asset pipeline init)
+//   3 = warden_init            (Warden user-mode AC arm — memory scan loop)
+//   4 = bnet_token             (Battle.net Agent IPC + auth token handshake)
+//   5 = character_select       (realm/character list 로드)
+//   6 = world_load             (zone/map streaming, terrain/MPQ-like asset)
+//   7 = first_frame            (D3D12 Present 첫 호출)
+//   8 = disconnect             (server kick / Warden reject / network drop)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t dll_loaded<int> \t warden_active<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwct_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wow_classic_track"
+}
+
+fn pwct_steps_path() -> str {
+    return pwct_dir() + "/steps.tsv"
+}
+
+fn pwct_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwct_dir() + "'")
+}
+
+fn cleanup_pwct() -> void {
+    pwct_ensure_dir()
+    let _ = exec("rm -f '" + pwct_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwct_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwct_append_row(path: str, row: str) -> void {
+    pwct_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: WoW Classic launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, dll_loaded: int, warden_active: int) -> void {
+    if step_id <= 0 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 8 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=phase_kind<=8 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if warden_active < 0 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=warden_active>=0 got=" + to_string(warden_active))
+    }
+    if warden_active > 1 {
+        panic("pe_wow_classic_track FAIL [record_step] expected=warden_active<=1 got=" + to_string(warden_active))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(warden_active) + "\n"
+    pwct_append_row(pwct_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = pwct_read_table(pwct_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pwct_read_table(pwct_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = pwct_read_table(pwct_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── warden_active_count: warden_active=1 인 step 수 ───
+fn warden_active_count() -> int {
+    let t = pwct_read_table(pwct_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── bnet_token_count: phase_kind=4 step 수 (Battle.net Agent token handshake) ───
+fn bnet_token_count() -> int {
+    return count_by_phase_kind(4)
+}
+
+// ─── step_dll_loaded: 특정 step_id 의 dll_loaded (없으면 0) ───
+fn step_dll_loaded(step_id: int) -> int {
+    let t = pwct_read_table(pwct_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pwct_stats: [step_count, loaded_count, warden_active_count, bnet_token_count, count_by_phase_kind(3)] ───
+fn pwct_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(warden_active_count())
+    out.push(bnet_token_count())
+    out.push(count_by_phase_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pwct-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pwct()
+
+    // 2. record 8 steps — WoW Classic launch chain 전체, phase_kind 1..8 각 1건
+    //   id 140001: phase 1 process_attach        dll=0 warden=0  (Wow.exe entry, TLS_CALLBACK)
+    //   id 140002: phase 2 blizzard_engine_init  dll=1 warden=0  (DX12 + Lua + asset pipeline)
+    //   id 140003: phase 3 warden_init           dll=1 warden=1  (Warden user-mode AC arm)
+    //   id 140004: phase 4 bnet_token            dll=1 warden=1  (Battle.net Agent IPC handshake)
+    //   id 140005: phase 5 character_select      dll=0 warden=1  (realm/character list)
+    //   id 140006: phase 6 world_load            dll=1 warden=1  (zone streaming)
+    //   id 140007: phase 7 first_frame           dll=0 warden=0  (D3D12 Present first)
+    //   id 140008: phase 8 disconnect            dll=0 warden=0  (server kick / network drop)
+    //   sums: steps=8, loaded=4, warden=4, bnet_token=1, count_kind(3)=1
+    record_step(140001, 1, 0, 0)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140001,\"phase_kind\":1,\"dll_loaded\":0,\"warden_active\":0,\"target\":\"process_attach\"")
+
+    record_step(140002, 2, 1, 0)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140002,\"phase_kind\":2,\"dll_loaded\":1,\"warden_active\":0,\"target\":\"blizzard_engine_init\"")
+
+    record_step(140003, 3, 1, 1)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140003,\"phase_kind\":3,\"dll_loaded\":1,\"warden_active\":1,\"target\":\"warden_init\"")
+
+    record_step(140004, 4, 1, 1)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140004,\"phase_kind\":4,\"dll_loaded\":1,\"warden_active\":1,\"target\":\"bnet_token\"")
+
+    record_step(140005, 5, 0, 1)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140005,\"phase_kind\":5,\"dll_loaded\":0,\"warden_active\":1,\"target\":\"character_select\"")
+
+    record_step(140006, 6, 1, 1)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140006,\"phase_kind\":6,\"dll_loaded\":1,\"warden_active\":1,\"target\":\"world_load\"")
+
+    record_step(140007, 7, 0, 0)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140007,\"phase_kind\":7,\"dll_loaded\":0,\"warden_active\":0,\"target\":\"first_frame\"")
+
+    record_step(140008, 8, 0, 0)
+    r0_emit("pe_wow_classic_track_record",
+        "\"step_id\":140008,\"phase_kind\":8,\"dll_loaded\":0,\"warden_active\":0,\"target\":\"disconnect\"")
+
+    // 3. step_count = 8
+    let c = step_count()
+    if c != 8 {
+        panic("pe_wow_classic_track FAIL [step_count] expected=8 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..8 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p8 = count_by_phase_kind(8)
+    if p8 != 1 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(p8))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_wow_classic_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (140002, 140003, 140004, 140006)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_wow_classic_track FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. warden_active_count = 4 (140003..140006)
+    let wc = warden_active_count()
+    if wc != 4 {
+        panic("pe_wow_classic_track FAIL [warden_active_count] expected=4 got=" + to_string(wc))
+    }
+
+    // 7. bnet_token_count = 1
+    let bt = bnet_token_count()
+    if bt != 1 {
+        panic("pe_wow_classic_track FAIL [bnet_token_count] expected=1 got=" + to_string(bt))
+    }
+
+    // 8. step_dll_loaded sanity
+    let d2 = step_dll_loaded(140002)
+    if d2 != 1 {
+        panic("pe_wow_classic_track FAIL [step_dll_loaded(140002)] expected=1 got=" + to_string(d2))
+    }
+    let d7 = step_dll_loaded(140007)
+    if d7 != 0 {
+        panic("pe_wow_classic_track FAIL [step_dll_loaded(140007)] expected=0 got=" + to_string(d7))
+    }
+    let d_miss = step_dll_loaded(9999)
+    if d_miss != 0 {
+        panic("pe_wow_classic_track FAIL [step_dll_loaded(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 9. pwct_stats() = [8, 4, 4, 1, 1]
+    let s = pwct_stats()
+    if len(s) != 5 {
+        panic("pe_wow_classic_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_wow_classic_track FAIL [stats step_count] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_wow_classic_track FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_wow_classic_track FAIL [stats warden_active_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_wow_classic_track FAIL [stats bnet_token_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_wow_classic_track FAIL [stats count_warden_init] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_wow_classic_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"warden_active_count\":" + to_string(s[2])
+        + ",\"bnet_token_count\":" + to_string(s[3])
+        + ",\"count_warden_init\":" + to_string(s[4]))
+
+    // 11. emit count >= 9 (8 records + 1 stats = 9)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 9 {
+        panic("pe_wow_classic_track FAIL [r0 emit count] expected=>=9 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pwct()
+    let s2 = pwct_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wow_classic_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wow_classic_track self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", warden=" + to_string(s[2])
+        + ", bnet_token=" + to_string(s[3]) + ", warden_init=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwct_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("warden_active_count\t" + to_string(s[2]))
+            println("bnet_token_count\t" + to_string(s[3]))
+            println("count_warden_init\t" + to_string(s[4]))
+            return
+        }
+        if sub == "loaded" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_dll_loaded\t" + to_string(step_dll_loaded(sid)))
+                return
+            }
+            println("usage: hexa run pe_wow_classic_track.hexa loaded <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_wow_classic_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwct()
+            println("cleaned: " + pwct_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwct_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wow_classic_track.hexa { self-test | stats | loaded <step_id> | count <phase_kind> | cleanup | dir }")
+}

@@ -1,0 +1,350 @@
+// lib/loader/pe_export_table.hexa — stage3 PE Export Directory parser skeleton
+//
+// PE 의 Export Directory walk: NumberOfFunctions / NumberOfNames /
+// AddressOfFunctions[] / AddressOfNames[] / AddressOfNameOrdinals[].
+// DLL export 의 function name + ordinal + RVA 추적.
+//
+// own 1 enforcement: Wine / CrossOver / community PE loader 코드 0 줄.
+//   참조 only — Microsoft PE/COFF spec (learn.microsoft.com),
+//   Optional Header Data Directory[0] = IMAGE_DIRECTORY_ENTRY_EXPORT.
+// own 2 mandate:
+//   - r0_emit ≥ 5 (record_export × 4 + cleanup|stats marker)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_export_table FAIL [<sub>] expected=X got=Y")
+//
+// table schema (TSV, 4-key):
+//   pet_log.tsv — "dll_id\tfn_count\tname_count\tforwarded_count\n"
+//
+// 동작 흐름 (skeleton):
+//   1. record_export(dll_id, fn_count, name_count, forwarded_count)
+//      pet_log.tsv 에 행 append. forwarded_count = "DLL.OrdinalOrName"
+//      형식 forwarder export 수.
+//   2. export_count() — 행 수 (DLL 수).
+//   3. total_functions() / total_names() / total_forwarded() — 합계.
+//   4. dll_function_count(dll_id) — 특정 DLL 의 fn_count.
+//   5. pet_stats() — [export_count, total_functions, total_names, total_forwarded].
+//
+// 실 export RVA → address 변환 (dlsym 등가) 은 stage4.
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 (4-key 작업 영역) ───
+fn pet_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_export_table"
+}
+
+fn pet_log_path() -> str {
+    return pet_dir() + "/pet_log.tsv"
+}
+
+fn ensure_pet_dir() -> void {
+    let _ = exec("mkdir -p '" + pet_dir() + "'")
+}
+
+fn cleanup_pet() -> void {
+    ensure_pet_dir()
+    let _ = exec("rm -f '" + pet_log_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pet_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pet_append_row(path: str, row: str) -> void {
+    ensure_pet_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_export: pet_log.tsv 행 추가 + r0_emit ───
+fn record_export(dll_id: int, fn_count: int, name_count: int, forwarded_count: int) -> void {
+    let row = to_string(dll_id) + "\t" + to_string(fn_count)
+        + "\t" + to_string(name_count) + "\t" + to_string(forwarded_count) + "\n"
+    pet_append_row(pet_log_path(), row)
+    r0_emit("pet_record",
+        "\"dll_id\":" + to_string(dll_id)
+        + ",\"fn_count\":" + to_string(fn_count)
+        + ",\"name_count\":" + to_string(name_count)
+        + ",\"forwarded_count\":" + to_string(forwarded_count))
+}
+
+// ─── export_count: log 의 행 수 (DLL 수) ───
+fn export_count() -> int {
+    let mut row_n = 0
+    let t = pet_read_table(pet_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    row_n = row_n + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    return row_n
+}
+
+// ─── total_functions: fn_count 합 ───
+fn total_functions() -> int {
+    let mut sum_fn = 0
+    let t = pet_read_table(pet_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum_fn = sum_fn + to_int(parts[1])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum_fn
+}
+
+// ─── total_names: name_count 합 ───
+fn total_names() -> int {
+    let mut sum_n = 0
+    let t = pet_read_table(pet_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum_n = sum_n + to_int(parts[2])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum_n
+}
+
+// ─── total_forwarded: forwarded_count 합 ───
+fn total_forwarded() -> int {
+    let mut sum_f = 0
+    let t = pet_read_table(pet_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum_f = sum_f + to_int(parts[3])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum_f
+}
+
+// ─── dll_function_count: 특정 DLL 의 fn_count ───
+fn dll_function_count(dll_id: int) -> int {
+    let t = pet_read_table(pet_log_path())
+    if t == "" {
+        return 0
+    }
+    let target = to_string(dll_id)
+    let mut hit = 0
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == target {
+                    hit = hit + to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return hit
+}
+
+// ─── pet_stats: [export_count, total_functions, total_names, total_forwarded] ───
+fn pet_stats() -> array {
+    let mut out = []
+    let c = export_count()
+    let f = total_functions()
+    let nm = total_names()
+    let fw = total_forwarded()
+    out.push(c)
+    out.push(f)
+    out.push(nm)
+    out.push(fw)
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pet-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup → log empty
+    cleanup_pet()
+    let s0 = pet_stats()
+    if s0[0] != 0 {
+        panic("pe_export_table FAIL [stats[0] init] expected=0 got=" + to_string(s0[0]))
+    }
+
+    // 2. synthesize 4 entries — typical Windows DLL export patterns
+    //    KERNEL32.dll  (dll_id=88001) — 1700 fn, 1500 names, 24 forwarded
+    //    USER32.dll    (dll_id=88002) — 480  fn, 460  names,  8 forwarded
+    //    GDI32.dll     (dll_id=88003) — 240  fn, 240  names, 12 forwarded
+    //    Ordinal-only  (dll_id=88004) — 480  fn,   0  names,  0 forwarded
+    record_export(88001, 1700, 1500, 24)
+    record_export(88002, 480, 460, 8)
+    record_export(88003, 240, 240, 12)
+    record_export(88004, 480, 0, 0)
+
+    // 3. export_count 검증 = 4
+    let c = export_count()
+    if c != 4 {
+        panic("pe_export_table FAIL [export_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_functions 검증 = 1700+480+240+480 = 2900
+    let tf = total_functions()
+    if tf != 2900 {
+        panic("pe_export_table FAIL [total_functions] expected=2900 got=" + to_string(tf))
+    }
+
+    // 5. total_names 검증 = 1500+460+240+0 = 2200
+    let tn = total_names()
+    if tn != 2200 {
+        panic("pe_export_table FAIL [total_names] expected=2200 got=" + to_string(tn))
+    }
+
+    // 6. total_forwarded 검증 = 24+8+12+0 = 44
+    let tw = total_forwarded()
+    if tw != 44 {
+        panic("pe_export_table FAIL [total_forwarded] expected=44 got=" + to_string(tw))
+    }
+
+    // 7. dll_function_count(88001)=1700, (88002)=480, (9999)=0
+    let dc1 = dll_function_count(88001)
+    if dc1 != 1700 {
+        panic("pe_export_table FAIL [dll_function_count 88001] expected=1700 got=" + to_string(dc1))
+    }
+    let dc2 = dll_function_count(88002)
+    if dc2 != 480 {
+        panic("pe_export_table FAIL [dll_function_count 88002] expected=480 got=" + to_string(dc2))
+    }
+    let dc3 = dll_function_count(9999)
+    if dc3 != 0 {
+        panic("pe_export_table FAIL [dll_function_count 9999] expected=0 got=" + to_string(dc3))
+    }
+
+    // 8. pet_stats() = [4, 2900, 2200, 44]
+    let s = pet_stats()
+    if len(s) != 4 {
+        panic("pe_export_table FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_export_table FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2900 {
+        panic("pe_export_table FAIL [stats[1]] expected=2900 got=" + to_string(s[1]))
+    }
+    if s[2] != 2200 {
+        panic("pe_export_table FAIL [stats[2]] expected=2200 got=" + to_string(s[2]))
+    }
+    if s[3] != 44 {
+        panic("pe_export_table FAIL [stats[3]] expected=44 got=" + to_string(s[3]))
+    }
+
+    // 9. r0_emit summary marker (ensures emit count ≥ 5)
+    r0_emit("pet_summary",
+        "\"export_count\":" + to_string(s[0])
+        + ",\"total_functions\":" + to_string(s[1])
+        + ",\"total_names\":" + to_string(s[2])
+        + ",\"total_forwarded\":" + to_string(s[3]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_export_table FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 10. cleanup → stats reset
+    cleanup_pet()
+    let s_after = pet_stats()
+    let j = 0
+    while j < len(s_after) {
+        if s_after[j] != 0 {
+            panic("pe_export_table FAIL [cleanup stats[" + to_string(j)
+                + "]] expected=0 got=" + to_string(s_after[j]))
+        }
+        j = j + 1
+    }
+
+    println("  ✅ pe_export_table self_test PASS (4 DLLs, 2900 fn, 2200 names, 44 forwarded, sid="
+        + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pet_stats()
+            println("export_count\t" + to_string(s[0]))
+            println("total_functions\t" + to_string(s[1]))
+            println("total_names\t" + to_string(s[2]))
+            println("total_forwarded\t" + to_string(s[3]))
+            return
+        }
+        if sub == "functions" {
+            if len(a) >= 4 {
+                let did = to_int(a[3])
+                let fc = dll_function_count(did)
+                println("dll_id\t" + to_string(did))
+                println("fn_count\t" + to_string(fc))
+                return
+            }
+            println("usage: functions <dll_id>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pet()
+            println("cleaned: " + pet_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pet_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_export_table.hexa { self-test | stats | functions <dll_id> | cleanup | dir }")
+}

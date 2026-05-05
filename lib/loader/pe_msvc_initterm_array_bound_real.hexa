@@ -1,0 +1,576 @@
+// lib/loader/pe_msvc_initterm_array_bound_real.hexa
+// — _initterm / _initterm_e array start/end RVA bound + slot classification 추적기
+//
+// Microsoft Learn `_initterm`, `_initterm_e` reference (docs/MSVC_ENCODE_POINTER_RESEARCH.md
+// § 3) 의 sig:
+//
+//   void __cdecl _initterm  (_PVFV*  first, _PVFV*  last);
+//   int  __cdecl _initterm_e(_PIFV*  first, _PIFV*  last);
+//
+// linker layout (alphabetic merge):
+//   .CRT$XIA / .CRT$XIZ : C   init array (_initterm_e)
+//   .CRT$XCA / .CRT$XCZ : C++ init array (_initterm)
+//
+// 본 hexa 는 walker 의 "array bound (start/end RVA) + slot 별 분류 (null /
+// valid_fn / encoded_fn / invalid) + walk 완료 통계 + computed vs declared
+// count match" 의 5 종 record 를 추적. pe_msvc_initterm_array_real (kind
+// 통계) / pe_msvc_initterm_real_walk (단순 walk) 와 별개의 보조 layer.
+//
+// own 1 enforcement: Wine msvcrt source 0 줄. Microsoft msvcrt source 0 줄.
+//                    Microsoft Learn _initterm / _initterm_e doc 만 참조.
+//   - third-party Wine/CrossOver/GPTK/Whisky 추천/언급 X
+//   - hexa pure (native bridge 호출 0)
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   array_segments.tsv      : seg_id<int>     \t segment_name<str> \t start_va_hex<str>
+//                             \t end_va_hex<str>
+//   walker_invocations.tsv  : walker_id<int>  \t walker_va_hex<str> \t array_start_hex<str>
+//                             \t array_end_hex<str>   \t total_count<int>
+//   slot_classifications.tsv: class_id<int>   \t walker_id<int>     \t slot_index<int>
+//                             \t slot_va_hex<str>     \t slot_kind<int>
+//   walk_completions.tsv    : comp_id<int>    \t walker_id<int>     \t valid_invoked<int>
+//                             \t null_skipped<int>    \t completed<int>
+//   bound_validations.tsv   : val_id<int>     \t walker_id<int>     \t computed_count<int>
+//                             \t declared_count<int>  \t matches<int>
+//
+// slot_kind code: 0=null 1=valid_fn 2=encoded_fn 3=invalid
+// segment_name → kind mapping:
+//   ".CRT$XCA" / ".CRT$XCZ" → CRT_CXX (1)
+//   ".CRT$XIA" / ".CRT$XIZ" → CRT_C   (0)
+//   기타                    → UNKNOWN (-1)
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → slot_kind / kind / k.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmiab_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_initterm_array_bound_real"
+}
+
+fn pmiab_array_segments_path() -> str {
+    return pmiab_dir() + "/array_segments.tsv"
+}
+
+fn pmiab_walker_invocations_path() -> str {
+    return pmiab_dir() + "/walker_invocations.tsv"
+}
+
+fn pmiab_slot_classifications_path() -> str {
+    return pmiab_dir() + "/slot_classifications.tsv"
+}
+
+fn pmiab_walk_completions_path() -> str {
+    return pmiab_dir() + "/walk_completions.tsv"
+}
+
+fn pmiab_bound_validations_path() -> str {
+    return pmiab_dir() + "/bound_validations.tsv"
+}
+
+fn pmiab_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmiab_dir() + "'")
+}
+
+fn cleanup_pmiab() -> void {
+    pmiab_ensure_dir()
+    let _ = exec("rm -f '" + pmiab_array_segments_path()
+        + "' '" + pmiab_walker_invocations_path()
+        + "' '" + pmiab_slot_classifications_path()
+        + "' '" + pmiab_walk_completions_path()
+        + "' '" + pmiab_bound_validations_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmiab_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmiab_append_row(path: str, row: str) -> void {
+    pmiab_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_array_segment: ".CRT$XCA"/".CRT$XCZ"/".CRT$XIA"/".CRT$XIZ" 1 건 ───
+//   start_va_hex / end_va_hex 둘 다 RVA hex string (e.g. "0x401000")
+fn record_array_segment(seg_id: int, segment_name: str, start_va_hex: str, end_va_hex: str) -> void {
+    if seg_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_array_segment] expected=seg_id>0 got=" + to_string(seg_id))
+    }
+    if segment_name == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_array_segment] expected=segment_name!=empty got=empty")
+    }
+    if start_va_hex == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_array_segment] expected=start_va_hex!=empty got=empty")
+    }
+    if end_va_hex == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_array_segment] expected=end_va_hex!=empty got=empty")
+    }
+    let row = to_string(seg_id) + "\t" + segment_name + "\t" + start_va_hex
+        + "\t" + end_va_hex + "\n"
+    pmiab_append_row(pmiab_array_segments_path(), row)
+}
+
+// ─── record_walker_invocation: _initterm / _initterm_e 1 회 호출 ───
+fn record_walker_invocation(walker_id: int, walker_va_hex: str, array_start_hex: str, array_end_hex: str, total_count: int) -> void {
+    if walker_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walker_invocation] expected=walker_id>0 got=" + to_string(walker_id))
+    }
+    if walker_va_hex == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walker_invocation] expected=walker_va_hex!=empty got=empty")
+    }
+    if array_start_hex == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walker_invocation] expected=array_start_hex!=empty got=empty")
+    }
+    if array_end_hex == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walker_invocation] expected=array_end_hex!=empty got=empty")
+    }
+    if total_count < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walker_invocation] expected=total_count>=0 got=" + to_string(total_count))
+    }
+    let row = to_string(walker_id) + "\t" + walker_va_hex + "\t" + array_start_hex
+        + "\t" + array_end_hex + "\t" + to_string(total_count) + "\n"
+    pmiab_append_row(pmiab_walker_invocations_path(), row)
+}
+
+// ─── record_slot_classification: walker 안의 한 slot 분류 ───
+//   slot_kind: 0=null 1=valid_fn 2=encoded_fn 3=invalid
+fn record_slot_classification(class_id: int, walker_id: int, slot_index: int, slot_va_hex: str, slot_kind: int) -> void {
+    if class_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_slot_classification] expected=class_id>0 got=" + to_string(class_id))
+    }
+    if walker_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_slot_classification] expected=walker_id>0 got=" + to_string(walker_id))
+    }
+    if slot_index < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_slot_classification] expected=slot_index>=0 got=" + to_string(slot_index))
+    }
+    if slot_va_hex == "" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_slot_classification] expected=slot_va_hex!=empty got=empty")
+    }
+    if slot_kind < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_slot_classification] expected=slot_kind>=0 got=" + to_string(slot_kind))
+    }
+    if slot_kind > 3 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_slot_classification] expected=slot_kind<=3 got=" + to_string(slot_kind))
+    }
+    let row = to_string(class_id) + "\t" + to_string(walker_id) + "\t" + to_string(slot_index)
+        + "\t" + slot_va_hex + "\t" + to_string(slot_kind) + "\n"
+    pmiab_append_row(pmiab_slot_classifications_path(), row)
+}
+
+// ─── record_walk_completion: walker 의 valid 호출/null skip/완료 여부 ───
+fn record_walk_completion(comp_id: int, walker_id: int, valid_invoked: int, null_skipped: int, completed: int) -> void {
+    if comp_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walk_completion] expected=comp_id>0 got=" + to_string(comp_id))
+    }
+    if walker_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walk_completion] expected=walker_id>0 got=" + to_string(walker_id))
+    }
+    if valid_invoked < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walk_completion] expected=valid_invoked>=0 got=" + to_string(valid_invoked))
+    }
+    if null_skipped < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walk_completion] expected=null_skipped>=0 got=" + to_string(null_skipped))
+    }
+    if completed < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walk_completion] expected=completed>=0 got=" + to_string(completed))
+    }
+    if completed > 1 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_walk_completion] expected=completed<=1 got=" + to_string(completed))
+    }
+    let row = to_string(comp_id) + "\t" + to_string(walker_id) + "\t" + to_string(valid_invoked)
+        + "\t" + to_string(null_skipped) + "\t" + to_string(completed) + "\n"
+    pmiab_append_row(pmiab_walk_completions_path(), row)
+}
+
+// ─── record_bound_validation: computed (= (end-start)/sizeof(ptr)) vs declared ───
+fn record_bound_validation(val_id: int, walker_id: int, computed_count: int, declared_count: int, matches: int) -> void {
+    if val_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_bound_validation] expected=val_id>0 got=" + to_string(val_id))
+    }
+    if walker_id <= 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_bound_validation] expected=walker_id>0 got=" + to_string(walker_id))
+    }
+    if computed_count < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_bound_validation] expected=computed_count>=0 got=" + to_string(computed_count))
+    }
+    if declared_count < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_bound_validation] expected=declared_count>=0 got=" + to_string(declared_count))
+    }
+    if matches < 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_bound_validation] expected=matches>=0 got=" + to_string(matches))
+    }
+    if matches > 1 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [record_bound_validation] expected=matches<=1 got=" + to_string(matches))
+    }
+    let row = to_string(val_id) + "\t" + to_string(walker_id) + "\t" + to_string(computed_count)
+        + "\t" + to_string(declared_count) + "\t" + to_string(matches) + "\n"
+    pmiab_append_row(pmiab_bound_validations_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmiab_count_rows(path: str, min_fields: int) -> int {
+    let t = pmiab_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn array_segment_count() -> int {
+    return pmiab_count_rows(pmiab_array_segments_path(), 4)
+}
+
+fn walker_invocation_count() -> int {
+    return pmiab_count_rows(pmiab_walker_invocations_path(), 5)
+}
+
+fn slot_classification_count() -> int {
+    return pmiab_count_rows(pmiab_slot_classifications_path(), 5)
+}
+
+fn walk_completion_count() -> int {
+    return pmiab_count_rows(pmiab_walk_completions_path(), 5)
+}
+
+fn bound_validation_count() -> int {
+    return pmiab_count_rows(pmiab_bound_validations_path(), 5)
+}
+
+// ─── helper: segment_name → kind ───
+//   ".CRT$XCA" / ".CRT$XCZ" → 1 (CRT_CXX)
+//   ".CRT$XIA" / ".CRT$XIZ" → 0 (CRT_C)
+//   else                    → -1 (UNKNOWN)
+fn segment_name_to_kind(segment_name: str) -> int {
+    if segment_name == ".CRT$XCA" {
+        return 1
+    }
+    if segment_name == ".CRT$XCZ" {
+        return 1
+    }
+    if segment_name == ".CRT$XIA" {
+        return 0
+    }
+    if segment_name == ".CRT$XIZ" {
+        return 0
+    }
+    return -1
+}
+
+// ─── helper: slot_kind name (0..3) ───
+fn slot_kind_name(k: int) -> str {
+    if k == 0 {
+        return "null"
+    }
+    if k == 1 {
+        return "valid_fn"
+    }
+    if k == 2 {
+        return "encoded_fn"
+    }
+    if k == 3 {
+        return "invalid"
+    }
+    panic("pe_msvc_initterm_array_bound_real FAIL [slot_kind_name] expected=0..3 got=" + to_string(k))
+}
+
+// ─── pmiab_stats: [array_segment, walker_invocation, slot_classification, walk_completion, bound_validation] ───
+fn pmiab_stats() -> array {
+    let mut out = []
+    out.push(array_segment_count())
+    out.push(walker_invocation_count())
+    out.push(slot_classification_count())
+    out.push(walk_completion_count())
+    out.push(bound_validation_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmiab-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmiab()
+
+    // 2. record_array_segment x4 — .CRT$XIA / .CRT$XIZ / .CRT$XCA / .CRT$XCZ
+    //    layout:
+    //      .CRT$XIA = 0x401000  .CRT$XIZ = 0x401010  → C   array  : 4 slot
+    //      .CRT$XCA = 0x401010  .CRT$XCZ = 0x401020  → C++ array  : 4 slot
+    record_array_segment(1, ".CRT$XIA", "0x401000", "0x401010")
+    r0_emit("pe_msvc_initterm_array_bound_real_record_array_segment",
+        "\"seg_id\":1,\"segment_name\":\".CRT$XIA\",\"start_va_hex\":\"0x401000\""
+        + ",\"end_va_hex\":\"0x401010\",\"kind\":" + to_string(segment_name_to_kind(".CRT$XIA")))
+
+    record_array_segment(2, ".CRT$XIZ", "0x401010", "0x401010")
+    r0_emit("pe_msvc_initterm_array_bound_real_record_array_segment",
+        "\"seg_id\":2,\"segment_name\":\".CRT$XIZ\",\"start_va_hex\":\"0x401010\""
+        + ",\"end_va_hex\":\"0x401010\",\"kind\":" + to_string(segment_name_to_kind(".CRT$XIZ")))
+
+    record_array_segment(3, ".CRT$XCA", "0x401010", "0x401020")
+    r0_emit("pe_msvc_initterm_array_bound_real_record_array_segment",
+        "\"seg_id\":3,\"segment_name\":\".CRT$XCA\",\"start_va_hex\":\"0x401010\""
+        + ",\"end_va_hex\":\"0x401020\",\"kind\":" + to_string(segment_name_to_kind(".CRT$XCA")))
+
+    record_array_segment(4, ".CRT$XCZ", "0x401020", "0x401020")
+    r0_emit("pe_msvc_initterm_array_bound_real_record_array_segment",
+        "\"seg_id\":4,\"segment_name\":\".CRT$XCZ\",\"start_va_hex\":\"0x401020\""
+        + ",\"end_va_hex\":\"0x401020\",\"kind\":" + to_string(segment_name_to_kind(".CRT$XCZ")))
+
+    // 3. record_walker_invocation x2 — _initterm_e (C, walker_id=1) + _initterm (C++, walker_id=2)
+    //    각 array 4 slot
+    record_walker_invocation(1, "0x500100", "0x401000", "0x401010", 4)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_walker_invocation",
+        "\"walker_id\":1,\"walker_va_hex\":\"0x500100\",\"array_start_hex\":\"0x401000\""
+        + ",\"array_end_hex\":\"0x401010\",\"total_count\":4,\"name\":\"_initterm_e\"")
+
+    record_walker_invocation(2, "0x500200", "0x401010", "0x401020", 4)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_walker_invocation",
+        "\"walker_id\":2,\"walker_va_hex\":\"0x500200\",\"array_start_hex\":\"0x401010\""
+        + ",\"array_end_hex\":\"0x401020\",\"total_count\":4,\"name\":\"_initterm\"")
+
+    // 4. record_slot_classification x8 — walker 1 (4 slot) + walker 2 (4 slot)
+    //    walker 1 (C init): null 1 / valid_fn 2 / encoded_fn 1
+    //      slot 0 → null      (0x401000)
+    //      slot 1 → valid_fn  (0x401004)
+    //      slot 2 → valid_fn  (0x401008)
+    //      slot 3 → encoded_fn(0x40100c)
+    record_slot_classification(1, 1, 0, "0x401000", 0)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":1,\"walker_id\":1,\"slot_index\":0,\"slot_va_hex\":\"0x401000\""
+        + ",\"slot_kind\":0,\"name\":\"" + slot_kind_name(0) + "\"")
+
+    record_slot_classification(2, 1, 1, "0x401004", 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":2,\"walker_id\":1,\"slot_index\":1,\"slot_va_hex\":\"0x401004\""
+        + ",\"slot_kind\":1,\"name\":\"" + slot_kind_name(1) + "\"")
+
+    record_slot_classification(3, 1, 2, "0x401008", 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":3,\"walker_id\":1,\"slot_index\":2,\"slot_va_hex\":\"0x401008\""
+        + ",\"slot_kind\":1,\"name\":\"" + slot_kind_name(1) + "\"")
+
+    record_slot_classification(4, 1, 3, "0x40100c", 2)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":4,\"walker_id\":1,\"slot_index\":3,\"slot_va_hex\":\"0x40100c\""
+        + ",\"slot_kind\":2,\"name\":\"" + slot_kind_name(2) + "\"")
+
+    //    walker 2 (C++ init): null 1 / valid_fn 2 / encoded_fn 1
+    //      slot 0 → null      (0x401010)
+    //      slot 1 → valid_fn  (0x401014)
+    //      slot 2 → encoded_fn(0x401018)
+    //      slot 3 → valid_fn  (0x40101c)
+    record_slot_classification(5, 2, 0, "0x401010", 0)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":5,\"walker_id\":2,\"slot_index\":0,\"slot_va_hex\":\"0x401010\""
+        + ",\"slot_kind\":0,\"name\":\"" + slot_kind_name(0) + "\"")
+
+    record_slot_classification(6, 2, 1, "0x401014", 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":6,\"walker_id\":2,\"slot_index\":1,\"slot_va_hex\":\"0x401014\""
+        + ",\"slot_kind\":1,\"name\":\"" + slot_kind_name(1) + "\"")
+
+    record_slot_classification(7, 2, 2, "0x401018", 2)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":7,\"walker_id\":2,\"slot_index\":2,\"slot_va_hex\":\"0x401018\""
+        + ",\"slot_kind\":2,\"name\":\"" + slot_kind_name(2) + "\"")
+
+    record_slot_classification(8, 2, 3, "0x40101c", 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_slot_classification",
+        "\"class_id\":8,\"walker_id\":2,\"slot_index\":3,\"slot_va_hex\":\"0x40101c\""
+        + ",\"slot_kind\":1,\"name\":\"" + slot_kind_name(1) + "\"")
+
+    // 5. record_walk_completion x2 — walker1 invoked=3 null_skip=1 / walker2 invoked=3 null_skip=1
+    record_walk_completion(1, 1, 3, 1, 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_walk_completion",
+        "\"comp_id\":1,\"walker_id\":1,\"valid_invoked\":3,\"null_skipped\":1,\"completed\":1")
+
+    record_walk_completion(2, 2, 3, 1, 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_walk_completion",
+        "\"comp_id\":2,\"walker_id\":2,\"valid_invoked\":3,\"null_skipped\":1,\"completed\":1")
+
+    // 6. record_bound_validation x2 — both matches=1
+    //    walker 1: computed = (0x401010 - 0x401000) / 4 = 4, declared = 4
+    //    walker 2: computed = (0x401020 - 0x401010) / 4 = 4, declared = 4
+    record_bound_validation(1, 1, 4, 4, 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_bound_validation",
+        "\"val_id\":1,\"walker_id\":1,\"computed_count\":4,\"declared_count\":4,\"matches\":1")
+
+    record_bound_validation(2, 2, 4, 4, 1)
+    r0_emit("pe_msvc_initterm_array_bound_real_record_bound_validation",
+        "\"val_id\":2,\"walker_id\":2,\"computed_count\":4,\"declared_count\":4,\"matches\":1")
+
+    // 7. assertion: array_segment == 4
+    let ag = array_segment_count()
+    if ag != 4 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [array_segment_count] expected=4 got=" + to_string(ag))
+    }
+
+    // 8. assertion: walker_invocation == 2
+    let wi = walker_invocation_count()
+    if wi != 2 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [walker_invocation_count] expected=2 got=" + to_string(wi))
+    }
+
+    // 9. assertion: slot_classification == 8
+    let sc = slot_classification_count()
+    if sc != 8 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [slot_classification_count] expected=8 got=" + to_string(sc))
+    }
+
+    // 10. assertion: walk_completion == 2
+    let wc = walk_completion_count()
+    if wc != 2 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [walk_completion_count] expected=2 got=" + to_string(wc))
+    }
+
+    // 11. assertion: bound_validation == 2
+    let bv = bound_validation_count()
+    if bv != 2 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [bound_validation_count] expected=2 got=" + to_string(bv))
+    }
+
+    // 12. segment_name_to_kind sanity (4 정의 + 1 unknown)
+    let kxia = segment_name_to_kind(".CRT$XIA")
+    if kxia != 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [segment_name_to_kind XIA] expected=0 got=" + to_string(kxia))
+    }
+    let kxiz = segment_name_to_kind(".CRT$XIZ")
+    if kxiz != 0 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [segment_name_to_kind XIZ] expected=0 got=" + to_string(kxiz))
+    }
+    let kxca = segment_name_to_kind(".CRT$XCA")
+    if kxca != 1 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [segment_name_to_kind XCA] expected=1 got=" + to_string(kxca))
+    }
+    let kxcz = segment_name_to_kind(".CRT$XCZ")
+    if kxcz != 1 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [segment_name_to_kind XCZ] expected=1 got=" + to_string(kxcz))
+    }
+    let kunk = segment_name_to_kind(".CRT$XYA")
+    if kunk != -1 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [segment_name_to_kind UNKNOWN] expected=-1 got=" + to_string(kunk))
+    }
+
+    // 13. slot_kind_name sanity (0..3)
+    let n0 = slot_kind_name(0)
+    if n0 != "null" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [slot_kind_name(0)] expected=null got=" + n0)
+    }
+    let n1 = slot_kind_name(1)
+    if n1 != "valid_fn" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [slot_kind_name(1)] expected=valid_fn got=" + n1)
+    }
+    let n2 = slot_kind_name(2)
+    if n2 != "encoded_fn" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [slot_kind_name(2)] expected=encoded_fn got=" + n2)
+    }
+    let n3 = slot_kind_name(3)
+    if n3 != "invalid" {
+        panic("pe_msvc_initterm_array_bound_real FAIL [slot_kind_name(3)] expected=invalid got=" + n3)
+    }
+
+    // 14. pmiab_stats() == [4, 2, 8, 2, 2]
+    let s = pmiab_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [stats array_segment] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [stats walker_invocation] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 8 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [stats slot_classification] expected=8 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [stats walk_completion] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [stats bound_validation] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_msvc_initterm_array_bound_real_stats",
+        "\"array_segment\":" + to_string(s[0])
+        + ",\"walker_invocation\":" + to_string(s[1])
+        + ",\"slot_classification\":" + to_string(s[2])
+        + ",\"walk_completion\":" + to_string(s[3])
+        + ",\"bound_validation\":" + to_string(s[4]))
+
+    // 16. emit count >= 14 — 4 seg + 2 walker + 8 slot + 2 comp + 2 val + 1 stats = 19
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_initterm_array_bound_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pmiab()
+    let s2 = pmiab_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_initterm_array_bound_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_initterm_array_bound_real self_test PASS (array_segment=" + to_string(s[0])
+        + ", walker_invocation=" + to_string(s[1]) + ", slot_classification=" + to_string(s[2])
+        + ", walk_completion=" + to_string(s[3]) + ", bound_validation=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmiab_stats()
+            println("array_segment_count\t" + to_string(s[0]))
+            println("walker_invocation_count\t" + to_string(s[1]))
+            println("slot_classification_count\t" + to_string(s[2]))
+            println("walk_completion_count\t" + to_string(s[3]))
+            println("bound_validation_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmiab()
+            println("cleaned: " + pmiab_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmiab_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_initterm_array_bound_real.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,477 @@
+// lib/loader/pe_oleaut32_variant_marshal.hexa — OleAut32 VARIANT marshaling tracker
+//
+// Battle.net Setup 의 OleAut32 ordinal 4 import surface 추적:
+//   VariantInit / VariantClear / SysAllocString / SysFreeString / VariantChangeType
+//
+// VARIANT (16 byte struct):
+//   offset 0  : VARTYPE vt          (2 byte — VT_EMPTY/VT_I4/VT_BSTR/VT_BOOL/VT_UI4 …)
+//   offset 2  : WORD wReserved1
+//   offset 4  : WORD wReserved2
+//   offset 6  : WORD wReserved3
+//   offset 8  : value union          (8 byte — int64 / BSTR ptr / IUnknown* / SAFEARRAY* …)
+//
+// BSTR layout:
+//   BSTR = WCHAR* with 4-byte length prefix (length in BYTE — UTF-16 char 수 × 2).
+//   pointer 는 char data 시작을 가리킴, prefix 는 (BSTR - 4) 위치.
+//   SysAllocString(L"abc") → malloc(3 * 2 + 4 + 2) = malloc(12) → [04 00 00 00] [a b c \0\0]
+//
+// VariantClear:
+//   - VT_BSTR  : SysFreeString(V_BSTR(pvar))
+//   - VT_UNKNOWN / VT_DISPATCH : IUnknown::Release
+//   - VT_ARRAY : SafeArrayDestroy
+//   - VT_EMPTY / VT_I4 / VT_UI4 / VT_BOOL : memset 0 (no release)
+//
+// own1: MSDN OleAut32 reference + Apple Foundation 만 인용. Wine oleaut32/variant.c X.
+// own 1 enforcement: Wine / Reactos / CrossOver / community 코드 0 줄.
+//   본 module 은 OleAut32 VARIANT marshaling tracker — 실 native dispatch X.
+//   Apple-native mapping 은 docstring 만 (실 helper.mm bridge stage 미정).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// func_ordinal code (OleAut32 export ordinal):
+//     2 = SysAllocString
+//     6 = SysFreeString
+//     8 = VariantInit
+//     9 = VariantClear
+//   110 = VariantChangeType
+//
+// vt_type code (VARTYPE):
+//     0 = VT_EMPTY
+//     3 = VT_I4
+//     8 = VT_BSTR
+//    11 = VT_BOOL
+//    19 = VT_UI4
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t func_ordinal<int> \t vt_type<int> \t data_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn povm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_oleaut32_variant_marshal"
+}
+
+fn povm_calls_path() -> str {
+    return povm_dir() + "/calls.tsv"
+}
+
+fn povm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + povm_dir() + "'")
+}
+
+fn cleanup_povm() -> void {
+    povm_ensure_dir()
+    let _ = exec("rm -f '" + povm_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn povm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn povm_append_row(path: str, row: str) -> void {
+    povm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: OleAut32 VARIANT 호출 1 건 기록 ───
+fn record_call(call_id: int, func_ordinal: int, vt_type: int, data_size_bytes: int) -> void {
+    if call_id <= 0 {
+        panic("pe_oleaut32_variant_marshal FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if func_ordinal < 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [record_call] expected=func_ordinal>=1 got=" + to_string(func_ordinal))
+    }
+    if func_ordinal > 200 {
+        panic("pe_oleaut32_variant_marshal FAIL [record_call] expected=func_ordinal<=200 got=" + to_string(func_ordinal))
+    }
+    if vt_type < 0 {
+        panic("pe_oleaut32_variant_marshal FAIL [record_call] expected=vt_type>=0 got=" + to_string(vt_type))
+    }
+    if vt_type > 100 {
+        panic("pe_oleaut32_variant_marshal FAIL [record_call] expected=vt_type<=100 got=" + to_string(vt_type))
+    }
+    if data_size_bytes < 0 {
+        panic("pe_oleaut32_variant_marshal FAIL [record_call] expected=data_size_bytes>=0 got=" + to_string(data_size_bytes))
+    }
+    let row = to_string(call_id) + "\t" + to_string(func_ordinal)
+        + "\t" + to_string(vt_type) + "\t" + to_string(data_size_bytes) + "\n"
+    povm_append_row(povm_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = povm_read_table(povm_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_func_ordinal: 특정 func_ordinal 의 호출 수 ───
+fn count_by_func_ordinal(func_ordinal: int) -> int {
+    let t = povm_read_table(povm_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == func_ordinal {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_vt_type: 특정 vt_type 의 호출 수 ───
+fn count_by_vt_type(vt_type: int) -> int {
+    let t = povm_read_table(povm_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == vt_type {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_data_size_bytes: 모든 호출의 data_size_bytes 합 ───
+fn total_data_size_bytes() -> int {
+    let t = povm_read_table(povm_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── bstr_alloc_count: SysAllocString (func_ordinal=2) 호출 수 ───
+fn bstr_alloc_count() -> int {
+    return count_by_func_ordinal(2)
+}
+
+// ─── call_data_size: 특정 call_id 의 data_size_bytes (없으면 0) ───
+fn call_data_size(call_id: int) -> int {
+    let t = povm_read_table(povm_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── povm_stats: [call_count, bstr_alloc_count, total_data_size_bytes, count_by_vt_type(8)] ───
+fn povm_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(bstr_alloc_count())
+    out.push(total_data_size_bytes())
+    out.push(count_by_vt_type(8))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "povm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_povm()
+
+    // 2. record 6 calls (≥4 func_ordinals, ≥3 vt_types)
+    //    func_ordinals: 2 (SysAllocString), 6 (SysFreeString), 8 (VariantInit),
+    //                   9 (VariantClear), 110 (VariantChangeType) = 5 distinct
+    //    vt_types: 0 (VT_EMPTY), 3 (VT_I4), 8 (VT_BSTR), 11 (VT_BOOL) = 4 distinct
+    //    data_size_bytes: SysAllocString L"Battle" → 6*2 + 4 + 2 = 18,
+    //                     SysAllocString L"D2R"    → 3*2 + 4 + 2 = 12,
+    //                     SysFreeString  → 18 (release prior alloc),
+    //                     VariantInit    → 16 (VARIANT struct size),
+    //                     VariantClear   → 16,
+    //                     VariantChangeType → 16
+    //    total_data_size_bytes = 18 + 12 + 18 + 16 + 16 + 16 = 96
+    //    bstr_alloc_count = 2 (call 1, call 2)
+    //    count_by_vt_type(8 / VT_BSTR) = 3 (call 1, call 2, call 3)
+
+    // call 1: SysAllocString(L"Battle") → VT_BSTR → 18 bytes
+    record_call(820001, 2, 8, 18)
+    r0_emit("pe_oleaut32_variant_marshal_record",
+        "\"call_id\":820001,\"func_ordinal\":2,\"vt_type\":8,\"data_size_bytes\":18,\"target\":\"SysAllocString\",\"native\":\"malloc(len*2+4+2)\"")
+
+    // call 2: SysAllocString(L"D2R") → VT_BSTR → 12 bytes
+    record_call(820002, 2, 8, 12)
+    r0_emit("pe_oleaut32_variant_marshal_record",
+        "\"call_id\":820002,\"func_ordinal\":2,\"vt_type\":8,\"data_size_bytes\":12,\"target\":\"SysAllocString\",\"native\":\"malloc(len*2+4+2)\"")
+
+    // call 3: SysFreeString(bstr) → VT_BSTR release → 18 bytes (prior alloc)
+    record_call(820003, 6, 8, 18)
+    r0_emit("pe_oleaut32_variant_marshal_record",
+        "\"call_id\":820003,\"func_ordinal\":6,\"vt_type\":8,\"data_size_bytes\":18,\"target\":\"SysFreeString\",\"native\":\"free(bstr-4)\"")
+
+    // call 4: VariantInit(&v) → VT_EMPTY → 16 bytes (VARIANT struct)
+    record_call(820004, 8, 0, 16)
+    r0_emit("pe_oleaut32_variant_marshal_record",
+        "\"call_id\":820004,\"func_ordinal\":8,\"vt_type\":0,\"data_size_bytes\":16,\"target\":\"VariantInit\",\"native\":\"memset_zero_16\"")
+
+    // call 5: VariantClear(&v) — VT_BOOL no release → 16 bytes
+    record_call(820005, 9, 11, 16)
+    r0_emit("pe_oleaut32_variant_marshal_record",
+        "\"call_id\":820005,\"func_ordinal\":9,\"vt_type\":11,\"data_size_bytes\":16,\"target\":\"VariantClear\",\"native\":\"memset_zero_16\"")
+
+    // call 6: VariantChangeType(&dst, &src, 0, VT_I4) → VT_I4 → 16 bytes
+    record_call(820006, 110, 3, 16)
+    r0_emit("pe_oleaut32_variant_marshal_record",
+        "\"call_id\":820006,\"func_ordinal\":110,\"vt_type\":3,\"data_size_bytes\":16,\"target\":\"VariantChangeType\",\"native\":\"coerce_int32\"")
+
+    // 3. call_count = 6
+    let c = call_count()
+    if c != 6 {
+        panic("pe_oleaut32_variant_marshal FAIL [call_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_func_ordinal sanity (5 distinct: 2 ×2, 6 ×1, 8 ×1, 9 ×1, 110 ×1)
+    let fo2 = count_by_func_ordinal(2)
+    if fo2 != 2 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_func_ordinal(2)] expected=2 got=" + to_string(fo2))
+    }
+    let fo6 = count_by_func_ordinal(6)
+    if fo6 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_func_ordinal(6)] expected=1 got=" + to_string(fo6))
+    }
+    let fo8 = count_by_func_ordinal(8)
+    if fo8 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_func_ordinal(8)] expected=1 got=" + to_string(fo8))
+    }
+    let fo9 = count_by_func_ordinal(9)
+    if fo9 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_func_ordinal(9)] expected=1 got=" + to_string(fo9))
+    }
+    let fo110 = count_by_func_ordinal(110)
+    if fo110 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_func_ordinal(110)] expected=1 got=" + to_string(fo110))
+    }
+    let fo_miss = count_by_func_ordinal(99)
+    if fo_miss != 0 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_func_ordinal(99)] expected=0 got=" + to_string(fo_miss))
+    }
+
+    // 5. count_by_vt_type — 4 distinct (0 ×1, 3 ×1, 8 ×3, 11 ×1)
+    let vt0 = count_by_vt_type(0)
+    if vt0 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_vt_type(0)] expected=1 got=" + to_string(vt0))
+    }
+    let vt3 = count_by_vt_type(3)
+    if vt3 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_vt_type(3)] expected=1 got=" + to_string(vt3))
+    }
+    let vt8 = count_by_vt_type(8)
+    if vt8 != 3 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_vt_type(8)] expected=3 got=" + to_string(vt8))
+    }
+    let vt11 = count_by_vt_type(11)
+    if vt11 != 1 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_vt_type(11)] expected=1 got=" + to_string(vt11))
+    }
+    let vt19 = count_by_vt_type(19)
+    if vt19 != 0 {
+        panic("pe_oleaut32_variant_marshal FAIL [count_by_vt_type(19)] expected=0 got=" + to_string(vt19))
+    }
+
+    // 6. bstr_alloc_count = 2 (call 1, call 2 — both SysAllocString)
+    let bac = bstr_alloc_count()
+    if bac != 2 {
+        panic("pe_oleaut32_variant_marshal FAIL [bstr_alloc_count] expected=2 got=" + to_string(bac))
+    }
+
+    // 7. total_data_size_bytes = 18+12+18+16+16+16 = 96
+    let tds = total_data_size_bytes()
+    if tds != 96 {
+        panic("pe_oleaut32_variant_marshal FAIL [total_data_size_bytes] expected=96 got=" + to_string(tds))
+    }
+
+    // 8. call_data_size sanity
+    let ds1 = call_data_size(820001)
+    if ds1 != 18 {
+        panic("pe_oleaut32_variant_marshal FAIL [call_data_size(820001)] expected=18 got=" + to_string(ds1))
+    }
+    let ds2 = call_data_size(820002)
+    if ds2 != 12 {
+        panic("pe_oleaut32_variant_marshal FAIL [call_data_size(820002)] expected=12 got=" + to_string(ds2))
+    }
+    let ds_miss = call_data_size(9999)
+    if ds_miss != 0 {
+        panic("pe_oleaut32_variant_marshal FAIL [call_data_size(9999)] expected=0 got=" + to_string(ds_miss))
+    }
+
+    // 9. povm_stats() = [6, 2, 96, 3]
+    let s = povm_stats()
+    if len(s) != 4 {
+        panic("pe_oleaut32_variant_marshal FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_oleaut32_variant_marshal FAIL [stats call_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_oleaut32_variant_marshal FAIL [stats bstr_alloc_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 96 {
+        panic("pe_oleaut32_variant_marshal FAIL [stats total_data_size_bytes] expected=96 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_oleaut32_variant_marshal FAIL [stats vt_bstr_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_oleaut32_variant_marshal_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"bstr_alloc_count\":" + to_string(s[1])
+        + ",\"total_data_size_bytes\":" + to_string(s[2])
+        + ",\"vt_bstr_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_oleaut32_variant_marshal FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_povm()
+    let s2 = povm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_oleaut32_variant_marshal FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_oleaut32_variant_marshal self_test PASS (calls=" + to_string(s[0])
+        + ", bstr_alloc=" + to_string(s[1]) + ", total_bytes=" + to_string(s[2])
+        + ", vt_bstr=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = povm_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("bstr_alloc_count\t" + to_string(s[1]))
+            println("total_data_size_bytes\t" + to_string(s[2]))
+            println("vt_bstr_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_data_size\t" + to_string(call_data_size(cid)))
+                return
+            }
+            println("usage: hexa run pe_oleaut32_variant_marshal.hexa size <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let mode = a[3]
+                let val = to_int(a[4])
+                if mode == "func" {
+                    println("count_by_func_ordinal\t" + to_string(count_by_func_ordinal(val)))
+                    return
+                }
+                if mode == "vt" {
+                    println("count_by_vt_type\t" + to_string(count_by_vt_type(val)))
+                    return
+                }
+                println("usage: hexa run pe_oleaut32_variant_marshal.hexa count { func <func_ordinal> | vt <vt_type> }")
+                return
+            }
+            println("usage: hexa run pe_oleaut32_variant_marshal.hexa count { func <func_ordinal> | vt <vt_type> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_povm()
+            println("cleaned: " + povm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(povm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_oleaut32_variant_marshal.hexa { self-test | stats | size <call_id> | count func <func_ordinal> | count vt <vt_type> | cleanup | dir }")
+}

@@ -1,0 +1,221 @@
+// lib/perf/c_dxil_vector_scalarize.hexa — CN-149 skeleton manjeom 15/15
+//
+// DXIL vec → scalar 변환 추적 — Apple GPU register allocator 가 scalar 코드를
+// 더 효율 압축. HLSL/DXIL shader 가 float4/float3 vector ALU 으로 작성됐을 때
+// Apple GPU 의 SIMD-lane 단위 scalar register allocator 는 vec lane 통째로
+// 잡아 register pressure 상승 → DXIL→AIR 변환 시 vec → scalar split 으로
+// register 절약, occupancy 상승. 본 모듈은 shader 단위 (shader_id × vec_op_count
+// × scalar_op_count × register_save_count) 의 4-key columnar log + sum/avg.
+//
+// 무기: shader × vec_op_count × scalar_op_count × register_save_count 4-key 로그.
+// 효과: D4 HLSL pixel/compute shader 의 register pressure 절감 → occupancy/wave
+// 상승 → ALU throughput 정량화.
+
+use "./r0_common"
+
+let DVS_DIR = GAMEBOX_HOME + "/persist/dxil_vector_scalarize"
+let SHADER_LOG = DVS_DIR + "/shaders.tsv"
+
+fn dvs_dir() -> str { return DVS_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DVS_DIR + "'")
+}
+
+// ─── shader 등록 ───
+//   shader_id (HLSL/DXIL shader logical id),
+//   vec_ops (vector ALU 명령 수 — float4/float3 등),
+//   scalar_ops (DXIL→AIR 후 split 된 scalar ALU 명령 수),
+//   reg_save (vec → scalar split 으로 절약된 register 수).
+fn record_shader(shader_id: int, vec_ops: int, scalar_ops: int, reg_save: int) -> void {
+    ensure_dir()
+    let line = to_string(shader_id) + "\t" + to_string(vec_ops) + "\t" + to_string(scalar_ops) + "\t" + to_string(reg_save)
+    let tmp = SHADER_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SHADER_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("dxil_vector_scalarize_record", "\"shader\":" + to_string(shader_id) + ",\"vec_ops\":" + to_string(vec_ops) + ",\"scalar_ops\":" + to_string(scalar_ops) + ",\"reg_save\":" + to_string(reg_save))
+}
+
+// ─── shader_count — 등록된 shader 행 수 ───
+fn shader_count() -> int {
+    let exists = exec("test -f '" + SHADER_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + SHADER_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_vec_ops — 모든 shader vec_ops 합 ───
+fn total_vec_ops() -> int {
+    let exists = exec("test -f '" + SHADER_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + SHADER_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_scalar_ops — 모든 shader scalar_ops 합 ───
+fn total_scalar_ops() -> int {
+    let exists = exec("test -f '" + SHADER_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + SHADER_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_register_save — 모든 shader reg_save 합 ───
+fn total_register_save() -> int {
+    let exists = exec("test -f '" + SHADER_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + SHADER_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_scalar_per_vec — total_scalar_ops / total_vec_ops (int trunc) ───
+//   vec_ops 0 이면 0 반환 (divide-by-zero guard).
+fn avg_scalar_per_vec() -> int {
+    let tv = total_vec_ops()
+    if tv == 0 { return 0 }
+    let ts = total_scalar_ops()
+    return ts / tv
+}
+
+// ─── shader_reg_save — 특정 shader_id 의 register_save_count ───
+//   shader_id 미등록이면 0.
+fn shader_reg_save(shader_id: int) -> int {
+    let exists = exec("test -f '" + SHADER_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v a=" + to_string(shader_id) + " '$1==a {s+=$4} END{print s+0}' '" + SHADER_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── dvs_stats — [shader_count, total_vec_ops, total_scalar_ops, total_register_save] ───
+fn dvs_stats() -> array {
+    return [shader_count(), total_vec_ops(), total_scalar_ops(), total_register_save()]
+}
+
+fn cleanup_dvs() -> void {
+    let _ = exec("rm -rf '" + DVS_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dvs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dvs()
+
+    // 합성 shader 3 종:
+    //   D4 pixel deferred lighting (id=6001) — vec=120 / scalar=480 / reg_save=24
+    //   D4 pixel post FX           (id=6002) — vec=80  / scalar=320 / reg_save=16
+    //   D4 compute reduction       (id=6003) — vec=40  / scalar=160 / reg_save=8
+    record_shader(6001, 120, 480, 24)
+    record_shader(6002, 80, 320, 16)
+    record_shader(6003, 40, 160, 8)
+
+    // shader_count = 3
+    let sc = shader_count()
+    if sc != 3 { panic("c_dxil_vector_scalarize FAIL [shader_count] expected=3 got=" + to_string(sc)) }
+
+    // total_vec_ops = 120+80+40 = 240
+    let tv = total_vec_ops()
+    if tv != 240 { panic("c_dxil_vector_scalarize FAIL [total_vec_ops] expected=240 got=" + to_string(tv)) }
+
+    // total_scalar_ops = 480+320+160 = 960
+    let ts = total_scalar_ops()
+    if ts != 960 { panic("c_dxil_vector_scalarize FAIL [total_scalar_ops] expected=960 got=" + to_string(ts)) }
+
+    // total_register_save = 24+16+8 = 48
+    let trs = total_register_save()
+    if trs != 48 { panic("c_dxil_vector_scalarize FAIL [total_register_save] expected=48 got=" + to_string(trs)) }
+
+    // avg_scalar_per_vec = 960 / 240 = 4 (int trunc)
+    let avg = avg_scalar_per_vec()
+    if avg != 4 { panic("c_dxil_vector_scalarize FAIL [avg_scalar_per_vec] expected=4 got=" + to_string(avg)) }
+
+    // shader_reg_save:
+    //   6001 → 24, 6002 → 16, 6003 → 8, 9999 → 0 (미등록)
+    let r1 = shader_reg_save(6001)
+    if r1 != 24 { panic("c_dxil_vector_scalarize FAIL [reg_save 6001] expected=24 got=" + to_string(r1)) }
+    let r2 = shader_reg_save(6002)
+    if r2 != 16 { panic("c_dxil_vector_scalarize FAIL [reg_save 6002] expected=16 got=" + to_string(r2)) }
+    let r3 = shader_reg_save(6003)
+    if r3 != 8 { panic("c_dxil_vector_scalarize FAIL [reg_save 6003] expected=8 got=" + to_string(r3)) }
+    let r4 = shader_reg_save(9999)
+    if r4 != 0 { panic("c_dxil_vector_scalarize FAIL [reg_save unknown] expected=0 got=" + to_string(r4)) }
+
+    let stats = dvs_stats()
+    if stats[0] != 3 { panic("c_dxil_vector_scalarize FAIL [stats shaders] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 240 { panic("c_dxil_vector_scalarize FAIL [stats vec_ops] expected=240 got=" + to_string(stats[1])) }
+    if stats[2] != 960 { panic("c_dxil_vector_scalarize FAIL [stats scalar_ops] expected=960 got=" + to_string(stats[2])) }
+    if stats[3] != 48 { panic("c_dxil_vector_scalarize FAIL [stats reg_save] expected=48 got=" + to_string(stats[3])) }
+
+    r0_emit("dxil_vector_scalarize_summary", "\"shaders\":" + to_string(stats[0]) + ",\"vec_ops\":" + to_string(stats[1]) + ",\"scalar_ops\":" + to_string(stats[2]) + ",\"reg_save\":" + to_string(stats[3]) + ",\"avg_scalar_per_vec\":" + to_string(avg))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_dxil_vector_scalarize FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic DXIL vector scalarize round-trip (Track BI — diablo2_resurrected cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track BI mission: c_dxil_* family 100% completion cycle (Track BF 1/4 → BI 4/4) —
+    // c_dxil_vector_scalarize 측 DXIL synthetic round-trip 추가. Vector scalarize
+    // lifecycle (vec_op_walk → component_split → register_alloc → scalar_emit)
+    // 측 spec freeze. DXIL scaffold only (own1 정합, real DXIL→AIR translator 0).
+    //
+    // (a) synthetic 4-phase vector scalarize lifecycle —
+    //     vec_op_walk → component_split → register_alloc → scalar_emit:
+    //     phase_count               4
+    //     scalarize_track_off       0x14015A000         (synthetic DXIL→AIR scalarize RVA)
+    //     lifecycle_kind            "synthetic_inline"  (실 LLVM IR scalarize 호출 X)
+    //
+    // (b) synthetic vec_width × component_kind 16-slot scalarize matrix —
+    //     4 vec_width (vec1/vec2/vec3/vec4) × 4 component_kind (xyzw/rgba/uvst/wave_lane) = 16 slots:
+    //     slot_total                16
+    //     scalar_emit_count         12                  (vec2/vec3/vec4 → 2/3/4 scalars)
+    //     identity_slot_count       4                   (vec1 already scalar — passthrough)
+    //     reg_save_total            48                  (estimated reg savings across slots)
+    //     matrix_kind               "synthetic_inline"
+    //
+    // round-trip = dxil_scalarize_phase(scaffold) → walk_vec_width_matrix(scaffold).
+    //              hexa-native loop only — 실 DXIL bytecode parse 0,
+    //              real Metal scalar emit 0.
+    //
+    // synthetic DXIL vector scalarize phase emit
+    r0_emit("c_dxil_vector_scalarize_synthetic_phase",
+        "\"stage\":\"dxil_scalarize_phase\",\"phase_count\":4,\"scalarize_track_off\":\"0x14015A000\",\"lifecycle_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"dxil_air_gap\":\"hexa-native scaffold — no real DXIL→AIR translator binary linkage\"")
+    println("__DXIL_SCALARIZE__ PARTIAL dxil_scalarize_phase")
+
+    // synthetic vec_width × component_kind scalarize matrix emit
+    r0_emit("c_dxil_vector_scalarize_synthetic_matrix",
+        "\"stage\":\"vec_width_matrix\",\"slot_total\":16,\"scalar_emit_count\":12,\"identity_slot_count\":4,\"reg_save_total\":48,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"dxil_air_gap\":\"hexa-native scaffold — no real DXIL→AIR translator binary linkage\"")
+    println("__DXIL_SCALARIZE__ PARTIAL vec_width_matrix")
+
+    cleanup_dvs()
+
+    println("  ✅ c_dxil_vector_scalarize self_test PASS (3 shaders, 240 vec_ops, 960 scalar_ops, 48 reg_save, avg=4, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = dvs_stats()
+            println("shaders=" + to_string(s[0]) + " vec_ops=" + to_string(s[1]) + " scalar_ops=" + to_string(s[2]) + " reg_save=" + to_string(s[3]))
+            return
+        }
+        if sub == "save" {
+            if len(a) >= 4 {
+                let shid = to_int(a[3])
+                let rs = shader_reg_save(shid)
+                println(to_string(rs))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_dvs(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_dxil_vector_scalarize.hexa { self-test | stats | save <shader_id> | cleanup }")
+}

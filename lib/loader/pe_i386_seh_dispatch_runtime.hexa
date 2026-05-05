@@ -1,0 +1,515 @@
+// lib/loader/pe_i386_seh_dispatch_runtime.hexa — i386 Win32 SEH runtime dispatch flow tracker
+//
+// 역할:
+//   기존 pe_i386_seh_chain_real.hexa 가 register / unwind / dispatch / handler_call /
+//   chain_invariant 를 record 단위로 기록한다면, 본 module 은 dispatch flow 의
+//   **runtime sequence** (event timeline) 를 추적한다. 즉 한 exception 이 raise 되어
+//   dispatcher 진입 → handler 다중 invoke → unwind 다단 step → resume (continue/collided/
+//   process_terminate) 까지의 실제 흐름을 event_id 단위로 묶어 timestamp 와 함께 남긴다.
+//
+// Microsoft Win32 i386 SEH 명세 (PE/COFF + ntdll!_KiUserExceptionDispatcher) 기반:
+//   1. 예외 raise (CPU GP/PF/UD/Trap → KiUserExceptionDispatcher)
+//   2. dispatcher 진입 (FS:[0] head 부터 walk 시작)
+//   3. handler 호출 → disposition (0=Continue / 1=Search / 2=Nested / 3=Collided)
+//   4. Search 시 prev record 로 walk 반복, Continue 시 unwind 시작
+//   5. unwind: 각 frame 단위로 cleanup handler 호출 (target_record_id 까지)
+//   6. resume: 0=continue (정상 재실행) / 1=collided (collided unwind) / 2=process_terminate
+//
+// own 1: Wine ntdll/_KiUserExceptionDispatcher 0줄. 우회 코드 없음.
+//        Microsoft Win32 SEH spec (Intel SDM Vol.3 §6 + PE/COFF) 기반.
+// own 1: Hexa pure — Apple SDK 호출 X.
+// own 2: r0_emit ≥ 14, panic, self-test ≥ 12 record.
+//
+// persist schema (TSV — events.tsv):
+//   event_id<int> \t kind<str> \t exception_code<int> \t fault_va<int> \t ts_ns<int>
+//     \t head_record_id<int> \t walk_started_ts<int> \t record_id<int> \t handler_va<int>
+//     \t args_hash<int> \t disposition<int> \t step_id<int> \t frame_addr<int>
+//     \t target_record_id<int> \t resume_kind<int>
+//
+// kind:
+//   "raise"      — record_exception_raise
+//   "dispatcher" — record_dispatcher_entry
+//   "handler"    — record_handler_invoke
+//   "unwind"     — record_unwind_step
+//   "resume"     — record_exception_resume
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pisdr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_seh_dispatch_runtime"
+}
+
+fn pisdr_events_path() -> str {
+    return pisdr_dir() + "/events.tsv"
+}
+
+fn pisdr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pisdr_dir() + "'")
+}
+
+fn cleanup_pisdr() -> void {
+    pisdr_ensure_dir()
+    let _ = exec("rm -f '" + pisdr_events_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pisdr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pisdr_append_row(path: str, row: str) -> void {
+    pisdr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int (lowercase/uppercase, no 0x prefix) ───
+fn pisdr_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_i386_seh_dispatch_runtime FAIL [pisdr_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── disposition_name: 0/1/2/3 → spec 이름 ───
+fn disposition_name(d: int) -> str {
+    if d == 0 { return "Continue" }
+    if d == 1 { return "Search" }
+    if d == 2 { return "Nested" }
+    if d == 3 { return "Collided" }
+    return "?"
+}
+
+// ─── resume_name: 0=continue / 1=collided / 2=process_terminate ───
+fn resume_name(k: int) -> str {
+    if k == 0 { return "continue" }
+    if k == 1 { return "collided" }
+    if k == 2 { return "terminate" }
+    return "?"
+}
+
+// ─── record_exception_raise: CPU 예외 발생 시점 ───
+fn record_exception_raise(event_id: int, exception_code_hex: str, fault_va_hex: str, ts_ns: int) -> void {
+    if event_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_raise] expected=event_id>0 got=" + to_string(event_id))
+    }
+    let exception_code = pisdr_hex_to_int(exception_code_hex)
+    if exception_code < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_raise] expected=exception_code>=0 got=" + to_string(exception_code))
+    }
+    let fault_va = pisdr_hex_to_int(fault_va_hex)
+    if fault_va < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_raise] expected=fault_va>=0 got=" + to_string(fault_va))
+    }
+    if ts_ns < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_raise] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    let row = to_string(event_id) + "\traise\t" + to_string(exception_code)
+        + "\t" + to_string(fault_va) + "\t" + to_string(ts_ns)
+        + "\t0\t0\t0\t0\t0\t-1\t0\t0\t0\t-1\n"
+    pisdr_append_row(pisdr_events_path(), row)
+}
+
+// ─── record_dispatcher_entry: KiUserExceptionDispatcher 진입 ───
+fn record_dispatcher_entry(event_id: int, head_record_id: int, walk_started_ts: int) -> void {
+    if event_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_dispatcher_entry] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if head_record_id < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_dispatcher_entry] expected=head_record_id>=0 got=" + to_string(head_record_id))
+    }
+    if walk_started_ts < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_dispatcher_entry] expected=walk_started_ts>=0 got=" + to_string(walk_started_ts))
+    }
+    let row = to_string(event_id) + "\tdispatcher\t0\t0\t0"
+        + "\t" + to_string(head_record_id) + "\t" + to_string(walk_started_ts)
+        + "\t0\t0\t0\t-1\t0\t0\t0\t-1\n"
+    pisdr_append_row(pisdr_events_path(), row)
+}
+
+// ─── record_handler_invoke: 단일 handler 호출 + disposition ───
+fn record_handler_invoke(event_id: int, record_id: int, handler_va_hex: str, args_hash: int, disposition: int) -> void {
+    if event_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_handler_invoke] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if record_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_handler_invoke] expected=record_id>0 got=" + to_string(record_id))
+    }
+    let handler_va = pisdr_hex_to_int(handler_va_hex)
+    if handler_va < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_handler_invoke] expected=handler_va>=0 got=" + to_string(handler_va))
+    }
+    if args_hash < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_handler_invoke] expected=args_hash>=0 got=" + to_string(args_hash))
+    }
+    if disposition < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_handler_invoke] expected=disposition>=0 got=" + to_string(disposition))
+    }
+    if disposition > 3 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_handler_invoke] expected=disposition<=3 got=" + to_string(disposition))
+    }
+    let row = to_string(event_id) + "\thandler\t0\t0\t0"
+        + "\t0\t0\t" + to_string(record_id) + "\t" + to_string(handler_va)
+        + "\t" + to_string(args_hash) + "\t" + to_string(disposition)
+        + "\t0\t0\t0\t-1\n"
+    pisdr_append_row(pisdr_events_path(), row)
+}
+
+// ─── record_unwind_step: unwind chain 의 한 step (frame → target_record_id) ───
+fn record_unwind_step(event_id: int, step_id: int, frame_addr_hex: str, target_record_id: int) -> void {
+    if event_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_unwind_step] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if step_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_unwind_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    let frame_addr = pisdr_hex_to_int(frame_addr_hex)
+    if frame_addr < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_unwind_step] expected=frame_addr>=0 got=" + to_string(frame_addr))
+    }
+    if target_record_id < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_unwind_step] expected=target_record_id>=0 got=" + to_string(target_record_id))
+    }
+    let row = to_string(event_id) + "\tunwind\t0\t0\t0"
+        + "\t0\t0\t0\t0\t0\t-1"
+        + "\t" + to_string(step_id) + "\t" + to_string(frame_addr)
+        + "\t" + to_string(target_record_id) + "\t-1\n"
+    pisdr_append_row(pisdr_events_path(), row)
+}
+
+// ─── record_exception_resume: dispatch flow 종료 (continue/collided/terminate) ───
+fn record_exception_resume(event_id: int, ts_ns: int, resume_kind: int) -> void {
+    if event_id <= 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_resume] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if ts_ns < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_resume] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    if resume_kind < 0 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_resume] expected=resume_kind>=0 got=" + to_string(resume_kind))
+    }
+    if resume_kind > 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [record_exception_resume] expected=resume_kind<=2 got=" + to_string(resume_kind))
+    }
+    let row = to_string(event_id) + "\tresume\t0\t0\t" + to_string(ts_ns)
+        + "\t0\t0\t0\t0\t0\t-1\t0\t0\t0\t" + to_string(resume_kind) + "\n"
+    pisdr_append_row(pisdr_events_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn pisdr_count_kind(kind_filter: str) -> int {
+    let t = pisdr_read_table(pisdr_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 15 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn exception_raise_count() -> int {
+    return pisdr_count_kind("raise")
+}
+
+fn dispatcher_entry_count() -> int {
+    return pisdr_count_kind("dispatcher")
+}
+
+fn handler_invoke_count() -> int {
+    return pisdr_count_kind("handler")
+}
+
+fn unwind_step_count() -> int {
+    return pisdr_count_kind("unwind")
+}
+
+fn resume_count() -> int {
+    return pisdr_count_kind("resume")
+}
+
+fn pisdr_stats() -> array {
+    let mut out = []
+    out.push(exception_raise_count())
+    out.push(dispatcher_entry_count())
+    out.push(handler_invoke_count())
+    out.push(unwind_step_count())
+    out.push(resume_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pisdr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pisdr()
+
+    // ─── event_id=1 : ACCESS_VIOLATION @ 0x401234 (handled by record_id=1 Continue, after Search ×2 + unwind ×3) ───
+    // 2. exception_raise #1 — CODE=0xC0000005 fault=0x401234
+    record_exception_raise(1, "C0000005", "401234", 1000)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"raise\",\"event_id\":1,\"exception_code\":\"0xC0000005\",\"name\":\"ACCESS_VIOLATION\",\"fault_va\":\"0x401234\",\"ts_ns\":1000")
+
+    // 3. dispatcher_entry #1 — head_record_id=3 (chain head 가 가장 최근 register 인 3)
+    record_dispatcher_entry(1, 3, 1100)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"dispatcher\",\"event_id\":1,\"head_record_id\":3,\"walk_started_ts\":1100")
+
+    // 4. handler_invoke #1 — record_id=3 disposition=1 Search (skip)
+    record_handler_invoke(1, 3, "401400", 0, 1)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"handler\",\"event_id\":1,\"record_id\":3,\"handler_va\":\"0x401400\",\"disposition\":1,\"name\":\"Search\"")
+
+    // 5. handler_invoke #2 — record_id=2 disposition=1 Search (skip)
+    record_handler_invoke(1, 2, "401200", 0, 1)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"handler\",\"event_id\":1,\"record_id\":2,\"handler_va\":\"0x401200\",\"disposition\":1,\"name\":\"Search\"")
+
+    // 6. handler_invoke #3 — record_id=1 disposition=0 Continue (handled)
+    record_handler_invoke(1, 1, "401000", 0, 0)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"handler\",\"event_id\":1,\"record_id\":1,\"handler_va\":\"0x401000\",\"disposition\":0,\"name\":\"Continue\"")
+
+    // 7. unwind_step #1 — step=1 frame=0x12FF40 target=2 (record 3 의 frame 정리, record 2 로 unwind)
+    record_unwind_step(1, 1, "12FF40", 2)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"unwind\",\"event_id\":1,\"step_id\":1,\"frame_addr\":\"0x12FF40\",\"target_record_id\":2")
+
+    // 8. unwind_step #2 — step=2 frame=0x12FF60 target=1
+    record_unwind_step(1, 2, "12FF60", 1)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"unwind\",\"event_id\":1,\"step_id\":2,\"frame_addr\":\"0x12FF60\",\"target_record_id\":1")
+
+    // 9. unwind_step #3 — step=3 frame=0x12FF80 target=1 (record 1 stop frame)
+    record_unwind_step(1, 3, "12FF80", 1)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"unwind\",\"event_id\":1,\"step_id\":3,\"frame_addr\":\"0x12FF80\",\"target_record_id\":1")
+
+    // 10. exception_resume #1 — resume_kind=0 continue (handled)
+    record_exception_resume(1, 1500, 0)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"resume\",\"event_id\":1,\"ts_ns\":1500,\"resume_kind\":0,\"name\":\"continue\"")
+
+    // ─── event_id=2 : BREAKPOINT @ 0x401200 → record_id=1 Continue 이지만 collided unwind ───
+    // 11. exception_raise #2 — CODE=0x80000003 BREAKPOINT
+    record_exception_raise(2, "80000003", "401200", 2000)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"raise\",\"event_id\":2,\"exception_code\":\"0x80000003\",\"name\":\"BREAKPOINT\",\"fault_va\":\"0x401200\",\"ts_ns\":2000")
+
+    // 12. dispatcher_entry #2 — head_record_id=1 (얕은 chain)
+    record_dispatcher_entry(2, 1, 2100)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"dispatcher\",\"event_id\":2,\"head_record_id\":1,\"walk_started_ts\":2100")
+
+    // 13. handler_invoke #4 — record_id=1 disposition=0 Continue
+    record_handler_invoke(2, 1, "401000", 0, 0)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"handler\",\"event_id\":2,\"record_id\":1,\"handler_va\":\"0x401000\",\"disposition\":0,\"name\":\"Continue\"")
+
+    // 14. exception_resume #2 — resume_kind=1 collided
+    record_exception_resume(2, 2300, 1)
+    r0_emit("pe_i386_seh_dispatch_runtime_record",
+        "\"kind\":\"resume\",\"event_id\":2,\"ts_ns\":2300,\"resume_kind\":1,\"name\":\"collided\"")
+
+    // ─── assertions ───
+    let rc = exception_raise_count()
+    if rc != 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [exception_raise_count] expected=2 got=" + to_string(rc))
+    }
+    let dc = dispatcher_entry_count()
+    if dc != 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [dispatcher_entry_count] expected=2 got=" + to_string(dc))
+    }
+    let hc = handler_invoke_count()
+    if hc != 4 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [handler_invoke_count] expected=4 got=" + to_string(hc))
+    }
+    let uc = unwind_step_count()
+    if uc != 3 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [unwind_step_count] expected=3 got=" + to_string(uc))
+    }
+    let resc = resume_count()
+    if resc != 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [resume_count] expected=2 got=" + to_string(resc))
+    }
+
+    // ─── disposition_name lookups ───
+    let n_cont = disposition_name(0)
+    if n_cont != "Continue" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [disposition_name(0)] expected=Continue got=" + n_cont)
+    }
+    let n_srch = disposition_name(1)
+    if n_srch != "Search" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [disposition_name(1)] expected=Search got=" + n_srch)
+    }
+    let n_nest = disposition_name(2)
+    if n_nest != "Nested" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [disposition_name(2)] expected=Nested got=" + n_nest)
+    }
+    let n_coll = disposition_name(3)
+    if n_coll != "Collided" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [disposition_name(3)] expected=Collided got=" + n_coll)
+    }
+
+    // ─── resume_name lookups ───
+    let r_cont = resume_name(0)
+    if r_cont != "continue" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [resume_name(0)] expected=continue got=" + r_cont)
+    }
+    let r_coll = resume_name(1)
+    if r_coll != "collided" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [resume_name(1)] expected=collided got=" + r_coll)
+    }
+    let r_term = resume_name(2)
+    if r_term != "terminate" {
+        panic("pe_i386_seh_dispatch_runtime FAIL [resume_name(2)] expected=terminate got=" + r_term)
+    }
+
+    // ─── hex parser sanity ───
+    let h_av = pisdr_hex_to_int("C0000005")
+    if h_av != 3221225477 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [pisdr_hex_to_int(C0000005)] expected=3221225477 got=" + to_string(h_av))
+    }
+    let h_bp = pisdr_hex_to_int("80000003")
+    if h_bp != 2147483651 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [pisdr_hex_to_int(80000003)] expected=2147483651 got=" + to_string(h_bp))
+    }
+
+    // ─── stats sanity ───
+    let s = pisdr_stats()
+    if len(s) != 5 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [stats exception_raise_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [stats dispatcher_entry_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [stats handler_invoke_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [stats unwind_step_count] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [stats resume_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit ───
+    r0_emit("pe_i386_seh_dispatch_runtime_stats",
+        "\"exception_raise_count\":" + to_string(s[0])
+        + ",\"dispatcher_entry_count\":" + to_string(s[1])
+        + ",\"handler_invoke_count\":" + to_string(s[2])
+        + ",\"unwind_step_count\":" + to_string(s[3])
+        + ",\"resume_count\":" + to_string(s[4]))
+
+    r0_emit("pe_i386_seh_dispatch_runtime_summary",
+        "\"phase\":\"i386_seh_runtime_dispatch_complete\""
+        + ",\"events\":2"
+        + ",\"event1\":\"ACCESS_VIOLATION_continue\""
+        + ",\"event2\":\"BREAKPOINT_collided\""
+        + ",\"total_handler_invokes\":" + to_string(s[2])
+        + ",\"total_unwind_steps\":" + to_string(s[3]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_seh_dispatch_runtime FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pisdr()
+    let s2 = pisdr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_seh_dispatch_runtime FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_seh_dispatch_runtime self_test PASS (raise=" + to_string(s[0])
+        + ", dispatcher=" + to_string(s[1]) + ", handler_invoke=" + to_string(s[2])
+        + ", unwind_step=" + to_string(s[3]) + ", resume=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pisdr_stats()
+            println("exception_raise_count\t" + to_string(s[0]))
+            println("dispatcher_entry_count\t" + to_string(s[1]))
+            println("handler_invoke_count\t" + to_string(s[2]))
+            println("unwind_step_count\t" + to_string(s[3]))
+            println("resume_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pisdr()
+            println("cleaned: " + pisdr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pisdr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_seh_dispatch_runtime.hexa { self-test | stats | cleanup | dir }")
+}

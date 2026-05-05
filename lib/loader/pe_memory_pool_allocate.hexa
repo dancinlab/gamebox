@@ -1,0 +1,387 @@
+// lib/loader/pe_memory_pool_allocate.hexa — cycle66 PE memory pool allocation tracker skeleton
+//
+// PE 로더가 사용하는 memory pool 할당 추적기 — heap / stack-frame / arena 분리.
+// 실 mmap() / VirtualAlloc() / posix_memalign() 호출 X (skeleton tracker only).
+// 후속 cycle 에서 native_helper_bridge 경유로 실 syscall 연결 예정.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 alloc record tracker — 실 alloc op X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// tag code:
+//   1 = heap   (general purpose pool)
+//   2 = stack  (thread frame pool)
+//   3 = arena  (bump-allocated lifetime pool)
+//
+// persist schema (TSV — allocations.tsv):
+//   pool_id<int> \t size_bytes<int> \t alignment<int> \t tag<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmpa_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_memory_pool_allocate"
+}
+
+fn pmpa_allocs_path() -> str {
+    return pmpa_dir() + "/allocations.tsv"
+}
+
+fn pmpa_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmpa_dir() + "'")
+}
+
+fn cleanup_pmpa() -> void {
+    pmpa_ensure_dir()
+    let _ = exec("rm -f '" + pmpa_allocs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmpa_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmpa_append_row(path: str, row: str) -> void {
+    pmpa_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_alloc: alloc 1 건 기록 ───
+fn record_alloc(pool_id: int, size_bytes: int, alignment: int, tag: int) -> void {
+    if pool_id <= 0 {
+        panic("pe_memory_pool_allocate FAIL [record_alloc] expected=pool_id>0 got=" + to_string(pool_id))
+    }
+    if size_bytes <= 0 {
+        panic("pe_memory_pool_allocate FAIL [record_alloc] expected=size_bytes>0 got=" + to_string(size_bytes))
+    }
+    if alignment <= 0 {
+        panic("pe_memory_pool_allocate FAIL [record_alloc] expected=alignment>0 got=" + to_string(alignment))
+    }
+    if tag < 1 {
+        panic("pe_memory_pool_allocate FAIL [record_alloc] expected=tag>=1 got=" + to_string(tag))
+    }
+    if tag > 3 {
+        panic("pe_memory_pool_allocate FAIL [record_alloc] expected=tag<=3 got=" + to_string(tag))
+    }
+    let row = to_string(pool_id) + "\t" + to_string(size_bytes)
+        + "\t" + to_string(alignment) + "\t" + to_string(tag) + "\n"
+    pmpa_append_row(pmpa_allocs_path(), row)
+}
+
+// ─── alloc_count: total alloc 수 ───
+fn alloc_count() -> int {
+    let t = pmpa_read_table(pmpa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_bytes: 모든 alloc size_bytes 합 ───
+fn total_size_bytes() -> int {
+    let t = pmpa_read_table(pmpa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_alignment: 특정 alignment 의 alloc 수 ───
+fn count_by_alignment(alignment: int) -> int {
+    let t = pmpa_read_table(pmpa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == alignment {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_tag: 특정 tag 의 alloc 수 ───
+fn count_by_tag(tag: int) -> int {
+    let t = pmpa_read_table(pmpa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == tag {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── alloc_size: 특정 pool_id 의 size_bytes (없으면 0) ───
+fn alloc_size(pool_id: int) -> int {
+    let t = pmpa_read_table(pmpa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == pool_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pmpa_stats: [alloc_count, total_size_bytes, count_by_tag(1), count_by_alignment(16)] ───
+fn pmpa_stats() -> array {
+    let mut out = []
+    out.push(alloc_count())
+    out.push(total_size_bytes())
+    out.push(count_by_tag(1))
+    out.push(count_by_alignment(16))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmpa-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmpa()
+
+    // 2. record 5 alloc rows (deterministic synthetic — 3 alignments, 3 tags)
+    record_alloc(660001, 4096, 8, 1)
+    r0_emit("pe_memory_pool_allocate_record",
+        "\"pool_id\":660001,\"size_bytes\":4096,\"alignment\":8,\"tag\":1,\"target\":\"heap\"")
+
+    record_alloc(660002, 8192, 16, 1)
+    r0_emit("pe_memory_pool_allocate_record",
+        "\"pool_id\":660002,\"size_bytes\":8192,\"alignment\":16,\"tag\":1,\"target\":\"heap\"")
+
+    record_alloc(660003, 2048, 16, 2)
+    r0_emit("pe_memory_pool_allocate_record",
+        "\"pool_id\":660003,\"size_bytes\":2048,\"alignment\":16,\"tag\":2,\"target\":\"stack\"")
+
+    record_alloc(660004, 16384, 64, 3)
+    r0_emit("pe_memory_pool_allocate_record",
+        "\"pool_id\":660004,\"size_bytes\":16384,\"alignment\":64,\"tag\":3,\"target\":\"arena\"")
+
+    record_alloc(660005, 1024, 8, 2)
+    r0_emit("pe_memory_pool_allocate_record",
+        "\"pool_id\":660005,\"size_bytes\":1024,\"alignment\":8,\"tag\":2,\"target\":\"stack\"")
+
+    // 3. alloc_count = 5
+    let c = alloc_count()
+    if c != 5 {
+        panic("pe_memory_pool_allocate FAIL [alloc_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_size_bytes = 31744
+    let tb = total_size_bytes()
+    if tb != 31744 {
+        panic("pe_memory_pool_allocate FAIL [total_size_bytes] expected=31744 got=" + to_string(tb))
+    }
+
+    // 5. count_by_alignment sanity (3 alignments: 8/16/64)
+    let a8 = count_by_alignment(8)
+    if a8 != 2 {
+        panic("pe_memory_pool_allocate FAIL [count_by_alignment(8)] expected=2 got=" + to_string(a8))
+    }
+    let a16 = count_by_alignment(16)
+    if a16 != 2 {
+        panic("pe_memory_pool_allocate FAIL [count_by_alignment(16)] expected=2 got=" + to_string(a16))
+    }
+    let a64 = count_by_alignment(64)
+    if a64 != 1 {
+        panic("pe_memory_pool_allocate FAIL [count_by_alignment(64)] expected=1 got=" + to_string(a64))
+    }
+    let a99 = count_by_alignment(99)
+    if a99 != 0 {
+        panic("pe_memory_pool_allocate FAIL [count_by_alignment(99)] expected=0 got=" + to_string(a99))
+    }
+
+    // 6. count_by_tag sanity (3 tags: 1/2/3)
+    let t1 = count_by_tag(1)
+    if t1 != 2 {
+        panic("pe_memory_pool_allocate FAIL [count_by_tag(1)] expected=2 got=" + to_string(t1))
+    }
+    let t2 = count_by_tag(2)
+    if t2 != 2 {
+        panic("pe_memory_pool_allocate FAIL [count_by_tag(2)] expected=2 got=" + to_string(t2))
+    }
+    let t3 = count_by_tag(3)
+    if t3 != 1 {
+        panic("pe_memory_pool_allocate FAIL [count_by_tag(3)] expected=1 got=" + to_string(t3))
+    }
+
+    // 7. alloc_size sanity
+    let s2 = alloc_size(660002)
+    if s2 != 8192 {
+        panic("pe_memory_pool_allocate FAIL [alloc_size(660002)] expected=8192 got=" + to_string(s2))
+    }
+    let s4 = alloc_size(660004)
+    if s4 != 16384 {
+        panic("pe_memory_pool_allocate FAIL [alloc_size(660004)] expected=16384 got=" + to_string(s4))
+    }
+    let s_miss = alloc_size(9999)
+    if s_miss != 0 {
+        panic("pe_memory_pool_allocate FAIL [alloc_size(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pmpa_stats() = [5, 31744, 2, 2]
+    let s = pmpa_stats()
+    if len(s) != 4 {
+        panic("pe_memory_pool_allocate FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_memory_pool_allocate FAIL [stats alloc_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 31744 {
+        panic("pe_memory_pool_allocate FAIL [stats total_size_bytes] expected=31744 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_memory_pool_allocate FAIL [stats tag_heap] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_memory_pool_allocate FAIL [stats align_16] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_memory_pool_allocate_stats",
+        "\"alloc_count\":" + to_string(s[0])
+        + ",\"total_size_bytes\":" + to_string(s[1])
+        + ",\"tag_heap\":" + to_string(s[2])
+        + ",\"align_16\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_memory_pool_allocate FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pmpa()
+    let s2b = pmpa_stats()
+    let i = 0
+    while i < len(s2b) {
+        if s2b[i] != 0 {
+            panic("pe_memory_pool_allocate FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2b[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_memory_pool_allocate self_test PASS (allocs=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", tag_heap=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmpa_stats()
+            println("alloc_count\t" + to_string(s[0]))
+            println("total_size_bytes\t" + to_string(s[1]))
+            println("count_tag_heap\t" + to_string(s[2]))
+            println("count_align_16\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("alloc_size\t" + to_string(alloc_size(pid)))
+                return
+            }
+            println("usage: hexa run pe_memory_pool_allocate.hexa size <pool_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let alignment = to_int(a[3])
+                println("count_by_alignment\t" + to_string(count_by_alignment(alignment)))
+                return
+            }
+            println("usage: hexa run pe_memory_pool_allocate.hexa count <alignment>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmpa()
+            println("cleaned: " + pmpa_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmpa_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_memory_pool_allocate.hexa { self-test | stats | size <pool_id> | count <alignment> | cleanup | dir }")
+}

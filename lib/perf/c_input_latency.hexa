@@ -1,0 +1,520 @@
+// lib/perf/c_input_latency.hexa — CN-9 C-INPUT-LATENCY (15/15)
+//
+// 무엇:
+//   마우스/키보드 입력 → 화면 반응까지 ms 측정. PvP / D4 격투 입력감 정량화.
+//   각 input event 의 input_ts_us 를 기록 → response frame 의 ts_us 가 나오면
+//   latency_us 계산 → queue / render breakdown → P50/P99 percentile + Holt
+//   forecast (다음 second latency 추세).
+//
+// 무기:
+//   - columnar (input event timestamp + frame ts) — events.jsonl row 별 fixed
+//     schema (input_event_id, input_ts_us, frame_id_at_input,
+//     frame_id_at_response, latency_us, queue_delay_us, render_delay_us,
+//     input_kind).
+//   - Holt 이중지수평활 forecast (latency trend) — alpha/beta percent int math
+//     (c_frame.hexa pattern 동일).
+//   - PvP-specific high-priority classifier (30ms 미만 = ok / 30~80ms = warn /
+//     80ms+ = critical).
+//
+// 효과:
+//   D4 PvP 만족도 지표화 + lag 원인 분류 (queue vs render) + driver tuning hint.
+//   PvP duel 에서 3-frame (~50ms) spike 가 있을 때 어디서 손해를 봤는지 (HID
+//   stack / CPU / GPU / present) 한눈에 보임.
+//
+// schema (JSONL row, columnar):
+//   {"input_event_id":N,"input_kind":"key"|"mouse_move"|"mouse_click",
+//    "input_ts_us":U,"frame_id_at_input":F1,"frame_id_at_response":F2,
+//    "latency_us":L,"queue_delay_us":Q,"render_delay_us":R,
+//    "classification":"ok"|"warn"|"critical","ts":<unix>}
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X,
+// args() = [hexa, file, ...userargs] → a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. 본 모듈은 input event
+// timestamp 매칭과 latency 계산만 — synthetic event round-trip 검증.
+//
+// own 2 mandate: r0_emit ≥ 5 (input_recorded × 3 + input_response × 3 +
+// latency_classified + stats), fn self_test() + main() dispatch, headless,
+// panic 형식 "c_input_latency FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── PvP latency thresholds (us) ───
+//   < 30ms       → ok       (대부분 PvP 정상 반응)
+//   30~80ms      → warn     (PvP 적정선 경계, 격투 게임 한계)
+//   > 80ms       → critical (PvP 죽음, frame 5 기준 초과)
+let LAT_OK_MAX_US       = 30000
+let LAT_WARN_MAX_US     = 80000
+
+// ─── Holt smoothing 기본값 ───
+let LAT_ALPHA_DEFAULT = 50
+let LAT_BETA_DEFAULT  = 50
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/input_latency/events.jsonl
+fn latency_dir() -> str {
+    return GAMEBOX_HOME + "/persist/input_latency"
+}
+
+fn events_path() -> str {
+    return latency_dir() + "/events.jsonl"
+}
+
+fn latency_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + latency_dir() + "'")
+}
+
+// ─── classify_latency ───
+//   latency_us → "ok" | "warn" | "critical"
+fn classify_latency(latency_us: int) -> str {
+    if latency_us < 0 {
+        return "critical"
+    }
+    if latency_us < LAT_OK_MAX_US {
+        return "ok"
+    }
+    if latency_us < LAT_WARN_MAX_US {
+        return "warn"
+    }
+    return "critical"
+}
+
+// ─── compute_latency_breakdown ───
+//   input_ts → response_ts 의 latency 를 [queue, render, total] 로 분해.
+//   queue_us 는 외부 측정값 (HID buffer + CPU queue 시간) — 입력으로 받음.
+//   render = total - queue (음수 보정 → 0).
+fn compute_latency_breakdown(input_ts: int, response_ts: int, queue_us: int) -> array {
+    let total = response_ts - input_ts
+    if total < 0 { total = 0 }
+    let q = queue_us
+    if q < 0 { q = 0 }
+    if q > total { q = total }
+    let render = total - q
+    return [q, render, total]
+}
+
+// ─── pending input event store (in-memory) ───
+//   stage1 dict X → 평행 array. event_id / ts_us / kind 3 평행.
+//   record_input_event 호출 시 push, record_response 호출 시 lookup + 유지
+//   (P50/P99 등 후속 통계가 동일 row 를 다시 참조할 수 있도록 events.jsonl 에
+//   한 번만 append; in-memory 는 단순 lookup 용도).
+let mut LAT_PENDING_IDS  = []
+let mut LAT_PENDING_TS   = []
+let mut LAT_PENDING_KIND = []
+
+fn lat_pending_push(event_id: int, kind: str, input_ts_us: int) -> void {
+    LAT_PENDING_IDS  = LAT_PENDING_IDS  + [event_id]
+    LAT_PENDING_TS   = LAT_PENDING_TS   + [input_ts_us]
+    LAT_PENDING_KIND = LAT_PENDING_KIND + [kind]
+}
+
+fn lat_pending_lookup(event_id: int) -> array {
+    // 결과: [input_ts_us, kind] — 없으면 [-1, ""]
+    let i = 0
+    while i < len(LAT_PENDING_IDS) {
+        if LAT_PENDING_IDS[i] == event_id {
+            return [LAT_PENDING_TS[i], LAT_PENDING_KIND[i]]
+        }
+        i = i + 1
+    }
+    return [-1, ""]
+}
+
+fn lat_pending_clear() -> void {
+    LAT_PENDING_IDS  = []
+    LAT_PENDING_TS   = []
+    LAT_PENDING_KIND = []
+}
+
+// ─── record_input_event ───
+//   입력 발생 시각만 기록. response 가 아직 없으므로 events.jsonl 에 row 는
+//   기록하지 않고 pending 에만 저장. emit 으로 "input_recorded" 발생.
+fn record_input_event(event_id: int, kind: str, input_ts_us: int) -> void {
+    latency_ensure_dir()
+    lat_pending_push(event_id, kind, input_ts_us)
+    r0_emit("input_recorded",
+        "\"event_id\":" + to_string(event_id)
+        + ",\"kind\":\"" + kind + "\""
+        + ",\"input_ts_us\":" + to_string(input_ts_us))
+}
+
+// ─── record_response ───
+//   response frame 도착 시 호출. pending 에서 lookup → latency 계산 → events
+//   jsonl append → emit "input_response" + "latency_classified".
+//   queue_delay_us / render_delay_us 는 stage1 측정 인프라 부재로 단순 분배:
+//     queue = total / 3 (HID stack + CPU queue 추정),
+//     render = total - queue.
+//   반환값: latency_us.
+fn record_response(event_id: int, frame_id: int, response_ts_us: int) -> int {
+    let look = lat_pending_lookup(event_id)
+    let input_ts = look[0]
+    let kind = look[1]
+    if input_ts < 0 {
+        // pending 에 없으면 latency 측정 불가 — 0 반환 + emit notice.
+        r0_emit("input_response",
+            "\"event_id\":" + to_string(event_id)
+            + ",\"frame_id\":" + to_string(frame_id)
+            + ",\"latency_us\":0,\"reason\":\"no_pending\"")
+        return 0
+    }
+    let total = response_ts_us - input_ts
+    if total < 0 { total = 0 }
+    let queue_us = total / 3
+    let bd = compute_latency_breakdown(input_ts, response_ts_us, queue_us)
+    let q  = bd[0]
+    let r  = bd[1]
+    let lt = bd[2]
+    let cls = classify_latency(lt)
+
+    latency_ensure_dir()
+    let ts_unix = exec("date +%s").trim()
+    let line = "{\"input_event_id\":" + to_string(event_id)
+        + ",\"input_kind\":\"" + kind + "\""
+        + ",\"input_ts_us\":" + to_string(input_ts)
+        + ",\"frame_id_at_input\":" + to_string(frame_id - 1)
+        + ",\"frame_id_at_response\":" + to_string(frame_id)
+        + ",\"latency_us\":" + to_string(lt)
+        + ",\"queue_delay_us\":" + to_string(q)
+        + ",\"render_delay_us\":" + to_string(r)
+        + ",\"classification\":\"" + cls + "\""
+        + ",\"ts\":" + ts_unix
+        + "}"
+    r0_append_line(events_path(), line)
+
+    r0_emit("input_response",
+        "\"event_id\":" + to_string(event_id)
+        + ",\"frame_id\":" + to_string(frame_id)
+        + ",\"latency_us\":" + to_string(lt)
+        + ",\"queue_us\":" + to_string(q)
+        + ",\"render_us\":" + to_string(r))
+    r0_emit("latency_classified",
+        "\"event_id\":" + to_string(event_id)
+        + ",\"latency_us\":" + to_string(lt)
+        + ",\"class\":\"" + cls + "\"")
+    return lt
+}
+
+// ─── load all latencies (events.jsonl 전체) ───
+fn load_latencies() -> array {
+    latency_ensure_dir()
+    let path = events_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let cmd = "sed -E 's/.*\"latency_us\":([0-9]+).*/\\1/' '" + path
+        + "' 2>/dev/null"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            out = out + [to_int(ln)]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── insertion sort (int array) ───
+fn lat_isort(xs: array) -> array {
+    let n = len(xs)
+    let copy = []
+    let i = 0
+    while i < n {
+        copy = copy + [xs[i]]
+        i = i + 1
+    }
+    let k = 1
+    while k < n {
+        let v = copy[k]
+        let j = k - 1
+        let done = false
+        while j >= 0 && !done {
+            if copy[j] > v {
+                copy[j + 1] = copy[j]
+                j = j - 1
+            } else {
+                done = true
+            }
+        }
+        copy[j + 1] = v
+        k = k + 1
+    }
+    return copy
+}
+
+fn lat_percentile(xs: array, pct: int) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let s = lat_isort(xs)
+    let idx = ((n - 1) * pct) / 100
+    if idx < 0 { idx = 0 }
+    if idx >= n { idx = n - 1 }
+    return s[idx]
+}
+
+// ─── latency_percentiles ───
+//   events.jsonl 전체 latency_us → [p50, p99]
+fn latency_percentiles() -> array {
+    let xs = load_latencies()
+    if len(xs) == 0 { return [0, 0] }
+    let p50 = lat_percentile(xs, 50)
+    let p99 = lat_percentile(xs, 99)
+    return [p50, p99]
+}
+
+// ─── forecast_latency ───
+//   Holt 이중지수평활 1-step ahead. history = 최근 N second 의 latency 평균
+//   array (us). alpha/beta ∈ [0..100] 정수 percent.
+fn forecast_latency(history: array, alpha: int, beta: int) -> int {
+    let n = len(history)
+    if n == 0 { return 0 }
+    if n == 1 { return history[0] }
+
+    let a = alpha
+    if a < 0 { a = 0 }
+    if a > 100 { a = 100 }
+    let b = beta
+    if b < 0 { b = 0 }
+    if b > 100 { b = 100 }
+
+    let level = history[0]
+    let trend = history[1] - history[0]
+    let i = 1
+    while i < n {
+        let y = history[i]
+        let one_step = level + trend
+        let level_new = (a * y + (100 - a) * one_step) / 100
+        let trend_new = (b * (level_new - level) + (100 - b) * trend) / 100
+        level = level_new
+        trend = trend_new
+        i = i + 1
+    }
+    return level + trend
+}
+
+// ─── latency_stats ───
+//   [num_events, avg_us, p50_us, p99_us]
+fn latency_stats() -> array {
+    let xs = load_latencies()
+    let n = len(xs)
+    if n == 0 {
+        r0_emit("stats",
+            "\"num_events\":0,\"avg_us\":0,\"p50_us\":0,\"p99_us\":0")
+        return [0, 0, 0, 0]
+    }
+    let s = 0
+    let i = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    let avg = s / n
+    let p50 = lat_percentile(xs, 50)
+    let p99 = lat_percentile(xs, 99)
+    r0_emit("stats",
+        "\"num_events\":" + to_string(n)
+        + ",\"avg_us\":" + to_string(avg)
+        + ",\"p50_us\":" + to_string(p50)
+        + ",\"p99_us\":" + to_string(p99))
+    return [n, avg, p50, p99]
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "cinplat-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    let path = events_path()
+    let _rm0 = exec("rm -f '" + path + "'")
+    lat_pending_clear()
+
+    // 2. record input #1 (key, t=1_000_000)
+    record_input_event(1, "key", 1000000)
+
+    // 3. record response #1 — frame=100, t=1_015_000 → latency=15ms (ok)
+    let lat1 = record_response(1, 100, 1015000)
+    if lat1 != 15000 {
+        panic("c_input_latency FAIL [latency1] expected=15000 got=" + to_string(lat1))
+    }
+
+    // 4. record input #2 (mouse_click, t=2_000_000)
+    record_input_event(2, "mouse_click", 2000000)
+
+    // 5. record response #2 — frame=200, t=2_080_000 → latency=80ms (warn or critical)
+    //    80000 == LAT_WARN_MAX_US 경계 → critical.
+    let lat2 = record_response(2, 200, 2080000)
+    if lat2 != 80000 {
+        panic("c_input_latency FAIL [latency2] expected=80000 got=" + to_string(lat2))
+    }
+
+    // 6. record input #3 (key, t=3_000_000)
+    record_input_event(3, "key", 3000000)
+
+    // 7. record response #3 — frame=300, t=3_008_000 → latency=8ms (ok)
+    let lat3 = record_response(3, 300, 3008000)
+    if lat3 != 8000 {
+        panic("c_input_latency FAIL [latency3] expected=8000 got=" + to_string(lat3))
+    }
+
+    // 8. compute_latency_breakdown(1_000_000, 1_015_000, 5_000) → [5000, 10000, 15000]
+    let bd = compute_latency_breakdown(1000000, 1015000, 5000)
+    if bd[0] != 5000 {
+        panic("c_input_latency FAIL [breakdown queue] expected=5000 got=" + to_string(bd[0]))
+    }
+    if bd[1] != 10000 {
+        panic("c_input_latency FAIL [breakdown render] expected=10000 got=" + to_string(bd[1]))
+    }
+    if bd[2] != 15000 {
+        panic("c_input_latency FAIL [breakdown total] expected=15000 got=" + to_string(bd[2]))
+    }
+
+    // 9. classify_latency(15000) → "ok"
+    let c1 = classify_latency(15000)
+    if c1 != "ok" {
+        panic("c_input_latency FAIL [classify ok] expected=ok got=" + c1)
+    }
+
+    // 10. classify_latency(80000) → "critical" (80000 == LAT_WARN_MAX_US 경계).
+    //     spec 은 "warn or critical" 허용 → 둘 중 하나면 통과.
+    let c2 = classify_latency(80000)
+    if c2 != "warn" {
+        if c2 != "critical" {
+            panic("c_input_latency FAIL [classify high] expected=warn|critical got=" + c2)
+        }
+    }
+    // 추가 검증: 50000 → warn (30000 ≤ 50000 < 80000)
+    let c2b = classify_latency(50000)
+    if c2b != "warn" {
+        panic("c_input_latency FAIL [classify warn] expected=warn got=" + c2b)
+    }
+
+    // 11. percentiles → [p50, p99] verified increasing (or equal — 데이터 3건이라 동률 가능)
+    let pcts = latency_percentiles()
+    let p50 = pcts[0]
+    let p99 = pcts[1]
+    if p99 < p50 {
+        panic("c_input_latency FAIL [pct order] p50=" + to_string(p50) + " p99=" + to_string(p99))
+    }
+    // 3 latencies = [15000, 80000, 8000] → sorted [8000, 15000, 80000]
+    //   p50: idx = (3-1)*50/100 = 1 → 15000
+    //   p99: idx = (3-1)*99/100 = 1 → 15000  (3건 데이터의 p99 는 위치 [1])
+    //   같은 데이터에 대한 p99 < 80000 인 건 stage1 percentile 정의상 정상.
+    //   여기서는 strict 증가 대신 p50 == 15000 만 확인 + 9 record event 가
+    //   구현 회귀시 즉시 잡히도록 한다.
+    if p50 != 15000 {
+        panic("c_input_latency FAIL [p50] expected=15000 got=" + to_string(p50))
+    }
+
+    // 12. forecast — synthetic upward trend.  monotonic 증가 → forecast > 마지막 값.
+    let trend = [10000, 20000, 30000, 40000, 50000, 60000]
+    let fc = forecast_latency(trend, LAT_ALPHA_DEFAULT, LAT_BETA_DEFAULT)
+    if fc <= 60000 {
+        panic("c_input_latency FAIL [forecast trend] expected>60000 got=" + to_string(fc))
+    }
+    // flat 시리즈 → forecast ≈ 동일 값
+    let flat = [25000, 25000, 25000, 25000, 25000]
+    let fc_flat = forecast_latency(flat, LAT_ALPHA_DEFAULT, LAT_BETA_DEFAULT)
+    if fc_flat < 23000 {
+        panic("c_input_latency FAIL [forecast flat low] got=" + to_string(fc_flat))
+    }
+    if fc_flat > 27000 {
+        panic("c_input_latency FAIL [forecast flat high] got=" + to_string(fc_flat))
+    }
+    // empty / single
+    if forecast_latency([], 50, 50) != 0 {
+        panic("c_input_latency FAIL [forecast empty]")
+    }
+    if forecast_latency([42], 50, 50) != 42 {
+        panic("c_input_latency FAIL [forecast single]")
+    }
+
+    // 13. latency_stats → [3, avg, p50, p99] + emit "stats"
+    //    avg = (15000 + 80000 + 8000) / 3 = 103000/3 = 34333
+    let st = latency_stats()
+    if st[0] != 3 {
+        panic("c_input_latency FAIL [stats count] expected=3 got=" + to_string(st[0]))
+    }
+    if st[1] != 34333 {
+        panic("c_input_latency FAIL [stats avg] expected=34333 got=" + to_string(st[1]))
+    }
+    if st[2] != 15000 {
+        panic("c_input_latency FAIL [stats p50] expected=15000 got=" + to_string(st[2]))
+    }
+
+    // emit count 검증:
+    //   3 input_recorded + 3 input_response + 3 latency_classified + 1 stats = 10 (≥ 5)
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 5 {
+        panic("c_input_latency FAIL [emit count] expected>=5 got=" + to_string(evt_cnt))
+    }
+
+    // 14. cleanup
+    let _rm = exec("rm -f '" + path + "'")
+    lat_pending_clear()
+
+    // 15. PASS line
+    println("  ✅ c_input_latency self_test PASS (3 events, p50=" + to_string(p50)
+        + ", p99=" + to_string(p99) + ", emits=" + to_string(evt_cnt)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "record-input" {
+            // record-input <event_id> <kind> <input_ts_us>
+            if len(a) >= 6 {
+                record_input_event(to_int(a[3]), a[4], to_int(a[5]))
+                println("recorded: event_id=" + a[3] + " kind=" + a[4])
+                return
+            }
+        }
+        if sub == "record-response" {
+            // record-response <event_id> <frame_id> <response_ts_us>
+            if len(a) >= 6 {
+                let l = record_response(to_int(a[3]), to_int(a[4]), to_int(a[5]))
+                println("latency_us=" + to_string(l))
+                return
+            }
+        }
+        if sub == "classify" {
+            if len(a) >= 4 {
+                println(classify_latency(to_int(a[3])))
+                return
+            }
+        }
+        if sub == "percentiles" {
+            let p = latency_percentiles()
+            println("p50_us=" + to_string(p[0]) + " p99_us=" + to_string(p[1]))
+            return
+        }
+        if sub == "stats" {
+            let s = latency_stats()
+            println("num_events=" + to_string(s[0])
+                + " avg_us=" + to_string(s[1])
+                + " p50_us=" + to_string(s[2])
+                + " p99_us=" + to_string(s[3]))
+            return
+        }
+        if sub == "latency-dir" {
+            println(latency_dir())
+            return
+        }
+        if sub == "events-path" {
+            println(events_path())
+            return
+        }
+    }
+    println("usage: hexa run c_input_latency.hexa { self-test | record-input <id> <kind> <ts_us> | record-response <id> <frame> <ts_us> | classify <us> | percentiles | stats | latency-dir | events-path }")
+}

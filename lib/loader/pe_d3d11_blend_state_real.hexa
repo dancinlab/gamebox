@@ -1,0 +1,435 @@
+// lib/loader/pe_d3d11_blend_state_real.hexa — D3D11 CreateBlendState → MTLRenderPipelineColorAttachmentDescriptor tracker
+//
+// ID3D11Device::CreateBlendState 호출의 D3D11_BLEND_DESC 매핑 추적기.
+// 본 module 은 blend state descriptor record/aggregate 만 — 실 ID3D11Device::CreateBlendState
+// / OMSetBlendState 호출은 stage2 native helper(D3DMetal binary 위임) 에서 처리.
+//
+// D3D11 CreateBlendState / OMSetBlendState → Metal MTLRenderPipelineColorAttachmentDescriptor:
+//   D3D11_BLEND_DESC.RenderTarget[i].BlendEnable        → colorAttachments[i].blendingEnabled
+//   D3D11_BLEND_DESC.RenderTarget[i].SrcBlend           → colorAttachments[i].sourceRGBBlendFactor       (MTLBlendFactor)
+//   D3D11_BLEND_DESC.RenderTarget[i].DestBlend          → colorAttachments[i].destinationRGBBlendFactor  (MTLBlendFactor)
+//   D3D11_BLEND_DESC.RenderTarget[i].BlendOp            → colorAttachments[i].rgbBlendOperation          (MTLBlendOperation)
+//   D3D11_BLEND_DESC.RenderTarget[i].SrcBlendAlpha      → colorAttachments[i].sourceAlphaBlendFactor
+//   D3D11_BLEND_DESC.RenderTarget[i].DestBlendAlpha     → colorAttachments[i].destinationAlphaBlendFactor
+//   D3D11_BLEND_DESC.RenderTarget[i].BlendOpAlpha       → colorAttachments[i].alphaBlendOperation
+//   D3D11_BLEND_DESC.RenderTarget[i].RenderTargetWriteMask → colorAttachments[i].writeMask                (MTLColorWriteMask)
+//   D3D11_BLEND_DESC.IndependentBlendEnable             → per-attachment descriptor (true=각 RT 별 독립 설정)
+//   D3D11_BLEND_DESC.AlphaToCoverageEnable              → MTLRenderPipelineDescriptor.alphaToCoverageEnabled
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11Device. MoltenVK/DXVK 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// blend_kind code (high-level preset of D3D11_BLEND_DESC.RenderTarget[0]):
+//   1 = opaque          (BlendEnable=FALSE — write source as-is)
+//   2 = alpha_blend     (Src=SRC_ALPHA, Dest=INV_SRC_ALPHA, Op=ADD)
+//   3 = additive        (Src=SRC_ALPHA, Dest=ONE,           Op=ADD)
+//   4 = multiplicative  (Src=DEST_COLOR, Dest=ZERO,         Op=ADD)
+//   5 = premultiplied   (Src=ONE,       Dest=INV_SRC_ALPHA, Op=ADD)
+//
+// independent_blend (D3D11_BLEND_DESC.IndependentBlendEnable):
+//   0 = single descriptor applied to all RTs
+//   1 = per-RT independent descriptors
+//
+// render_target_count: number of bound color attachments (1..8 per D3D11 / Metal)
+//
+// persist schema (TSV — states.tsv):
+//   state_id<int> \t blend_kind<int> \t independent_blend<int> \t render_target_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdbs11_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_blend_state_real"
+}
+
+fn pdbs11_states_path() -> str {
+    return pdbs11_dir() + "/states.tsv"
+}
+
+fn pdbs11_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdbs11_dir() + "'")
+}
+
+fn cleanup_pdbs11() -> void {
+    pdbs11_ensure_dir()
+    let _ = exec("rm -f '" + pdbs11_states_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdbs11_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdbs11_append_row(path: str, row: str) -> void {
+    pdbs11_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_state: blend state descriptor 1 건 기록 ───
+fn record_state(state_id: int, blend_kind: int, independent_blend: int, render_target_count: int) -> void {
+    if state_id <= 0 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if blend_kind < 1 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=blend_kind>=1 got=" + to_string(blend_kind))
+    }
+    if blend_kind > 5 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=blend_kind<=5 got=" + to_string(blend_kind))
+    }
+    if independent_blend < 0 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=independent_blend>=0 got=" + to_string(independent_blend))
+    }
+    if independent_blend > 1 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=independent_blend<=1 got=" + to_string(independent_blend))
+    }
+    if render_target_count < 1 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=render_target_count>=1 got=" + to_string(render_target_count))
+    }
+    if render_target_count > 8 {
+        panic("pe_d3d11_blend_state_real FAIL [record_state] expected=render_target_count<=8 got=" + to_string(render_target_count))
+    }
+    let row = to_string(state_id) + "\t" + to_string(blend_kind)
+        + "\t" + to_string(independent_blend) + "\t" + to_string(render_target_count) + "\n"
+    pdbs11_append_row(pdbs11_states_path(), row)
+}
+
+// ─── state_count: total blend state 수 ───
+fn state_count() -> int {
+    let t = pdbs11_read_table(pdbs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_blend_kind: 특정 blend_kind 의 state 수 ───
+fn count_by_blend_kind(blend_kind: int) -> int {
+    let t = pdbs11_read_table(pdbs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == blend_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── independent_count: independent_blend=1 인 state 수 ───
+fn independent_count() -> int {
+    let t = pdbs11_read_table(pdbs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_rt_count: 모든 state 의 render_target_count 합 ───
+fn total_rt_count() -> int {
+    let t = pdbs11_read_table(pdbs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── alpha_blend_count: alpha_blend(2) + premultiplied(5) ───
+fn alpha_blend_count() -> int {
+    return count_by_blend_kind(2) + count_by_blend_kind(5)
+}
+
+// ─── state_rt_count: 특정 state_id 의 render_target_count (없으면 0) ───
+fn state_rt_count(state_id: int) -> int {
+    let t = pdbs11_read_table(pdbs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == state_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdbs11_stats: [state_count, total_rt_count, alpha_blend_count, independent_count] ───
+fn pdbs11_stats() -> array {
+    let mut out = []
+    out.push(state_count())
+    out.push(total_rt_count())
+    out.push(alpha_blend_count())
+    out.push(independent_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdbs11-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdbs11()
+
+    // 2. record 5 states — ≥3 blend_kinds, ≥2 independent
+    //    s1: opaque, single, RT=1
+    record_state(420001, 1, 0, 1)
+    r0_emit("pe_d3d11_blend_state_real_record",
+        "\"state_id\":420001,\"blend_kind\":1,\"independent_blend\":0,\"render_target_count\":1,\"target\":\"colorAttachmentDescriptor\"")
+
+    //    s2: alpha_blend, single, RT=1
+    record_state(420002, 2, 0, 1)
+    r0_emit("pe_d3d11_blend_state_real_record",
+        "\"state_id\":420002,\"blend_kind\":2,\"independent_blend\":0,\"render_target_count\":1,\"target\":\"colorAttachmentDescriptor\"")
+
+    //    s3: additive, independent, RT=4
+    record_state(420003, 3, 1, 4)
+    r0_emit("pe_d3d11_blend_state_real_record",
+        "\"state_id\":420003,\"blend_kind\":3,\"independent_blend\":1,\"render_target_count\":4,\"target\":\"colorAttachmentDescriptor\"")
+
+    //    s4: premultiplied, independent, RT=2
+    record_state(420004, 5, 1, 2)
+    r0_emit("pe_d3d11_blend_state_real_record",
+        "\"state_id\":420004,\"blend_kind\":5,\"independent_blend\":1,\"render_target_count\":2,\"target\":\"colorAttachmentDescriptor\"")
+
+    //    s5: alpha_blend, single, RT=1
+    record_state(420005, 2, 0, 1)
+    r0_emit("pe_d3d11_blend_state_real_record",
+        "\"state_id\":420005,\"blend_kind\":2,\"independent_blend\":0,\"render_target_count\":1,\"target\":\"colorAttachmentDescriptor\"")
+
+    // 3. state_count = 5
+    let c = state_count()
+    if c != 5 {
+        panic("pe_d3d11_blend_state_real FAIL [state_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_rt_count = 1+1+4+2+1 = 9
+    let trt = total_rt_count()
+    if trt != 9 {
+        panic("pe_d3d11_blend_state_real FAIL [total_rt_count] expected=9 got=" + to_string(trt))
+    }
+
+    // 5. count_by_blend_kind sanity
+    //    opaque(1) → s1 = 1
+    let k1 = count_by_blend_kind(1)
+    if k1 != 1 {
+        panic("pe_d3d11_blend_state_real FAIL [count_by_blend_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    //    alpha_blend(2) → s2, s5 = 2
+    let k2 = count_by_blend_kind(2)
+    if k2 != 2 {
+        panic("pe_d3d11_blend_state_real FAIL [count_by_blend_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    //    additive(3) → s3 = 1
+    let k3 = count_by_blend_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d11_blend_state_real FAIL [count_by_blend_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    //    multiplicative(4) → none = 0
+    let k4 = count_by_blend_kind(4)
+    if k4 != 0 {
+        panic("pe_d3d11_blend_state_real FAIL [count_by_blend_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    //    premultiplied(5) → s4 = 1
+    let k5 = count_by_blend_kind(5)
+    if k5 != 1 {
+        panic("pe_d3d11_blend_state_real FAIL [count_by_blend_kind(5)] expected=1 got=" + to_string(k5))
+    }
+
+    // 6. independent_count = 2 (s3, s4)
+    let ic = independent_count()
+    if ic != 2 {
+        panic("pe_d3d11_blend_state_real FAIL [independent_count] expected=2 got=" + to_string(ic))
+    }
+
+    // 7. alpha_blend_count = count_by_blend_kind(2) + count_by_blend_kind(5) = 2+1 = 3
+    let ab = alpha_blend_count()
+    if ab != 3 {
+        panic("pe_d3d11_blend_state_real FAIL [alpha_blend_count] expected=3 got=" + to_string(ab))
+    }
+
+    // 8. state_rt_count sanity
+    let r3 = state_rt_count(420003)
+    if r3 != 4 {
+        panic("pe_d3d11_blend_state_real FAIL [state_rt_count(420003)] expected=4 got=" + to_string(r3))
+    }
+    let r4 = state_rt_count(420004)
+    if r4 != 2 {
+        panic("pe_d3d11_blend_state_real FAIL [state_rt_count(420004)] expected=2 got=" + to_string(r4))
+    }
+    let r_miss = state_rt_count(99999)
+    if r_miss != 0 {
+        panic("pe_d3d11_blend_state_real FAIL [state_rt_count(99999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 9. pdbs11_stats() = [5, 9, 3, 2]
+    let s = pdbs11_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_blend_state_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d11_blend_state_real FAIL [stats state_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 9 {
+        panic("pe_d3d11_blend_state_real FAIL [stats total_rt_count] expected=9 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_d3d11_blend_state_real FAIL [stats alpha_blend_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d11_blend_state_real FAIL [stats independent_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d11_blend_state_real_stats",
+        "\"state_count\":" + to_string(s[0])
+        + ",\"total_rt_count\":" + to_string(s[1])
+        + ",\"alpha_blend_count\":" + to_string(s[2])
+        + ",\"independent_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d11_blend_state_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdbs11()
+    let s2 = pdbs11_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_blend_state_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_blend_state_real self_test PASS (states=" + to_string(s[0])
+        + ", rts=" + to_string(s[1]) + ", alpha=" + to_string(s[2])
+        + ", independent=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdbs11_stats()
+            println("state_count\t" + to_string(s[0]))
+            println("total_rt_count\t" + to_string(s[1]))
+            println("alpha_blend_count\t" + to_string(s[2]))
+            println("independent_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "rt" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("state_rt_count\t" + to_string(state_rt_count(sid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_blend_state_real.hexa rt <state_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "blend" {
+                    println("count_by_blend_kind\t" + to_string(count_by_blend_kind(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_blend_state_real.hexa count blend <blend_kind>")
+                return
+            }
+            println("usage: hexa run pe_d3d11_blend_state_real.hexa count blend <blend_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdbs11()
+            println("cleaned: " + pdbs11_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdbs11_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_blend_state_real.hexa { self-test | stats | rt <state_id> | count blend <blend_kind> | cleanup | dir }")
+}

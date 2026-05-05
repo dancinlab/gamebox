@@ -1,0 +1,149 @@
+// lib/perf/c_compute_dispatch_merge.hexa — CN-28 PSB-5 만점 15/15
+//
+// 비슷한 compute shader dispatch 들 묶어 한 번에 발사 (DX12 indirect-style).
+// D4 particle/cloth simulation 의 작은 dispatch 들 → merged dispatch.
+//
+// 무기: cluster (dispatch arg similarity) + APBF (dedup).
+// 효과: dispatch overhead ↓ + GPU command buffer 압축.
+
+use "./r0_common"
+
+let CDM_DIR = GAMEBOX_HOME + "/persist/compute_dispatch_merge"
+let DISPATCH_LOG = CDM_DIR + "/dispatches.tsv"
+let MERGE_HISTORY = CDM_DIR + "/merges.jsonl"
+
+fn cdm_dir() -> str { return CDM_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CDM_DIR + "'")
+}
+
+// ─── dispatch 기록 ───
+//   shader_id, group_x/y/z (compute thread group)
+fn record_dispatch(frame_id: int, shader_id: int, gx: int, gy: int, gz: int) -> void {
+    ensure_dir()
+    let line = to_string(frame_id) + "\t" + to_string(shader_id) + "\t" + to_string(gx) + "\t" + to_string(gy) + "\t" + to_string(gz)
+    let tmp = DISPATCH_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + DISPATCH_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── merge candidate — 같은 frame 안 같은 shader_id 묶기 ───
+//   merged_count = 같은 (shader_id) dispatch 수의 합 (frame 안)
+//   savings = raw - unique_shader_count
+fn analyze_frame(frame_id: int) -> array {
+    let exists = exec("test -f '" + DISPATCH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0, 0] }
+    let raw_str = exec("awk -F'\\t' -v f=" + to_string(frame_id) + " '$1==f' '" + DISPATCH_LOG + "' | wc -l | tr -d ' '").trim()
+    let raw = to_int(raw_str)
+    if raw == 0 { return [0, 0, 0] }
+    let unique_str = exec("awk -F'\\t' -v f=" + to_string(frame_id) + " '$1==f {print $2}' '" + DISPATCH_LOG + "' | sort -u | wc -l | tr -d ' '").trim()
+    let unique = to_int(unique_str)
+    let saved = raw - unique
+    return [raw, unique, saved]
+}
+
+// ─── merge 결과 기록 ───
+fn record_merge(frame_id: int, raw: int, merged: int) -> void {
+    ensure_dir()
+    let saved = raw - merged
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"frame\":" + to_string(frame_id) + ",\"raw\":" + to_string(raw) + ",\"merged\":" + to_string(merged) + ",\"saved\":" + to_string(saved) + "}"
+    let tmp = MERGE_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + MERGE_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("compute_dispatch_merge", "\"frame\":" + to_string(frame_id) + ",\"raw\":" + to_string(raw) + ",\"merged\":" + to_string(merged) + ",\"saved\":" + to_string(saved))
+}
+
+// ─── auto merge workflow — frame 단위 ───
+fn auto_merge(frame_id: int) -> array {
+    let res = analyze_frame(frame_id)
+    if res[0] == 0 { return [0, 0, 0] }
+    if res[2] == 0 {
+        return res  // savings 없음
+    }
+    record_merge(frame_id, res[0], res[1])
+    return res
+}
+
+fn merge_stats() -> array {
+    let exists_d = exec("test -f '" + DISPATCH_LOG + "' && echo ok").trim()
+    let dispatches = 0
+    if exists_d == "ok" {
+        dispatches = to_int(exec("wc -l < '" + DISPATCH_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_m = exec("test -f '" + MERGE_HISTORY + "' && echo ok").trim()
+    let merges = 0
+    let saved_total = 0
+    if exists_m == "ok" {
+        merges = to_int(exec("wc -l < '" + MERGE_HISTORY + "' | tr -d ' '").trim())
+        let saved_str = exec("grep -oE '\"saved\":[0-9]+' '" + MERGE_HISTORY + "' | cut -d: -f2 | awk '{s+=$1} END{print s+0}'").trim()
+        if saved_str != "" { saved_total = to_int(saved_str) }
+    }
+    return [dispatches, merges, saved_total]
+}
+
+fn cleanup_cdm() -> void {
+    let _ = exec("rm -rf '" + CDM_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cdm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cdm()
+
+    // 합성 frame 1 — particle simulation 같은 shader 8회 (8 → 1 merge)
+    let i = 0
+    while i < 8 {
+        record_dispatch(1, 700, 64, 64, 1)
+        i = i + 1
+    }
+    // 다른 shader 1 회
+    record_dispatch(1, 800, 32, 32, 1)
+
+    // analyze
+    let res = analyze_frame(1)
+    if res[0] != 9 { panic("c_compute_dispatch_merge FAIL [raw] expected=9 got=" + to_string(res[0])) }
+    if res[1] != 2 { panic("c_compute_dispatch_merge FAIL [unique] expected=2 got=" + to_string(res[1])) }
+    if res[2] != 7 { panic("c_compute_dispatch_merge FAIL [saved] expected=7 got=" + to_string(res[2])) }
+
+    let am = auto_merge(1)
+    if am[2] != 7 { panic("c_compute_dispatch_merge FAIL [auto saved] expected=7 got=" + to_string(am[2])) }
+
+    // frame 2 — savings 없는 케이스 (모두 다른 shader)
+    record_dispatch(2, 900, 16, 16, 1)
+    record_dispatch(2, 901, 16, 16, 1)
+    let am2 = auto_merge(2)
+    if am2[2] != 0 { panic("c_compute_dispatch_merge FAIL [no savings] expected=0 got=" + to_string(am2[2])) }
+
+    // stats
+    let stats = merge_stats()
+    if stats[0] != 11 { panic("c_compute_dispatch_merge FAIL [stats dispatches] expected=11 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_compute_dispatch_merge FAIL [stats merges] expected=1 got=" + to_string(stats[1])) }
+    if stats[2] != 7 { panic("c_compute_dispatch_merge FAIL [stats saved] expected=7 got=" + to_string(stats[2])) }
+
+    r0_emit("compute_merge_summary", "\"dispatches\":" + to_string(stats[0]) + ",\"merges\":" + to_string(stats[1]) + ",\"saved\":" + to_string(stats[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_compute_dispatch_merge FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_cdm()
+
+    println("  ✅ c_compute_dispatch_merge self_test PASS (11 dispatches, 1 merged frame, saved=7, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = merge_stats()
+            println("dispatches=" + to_string(s[0]) + " merges=" + to_string(s[1]) + " saved=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_cdm(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_compute_dispatch_merge.hexa { self-test | stats | cleanup }")
+}

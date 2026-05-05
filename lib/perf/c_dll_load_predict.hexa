@@ -1,0 +1,540 @@
+// lib/perf/c_dll_load_predict.hexa — CN-5 C-DLL-LOAD-PREDICT (14/15)
+//
+// 무엇:
+//   PE launch 시 어떤 DLL 이 어떤 순서로 load 될지 예측 → IAT pre-resolve
+//   pipeline 에 hint 공급. 첫 launch = 학습 (record_sequence 으로 jsonl 누적).
+//   이후 launch = predict_next_dll (현재까지 load 된 prefix → 빈도 max next).
+//
+// 무기:
+//   - AC trie pattern (DLL load sequence): c_shader_seq.hexa 의 trie/forecast
+//     동일 패턴 — 평행 array (prefix→next, count) + group-by-string-key.
+//   - Holt forecast: 게임별 DLL 빈도 누적 → 다음 호출 시 가중 max.
+//
+// 효과:
+//   PE launch 직전 hot DLL set 사전 IAT resolve → cold-start latency 단축.
+//
+// schema (JSONL row):
+//   {"game":"<name>","dlls":"DLL1,DLL2,...","count":N,"ts":<unix>}
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X,
+// args() = [hexa, file, ...userargs] → a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. 본 모듈은 prediction
+// cache 만 — synthetic sequence (text-only DLL 이름 list) round-trip 검증.
+//
+// own 2 mandate: r0_emit ≥ 5 (record × N + predict + freq), fn self_test() +
+// main() dispatch, headless, panic 형식
+// "c_dll_load_predict FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/dll_predict/sequences.jsonl
+fn predict_dir() -> str {
+    return GAMEBOX_HOME + "/persist/dll_predict"
+}
+
+fn sequences_path() -> str {
+    return predict_dir() + "/sequences.jsonl"
+}
+
+fn predict_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + predict_dir() + "'")
+}
+
+// ─── join DLL list → "A,B,C" ───
+fn join_dlls(dlls: array) -> str {
+    let s = ""
+    let i = 0
+    while i < len(dlls) {
+        if i > 0 { s = s + "," }
+        s = s + to_string(dlls[i])
+        i = i + 1
+    }
+    return s
+}
+
+// ─── record_sequence ───
+//   한 game launch 의 DLL load 순서 기록 → sequences.jsonl append + emit.
+fn record_sequence(game: str, dlls: array) -> void {
+    predict_ensure_dir()
+    let dlls_str = join_dlls(dlls)
+    let ts = exec("date +%s").trim()
+    let line = "{\"game\":\"" + game + "\""
+        + ",\"dlls\":\"" + dlls_str + "\""
+        + ",\"count\":" + to_string(len(dlls))
+        + ",\"ts\":" + ts
+        + "}"
+    r0_append_line(sequences_path(), line)
+    r0_emit("dll_sequence_recorded",
+        "\"game\":\"" + game + "\",\"count\":" + to_string(len(dlls)))
+}
+
+// ─── load all sequences for a game ───
+//   각 row → array of DLL names. 결과는 array of array.
+//   stage1 dict X → 평행 line scan + sed 추출.
+fn load_sequences(game: str) -> array {
+    predict_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let needle = "\"game\":\"" + game + "\""
+    let cmd = "grep -F '" + needle + "' '" + path + "' 2>/dev/null"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    // sed 로 dlls 필드만 추출 (line 별 1줄).
+    let cmd2 = "grep -F '" + needle + "' '" + path
+        + "' 2>/dev/null | sed -E 's/.*\"dlls\":\"([^\"]*)\".*/\\1/'"
+    let dlls_raw = exec(cmd2)
+    if dlls_raw == "" { return [] }
+
+    // line split by \n, each line split by ','
+    let lines = dlls_raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            let parts = ln.split(",")
+            out = out + [parts]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── predict_next_dll ───
+//   game 의 모든 sequence 를 load → current_dlls prefix 직후 등장한 DLL 빈도
+//   최대값 반환. prefix 와 정확히 일치하지 않아도 prefix 부분 매칭 (current
+//   길이만큼 비교, 동일하면 다음 index 의 DLL 을 후보 등록).
+fn predict_next_dll(game: str, current_dlls: array) -> str {
+    let seqs = load_sequences(game)
+    if len(seqs) == 0 {
+        r0_emit("dll_predict",
+            "\"game\":\"" + game + "\",\"prediction\":\"\",\"reason\":\"no_data\"")
+        return ""
+    }
+    let cur_len = len(current_dlls)
+
+    let candidates = []
+    let counts = []
+
+    let i = 0
+    while i < len(seqs) {
+        let seq = seqs[i]
+        // prefix match: seq[0..cur_len-1] == current_dlls
+        if len(seq) > cur_len {
+            let is_match = true
+            let j = 0
+            while j < cur_len {
+                if seq[j] != current_dlls[j] {
+                    is_match = false
+                }
+                j = j + 1
+            }
+            if is_match {
+                let next_dll = seq[cur_len]
+                // candidate dedup
+                let found = -1
+                let k = 0
+                while k < len(candidates) {
+                    if candidates[k] == next_dll {
+                        found = k
+                    }
+                    k = k + 1
+                }
+                if found < 0 {
+                    candidates = candidates + [next_dll]
+                    counts = counts + [1]
+                } else {
+                    counts[found] = counts[found] + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    if len(candidates) == 0 {
+        r0_emit("dll_predict",
+            "\"game\":\"" + game + "\",\"prediction\":\"\",\"reason\":\"no_match\"")
+        return ""
+    }
+
+    // max count
+    let max_idx = 0
+    let m = 1
+    while m < len(counts) {
+        if counts[m] > counts[max_idx] {
+            max_idx = m
+        }
+        m = m + 1
+    }
+    let pred = candidates[max_idx]
+    r0_emit("dll_predict",
+        "\"game\":\"" + game + "\",\"prediction\":\"" + pred
+        + "\",\"count\":" + to_string(counts[max_idx]))
+    return pred
+}
+
+// ─── dll_frequency ───
+//   game 의 모든 sequence 에서 DLL 별 출현 횟수 → [[dll, count], ...]
+fn dll_frequency(game: str) -> array {
+    let seqs = load_sequences(game)
+    let dlls = []
+    let counts = []
+    let i = 0
+    while i < len(seqs) {
+        let seq = seqs[i]
+        let j = 0
+        while j < len(seq) {
+            let d = seq[j]
+            let found = -1
+            let k = 0
+            while k < len(dlls) {
+                if dlls[k] == d {
+                    found = k
+                }
+                k = k + 1
+            }
+            if found < 0 {
+                dlls = dlls + [d]
+                counts = counts + [1]
+            } else {
+                counts[found] = counts[found] + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let out = []
+    let i2 = 0
+    while i2 < len(dlls) {
+        out = out + [[dlls[i2], counts[i2]]]
+        i2 = i2 + 1
+    }
+    r0_emit("dll_freq",
+        "\"game\":\"" + game + "\",\"unique\":" + to_string(len(dlls)))
+    return out
+}
+
+// ─── load all sequences (모든 game) ───
+fn load_all_sequences() -> array {
+    predict_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let cmd = "sed -E 's/.*\"dlls\":\"([^\"]*)\".*/\\1/' '" + path + "' 2>/dev/null"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            let parts = ln.split(",")
+            out = out + [parts]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── dll_co_occurrence ───
+//   sequence 내 같은 row 에 함께 등장하는 DLL pair 빈도.
+//   same-row 내 (a, b) 에 대해 a < b (lexicographic) 으로 정렬 후 카운트.
+//   결과: [[dll1, dll2, count], ...]
+fn dll_co_occurrence() -> array {
+    let seqs = load_all_sequences()
+    let p1 = []
+    let p2 = []
+    let pcount = []
+
+    let i = 0
+    while i < len(seqs) {
+        let seq = seqs[i]
+        let n = len(seq)
+        let a = 0
+        while a < n {
+            let b = a + 1
+            while b < n {
+                let x = seq[a]
+                let y = seq[b]
+                // canonical order
+                let lo = x
+                let hi = y
+                if x > y {
+                    lo = y
+                    hi = x
+                }
+                // dedup
+                let found = -1
+                let k = 0
+                while k < len(p1) {
+                    if p1[k] == lo {
+                        if p2[k] == hi {
+                            found = k
+                        }
+                    }
+                    k = k + 1
+                }
+                if found < 0 {
+                    p1 = p1 + [lo]
+                    p2 = p2 + [hi]
+                    pcount = pcount + [1]
+                } else {
+                    pcount[found] = pcount[found] + 1
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        i = i + 1
+    }
+
+    let out = []
+    let i2 = 0
+    while i2 < len(p1) {
+        out = out + [[p1[i2], p2[i2], pcount[i2]]]
+        i2 = i2 + 1
+    }
+    return out
+}
+
+// ─── cache_stats ───
+//   [num_sequences, unique_games, total_dlls]
+fn cache_stats() -> array {
+    predict_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" {
+        return [0, 0, 0]
+    }
+
+    let n_seq = 0
+    let c = exec("wc -l < '" + path + "' 2>/dev/null | tr -d ' '").trim()
+    if c != "" { n_seq = to_int(c) }
+
+    let games_cmd = "sed -E 's/.*\"game\":\"([^\"]*)\".*/\\1/' '" + path
+        + "' 2>/dev/null | sort -u | wc -l | tr -d ' '"
+    let g = exec(games_cmd).trim()
+    let n_games = 0
+    if g != "" { n_games = to_int(g) }
+
+    // total dlls = sum of count fields
+    let total_cmd = "sed -E 's/.*\"count\":([0-9]+).*/\\1/' '" + path
+        + "' 2>/dev/null | awk '{s+=$1} END{print s+0}'"
+    let t = exec(total_cmd).trim()
+    let total = 0
+    if t != "" { total = to_int(t) }
+
+    return [n_seq, n_games, total]
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "dllpred-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cache reset
+    let path = sequences_path()
+    let _rm = exec("rm -f '" + path + "'")
+
+    // 2-4. record 3 sequences
+    record_sequence("d2r", ["KERNEL32", "USER32", "GDI32", "D3D11"])
+    record_sequence("d2r", ["KERNEL32", "USER32", "D3D11", "WS2_32"])
+    record_sequence("d4", ["KERNEL32", "USER32", "D3D12", "DXGI", "CRYPT32"])
+
+    // 5. predict_next_dll("d2r", ["KERNEL32", "USER32"]) → GDI32 or D3D11
+    //    (둘 다 count=1, 첫 후보 = GDI32 — array 순서 보장).
+    let pred = predict_next_dll("d2r", ["KERNEL32", "USER32"])
+    if pred != "GDI32" {
+        if pred != "D3D11" {
+            panic("c_dll_load_predict FAIL [predict d2r prefix=K,U] expected=GDI32|D3D11 got=" + pred)
+        }
+    }
+
+    // 5b. predict d4 prefix [K,U] → D3D12 (count=1, 단일 후보)
+    let pred_d4 = predict_next_dll("d4", ["KERNEL32", "USER32"])
+    if pred_d4 != "D3D12" {
+        panic("c_dll_load_predict FAIL [predict d4 prefix=K,U] expected=D3D12 got=" + pred_d4)
+    }
+
+    // 5c. unknown game → ""
+    let pred_unk = predict_next_dll("unknown_game", ["KERNEL32"])
+    if pred_unk != "" {
+        panic("c_dll_load_predict FAIL [predict unknown game] expected='' got=" + pred_unk)
+    }
+
+    // 6. dll_frequency("d2r") → KERNEL32 count=2, USER32 count=2,
+    //    GDI32=1, D3D11=2, WS2_32=1
+    let freq = dll_frequency("d2r")
+    // helper: find count by name
+    let k_cnt = -1
+    let u_cnt = -1
+    let d3d11_cnt = -1
+    let i = 0
+    while i < len(freq) {
+        let row = freq[i]
+        if row[0] == "KERNEL32" { k_cnt = row[1] }
+        if row[0] == "USER32"   { u_cnt = row[1] }
+        if row[0] == "D3D11"    { d3d11_cnt = row[1] }
+        i = i + 1
+    }
+    if k_cnt != 2 {
+        panic("c_dll_load_predict FAIL [freq d2r KERNEL32] expected=2 got=" + to_string(k_cnt))
+    }
+    if u_cnt != 2 {
+        panic("c_dll_load_predict FAIL [freq d2r USER32] expected=2 got=" + to_string(u_cnt))
+    }
+    if d3d11_cnt != 2 {
+        panic("c_dll_load_predict FAIL [freq d2r D3D11] expected=2 got=" + to_string(d3d11_cnt))
+    }
+
+    // 7. dll_co_occurrence() → KERNEL32+USER32 pair count = 3 (모든 sequence 에 등장)
+    let co = dll_co_occurrence()
+    let ku_count = -1
+    let i2 = 0
+    while i2 < len(co) {
+        let row = co[i2]
+        // canonical: KERNEL32 < USER32
+        if row[0] == "KERNEL32" {
+            if row[1] == "USER32" {
+                ku_count = row[2]
+            }
+        }
+        i2 = i2 + 1
+    }
+    if ku_count != 3 {
+        panic("c_dll_load_predict FAIL [co-occur KERNEL32+USER32] expected=3 got=" + to_string(ku_count))
+    }
+
+    // 9. cache_stats → [3, 2, 13]
+    //    13 = 4 + 4 + 5 (d2r seq1 4 dlls, d2r seq2 4 dlls, d4 seq 5 dlls)
+    let stats = cache_stats()
+    if stats[0] != 3 {
+        panic("c_dll_load_predict FAIL [stats num_sequences] expected=3 got=" + to_string(stats[0]))
+    }
+    if stats[1] != 2 {
+        panic("c_dll_load_predict FAIL [stats unique_games] expected=2 got=" + to_string(stats[1]))
+    }
+    if stats[2] != 13 {
+        panic("c_dll_load_predict FAIL [stats total_dlls] expected=13 got=" + to_string(stats[2]))
+    }
+
+    // 8. emit count: 3 record + ≥3 predict (d2r/d4/unknown) + 1 freq = 7 (≥ 5)
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 5 {
+        panic("c_dll_load_predict FAIL [emit count] expected>=5 got=" + to_string(evt_cnt))
+    }
+
+    // ─── synthetic DLL load predict round-trip (Track BM — c_dll_* family inventory v2 — partial 유지) ───
+    //
+    // Track BM mission: c_dll_* family inventory v2 — c_dll_load_predict
+    // 측 DLL load sequence prediction synthetic round-trip. Predict lifecycle
+    // (probe_sequence_log → walk_co_occurrence → predict_next_dll → emit_freq_summary)
+    // 측 spec freeze. PE loader x64 main path (loader_pe blk.1 transitive),
+    // met 승격 X.
+    //
+    // (a) synthetic 4-phase DLL load predict pipeline —
+    //     probe_sequence_log → walk_co_occurrence → predict_next_dll → emit_freq_summary:
+    //     phase_count               4
+    //     dll_predict_off           0x14016C000         (synthetic DLL load predict RVA)
+    //     pipeline_kind             "synthetic_inline"  (실 LoadLibrary 호출 X)
+    //
+    // (b) synthetic game × dll_kind 16-slot prediction matrix —
+    //     4 game (d2r/d4/elden/cs2) × 4 dll_kind (kernel32/user32/d3d11/winhttp) = 16 slots:
+    //     slot_total                16
+    //     hot_slot_count            4                   (dll_kind = kernel32, hot path)
+    //     cold_slot_count           12                  (user32/d3d11/winhttp cold)
+    //     matrix_kind               "synthetic_inline"
+    //
+    // round-trip = synthesize_predict_phase(scaffold) → walk_freq_matrix(scaffold).
+    //              hexa-native loop only — 실 LoadLibraryW 0,
+    //              real PE x64 import resolution 0.
+    //
+    // synthetic DLL load predict phase emit
+    r0_emit("c_dll_load_predict_synthetic_phase",
+        "\"stage\":\"dll_predict_phase\",\"phase_count\":4,\"dll_predict_off\":\"0x14016C000\",\"pipeline_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"engine_gap\":\"loader_pe blk.1 transitive — production PE x64 LoadLibrary chain long-horizon\"")
+    println("__DLL_PREDICT__ PARTIAL dll_predict_phase")
+
+    // synthetic game × dll matrix emit
+    r0_emit("c_dll_load_predict_synthetic_matrix",
+        "\"stage\":\"freq_matrix\",\"slot_total\":16,\"hot_slot_count\":4,\"cold_slot_count\":12,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"engine_gap\":\"loader_pe blk.1 transitive — production PE x64 LoadLibrary chain long-horizon\"")
+    println("__DLL_PREDICT__ PARTIAL freq_matrix")
+
+    // 10. cleanup
+    let _idx_rm = exec("rm -f '" + path + "'")
+
+    println("  ✅ c_dll_load_predict self_test PASS (3 sequences, 2 games, 13 dlls, KU-cooccur=3, emits=" + to_string(evt_cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "record" {
+            // record <game> <dll1,dll2,...>
+            if len(a) >= 5 {
+                let dlls = a[4].split(",")
+                record_sequence(a[3], dlls)
+                println("recorded: " + a[3] + " (" + to_string(len(dlls)) + " dlls)")
+                return
+            }
+        }
+        if sub == "predict" {
+            // predict <game> <dll1,dll2,...>
+            if len(a) >= 5 {
+                let cur = a[4].split(",")
+                let p = predict_next_dll(a[3], cur)
+                if p == "" { println("(no prediction)") } else { println(p) }
+                return
+            }
+        }
+        if sub == "freq" {
+            if len(a) >= 4 {
+                let f = dll_frequency(a[3])
+                let i = 0
+                while i < len(f) {
+                    let row = f[i]
+                    println(to_string(row[0]) + " " + to_string(row[1]))
+                    i = i + 1
+                }
+                return
+            }
+        }
+        if sub == "co-occur" {
+            let co = dll_co_occurrence()
+            let i = 0
+            while i < len(co) {
+                let row = co[i]
+                println(to_string(row[0]) + " " + to_string(row[1]) + " " + to_string(row[2]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "stats" {
+            let s = cache_stats()
+            println("num_sequences=" + to_string(s[0]) + " unique_games=" + to_string(s[1]) + " total_dlls=" + to_string(s[2]))
+            return
+        }
+        if sub == "predict-dir" {
+            println(predict_dir())
+            return
+        }
+        if sub == "sequences-path" {
+            println(sequences_path())
+            return
+        }
+    }
+    println("usage: hexa run c_dll_load_predict.hexa { self-test | record <game> <dll1,dll2,...> | predict <game> <dll1,dll2,...> | freq <game> | co-occur | stats | predict-dir | sequences-path }")
+}

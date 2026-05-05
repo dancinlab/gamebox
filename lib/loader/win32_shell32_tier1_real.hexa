@@ -1,0 +1,469 @@
+// lib/loader/win32_shell32_tier1_real.hexa — cycle 81 R6 SHELL32 Tier 1 trivial real-call tracker
+//
+// SHELL32 의 trivial 함수 — known folder lookup / shell open / argv parse 등을
+// Apple-native (Foundation / AppKit / NSWorkspace) 로 1:1 매핑하기 위한 tracker.
+// 본 module 은 call accounting 만 — 실 NSSearchPath / NSWorkspace 호출은 native
+// helper bridge (airgenome_helper.mm) 가 담당. 본 file 은 그 호출 metadata 를
+// TSV 로 persist + impl_status 분류 + r0_emit 발행만 한다.
+//
+// own 1 enforcement: Wine / CrossOver / GPTK / Whisky / community 코드 0 줄.
+//   참조 only — Microsoft 공식 SHELL32 + Apple 공식 Foundation/AppKit:
+//     - SHGetFolderPathW:        https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/
+//     - SHGetKnownFolderPath:    https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/
+//     - SHGetSpecialFolderPathW: https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/
+//     - ShellExecuteW:           https://learn.microsoft.com/en-us/windows/win32/api/shellapi/
+//     - CommandLineToArgvW:      https://learn.microsoft.com/en-us/windows/win32/api/shellapi/
+//     - ExtractIconW:            https://learn.microsoft.com/en-us/windows/win32/api/shellapi/
+//     - SHGetFileInfo:           https://learn.microsoft.com/en-us/windows/win32/api/shellapi/
+//     - DragQueryFile:           https://learn.microsoft.com/en-us/windows/win32/api/shellapi/
+//     - NSSearchPathForDirectoriesInDomains:
+//         https://developer.apple.com/documentation/foundation/1414224-nssearchpathfordirectoriesindoma
+//     - NSWorkspace openURL:     https://developer.apple.com/documentation/appkit/nsworkspace
+//   Wine shell32/shellpath.c / 기타 third-party 단 1 줄도 import / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 6 (5 record + 1 stats)
+//   - fn self_test() + main() dispatch
+//   - headless safe (file IO + r0 만)
+//   - panic("win32_shell32_tier1_real FAIL [<sub>] expected=X got=Y")
+//
+// Tier 1 trivial SHELL32 → Apple-native:
+//   SHGetFolderPathW(CSIDL_APPDATA)       → NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory)
+//   SHGetFolderPathW(CSIDL_LOCAL_APPDATA) → ~/Library/Application Support/<bundle-id>
+//   SHGetFolderPathW(CSIDL_DESKTOP)       → NSDesktopDirectory
+//   SHGetKnownFolderPath(FOLDERID_*)      → CSIDL 매핑 테이블 → NSSearchPathForDir
+//   ShellExecuteW("open", url)            → NSWorkspace openURL
+//   CommandLineToArgvW                    → glibc-like CommandLineToArgvW MSDN spec 자체 구현
+//   ExtractIconW                          → NSWorkspace iconForFile (best-effort)
+//   SHGetFileInfo                         → POSIX stat + NSWorkspace queries
+//   DragQueryFile                         → CFArray pasteboard 매핑
+// own1: Apple Foundation/AppKit + MSDN. Wine shell32/shellpath.c 인용 X
+//
+// func_kind code:
+//   1 = SHGetFolderPathW
+//   2 = SHGetKnownFolderPath
+//   3 = SHGetSpecialFolderPathW
+//   4 = ShellExecuteW
+//   5 = CommandLineToArgvW
+//   6 = ExtractIconW
+//   7 = SHGetFileInfo
+//   8 = DragQueryFile
+//
+// impl_status code:
+//   1 = real_apple_path     (NSSearchPath / NSWorkspace 실 mapping 확보)
+//   2 = stub_string         (string 반환 stub — 실 path 미확보)
+//   3 = stub_handle         (HANDLE / HICON / argv ptr stub — non-NULL synthetic)
+//   4 = passthrough         (caller 에 그대로 넘김 — record only)
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t func_kind<int> \t impl_status<int> \t return_value<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn wst1_dir() -> str {
+    return GAMEBOX_HOME + "/persist/win32_shell32_tier1_real"
+}
+
+fn wst1_calls_path() -> str {
+    return wst1_dir() + "/calls.tsv"
+}
+
+fn wst1_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + wst1_dir() + "'")
+}
+
+fn cleanup_wst1() -> void {
+    wst1_ensure_dir()
+    let _ = exec("rm -f '" + wst1_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn wst1_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn wst1_append_row(path: str, row: str) -> void {
+    wst1_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: SHELL32 call 1 건 기록 ───
+fn record_call(call_id: int, func_kind: int, impl_status: int, return_value: int) -> void {
+    if call_id <= 0 {
+        panic("win32_shell32_tier1_real FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if func_kind < 1 {
+        panic("win32_shell32_tier1_real FAIL [record_call] expected=func_kind>=1 got=" + to_string(func_kind))
+    }
+    if func_kind > 8 {
+        panic("win32_shell32_tier1_real FAIL [record_call] expected=func_kind<=8 got=" + to_string(func_kind))
+    }
+    if impl_status < 1 {
+        panic("win32_shell32_tier1_real FAIL [record_call] expected=impl_status>=1 got=" + to_string(impl_status))
+    }
+    if impl_status > 4 {
+        panic("win32_shell32_tier1_real FAIL [record_call] expected=impl_status<=4 got=" + to_string(impl_status))
+    }
+    if return_value < 0 {
+        panic("win32_shell32_tier1_real FAIL [record_call] expected=return_value>=0 got=" + to_string(return_value))
+    }
+    let row = to_string(call_id) + "\t" + to_string(func_kind)
+        + "\t" + to_string(impl_status) + "\t" + to_string(return_value) + "\n"
+    wst1_append_row(wst1_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = wst1_read_table(wst1_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_func_kind: 특정 func_kind 의 call 수 ───
+fn count_by_func_kind(kind: int) -> int {
+    let t = wst1_read_table(wst1_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_impl_status: 특정 impl_status 의 call 수 ───
+fn count_by_impl_status(status: int) -> int {
+    let t = wst1_read_table(wst1_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == status {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── real_apple_count: impl_status=1 (real_apple_path) call 수 ───
+fn real_apple_count() -> int {
+    return count_by_impl_status(1)
+}
+
+// ─── total_return_value: 모든 call return_value 합 ───
+fn total_return_value() -> int {
+    let t = wst1_read_table(wst1_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── call_return_value: 특정 call_id 의 return_value (없으면 0) ───
+fn call_return_value(call_id: int) -> int {
+    let t = wst1_read_table(wst1_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── wst1_stats: [call_count, real_apple_count, total_return_value, count_by_func_kind(1)] ───
+fn wst1_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(real_apple_count())
+    out.push(total_return_value())
+    out.push(count_by_func_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "wst1-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_wst1()
+
+    // 2. record 5 SHELL32 Tier 1 calls — 5 distinct func_kinds (1,2,4,5,7), 3 impl_statuses (1,3,4)
+    //    SHGetFolderPathW(CSIDL_APPDATA=26)             → NSApplicationSupportDirectory  → real_apple_path, S_OK=0
+    record_call(810001, 1, 1, 0)
+    r0_emit("win32_shell32_tier1_real_record",
+        "\"call_id\":810001,\"func_kind\":1,\"impl_status\":1,\"return_value\":0,\"target\":\"SHGetFolderPathW(CSIDL_APPDATA)→NSApplicationSupportDirectory\"")
+
+    //    SHGetKnownFolderPath(FOLDERID_Desktop)         → NSDesktopDirectory             → real_apple_path, S_OK=0
+    record_call(810002, 2, 1, 0)
+    r0_emit("win32_shell32_tier1_real_record",
+        "\"call_id\":810002,\"func_kind\":2,\"impl_status\":1,\"return_value\":0,\"target\":\"SHGetKnownFolderPath(FOLDERID_Desktop)→NSDesktopDirectory\"")
+
+    //    ShellExecuteW(open, https://...)               → NSWorkspace openURL            → real_apple_path, HINSTANCE > 32 = 33
+    record_call(810003, 4, 1, 33)
+    r0_emit("win32_shell32_tier1_real_record",
+        "\"call_id\":810003,\"func_kind\":4,\"impl_status\":1,\"return_value\":33,\"target\":\"ShellExecuteW(open,url)→NSWorkspace.openURL\"")
+
+    //    CommandLineToArgvW(\"foo bar\", &n)            → MSDN spec self impl            → stub_handle (argv ptr) = 1
+    record_call(810004, 5, 3, 1)
+    r0_emit("win32_shell32_tier1_real_record",
+        "\"call_id\":810004,\"func_kind\":5,\"impl_status\":3,\"return_value\":1,\"target\":\"CommandLineToArgvW→argv_ptr\"")
+
+    //    SHGetFileInfo(path, ...)                       → record-only passthrough        → BOOL 1
+    record_call(810005, 7, 4, 1)
+    r0_emit("win32_shell32_tier1_real_record",
+        "\"call_id\":810005,\"func_kind\":7,\"impl_status\":4,\"return_value\":1,\"target\":\"SHGetFileInfo→passthrough\"")
+
+    // 3. call_count = 5
+    let c = call_count()
+    if c != 5 {
+        panic("win32_shell32_tier1_real FAIL [call_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. ≥3 distinct func_kinds — 1,2,4,5,7 each 1
+    let fk1 = count_by_func_kind(1)
+    if fk1 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_func_kind(1)] expected=1 got=" + to_string(fk1))
+    }
+    let fk2 = count_by_func_kind(2)
+    if fk2 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_func_kind(2)] expected=1 got=" + to_string(fk2))
+    }
+    let fk4 = count_by_func_kind(4)
+    if fk4 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_func_kind(4)] expected=1 got=" + to_string(fk4))
+    }
+    let fk5 = count_by_func_kind(5)
+    if fk5 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_func_kind(5)] expected=1 got=" + to_string(fk5))
+    }
+    let fk7 = count_by_func_kind(7)
+    if fk7 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_func_kind(7)] expected=1 got=" + to_string(fk7))
+    }
+    let fk_miss = count_by_func_kind(8)
+    if fk_miss != 0 {
+        panic("win32_shell32_tier1_real FAIL [count_by_func_kind(8)] expected=0 got=" + to_string(fk_miss))
+    }
+
+    // 5. ≥3 distinct impl_statuses — 1=3, 3=1, 4=1, 2=0
+    let is1 = count_by_impl_status(1)
+    if is1 != 3 {
+        panic("win32_shell32_tier1_real FAIL [count_by_impl_status(1)] expected=3 got=" + to_string(is1))
+    }
+    let is3 = count_by_impl_status(3)
+    if is3 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_impl_status(3)] expected=1 got=" + to_string(is3))
+    }
+    let is4 = count_by_impl_status(4)
+    if is4 != 1 {
+        panic("win32_shell32_tier1_real FAIL [count_by_impl_status(4)] expected=1 got=" + to_string(is4))
+    }
+    let is2 = count_by_impl_status(2)
+    if is2 != 0 {
+        panic("win32_shell32_tier1_real FAIL [count_by_impl_status(2)] expected=0 got=" + to_string(is2))
+    }
+
+    // 6. real_apple_count = 3
+    let rac = real_apple_count()
+    if rac != 3 {
+        panic("win32_shell32_tier1_real FAIL [real_apple_count] expected=3 got=" + to_string(rac))
+    }
+
+    // 7. total_return_value = 0+0+33+1+1 = 35
+    let trv = total_return_value()
+    if trv != 35 {
+        panic("win32_shell32_tier1_real FAIL [total_return_value] expected=35 got=" + to_string(trv))
+    }
+
+    // 8. call_return_value sanity
+    let rv3 = call_return_value(810003)
+    if rv3 != 33 {
+        panic("win32_shell32_tier1_real FAIL [call_return_value(810003)] expected=33 got=" + to_string(rv3))
+    }
+    let rv4 = call_return_value(810004)
+    if rv4 != 1 {
+        panic("win32_shell32_tier1_real FAIL [call_return_value(810004)] expected=1 got=" + to_string(rv4))
+    }
+    let rv_miss = call_return_value(9999)
+    if rv_miss != 0 {
+        panic("win32_shell32_tier1_real FAIL [call_return_value(9999)] expected=0 got=" + to_string(rv_miss))
+    }
+
+    // 9. wst1_stats = [5, 3, 35, 1]
+    let s = wst1_stats()
+    if len(s) != 4 {
+        panic("win32_shell32_tier1_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("win32_shell32_tier1_real FAIL [stats call_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("win32_shell32_tier1_real FAIL [stats real_apple_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 35 {
+        panic("win32_shell32_tier1_real FAIL [stats total_return_value] expected=35 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("win32_shell32_tier1_real FAIL [stats count_kind(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (6th emit — total ≥ 6)
+    r0_emit("win32_shell32_tier1_real_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"real_apple_count\":" + to_string(s[1])
+        + ",\"total_return_value\":" + to_string(s[2])
+        + ",\"kind_shgetfolderpathw\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("win32_shell32_tier1_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_wst1()
+    let s2 = wst1_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("win32_shell32_tier1_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ win32_shell32_tier1_real self_test PASS (calls=" + to_string(s[0])
+        + ", real_apple=" + to_string(s[1]) + ", ret_sum=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = wst1_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("real_apple_count\t" + to_string(s[1]))
+            println("total_return_value\t" + to_string(s[2]))
+            println("count_kind_shgetfolderpathw\t" + to_string(s[3]))
+            return
+        }
+        if sub == "return" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_return_value\t" + to_string(call_return_value(cid)))
+                return
+            }
+            println("usage: hexa run win32_shell32_tier1_real.hexa return <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let val = to_int(a[4])
+                if dim == "func" {
+                    println("count_by_func_kind\t" + to_string(count_by_func_kind(val)))
+                    return
+                }
+                if dim == "impl" {
+                    println("count_by_impl_status\t" + to_string(count_by_impl_status(val)))
+                    return
+                }
+                println("usage: hexa run win32_shell32_tier1_real.hexa count { func <func_kind> | impl <impl_status> }")
+                return
+            }
+            println("usage: hexa run win32_shell32_tier1_real.hexa count { func <func_kind> | impl <impl_status> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_wst1()
+            println("cleaned: " + wst1_dir())
+            return
+        }
+        if sub == "dir" {
+            println(wst1_dir())
+            return
+        }
+    }
+    println("usage: hexa run win32_shell32_tier1_real.hexa { self-test | stats | return <call_id> | count func <func_kind> | count impl <impl_status> | cleanup | dir }")
+}

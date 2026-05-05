@@ -1,0 +1,230 @@
+// lib/perf/c_pso_family_cluster.hexa — CN-14 PSB-2 sketch 즉시 채택 (만점 15/15)
+//
+// 닮은 PSO batch 컴파일 — 8축 중 6+축 같으면 family.
+// 효과: D4 마법사 fireball/critical/combat (일부 축만 다름) → family 단위 batch.
+// 무기: columnar (PSO axis matrix) + cluster.
+//
+// own 1 + own 2 mandate.
+
+use "./r0_common"
+
+let PSO_FAMILY_DIR = GAMEBOX_HOME + "/persist/pso_family"
+let PSO_TABLE = PSO_FAMILY_DIR + "/pso_axis.tsv"
+
+fn family_dir() -> str { return PSO_FAMILY_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + PSO_FAMILY_DIR + "'")
+}
+
+// ─── PSO axis 등록 ───
+fn register_pso(pso_id: int, vertex: int, fragment: int, compute: int, depth: int, blend: int, raster: int, primitive: int, resource: int) -> void {
+    ensure_dir()
+    let line = to_string(pso_id) + "\t" + to_string(vertex) + "\t" + to_string(fragment) + "\t" + to_string(compute) + "\t" + to_string(depth) + "\t" + to_string(blend) + "\t" + to_string(raster) + "\t" + to_string(primitive) + "\t" + to_string(resource)
+    let tmp = PSO_TABLE + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PSO_TABLE + "' && rm -f '" + tmp + "'")
+    r0_emit("pso_registered", "\"pso_id\":" + to_string(pso_id) + ",\"vertex\":" + to_string(vertex))
+}
+
+// ─── 두 PSO axis array similarity (8축 중 같은 축 수) ───
+fn similarity(pso1: array, pso2: array) -> int {
+    let same = 0
+    let i = 0
+    while i < len(pso1) {
+        if i < len(pso2) {
+            if pso1[i] == pso2[i] { same = same + 1 }
+        }
+        i = i + 1
+    }
+    return same
+}
+
+// ─── PSO 한 줄 → axis array ───
+fn parse_pso_line(line: str) -> array {
+    let parts = line.split("\t")
+    if len(parts) < 9 { return [] }
+    return [to_int(parts[1]), to_int(parts[2]), to_int(parts[3]), to_int(parts[4]), to_int(parts[5]), to_int(parts[6]), to_int(parts[7]), to_int(parts[8])]
+}
+
+// ─── 모든 PSO 의 (id, axes) 로드 ───
+fn load_all_psos() -> array {
+    let exists = exec("test -f '" + PSO_TABLE + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+    let n = to_int(exec("wc -l < '" + PSO_TABLE + "' | tr -d ' '").trim())
+    let i = 1
+    let result = []
+    while i <= n {
+        let line = exec("sed -n '" + to_string(i) + "p' '" + PSO_TABLE + "'")
+        let parts = line.split("\t")
+        if len(parts) >= 9 {
+            let pso_id = to_int(parts[0])
+            let axes = parse_pso_line(line)
+            result = result + [[pso_id, axes]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ─── family clustering ───
+//   threshold 이상 같은 축 수 면 같은 family
+//   returns array of [family_id, [pso_ids]]
+fn cluster_psos(threshold: int) -> array {
+    let psos = load_all_psos()
+    let n = len(psos)
+    if n == 0 { return [] }
+
+    // assigned[i] = family_id for psos[i]
+    let assigned = []
+    let i = 0
+    while i < n {
+        assigned = assigned + [-1]
+        i = i + 1
+    }
+
+    let next_fid = 1
+    let families = []  // array of [fid, [pso_ids]]
+
+    let j = 0
+    while j < n {
+        if assigned[j] == -1 {
+            let fid = next_fid
+            next_fid = next_fid + 1
+            assigned[j] = fid
+            let members = [psos[j][0]]
+            // 다른 모든 psos 와 비교
+            let k = j + 1
+            while k < n {
+                if assigned[k] == -1 {
+                    let sim = similarity(psos[j][1], psos[k][1])
+                    if sim >= threshold {
+                        assigned[k] = fid
+                        members = members + [psos[k][0]]
+                    }
+                }
+                k = k + 1
+            }
+            families = families + [[fid, members]]
+        }
+        j = j + 1
+    }
+    r0_emit("family_cluster", "\"threshold\":" + to_string(threshold) + ",\"family_count\":" + to_string(len(families)))
+    return families
+}
+
+// ─── batch plan ───
+fn create_batch_plan(threshold: int) -> str {
+    let families = cluster_psos(threshold)
+    let plan = "{\"threshold\":" + to_string(threshold) + ",\"family_count\":" + to_string(len(families)) + ",\"families\":["
+    let i = 0
+    while i < len(families) {
+        if i > 0 { plan = plan + "," }
+        plan = plan + "{\"fid\":" + to_string(families[i][0]) + ",\"size\":" + to_string(len(families[i][1])) + "}"
+        i = i + 1
+    }
+    plan = plan + "]}"
+    r0_emit("batch_plan", "\"families\":" + to_string(len(families)))
+    return plan
+}
+
+// ─── savings ratio ───
+fn compile_savings(total_psos: int, num_families: int) -> int {
+    if total_psos <= 0 { return 0 }
+    let saved = total_psos - num_families
+    return saved * 1000 / total_psos
+}
+
+// ─── stats ───
+fn family_stats() -> array {
+    let exists = exec("test -f '" + PSO_TABLE + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0, 0, 0] }
+    let total = to_int(exec("wc -l < '" + PSO_TABLE + "' | tr -d ' '").trim())
+    let families = cluster_psos(6)
+    let max_size = 0
+    let i = 0
+    while i < len(families) {
+        let sz = len(families[i][1])
+        if sz > max_size { max_size = sz }
+        i = i + 1
+    }
+    let savings = compile_savings(total, len(families))
+    return [total, len(families), max_size, savings]
+}
+
+fn cleanup_pso_family() -> void {
+    let _ = exec("rm -rf '" + PSO_FAMILY_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "psofamily-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pso_family()
+
+    register_pso(1, 100, 200, 0, 1, 1, 1, 4, 1)
+    register_pso(2, 100, 200, 0, 1, 2, 1, 4, 1)
+    register_pso(3, 100, 200, 0, 1, 1, 2, 4, 1)
+    register_pso(4, 500, 600, 0, 1, 1, 1, 4, 1)
+    register_pso(5, 500, 600, 0, 1, 1, 1, 4, 1)
+
+    let sim_12 = similarity([100,200,0,1,1,1,4,1], [100,200,0,1,2,1,4,1])
+    if sim_12 != 7 { panic("c_pso_family_cluster FAIL [sim 1,2] expected=7 got=" + to_string(sim_12)) }
+    let sim_14 = similarity([100,200,0,1,1,1,4,1], [500,600,0,1,1,1,4,1])
+    if sim_14 != 6 { panic("c_pso_family_cluster FAIL [sim 1,4] expected=6 got=" + to_string(sim_14)) }
+    let sim_45 = similarity([500,600,0,1,1,1,4,1], [500,600,0,1,1,1,4,1])
+    if sim_45 != 8 { panic("c_pso_family_cluster FAIL [sim 4,5] expected=8 got=" + to_string(sim_45)) }
+
+    let families_6 = cluster_psos(6)
+    // threshold 6 — 모두 한 family (greedy: 1 와 2/3/4/5 모두 sim>=6)
+    let total_members = 0
+    let i = 0
+    while i < len(families_6) {
+        total_members = total_members + len(families_6[i][1])
+        i = i + 1
+    }
+    if total_members != 5 {
+        panic("c_pso_family_cluster FAIL [families_6 total members] expected=5 got=" + to_string(total_members))
+    }
+
+    let families_8 = cluster_psos(8)
+    // threshold 8 — 4 와 5 만 같은 family, 나머지 singleton
+    if len(families_8) != 4 {
+        panic("c_pso_family_cluster FAIL [families_8 count] expected=4 got=" + to_string(len(families_8)))
+    }
+
+    let plan = create_batch_plan(6)
+    if !plan.contains("family_count") {
+        panic("c_pso_family_cluster FAIL [plan] expected contains family_count, got=" + plan)
+    }
+
+    let savings = compile_savings(5, 2)
+    if savings != 600 { panic("c_pso_family_cluster FAIL [savings 5,2] expected=600 got=" + to_string(savings)) }
+
+    let stats = family_stats()
+    if stats[0] != 5 { panic("c_pso_family_cluster FAIL [stats total] expected=5 got=" + to_string(stats[0])) }
+
+    r0_emit("stats", "\"total\":" + to_string(stats[0]) + ",\"families\":" + to_string(stats[1]) + ",\"max_size\":" + to_string(stats[2]) + ",\"savings\":" + to_string(stats[3]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_pso_family_cluster FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    cleanup_pso_family()
+
+    println("  ✅ c_pso_family_cluster self_test PASS (5 PSOs, " + to_string(stats[1]) + " families threshold 6, savings " + to_string(stats[3]) + "‰, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = family_stats()
+            println("total=" + to_string(s[0]) + " families=" + to_string(s[1]) + " max_size=" + to_string(s[2]) + " savings=" + to_string(s[3]) + "‰")
+            return
+        }
+        if sub == "cleanup" { cleanup_pso_family(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_pso_family_cluster.hexa { self-test | stats | cleanup }")
+}

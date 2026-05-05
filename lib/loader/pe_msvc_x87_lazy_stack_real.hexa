@@ -1,0 +1,626 @@
+// lib/loader/pe_msvc_x87_lazy_stack_real.hexa
+// — Box86-style x87 lazy stack barrier 패턴 추적기 (research-D 참조)
+//
+// MSVC i386 native code 의 x87 FPU 는 stack-machine (ST(0)..ST(7)) 모델을
+// 갖는다. 매 instruction 마다 8 slot stack 의 일관성을 sync 하면 비용이 매우
+// 크기 때문에 Box86 의 dynarec 가 사용하는 "lazy stack" 전략을 reference 한다:
+//
+//   - x87 register state 는 매 inst 마다 sync 안 함
+//   - basic block 끝 (barrier) 또는 stack overflow 위험 시점에만 sync
+//   - control word 변경 / FP exception 발생 시 강제 commit
+//
+// 본 module 은 어디까지나 "추적/관측" 전용 — 실 lazy stack 은 helper.mm
+// IPC kind=12 (FPU) 가 native side 에서 처리. hexa 는 record API 만 제공.
+//
+// own 1 enforcement: Box86 / Wine / CrossOver / GPTK / Whisky / QEMU / Bochs
+//                    source lift 0 줄. Intel SDM Vol 1 §8 (x87 FPU) +
+//                    public "Box86 dynarec lazy stack" 알고리즘 reference 만.
+//                    helper.mm IPC kind=12 (FPU) 의 native bridge 에 dispatch
+//                    하지 않고 hexa pure 추적기로 동작 (research-D 한정).
+//                    타사 wine wrapper 추천/언급 X.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic.
+//
+// persist schema (TSV 5 종):
+//   x87_inst.tsv         : inst_id<int>     \t opcode_byte<str> \t mnemonic<str>
+//                          \t stack_op_kind<int>
+//   lazy_state.tsv       : state_id<int>    \t st_top_value<int> \t lazy_pending_ops<int>
+//                          \t sync_mode<int>
+//   barrier_sync.tsv     : sync_id<int>     \t barrier_kind<int> \t before_top<int>
+//                          \t after_top<int> \t ops_committed<int>
+//   overflow_event.tsv   : overflow_id<int> \t st_top_value<int> \t attempted_push<int>
+//   control_word.tsv     : cw_id<int>       \t before_value<str> \t after_value<str>
+//                          \t change_kind<int>
+//
+// stack_op_kind code (x87_inst):
+//   0 = push                    (FLD / FILD / FLDZ / FLD1 / FLDPI ...)
+//   1 = pop                     (FSTP / FISTP / FCOMP / FCOMPP / FFREE+FINCSTP)
+//   2 = load                    (FLD reg-only — top 변동 없는 변형 추적용)
+//   3 = store                   (FST / FIST — pop 없이 store)
+//   4 = arith                   (FADD / FSUB / FMUL / FDIV / FCHS / FABS / FSQRT)
+//   5 = cmp                     (FCOM / FCOMI / FUCOM / FTST)
+//
+// sync_mode code (lazy_state):
+//   0 = eager                   (매 inst 마다 commit — lazy 비활성)
+//   1 = lazy                    (barrier 까지 commit 보류 — Box86 default)
+//   2 = mixed                   (대부분 lazy, control_word 등 일부만 eager)
+//
+// barrier_kind code (barrier_sync):
+//   0 = block_end               (basic block boundary — JMP/JCC/CALL/RET)
+//   1 = overflow                (stack 8 slot 한계 — push 전 강제 sync)
+//   2 = control_word_change     (FLDCW / FNSTCW — precision/rounding 변경)
+//   3 = fp_exception            (FE_INVALID / FE_DIVBYZERO / FE_OVERFLOW)
+//
+// change_kind code (control_word):
+//   0 = precision               (PC field — 24/53/64 bit)
+//   1 = rounding                (RC field — nearest/down/up/zero)
+//   2 = exception_mask          (PM/UM/OM/ZM/DM/IM bit)
+//
+// Hexa 예약어 회피: type/mod/handle/resume 단독 identifier 금지 → kind / k /
+//                   stack_op_kind / barrier_kind / change_kind / sync_mode.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmxls_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_x87_lazy_stack_real"
+}
+
+fn pmxls_x87_inst_path() -> str {
+    return pmxls_dir() + "/x87_inst.tsv"
+}
+
+fn pmxls_lazy_state_path() -> str {
+    return pmxls_dir() + "/lazy_state.tsv"
+}
+
+fn pmxls_barrier_sync_path() -> str {
+    return pmxls_dir() + "/barrier_sync.tsv"
+}
+
+fn pmxls_overflow_event_path() -> str {
+    return pmxls_dir() + "/overflow_event.tsv"
+}
+
+fn pmxls_control_word_path() -> str {
+    return pmxls_dir() + "/control_word.tsv"
+}
+
+fn pmxls_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmxls_dir() + "'")
+}
+
+fn cleanup_pmxls() -> void {
+    pmxls_ensure_dir()
+    let _ = exec("rm -f '" + pmxls_x87_inst_path()
+        + "' '" + pmxls_lazy_state_path()
+        + "' '" + pmxls_barrier_sync_path()
+        + "' '" + pmxls_overflow_event_path()
+        + "' '" + pmxls_control_word_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmxls_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmxls_append_row(path: str, row: str) -> void {
+    pmxls_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmxls_count_rows(path: str, min_fields: int) -> int {
+    let t = pmxls_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_x87_inst ───
+//   stack_op_kind: 0=push 1=pop 2=load 3=store 4=arith 5=cmp
+fn record_x87_inst(inst_id: int, opcode_byte: str, mnemonic: str, stack_op_kind: int) -> void {
+    if inst_id <= 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_x87_inst] expected=inst_id>0 got=" + to_string(inst_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_x87_inst] expected=opcode_byte!=empty got=empty")
+    }
+    if mnemonic == "" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_x87_inst] expected=mnemonic!=empty got=empty")
+    }
+    if stack_op_kind < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_x87_inst] expected=stack_op_kind>=0 got=" + to_string(stack_op_kind))
+    }
+    if stack_op_kind > 5 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_x87_inst] expected=stack_op_kind<=5 got=" + to_string(stack_op_kind))
+    }
+    let row = to_string(inst_id) + "\t" + opcode_byte + "\t" + mnemonic
+        + "\t" + to_string(stack_op_kind) + "\n"
+    pmxls_append_row(pmxls_x87_inst_path(), row)
+}
+
+// ─── record_lazy_state ───
+//   sync_mode: 0=eager 1=lazy 2=mixed
+fn record_lazy_state(state_id: int, st_top_value: int, lazy_pending_ops: int, sync_mode: int) -> void {
+    if state_id <= 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_lazy_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if st_top_value < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_lazy_state] expected=st_top_value>=0 got=" + to_string(st_top_value))
+    }
+    if st_top_value > 7 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_lazy_state] expected=st_top_value<=7 got=" + to_string(st_top_value))
+    }
+    if lazy_pending_ops < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_lazy_state] expected=lazy_pending_ops>=0 got=" + to_string(lazy_pending_ops))
+    }
+    if sync_mode < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_lazy_state] expected=sync_mode>=0 got=" + to_string(sync_mode))
+    }
+    if sync_mode > 2 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_lazy_state] expected=sync_mode<=2 got=" + to_string(sync_mode))
+    }
+    let row = to_string(state_id) + "\t" + to_string(st_top_value) + "\t"
+        + to_string(lazy_pending_ops) + "\t" + to_string(sync_mode) + "\n"
+    pmxls_append_row(pmxls_lazy_state_path(), row)
+}
+
+// ─── record_barrier_sync ───
+//   barrier_kind: 0=block_end 1=overflow 2=control_word_change 3=fp_exception
+fn record_barrier_sync(sync_id: int, barrier_kind: int, before_top: int, after_top: int, ops_committed: int) -> void {
+    if sync_id <= 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=sync_id>0 got=" + to_string(sync_id))
+    }
+    if barrier_kind < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=barrier_kind>=0 got=" + to_string(barrier_kind))
+    }
+    if barrier_kind > 3 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=barrier_kind<=3 got=" + to_string(barrier_kind))
+    }
+    if before_top < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=before_top>=0 got=" + to_string(before_top))
+    }
+    if before_top > 7 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=before_top<=7 got=" + to_string(before_top))
+    }
+    if after_top < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=after_top>=0 got=" + to_string(after_top))
+    }
+    if after_top > 7 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=after_top<=7 got=" + to_string(after_top))
+    }
+    if ops_committed < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_barrier_sync] expected=ops_committed>=0 got=" + to_string(ops_committed))
+    }
+    let row = to_string(sync_id) + "\t" + to_string(barrier_kind) + "\t"
+        + to_string(before_top) + "\t" + to_string(after_top) + "\t"
+        + to_string(ops_committed) + "\n"
+    pmxls_append_row(pmxls_barrier_sync_path(), row)
+}
+
+// ─── record_overflow_event ───
+fn record_overflow_event(overflow_id: int, st_top_value: int, attempted_push: int) -> void {
+    if overflow_id <= 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_overflow_event] expected=overflow_id>0 got=" + to_string(overflow_id))
+    }
+    if st_top_value < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_overflow_event] expected=st_top_value>=0 got=" + to_string(st_top_value))
+    }
+    if st_top_value > 7 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_overflow_event] expected=st_top_value<=7 got=" + to_string(st_top_value))
+    }
+    if attempted_push < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_overflow_event] expected=attempted_push>=0 got=" + to_string(attempted_push))
+    }
+    if attempted_push > 1 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_overflow_event] expected=attempted_push<=1 got=" + to_string(attempted_push))
+    }
+    let row = to_string(overflow_id) + "\t" + to_string(st_top_value) + "\t"
+        + to_string(attempted_push) + "\n"
+    pmxls_append_row(pmxls_overflow_event_path(), row)
+}
+
+// ─── record_control_word ───
+//   change_kind: 0=precision 1=rounding 2=exception_mask
+fn record_control_word(cw_id: int, before_value: str, after_value: str, change_kind: int) -> void {
+    if cw_id <= 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_control_word] expected=cw_id>0 got=" + to_string(cw_id))
+    }
+    if before_value == "" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_control_word] expected=before_value!=empty got=empty")
+    }
+    if after_value == "" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_control_word] expected=after_value!=empty got=empty")
+    }
+    if change_kind < 0 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_control_word] expected=change_kind>=0 got=" + to_string(change_kind))
+    }
+    if change_kind > 2 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [record_control_word] expected=change_kind<=2 got=" + to_string(change_kind))
+    }
+    let row = to_string(cw_id) + "\t" + before_value + "\t" + after_value
+        + "\t" + to_string(change_kind) + "\n"
+    pmxls_append_row(pmxls_control_word_path(), row)
+}
+
+// ─── statistics ───
+fn x87_inst_count() -> int {
+    return pmxls_count_rows(pmxls_x87_inst_path(), 4)
+}
+
+fn lazy_state_count() -> int {
+    return pmxls_count_rows(pmxls_lazy_state_path(), 4)
+}
+
+fn barrier_sync_count() -> int {
+    return pmxls_count_rows(pmxls_barrier_sync_path(), 5)
+}
+
+fn overflow_count() -> int {
+    return pmxls_count_rows(pmxls_overflow_event_path(), 3)
+}
+
+fn control_word_count() -> int {
+    return pmxls_count_rows(pmxls_control_word_path(), 4)
+}
+
+fn pmxls_stats() -> array {
+    let mut out = []
+    out.push(x87_inst_count())
+    out.push(lazy_state_count())
+    out.push(barrier_sync_count())
+    out.push(overflow_count())
+    out.push(control_word_count())
+    return out
+}
+
+// ─── name helpers ───
+fn stack_op_kind_name(k: int) -> str {
+    if k == 0 { return "push" }
+    if k == 1 { return "pop" }
+    if k == 2 { return "load" }
+    if k == 3 { return "store" }
+    if k == 4 { return "arith" }
+    if k == 5 { return "cmp" }
+    panic("pe_msvc_x87_lazy_stack_real FAIL [stack_op_kind_name] expected=0..5 got=" + to_string(k))
+}
+
+fn sync_mode_name(k: int) -> str {
+    if k == 0 { return "eager" }
+    if k == 1 { return "lazy" }
+    if k == 2 { return "mixed" }
+    panic("pe_msvc_x87_lazy_stack_real FAIL [sync_mode_name] expected=0..2 got=" + to_string(k))
+}
+
+fn barrier_kind_name(k: int) -> str {
+    if k == 0 { return "block_end" }
+    if k == 1 { return "overflow" }
+    if k == 2 { return "control_word_change" }
+    if k == 3 { return "fp_exception" }
+    panic("pe_msvc_x87_lazy_stack_real FAIL [barrier_kind_name] expected=0..3 got=" + to_string(k))
+}
+
+fn change_kind_name(k: int) -> str {
+    if k == 0 { return "precision" }
+    if k == 1 { return "rounding" }
+    if k == 2 { return "exception_mask" }
+    panic("pe_msvc_x87_lazy_stack_real FAIL [change_kind_name] expected=0..2 got=" + to_string(k))
+}
+
+// ─── self_test (≥ 12 record + r0_emit ≥ 14) ───
+fn self_test() -> void {
+    let sid = "pmxls-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmxls()
+
+    // ─── 1. x87_inst × 6 (각 stack_op_kind 0..5) ───
+    //    push: FLD m32 (D9 /0), pop: FSTP m32 (D9 /3),
+    //    load: FLD ST(i) (D9 C0+i), store: FST m32 (D9 /2),
+    //    arith: FADDP (DE C1), cmp: FCOMI (DB F0+i)
+    record_x87_inst(1, "D9", "FLD m32", 0)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_x87_inst",
+        "\"inst_id\":1,\"opcode_byte\":\"D9\",\"mnemonic\":\"FLD m32\""
+        + ",\"stack_op_kind\":0,\"name\":\"" + stack_op_kind_name(0) + "\"")
+
+    record_x87_inst(2, "D9", "FSTP m32", 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_x87_inst",
+        "\"inst_id\":2,\"opcode_byte\":\"D9\",\"mnemonic\":\"FSTP m32\""
+        + ",\"stack_op_kind\":1,\"name\":\"" + stack_op_kind_name(1) + "\"")
+
+    record_x87_inst(3, "D9", "FLD ST(0)", 2)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_x87_inst",
+        "\"inst_id\":3,\"opcode_byte\":\"D9\",\"mnemonic\":\"FLD ST(0)\""
+        + ",\"stack_op_kind\":2,\"name\":\"" + stack_op_kind_name(2) + "\"")
+
+    record_x87_inst(4, "D9", "FST m32", 3)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_x87_inst",
+        "\"inst_id\":4,\"opcode_byte\":\"D9\",\"mnemonic\":\"FST m32\""
+        + ",\"stack_op_kind\":3,\"name\":\"" + stack_op_kind_name(3) + "\"")
+
+    record_x87_inst(5, "DE", "FADDP", 4)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_x87_inst",
+        "\"inst_id\":5,\"opcode_byte\":\"DE\",\"mnemonic\":\"FADDP\""
+        + ",\"stack_op_kind\":4,\"name\":\"" + stack_op_kind_name(4) + "\"")
+
+    record_x87_inst(6, "DB", "FCOMI", 5)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_x87_inst",
+        "\"inst_id\":6,\"opcode_byte\":\"DB\",\"mnemonic\":\"FCOMI\""
+        + ",\"stack_op_kind\":5,\"name\":\"" + stack_op_kind_name(5) + "\"")
+
+    // ─── 2. lazy_state × 4 (sync_mode 변화 — eager / lazy / mixed / lazy) ───
+    record_lazy_state(1, 7, 0, 0)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_lazy_state",
+        "\"state_id\":1,\"st_top_value\":7,\"lazy_pending_ops\":0,\"sync_mode\":0"
+        + ",\"name\":\"" + sync_mode_name(0) + "\"")
+
+    record_lazy_state(2, 5, 3, 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_lazy_state",
+        "\"state_id\":2,\"st_top_value\":5,\"lazy_pending_ops\":3,\"sync_mode\":1"
+        + ",\"name\":\"" + sync_mode_name(1) + "\"")
+
+    record_lazy_state(3, 4, 2, 2)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_lazy_state",
+        "\"state_id\":3,\"st_top_value\":4,\"lazy_pending_ops\":2,\"sync_mode\":2"
+        + ",\"name\":\"" + sync_mode_name(2) + "\"")
+
+    record_lazy_state(4, 6, 5, 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_lazy_state",
+        "\"state_id\":4,\"st_top_value\":6,\"lazy_pending_ops\":5,\"sync_mode\":1"
+        + ",\"name\":\"" + sync_mode_name(1) + "\"")
+
+    // ─── 3. barrier_sync × 4 (각 barrier_kind 0..3) ───
+    record_barrier_sync(1, 0, 5, 5, 3)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_barrier_sync",
+        "\"sync_id\":1,\"barrier_kind\":0,\"before_top\":5,\"after_top\":5,\"ops_committed\":3"
+        + ",\"name\":\"" + barrier_kind_name(0) + "\"")
+
+    record_barrier_sync(2, 1, 0, 7, 8)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_barrier_sync",
+        "\"sync_id\":2,\"barrier_kind\":1,\"before_top\":0,\"after_top\":7,\"ops_committed\":8"
+        + ",\"name\":\"" + barrier_kind_name(1) + "\"")
+
+    record_barrier_sync(3, 2, 4, 4, 2)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_barrier_sync",
+        "\"sync_id\":3,\"barrier_kind\":2,\"before_top\":4,\"after_top\":4,\"ops_committed\":2"
+        + ",\"name\":\"" + barrier_kind_name(2) + "\"")
+
+    record_barrier_sync(4, 3, 6, 6, 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_barrier_sync",
+        "\"sync_id\":4,\"barrier_kind\":3,\"before_top\":6,\"after_top\":6,\"ops_committed\":1"
+        + ",\"name\":\"" + barrier_kind_name(3) + "\"")
+
+    // ─── 4. overflow_event × 2 (st_top=0 일 때 push 시도 = 8 slot full) ───
+    record_overflow_event(1, 0, 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_overflow_event",
+        "\"overflow_id\":1,\"st_top_value\":0,\"attempted_push\":1"
+        + ",\"target\":\"FLD on full stack\"")
+
+    record_overflow_event(2, 0, 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_overflow_event",
+        "\"overflow_id\":2,\"st_top_value\":0,\"attempted_push\":1"
+        + ",\"target\":\"FLD on full stack second\"")
+
+    // ─── 5. control_word × 3 (precision / rounding / exception_mask) ───
+    //    MSVC default cw = 0x027F (PC=2 53bit / RC=0 nearest / mask=all)
+    //    D2R / Battle.net 류 _control87 호출은 PC 24bit (0x007F) 또는
+    //    rounding round_down (0x0CFF) 또는 mask change (0x0272) 변경 가능.
+    record_control_word(1, "0x027F", "0x007F", 0)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_control_word",
+        "\"cw_id\":1,\"before_value\":\"0x027F\",\"after_value\":\"0x007F\",\"change_kind\":0"
+        + ",\"name\":\"" + change_kind_name(0) + "\"")
+
+    record_control_word(2, "0x027F", "0x0CFF", 1)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_control_word",
+        "\"cw_id\":2,\"before_value\":\"0x027F\",\"after_value\":\"0x0CFF\",\"change_kind\":1"
+        + ",\"name\":\"" + change_kind_name(1) + "\"")
+
+    record_control_word(3, "0x027F", "0x0272", 2)
+    r0_emit("pe_msvc_x87_lazy_stack_real_record_control_word",
+        "\"cw_id\":3,\"before_value\":\"0x027F\",\"after_value\":\"0x0272\",\"change_kind\":2"
+        + ",\"name\":\"" + change_kind_name(2) + "\"")
+
+    // ─── assertions: count ───
+    let xic = x87_inst_count()
+    if xic != 6 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [x87_inst_count] expected=6 got=" + to_string(xic))
+    }
+    let lsc = lazy_state_count()
+    if lsc != 4 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [lazy_state_count] expected=4 got=" + to_string(lsc))
+    }
+    let bsc = barrier_sync_count()
+    if bsc != 4 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [barrier_sync_count] expected=4 got=" + to_string(bsc))
+    }
+    let oc = overflow_count()
+    if oc != 2 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [overflow_count] expected=2 got=" + to_string(oc))
+    }
+    let cwc = control_word_count()
+    if cwc != 3 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [control_word_count] expected=3 got=" + to_string(cwc))
+    }
+
+    // ─── name helper sanity ───
+    if stack_op_kind_name(0) != "push" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stack_op_kind_name(0)] expected=push got=" + stack_op_kind_name(0))
+    }
+    if stack_op_kind_name(5) != "cmp" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stack_op_kind_name(5)] expected=cmp got=" + stack_op_kind_name(5))
+    }
+    if sync_mode_name(0) != "eager" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [sync_mode_name(0)] expected=eager got=" + sync_mode_name(0))
+    }
+    if sync_mode_name(1) != "lazy" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [sync_mode_name(1)] expected=lazy got=" + sync_mode_name(1))
+    }
+    if sync_mode_name(2) != "mixed" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [sync_mode_name(2)] expected=mixed got=" + sync_mode_name(2))
+    }
+    if barrier_kind_name(0) != "block_end" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [barrier_kind_name(0)] expected=block_end got=" + barrier_kind_name(0))
+    }
+    if barrier_kind_name(1) != "overflow" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [barrier_kind_name(1)] expected=overflow got=" + barrier_kind_name(1))
+    }
+    if barrier_kind_name(2) != "control_word_change" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [barrier_kind_name(2)] expected=control_word_change got=" + barrier_kind_name(2))
+    }
+    if barrier_kind_name(3) != "fp_exception" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [barrier_kind_name(3)] expected=fp_exception got=" + barrier_kind_name(3))
+    }
+    if change_kind_name(0) != "precision" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [change_kind_name(0)] expected=precision got=" + change_kind_name(0))
+    }
+    if change_kind_name(1) != "rounding" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [change_kind_name(1)] expected=rounding got=" + change_kind_name(1))
+    }
+    if change_kind_name(2) != "exception_mask" {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [change_kind_name(2)] expected=exception_mask got=" + change_kind_name(2))
+    }
+
+    // ─── stats sanity ───
+    let s = pmxls_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stats x87_inst] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stats lazy_state] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stats barrier_sync] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stats overflow] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [stats control_word] expected=3 got=" + to_string(s[4]))
+    }
+
+    // ─── stats / summary / kpi r0_emit ───
+    //    19 record emit + 3 summary = 22 (≥ 14).
+    r0_emit("pe_msvc_x87_lazy_stack_real_stats",
+        "\"x87_inst_count\":" + to_string(s[0])
+        + ",\"lazy_state_count\":" + to_string(s[1])
+        + ",\"barrier_sync_count\":" + to_string(s[2])
+        + ",\"overflow_count\":" + to_string(s[3])
+        + ",\"control_word_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_x87_lazy_stack_real_summary",
+        "\"flow\":\"x87_inst -> lazy_state(eager|lazy|mixed) -> barrier_sync(block_end|overflow|cw_change|fp_exception) -> overflow_event + control_word\""
+        + ",\"total_records\":19")
+
+    r0_emit("pe_msvc_x87_lazy_stack_real_kpi",
+        "\"stack_op_kinds_covered\":6,\"sync_modes_covered\":3,\"barrier_kinds_covered\":4"
+        + ",\"change_kinds_covered\":3,\"overflow_events\":2"
+        + ",\"box86_lazy_strategy\":\"observed_only_no_native_dispatch\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_x87_lazy_stack_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmxls()
+    let s2 = pmxls_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_x87_lazy_stack_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_x87_lazy_stack_real self_test PASS (x87_inst="
+        + to_string(s[0]) + ", lazy_state=" + to_string(s[1])
+        + ", barrier_sync=" + to_string(s[2]) + ", overflow=" + to_string(s[3])
+        + ", control_word=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmxls_stats()
+            println("x87_inst_count\t" + to_string(s[0]))
+            println("lazy_state_count\t" + to_string(s[1]))
+            println("barrier_sync_count\t" + to_string(s[2]))
+            println("overflow_count\t" + to_string(s[3]))
+            println("control_word_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "stack-op-kind-name" {
+            if len(a) >= 4 {
+                println("stack_op_kind_name\t" + stack_op_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_x87_lazy_stack_real.hexa stack-op-kind-name <k>")
+            return
+        }
+        if sub == "sync-mode-name" {
+            if len(a) >= 4 {
+                println("sync_mode_name\t" + sync_mode_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_x87_lazy_stack_real.hexa sync-mode-name <k>")
+            return
+        }
+        if sub == "barrier-kind-name" {
+            if len(a) >= 4 {
+                println("barrier_kind_name\t" + barrier_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_x87_lazy_stack_real.hexa barrier-kind-name <k>")
+            return
+        }
+        if sub == "change-kind-name" {
+            if len(a) >= 4 {
+                println("change_kind_name\t" + change_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_x87_lazy_stack_real.hexa change-kind-name <k>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmxls()
+            println("cleaned: " + pmxls_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmxls_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_x87_lazy_stack_real.hexa { self-test | stats | stack-op-kind-name <k> | sync-mode-name <k> | barrier-kind-name <k> | change-kind-name <k> | cleanup | dir }")
+}

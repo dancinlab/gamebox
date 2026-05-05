@@ -1,0 +1,447 @@
+// lib/loader/pe_ntdll_map_section_real.hexa — NTDLL NtCreateSection / NtMapViewOfSection 실 호출 추적
+//
+// NTDLL section object lifecycle → POSIX mmap bridge:
+//   NtCreateSection(out SectionHandle, DesiredAccess, OBJECT_ATTRIBUTES*, MaxSize, PageProtection, AllocAttrs, FileHandle)
+//     → shm_open() + ftruncate()  또는 anonymous mmap-backed object
+//        (FileHandle != NULL → file-backed; SEC_IMAGE → PE binary 매핑; FileHandle == NULL → pagefile/anonymous)
+//   NtMapViewOfSection(SectionHandle, ProcessHandle, *BaseAddress, ZeroBits, CommitSize, *SectionOffset,
+//                      *ViewSize, InheritDisposition, AllocationType, Win32Protect)
+//     → mmap(NULL, ViewSize, prot, MAP_SHARED, fd, offset)
+//        SEC_IMAGE 경우 — R2 pe_section_mapper_real cross-ref (PE header 파싱 후 각 section 별도 매핑)
+//   NtUnmapViewOfSection(ProcessHandle, BaseAddress)  → munmap(addr, len)
+//   NtQuerySection(SectionHandle, InfoClass, *Info, Length, *ResultLen)
+//     → fstat(fd) + 보관된 metadata 조회 (size/protection/attrs)
+//   NtExtendSection(SectionHandle, *NewMaxSize)       → ftruncate(fd, new_size)
+//
+// section_kind:
+//   image           — SEC_IMAGE (PE binary 매핑) — pe_section_mapper_real.hexa cross-ref
+//   data_file       — file-backed section (FileHandle 있음, SEC_IMAGE X)
+//   pagefile_backed — FileHandle == NULL, SEC_COMMIT (anonymous shared)
+//   large_pages     — SEC_LARGE_PAGES (huge page backing)
+//
+// own1: NTDLL spec + Apple mmap(2). Wine ntdll/virtual.c 인용 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NT section API call tracker — 실 NtCreateSection / mmap() 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = NtCreateSection
+//   2 = NtMapViewOfSection
+//   3 = NtUnmapViewOfSection
+//   4 = NtQuerySection
+//   5 = NtExtendSection
+//
+// section_kind code:
+//   1 = image
+//   2 = data_file
+//   3 = pagefile_backed
+//   4 = large_pages
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t section_kind<int> \t size_kb<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnms_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_map_section_real"
+}
+
+fn pnms_ops_path() -> str {
+    return pnms_dir() + "/ops.tsv"
+}
+
+fn pnms_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnms_dir() + "'")
+}
+
+fn cleanup_pnms() -> void {
+    pnms_ensure_dir()
+    let _ = exec("rm -f '" + pnms_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnms_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnms_append_row(path: str, row: str) -> void {
+    pnms_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: section op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, section_kind: int, size_kb: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_map_section_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ntdll_map_section_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 5 {
+        panic("pe_ntdll_map_section_real FAIL [record_op] expected=op_kind<=5 got=" + to_string(op_kind))
+    }
+    if section_kind < 1 {
+        panic("pe_ntdll_map_section_real FAIL [record_op] expected=section_kind>=1 got=" + to_string(section_kind))
+    }
+    if section_kind > 4 {
+        panic("pe_ntdll_map_section_real FAIL [record_op] expected=section_kind<=4 got=" + to_string(section_kind))
+    }
+    if size_kb < 0 {
+        panic("pe_ntdll_map_section_real FAIL [record_op] expected=size_kb>=0 got=" + to_string(size_kb))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(section_kind) + "\t" + to_string(size_kb) + "\n"
+    pnms_append_row(pnms_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pnms_read_table(pnms_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pnms_read_table(pnms_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_kb: 전체 size_kb 합 ───
+fn total_size_kb() -> int {
+    let t = pnms_read_table(pnms_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut total = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                total = total + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ─── count_by_section_kind: 특정 section_kind 의 op 수 ───
+fn count_by_section_kind(kind: int) -> int {
+    let t = pnms_read_table(pnms_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── image_section_count: section_kind == 1 (image) op 수 ───
+fn image_section_count() -> int {
+    return count_by_section_kind(1)
+}
+
+// ─── op_size: 특정 op_id 의 size_kb (없으면 -1) ───
+fn op_size(op_id: int) -> int {
+    let t = pnms_read_table(pnms_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnms_stats: [op_count, image_section_count, count_by_op_kind(2), total_size_kb] ───
+fn pnms_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(image_section_count())
+    out.push(count_by_op_kind(2))
+    out.push(total_size_kb())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnms-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnms()
+
+    // 2. record 6 ops — covers ≥3 op_kinds (1,2,3,4) + ≥3 section_kinds (1,2,3)
+    //    NtCreateSection — image (PE binary 매핑, e.g. game.exe = 4096 KB)
+    record_op(140001, 1, 1, 4096)
+    r0_emit("pe_ntdll_map_section_real_record",
+        "\"op_id\":140001,\"op_kind\":1,\"section_kind\":1,\"size_kb\":4096,\"target\":\"NtCreateSection_image\"")
+
+    //    NtMapViewOfSection — image view (PE binary mmap, MAP_SHARED)
+    record_op(140002, 2, 1, 4096)
+    r0_emit("pe_ntdll_map_section_real_record",
+        "\"op_id\":140002,\"op_kind\":2,\"section_kind\":1,\"size_kb\":4096,\"target\":\"NtMapViewOfSection_image\"")
+
+    //    NtCreateSection — data_file (e.g. .mpq archive 매핑, 16 MB = 16384 KB)
+    record_op(140003, 1, 2, 16384)
+    r0_emit("pe_ntdll_map_section_real_record",
+        "\"op_id\":140003,\"op_kind\":1,\"section_kind\":2,\"size_kb\":16384,\"target\":\"NtCreateSection_data_file\"")
+
+    //    NtMapViewOfSection — data_file view
+    record_op(140004, 2, 2, 16384)
+    r0_emit("pe_ntdll_map_section_real_record",
+        "\"op_id\":140004,\"op_kind\":2,\"section_kind\":2,\"size_kb\":16384,\"target\":\"NtMapViewOfSection_data_file\"")
+
+    //    NtCreateSection — pagefile_backed (anonymous shared, 1 MB)
+    record_op(140005, 1, 3, 1024)
+    r0_emit("pe_ntdll_map_section_real_record",
+        "\"op_id\":140005,\"op_kind\":1,\"section_kind\":3,\"size_kb\":1024,\"target\":\"NtCreateSection_pagefile\"")
+
+    //    NtUnmapViewOfSection — image view 해제 (size_kb=0 — view 크기 추적 X)
+    record_op(140006, 3, 1, 0)
+    r0_emit("pe_ntdll_map_section_real_record",
+        "\"op_id\":140006,\"op_kind\":3,\"section_kind\":1,\"size_kb\":0,\"target\":\"NtUnmapViewOfSection_image\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_ntdll_map_section_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (3 op_kinds covered: 1,2,3)
+    let k1 = count_by_op_kind(1)
+    if k1 != 3 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_op_kind(1)] expected=3 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. count_by_section_kind sanity (3 section_kinds covered: 1,2,3)
+    let sk1 = count_by_section_kind(1)
+    if sk1 != 3 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_section_kind(1)] expected=3 got=" + to_string(sk1))
+    }
+    let sk2 = count_by_section_kind(2)
+    if sk2 != 2 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_section_kind(2)] expected=2 got=" + to_string(sk2))
+    }
+    let sk3 = count_by_section_kind(3)
+    if sk3 != 1 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_section_kind(3)] expected=1 got=" + to_string(sk3))
+    }
+    let sk4 = count_by_section_kind(4)
+    if sk4 != 0 {
+        panic("pe_ntdll_map_section_real FAIL [count_by_section_kind(4)] expected=0 got=" + to_string(sk4))
+    }
+
+    // 6. image_section_count == count_by_section_kind(1) == 3
+    let isc = image_section_count()
+    if isc != 3 {
+        panic("pe_ntdll_map_section_real FAIL [image_section_count] expected=3 got=" + to_string(isc))
+    }
+
+    // 7. total_size_kb = 4096+4096+16384+16384+1024+0 = 41984
+    let tsz = total_size_kb()
+    if tsz != 41984 {
+        panic("pe_ntdll_map_section_real FAIL [total_size_kb] expected=41984 got=" + to_string(tsz))
+    }
+
+    // 8. op_size sanity
+    let sz3 = op_size(140003)
+    if sz3 != 16384 {
+        panic("pe_ntdll_map_section_real FAIL [op_size(140003)] expected=16384 got=" + to_string(sz3))
+    }
+    let sz6 = op_size(140006)
+    if sz6 != 0 {
+        panic("pe_ntdll_map_section_real FAIL [op_size(140006)] expected=0 got=" + to_string(sz6))
+    }
+    let sz_miss = op_size(9999)
+    if sz_miss != -1 {
+        panic("pe_ntdll_map_section_real FAIL [op_size(9999)] expected=-1 got=" + to_string(sz_miss))
+    }
+
+    // 9. pnms_stats() = [6, 3, 2, 41984]
+    let s = pnms_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_map_section_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_ntdll_map_section_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_ntdll_map_section_real FAIL [stats image_section_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_ntdll_map_section_real FAIL [stats op_kind(2)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 41984 {
+        panic("pe_ntdll_map_section_real FAIL [stats total_size_kb] expected=41984 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit)
+    r0_emit("pe_ntdll_map_section_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"image_sections\":" + to_string(s[1])
+        + ",\"map_view_count\":" + to_string(s[2])
+        + ",\"total_size_kb\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_ntdll_map_section_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pnms()
+    let s2 = pnms_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_map_section_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_map_section_real self_test PASS (ops=" + to_string(s[0])
+        + ", image=" + to_string(s[1]) + ", map_view=" + to_string(s[2])
+        + ", total_kb=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnms_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("image_section_count\t" + to_string(s[1]))
+            println("count_op_kind_map_view\t" + to_string(s[2]))
+            println("total_size_kb\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_size\t" + to_string(op_size(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_map_section_real.hexa size <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "op" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+                if what == "section" {
+                    println("count_by_section_kind\t" + to_string(count_by_section_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_map_section_real.hexa count { op <op_kind> | section <section_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnms()
+            println("cleaned: " + pnms_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnms_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_map_section_real.hexa { self-test | stats | size <op_id> | count op <op_kind> | count section <section_kind> | cleanup | dir }")
+}

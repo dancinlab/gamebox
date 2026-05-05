@@ -1,0 +1,378 @@
+// lib/loader/pe_ipc_sync_primitive.hexa — stage6 POSIX sync primitive IPC skeleton
+//
+// shared memory 위 sync primitive — sem_t (semaphore), pthread_mutex_t
+// (mutex), pthread_cond_t (condvar). producer/consumer pattern,
+// notification.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 sync primitive tracker — 실 sem_init() / pthread_mutex_init() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// prim_kind code:
+//   1 = semaphore
+//   2 = mutex
+//   3 = condvar
+//   4 = barrier
+//
+// persist schema (TSV — sync_primitives.tsv):
+//   prim_id<int> \t prim_kind<int> \t wait_count<int> \t wait_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pisp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_sync_primitive"
+}
+
+fn pisp_prims_path() -> str {
+    return pisp_dir() + "/sync_primitives.tsv"
+}
+
+fn pisp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pisp_dir() + "'")
+}
+
+fn cleanup_pisp() -> void {
+    pisp_ensure_dir()
+    let _ = exec("rm -f '" + pisp_prims_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pisp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pisp_append_row(path: str, row: str) -> void {
+    pisp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_prim: sync primitive 1 건 기록 ───
+fn record_prim(prim_id: int, prim_kind: int, wait_count: int, wait_us: int) -> void {
+    if prim_id <= 0 {
+        panic("pe_ipc_sync_primitive FAIL [record_prim] expected=prim_id>0 got=" + to_string(prim_id))
+    }
+    if prim_kind < 1 {
+        panic("pe_ipc_sync_primitive FAIL [record_prim] expected=prim_kind>=1 got=" + to_string(prim_kind))
+    }
+    if prim_kind > 4 {
+        panic("pe_ipc_sync_primitive FAIL [record_prim] expected=prim_kind<=4 got=" + to_string(prim_kind))
+    }
+    if wait_count < 0 {
+        panic("pe_ipc_sync_primitive FAIL [record_prim] expected=wait_count>=0 got=" + to_string(wait_count))
+    }
+    if wait_us < 0 {
+        panic("pe_ipc_sync_primitive FAIL [record_prim] expected=wait_us>=0 got=" + to_string(wait_us))
+    }
+    let row = to_string(prim_id) + "\t" + to_string(prim_kind)
+        + "\t" + to_string(wait_count) + "\t" + to_string(wait_us) + "\n"
+    pisp_append_row(pisp_prims_path(), row)
+}
+
+// ─── prim_count: total primitive 수 ───
+fn prim_count() -> int {
+    let t = pisp_read_table(pisp_prims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_waits: 모든 primitive wait_count 합 ───
+fn total_waits() -> int {
+    let t = pisp_read_table(pisp_prims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_wait_us: 모든 primitive wait_us 합 ───
+fn total_wait_us() -> int {
+    let t = pisp_read_table(pisp_prims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_kind: 특정 prim_kind 의 primitive 수 ───
+fn count_by_kind(kind: int) -> int {
+    let t = pisp_read_table(pisp_prims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── prim_wait_us: 특정 prim_id 의 wait_us (없으면 0) ───
+fn prim_wait_us(prim_id: int) -> int {
+    let t = pisp_read_table(pisp_prims_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == prim_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pisp_stats: [prim_count, total_waits, total_wait_us, count_by_kind(1)] ───
+fn pisp_stats() -> array {
+    let mut out = []
+    out.push(prim_count())
+    out.push(total_waits())
+    out.push(total_wait_us())
+    out.push(count_by_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pisp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pisp()
+
+    // 2. record 4 sync primitives (deterministic synthetic)
+    record_prim(126001, 1, 240, 18000)
+    r0_emit("pe_ipc_sync_primitive_record",
+        "\"prim_id\":126001,\"prim_kind\":1,\"wait_count\":240,\"wait_us\":18000,\"target\":\"semaphore\"")
+
+    record_prim(126002, 2, 480, 12000)
+    r0_emit("pe_ipc_sync_primitive_record",
+        "\"prim_id\":126002,\"prim_kind\":2,\"wait_count\":480,\"wait_us\":12000,\"target\":\"mutex\"")
+
+    record_prim(126003, 3, 120, 24000)
+    r0_emit("pe_ipc_sync_primitive_record",
+        "\"prim_id\":126003,\"prim_kind\":3,\"wait_count\":120,\"wait_us\":24000,\"target\":\"condvar\"")
+
+    record_prim(126004, 4, 12, 6000)
+    r0_emit("pe_ipc_sync_primitive_record",
+        "\"prim_id\":126004,\"prim_kind\":4,\"wait_count\":12,\"wait_us\":6000,\"target\":\"barrier\"")
+
+    // 3. prim_count = 4
+    let c = prim_count()
+    if c != 4 {
+        panic("pe_ipc_sync_primitive FAIL [prim_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_waits = 852
+    let tw = total_waits()
+    if tw != 852 {
+        panic("pe_ipc_sync_primitive FAIL [total_waits] expected=852 got=" + to_string(tw))
+    }
+
+    // 5. total_wait_us = 60000
+    let twu = total_wait_us()
+    if twu != 60000 {
+        panic("pe_ipc_sync_primitive FAIL [total_wait_us] expected=60000 got=" + to_string(twu))
+    }
+
+    // 6. count_by_kind sanity
+    let k1 = count_by_kind(1)
+    if k1 != 1 {
+        panic("pe_ipc_sync_primitive FAIL [count_by_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_kind(2)
+    if k2 != 1 {
+        panic("pe_ipc_sync_primitive FAIL [count_by_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_kind(3)
+    if k3 != 1 {
+        panic("pe_ipc_sync_primitive FAIL [count_by_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_kind(4)
+    if k4 != 1 {
+        panic("pe_ipc_sync_primitive FAIL [count_by_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_kind(99)
+    if k99 != 0 {
+        panic("pe_ipc_sync_primitive FAIL [count_by_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. prim_wait_us sanity
+    let w1 = prim_wait_us(126001)
+    if w1 != 18000 {
+        panic("pe_ipc_sync_primitive FAIL [prim_wait_us(126001)] expected=18000 got=" + to_string(w1))
+    }
+    let w4 = prim_wait_us(126004)
+    if w4 != 6000 {
+        panic("pe_ipc_sync_primitive FAIL [prim_wait_us(126004)] expected=6000 got=" + to_string(w4))
+    }
+    let w_miss = prim_wait_us(9999)
+    if w_miss != 0 {
+        panic("pe_ipc_sync_primitive FAIL [prim_wait_us(9999)] expected=0 got=" + to_string(w_miss))
+    }
+
+    // 8. pisp_stats() = [4, 852, 60000, 1]
+    let s = pisp_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_sync_primitive FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_ipc_sync_primitive FAIL [stats prim_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 852 {
+        panic("pe_ipc_sync_primitive FAIL [stats total_waits] expected=852 got=" + to_string(s[1]))
+    }
+    if s[2] != 60000 {
+        panic("pe_ipc_sync_primitive FAIL [stats total_wait_us] expected=60000 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_ipc_sync_primitive FAIL [stats count_kind(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_sync_primitive_stats",
+        "\"prim_count\":" + to_string(s[0])
+        + ",\"total_waits\":" + to_string(s[1])
+        + ",\"total_wait_us\":" + to_string(s[2])
+        + ",\"kind_semaphore\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_ipc_sync_primitive FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pisp()
+    let s2 = pisp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_sync_primitive FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_sync_primitive self_test PASS (prims=" + to_string(s[0])
+        + ", waits=" + to_string(s[1]) + ", wait_us=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pisp_stats()
+            println("prim_count\t" + to_string(s[0]))
+            println("total_waits\t" + to_string(s[1]))
+            println("total_wait_us\t" + to_string(s[2]))
+            println("count_kind_semaphore\t" + to_string(s[3]))
+            return
+        }
+        if sub == "wait" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("prim_wait_us\t" + to_string(prim_wait_us(pid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_sync_primitive.hexa wait <prim_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_kind\t" + to_string(count_by_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_ipc_sync_primitive.hexa count <prim_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pisp()
+            println("cleaned: " + pisp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pisp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_sync_primitive.hexa { self-test | stats | wait <prim_id> | count <prim_kind> | cleanup | dir }")
+}

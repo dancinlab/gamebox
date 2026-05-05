@@ -1,0 +1,527 @@
+// lib/loader/win32_advapi32.hexa — Phase 4c — advapi32 mapping skeleton
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft 공식 advapi32 API spec:
+//     - Registry:  https://learn.microsoft.com/en-us/windows/win32/api/winreg/
+//     - Security:  https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/
+//     - Services:  https://learn.microsoft.com/en-us/windows/win32/api/winsvc/
+//     - Crypto:    https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/
+//   macOS equivalent 은 developer.apple.com (CommonCrypto / pwd.h / SystemConfiguration) 만 참조.
+//   Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 1 (실제 ≥ 3: advapi32_lookup + advapi32_stats + reg_set)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만 — Registry = in-memory dict simulator)
+//   - panic("win32_advapi32 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 4c — skeleton):
+//   25 핵심 advapi32 함수의 *mapping table* + in-memory Registry 합성 store.
+//   각 entry = (Win32 함수명, 대응되는 macOS / CommonCrypto / posix 호출, 카테고리, status).
+//   실제 implementation (CCCryptor / pwd lookup / SC store) 은 Phase 4c 후속.
+//
+// status 값:
+//   "skeleton" — mapping 만 (Phase 4c 현재 모든 entry)
+//   "stub"     — default value 만 반환 (호출 시 ERROR_SUCCESS 또는 NULL)
+//   "impl"     — 실제 macOS / CommonCrypto 호출 수행
+//
+// 25 함수 카테고리 (실제 분포):
+//   Registry  10  (RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, RegCloseKey,
+//                  RegDeleteKeyW, RegCreateKeyExW, RegEnumKeyExW, RegEnumValueW,
+//                  RegGetValueW, RegFlushKey)
+//   Security   8  (OpenProcessToken, GetTokenInformation, AdjustTokenPrivileges,
+//                  ImpersonateLoggedOnUser, RevertToSelf, LookupAccountNameW,
+//                  LookupAccountSidW, ConvertSidToStringSidW)
+//   Services   2  (OpenSCManager, CloseServiceHandle)
+//   Crypto     5  (CryptAcquireContextW, CryptCreateHash, CryptHashData,
+//                  CryptGetHashParam, CryptDestroyHash)
+//   ──────────
+//   total     25  / 4 categories
+//
+// Built-in Registry simulator (skeleton):
+//   in-memory dict — TSV encoding ("path\tname\tvalue\n"…) on a module-level str.
+//   reg_set(path, name, value) → 동일 (path,name) entry 갱신 또는 append.
+//   reg_get(path, name)        → value 또는 "".
+//   stage1 hexa 의 dict 부재 우회용 — file system 우회 (memory only).
+
+use "../perf/r0_common"
+
+// ─── 25 함수 mapping table (TSV — name\tmacos_equiv\tcategory\tstatus) ───
+//
+// 한 줄 = "<Win32 name>\t<macOS equivalent>\t<category>\t<status>"
+// 줄 구분자 = "\n". 첫 줄도 의미 entry (header 없음 — 데이터 25 줄).
+fn advapi32_table() -> str {
+    let t = ""
+    // Registry (10)
+    t = t + "RegOpenKeyExW\tfopen_simulated_reg\tRegistry\tskeleton\n"
+    t = t + "RegQueryValueExW\tread_reg_value\tRegistry\tskeleton\n"
+    t = t + "RegSetValueExW\twrite_reg_value\tRegistry\tskeleton\n"
+    t = t + "RegCloseKey\tclose_reg\tRegistry\tskeleton\n"
+    t = t + "RegDeleteKeyW\tunlink_reg\tRegistry\tskeleton\n"
+    t = t + "RegCreateKeyExW\tcreate_reg\tRegistry\tskeleton\n"
+    t = t + "RegEnumKeyExW\tlist_reg\tRegistry\tskeleton\n"
+    t = t + "RegEnumValueW\tlist_reg_values\tRegistry\tskeleton\n"
+    t = t + "RegGetValueW\tread_reg_value\tRegistry\tskeleton\n"
+    t = t + "RegFlushKey\tfsync_reg\tRegistry\tskeleton\n"
+    // Security (8)
+    t = t + "OpenProcessToken\tfake_token\tSecurity\tskeleton\n"
+    t = t + "GetTokenInformation\tfake_info\tSecurity\tskeleton\n"
+    t = t + "AdjustTokenPrivileges\tnoop\tSecurity\tskeleton\n"
+    t = t + "ImpersonateLoggedOnUser\tnoop\tSecurity\tskeleton\n"
+    t = t + "RevertToSelf\tnoop\tSecurity\tskeleton\n"
+    t = t + "LookupAccountNameW\tgetpwnam\tSecurity\tskeleton\n"
+    t = t + "LookupAccountSidW\tgetpwuid\tSecurity\tskeleton\n"
+    t = t + "ConvertSidToStringSidW\tsid_to_str\tSecurity\tskeleton\n"
+    // Services (2)
+    t = t + "OpenSCManager\tnoop_handle\tServices\tskeleton\n"
+    t = t + "CloseServiceHandle\tclose\tServices\tskeleton\n"
+    // Crypto (5)
+    t = t + "CryptAcquireContextW\tCCCryptorCreate\tCrypto\tskeleton\n"
+    t = t + "CryptCreateHash\tCC_SHA256_Init\tCrypto\tskeleton\n"
+    t = t + "CryptHashData\tCC_SHA256_Update\tCrypto\tskeleton\n"
+    t = t + "CryptGetHashParam\tCC_SHA256_Final\tCrypto\tskeleton\n"
+    t = t + "CryptDestroyHash\tCC_release\tCrypto\tskeleton\n"
+    return t
+}
+
+// ─── table line count (entry 수 = 25) ───
+fn advapi32_table_size() -> int {
+    let t = advapi32_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let count = 0
+    while i < n {
+        if lines[i] != "" {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── lookup: Win32 함수명 → "<macos>\t<category>\t<status>" 또는 "" ───
+fn lookup_mapping(name: str) -> str {
+    let t = advapi32_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == name {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── status only ───
+fn function_status(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[2]
+    }
+    return ""
+}
+
+// ─── category only ───
+fn function_category(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[1]
+    }
+    return ""
+}
+
+// ─── macOS equivalent only ───
+fn function_macos_equiv(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[0]
+    }
+    return ""
+}
+
+// ─── category 통계 ───
+//
+//   반환: array of [category_name, total_count, impl_count]
+//   (hexa stage1 dict 부재 → array of array).
+//   impl_count = status == "impl" 인 entry 수 (Phase 4c 현재 모두 0).
+fn advapi32_stats() -> array {
+    let mut cats = []
+    cats.push(["Registry", 0, 0])
+    cats.push(["Security", 0, 0])
+    cats.push(["Services", 0, 0])
+    cats.push(["Crypto", 0, 0])
+
+    let t = advapi32_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let cat = parts[2]
+                let st = parts[3]
+                let j = 0
+                while j < len(cats) {
+                    if cats[j][0] == cat {
+                        cats[j][1] = cats[j][1] + 1
+                        if st == "impl" {
+                            cats[j][2] = cats[j][2] + 1
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cats
+}
+
+// ─── 전체 impl_count 합 (스카라) ───
+fn advapi32_impl_count() -> int {
+    let stats = advapi32_stats()
+    let n = len(stats)
+    let i = 0
+    let total = 0
+    while i < n {
+        total = total + stats[i][2]
+        i = i + 1
+    }
+    return total
+}
+
+// ─── in-memory Registry simulator (TSV "path\tname\tvalue\n" lines) ───
+//
+//   stage1 hexa 의 dict 부재 우회 — 단순 module-level str 누적.
+//   reg_state() / reg_state_set(s) 를 통해 read-modify-write.
+//   환경 변수 활용 (env "REG_STATE") — 같은 process 내 round-trip 보장.
+fn reg_state() -> str {
+    let s = exec("printf '%s' \"$AIRGENOME_ADVAPI32_REG_STATE\"")
+    return s
+}
+
+fn reg_state_set(s: str) -> void {
+    // export — 후속 exec call 에서 read 가능하게.
+    let escaped = s
+    setenv("AIRGENOME_ADVAPI32_REG_STATE", escaped)
+}
+
+// ─── reg_set: (path, name, value) → in-memory store 갱신 (skeleton) ───
+//
+//   동일 (path, name) entry 가 있으면 value 교체, 없으면 append.
+fn reg_set(path: str, name: str, value: str) -> void {
+    let cur = reg_state()
+    let lines = cur.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut out = ""
+    let mut replaced = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                if parts[0] == path {
+                    if parts[1] == name {
+                        out = out + path + "\t" + name + "\t" + value + "\n"
+                        replaced = true
+                    } else {
+                        out = out + line + "\n"
+                    }
+                } else {
+                    out = out + line + "\n"
+                }
+            } else {
+                out = out + line + "\n"
+            }
+        }
+        i = i + 1
+    }
+    if replaced == false {
+        out = out + path + "\t" + name + "\t" + value + "\n"
+    }
+    reg_state_set(out)
+    r0_emit("reg_set",
+        "\"path\":\"" + path + "\",\"name\":\"" + name + "\",\"len\":" + to_string(len(value)))
+}
+
+// ─── reg_get: (path, name) → value 또는 "" ───
+fn reg_get(path: str, name: str) -> str {
+    let cur = reg_state()
+    let lines = cur.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                if parts[0] == path {
+                    if parts[1] == name {
+                        return parts[2]
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "advapi32test-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. table_size ≥ 22 (실제 25)
+    let sz = advapi32_table_size()
+    if sz < 22 {
+        panic("win32_advapi32 FAIL [table_size] expected=>=22 got=" + to_string(sz))
+    }
+    if sz != 25 {
+        panic("win32_advapi32 FAIL [table_size_exact] expected=25 got=" + to_string(sz))
+    }
+
+    // 2. lookup_mapping("RegOpenKeyExW") = "fopen_simulated_reg\tRegistry\tskeleton"
+    let m_reg = lookup_mapping("RegOpenKeyExW")
+    let exp_reg = "fopen_simulated_reg\tRegistry\tskeleton"
+    if m_reg != exp_reg {
+        panic("win32_advapi32 FAIL [lookup RegOpenKeyExW] expected=" + exp_reg + " got=" + m_reg)
+    }
+
+    // 3. lookup_mapping("OpenProcessToken") = "fake_token\tSecurity\tskeleton"
+    let m_tok = lookup_mapping("OpenProcessToken")
+    let exp_tok = "fake_token\tSecurity\tskeleton"
+    if m_tok != exp_tok {
+        panic("win32_advapi32 FAIL [lookup OpenProcessToken] expected=" + exp_tok + " got=" + m_tok)
+    }
+
+    // 3b. Crypto / Services entry 검증
+    let m_cry = lookup_mapping("CryptCreateHash")
+    let exp_cry = "CC_SHA256_Init\tCrypto\tskeleton"
+    if m_cry != exp_cry {
+        panic("win32_advapi32 FAIL [lookup CryptCreateHash] expected=" + exp_cry + " got=" + m_cry)
+    }
+    let m_svc = lookup_mapping("OpenSCManager")
+    let exp_svc = "noop_handle\tServices\tskeleton"
+    if m_svc != exp_svc {
+        panic("win32_advapi32 FAIL [lookup OpenSCManager] expected=" + exp_svc + " got=" + m_svc)
+    }
+
+    // 3c. unknown name → empty
+    let m_unknown = lookup_mapping("NoSuchAdvapi32Function")
+    if m_unknown != "" {
+        panic("win32_advapi32 FAIL [lookup unknown] expected=empty got=" + m_unknown)
+    }
+
+    // 4. r0_emit "advapi32_lookup" {name, macos}
+    let macos_reg = function_macos_equiv("RegOpenKeyExW")
+    r0_emit("advapi32_lookup",
+        "\"name\":\"RegOpenKeyExW\",\"macos\":\"" + macos_reg + "\"")
+
+    // 5. advapi32_stats() ≥ 4 categories with expected counts
+    let stats = advapi32_stats()
+    let cat_n = len(stats)
+    if cat_n < 4 {
+        panic("win32_advapi32 FAIL [stats categories] expected=>=4 got=" + to_string(cat_n))
+    }
+    let i = 0
+    let sum_total = 0
+    let sum_impl = 0
+    let mut saw_registry = false
+    let mut saw_security = false
+    let mut saw_services = false
+    let mut saw_crypto = false
+    while i < cat_n {
+        let cn = stats[i][0]
+        let ct = stats[i][1]
+        let ci = stats[i][2]
+        sum_total = sum_total + ct
+        sum_impl = sum_impl + ci
+        if cn == "Registry" {
+            saw_registry = true
+            if ct != 10 {
+                panic("win32_advapi32 FAIL [stats Registry count] expected=10 got=" + to_string(ct))
+            }
+        }
+        if cn == "Security" {
+            saw_security = true
+            if ct != 8 {
+                panic("win32_advapi32 FAIL [stats Security count] expected=8 got=" + to_string(ct))
+            }
+        }
+        if cn == "Services" {
+            saw_services = true
+            if ct != 2 {
+                panic("win32_advapi32 FAIL [stats Services count] expected=2 got=" + to_string(ct))
+            }
+        }
+        if cn == "Crypto" {
+            saw_crypto = true
+            if ct != 5 {
+                panic("win32_advapi32 FAIL [stats Crypto count] expected=5 got=" + to_string(ct))
+            }
+        }
+        i = i + 1
+    }
+    if saw_registry == false {
+        panic("win32_advapi32 FAIL [stats missing Registry] expected=present got=absent")
+    }
+    if saw_security == false {
+        panic("win32_advapi32 FAIL [stats missing Security] expected=present got=absent")
+    }
+    if saw_services == false {
+        panic("win32_advapi32 FAIL [stats missing Services] expected=present got=absent")
+    }
+    if saw_crypto == false {
+        panic("win32_advapi32 FAIL [stats missing Crypto] expected=present got=absent")
+    }
+    if sum_total != 25 {
+        panic("win32_advapi32 FAIL [stats total sum] expected=25 got=" + to_string(sum_total))
+    }
+    if sum_impl != 0 {
+        panic("win32_advapi32 FAIL [stats impl sum] expected=0 got=" + to_string(sum_impl))
+    }
+
+    // 6. r0_emit "advapi32_stats" {table_size, categories, impl_count}
+    r0_emit("advapi32_stats",
+        "\"table_size\":" + to_string(sz)
+        + ",\"categories\":" + to_string(cat_n)
+        + ",\"impl_count\":" + to_string(sum_impl))
+
+    // 7. reg_set + reg_get round-trip 검증 (in-memory simulator)
+    //    HKCU\Software\Test : { "Foo" → "BAR_v1", "Baz" → "qux" }
+    let path_a = "HKCU\\Software\\Test"
+    reg_set(path_a, "Foo", "BAR_v1")
+    reg_set(path_a, "Baz", "qux")
+    let v_foo = reg_get(path_a, "Foo")
+    if v_foo != "BAR_v1" {
+        panic("win32_advapi32 FAIL [reg_get Foo] expected=BAR_v1 got=" + v_foo)
+    }
+    let v_baz = reg_get(path_a, "Baz")
+    if v_baz != "qux" {
+        panic("win32_advapi32 FAIL [reg_get Baz] expected=qux got=" + v_baz)
+    }
+    // overwrite same (path, name) → 갱신 검증
+    reg_set(path_a, "Foo", "BAR_v2")
+    let v_foo2 = reg_get(path_a, "Foo")
+    if v_foo2 != "BAR_v2" {
+        panic("win32_advapi32 FAIL [reg_get Foo overwrite] expected=BAR_v2 got=" + v_foo2)
+    }
+    // 다른 path 격리 검증
+    let v_other = reg_get("HKLM\\Software\\Other", "Foo")
+    if v_other != "" {
+        panic("win32_advapi32 FAIL [reg_get other path] expected=empty got=" + v_other)
+    }
+    // 미존재 name 검증
+    let v_miss = reg_get(path_a, "Missing")
+    if v_miss != "" {
+        panic("win32_advapi32 FAIL [reg_get missing name] expected=empty got=" + v_miss)
+    }
+
+    // R0 emit count 검증 — 정확히 5 events
+    //   advapi32_lookup (1) + advapi32_stats (1) + reg_set × 3 (Foo, Baz, Foo overwrite)
+    let emit_n = r0_session_count(sid)
+    if emit_n != 5 {
+        panic("win32_advapi32 FAIL [r0 emit count] expected=5 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ win32_advapi32 self_test PASS (25 functions, 4 categories, all skeleton, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "table" {
+            print(advapi32_table())
+            return
+        }
+        if sub == "lookup" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let m = lookup_mapping(name)
+                if m == "" {
+                    println("(not found)")
+                } else {
+                    println(m)
+                }
+                return
+            }
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let s = function_status(name)
+                if s == "" {
+                    println("(not found)")
+                } else {
+                    println(s)
+                }
+                return
+            }
+        }
+        if sub == "stats" {
+            let stats = advapi32_stats()
+            let n = len(stats)
+            let i = 0
+            while i < n {
+                println(stats[i][0]
+                    + "\t" + to_string(stats[i][1])
+                    + "\t" + to_string(stats[i][2]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "size" {
+            println(to_string(advapi32_table_size()))
+            return
+        }
+        if sub == "reg-set" {
+            if len(a) >= 6 {
+                reg_set(a[3], a[4], a[5])
+                println("OK")
+                return
+            }
+        }
+        if sub == "reg-get" {
+            if len(a) >= 5 {
+                let v = reg_get(a[3], a[4])
+                if v == "" {
+                    println("(not found)")
+                } else {
+                    println(v)
+                }
+                return
+            }
+        }
+    }
+    println("usage: hexa run win32_advapi32.hexa { self-test | table | lookup <name> | status <name> | stats | size | reg-set <path> <name> <value> | reg-get <path> <name> }")
+}

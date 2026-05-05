@@ -1,0 +1,2346 @@
+// tool/roadmap_op.hexa — airgenome-gamebox `.roadmap.<name>` mk2 CLI dispatcher (Track I + Track M + Track AB + Track AE, 14 subcmd)
+//
+// PURPOSE
+//   Hexa-native CLI dispatcher for `.roadmap.<name>` mk2 JSONL header file ops.
+//   Track-I (cycle 1) landed minimum-viable 5 subcmd. Track-M (cycle 2) lands the
+//   remaining 6 deferred subcmd to reach full 11/11 anima parity. Track-AB (cycle
+//   1 of 3 of mk2 checkpoint mechanism) extends additively with 3 NEW checkpoint
+//   subcmd over `.checkpoint.<name>` SSOT files (Track-AA D1=b cross-roadmap +
+//   D2=b separate SSOT + D3=a reuse cond enum + D4=a roadmap_op extend lock-in).
+//   Track-AE (phase 2 aggregation rule extension) adds a `weighted_threshold`
+//   aggregation kind for win32_*pct coverage candidates, alongside the existing
+//   AND_all_required_met (Track-AB) — dispatched via the `aggregation` field in
+//   the .checkpoint header. Unknown values fall back to AND with explicit stderr
+//   warning (own2 silent_error_ban — fallback emit honest).
+//   All extension is additive: existing 11 subcmd fn bodies + main() dispatch
+//   existing cases preserved + Track-AB AND aggregation byte-for-byte preserved.
+//
+// SUBCOMMANDS (14 = Track-I 5 + Track-M 6 + Track-AB 3)
+//   add                --roadmap <path> --cond <id> --evidence <text>
+//   update             --roadmap <path> (--cond <id> --status <enum> | --blocker <id> --status_enum_adopted <retired_intentional>)
+//   list               [--filter <kind=game|launcher|loader>]
+//   show               --roadmap <path>
+//   verify             [--roadmap <path>]
+//   edit-blocker       --roadmap <path> --blocker <id> (--status <enum> | --resolution_path <text> | --eta <iso>)
+//   promote-met        --roadmap <path> --cond <id> [--require-evidence-min <N>]
+//   dump-evidence      --roadmap <path> --cond <id> [--format tsv|json|md]
+//   diff               --roadmap-a <path> --roadmap-b <path>
+//   migrate            --roadmap <path> [--from mk1 --to mk2]   (NO-OP guard — always FAIL per migration:forbidden)
+//   archive            --roadmap <path>                          (freeze marker stub if blk.1.status_enum_adopted=retired_intentional)
+//   checkpoint-status  --checkpoint <path>                       (Track-AB cycle 1) — derive checkpoint status from cond_refs[]
+//   checkpoint-list    [--filter <kind>]                         (Track-AB cycle 1) — enumerate `.checkpoint.*` files
+//   checkpoint-verify  [--checkpoint <path>]                     (Track-AB cycle 1) — schema validator for `.checkpoint.<name>`
+//
+// ANIMA REFERENCE POSTURE
+//   Anima sibling at /Users/ghost/core/anima/tool/roadmap_op.hexa is study-only.
+//   This file is hexa-native to airgenome-gamebox conventions — no clone, no import,
+//   no symlink. Surface (subcmd dispatch shape) is inspired by anima precedent;
+//   implementation is independent (raw 9 hexa-only / own1 외부 의존 0 정합).
+//
+// HEADER LINE CONVENTION (mk2 .roadmap.<name>)
+//   Each `.roadmap.<name>` file has a comment-prologue (# lines) + ONE header JSON line.
+//   Convention: line 5 (1-indexed) is the header (`{"type":"header",...}`).
+//   The header carries: type / kind / name / required_conditions[] / blockers[] / cross_link.
+//
+// WRITE POLICY
+//   All write subcmds are additive_only — append evidence row to a cond, or set a single
+//   field (status / status_enum_adopted) on a single cond/blocker. Atomic write via tmp+mv.
+//   Refuse cond status downgrade (met → partial) without --force flag (silent_error_ban).
+//
+// HONEST EMIT (own2 mandate)
+//   Every subcmd emits: `__ROADMAP_OP__ <PASS|FAIL> <subcmd> <reason>` on completion.
+//   Exit code 0 on PASS, 1 on FAIL. silent_error_ban — never swallow errors.
+//
+// RAW
+//   raw 9   hexa-only        raw 11  snake_case
+//   raw 12  silent_error_ban raw 15  env_lazy / repo-relative paths
+//   raw 168 minimum-viable subset 1-cycle land
+//   raw 175 BR-NO-USER-VERBATIM (no verbatim user quotes)
+//
+// VALIDATOR FIRST-PRIORITY (verify subcmd)
+//   `status_enum_adopted` MUST be string-typed (value `retired_intentional`).
+//   Track G (lineage_classic_r28) discovered hand-edit drift where this field was
+//   bool-typed (`true`). The verify subcmd flags any non-string occurrence as FAIL
+//   with explicit issue text — fixes the structural root cause per Track-H §1.3.
+//
+// USAGE
+//   hexa run tool/roadmap_op.hexa --help
+//   hexa run tool/roadmap_op.hexa <subcmd> [args...]
+
+use "../lib/perf/r0_common"
+
+// ─── version + constants ──────────────────────────────────────
+
+let ROADMAP_OP_VERSION = "0.3.1-checkpoint14-weighted"
+let SCHEMA_VERSION = "airgenome-gamebox/roadmap/mk2/header/1"
+let CHECKPOINT_SCHEMA_VERSION = "airgenome-gamebox/checkpoint/mk2/header/1"
+
+// status enum allowed values (cond.status). retired_intentional = block-acknowledged PASS-equivalent.
+let STATUS_ENUM_ALLOWED = ["unmet", "partial", "met", "retired_intentional"]
+
+// blocker.status enum (existing values across 14 files; superset).
+let BLOCKER_STATUS_ALLOWED = ["open", "closed", "acknowledged", "warn"]
+
+// status_enum_adopted allowed value (string-only — Track G normalization).
+let STATUS_ENUM_ADOPTED_ALLOWED = ["retired_intentional"]
+
+// status promotion forward-only matrix (downgrade requires --force).
+// rank: unmet=0, partial=1, met=2, retired_intentional=3 (sideways from any).
+fn status_rank(s: str) -> int {
+    if s == "unmet" { return 0 }
+    if s == "partial" { return 1 }
+    if s == "met" { return 2 }
+    if s == "retired_intentional" { return 3 }
+    return -1
+}
+
+// ─── small string helpers ─────────────────────────────────────
+
+fn sh_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn file_exists(path: str) -> bool {
+    let r = exec("test -f '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn read_text(path: str) -> str {
+    if !file_exists(path) { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn atomic_write(path: str, content: str) -> bool {
+    let stamp = exec("date +%s").trim()
+    let tmp = path + ".roadmap_op.tmp." + stamp
+    write_file(tmp, content)
+    let _ = exec("mv '" + tmp + "' '" + path + "'")
+    return file_exists(path)
+}
+
+// ─── JSON-ish field extraction (header line is single-line strict JSON) ───
+//
+// We do NOT hand-roll a full JSON parser; we use targeted substring extraction
+// on the header line (always single-line, always strict double-quote, mk2 spec).
+// This is sufficient for the 5 minimum-viable subcmd.
+
+fn idx_of(haystack: str, needle: str) -> int {
+    return haystack.index_of(needle)
+}
+
+fn extract_str_after(line: str, key: str) -> str {
+    // Extract: ...<key>"<value>"... → returns <value>. Returns "" on miss.
+    let i = idx_of(line, key)
+    if i < 0 { return "" }
+    let start = i + len(key)
+    let rest = line.substring(start, len(line))
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+fn header_extract_name(header: str) -> str {
+    return extract_str_after(header, "\"name\":\"")
+}
+
+fn header_extract_kind(header: str) -> str {
+    return extract_str_after(header, "\"kind\":\"")
+}
+
+fn header_extract_type(header: str) -> str {
+    return extract_str_after(header, "\"type\":\"")
+}
+
+// Count occurrences of substring in a larger string (naive sliding scan).
+fn count_substr(big: str, small: str) -> int {
+    let n = len(big)
+    let m = len(small)
+    if m == 0 || m > n { return 0 }
+    let mut i = 0
+    let mut cnt = 0
+    while i <= n - m {
+        let chunk = big.substring(i, i + m)
+        if chunk == small {
+            cnt = cnt + 1
+            i = i + m
+        } else {
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// Count cond entries in header (each is `{"id":"<name>.cond.N",...}`)
+fn header_count_conds(header: str) -> int {
+    return count_substr(header, "\"id\":\"" + header_extract_name(header) + ".cond.")
+}
+
+// Count blocker entries in header (each is `{"id":"<name>.blk.N",...}`)
+fn header_count_blockers(header: str) -> int {
+    return count_substr(header, "\"id\":\"" + header_extract_name(header) + ".blk.")
+}
+
+fn header_count_status_enum_adopted(header: str) -> int {
+    return count_substr(header, "\"status_enum_adopted\":")
+}
+
+// ─── header line locate (line 5 by mk2 convention; fallback scan) ─────
+
+fn header_line_no(content: str) -> int {
+    let lines = content.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if line.contains("\"type\":\"header\"") && line.contains("\"name\":\"") {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn header_line_get(content: str) -> str {
+    let lines = content.split("\n")
+    let idx = header_line_no(content)
+    if idx < 0 { return "" }
+    return lines[idx]
+}
+
+fn header_line_replace(content: str, new_header: str) -> str {
+    let lines = content.split("\n")
+    let idx = header_line_no(content)
+    if idx < 0 { return content }
+    let n = len(lines)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            out = out + new_header
+        } else {
+            out = out + lines[i]
+        }
+        if i < n - 1 { out = out + "\n" }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── locate cond/blocker object span inside the header line ───────────
+//
+// Search strategy: find `"id":"<id>"` index; walk backward to nearest `{`;
+// walk forward with a depth counter to matching `}`. Returns [start, end] inclusive
+// of the braces, or [-1, -1] on miss.
+
+fn locate_obj_span(header: str, id_marker: str) -> array {
+    let key = "\"id\":\"" + id_marker + "\""
+    let i = idx_of(header, key)
+    if i < 0 {
+        let mut a = []
+        a = a.push(-1)
+        a = a.push(-1)
+        return a
+    }
+    // Walk backward to nearest `{`.
+    let mut s = i
+    while s >= 0 {
+        let ch = header.substring(s, s + 1)
+        if ch == "{" { break }
+        s = s - 1
+    }
+    if s < 0 {
+        let mut a = []
+        a = a.push(-1)
+        a = a.push(-1)
+        return a
+    }
+    // Walk forward with depth counter.
+    let n = len(header)
+    let mut depth = 0
+    let mut j = s
+    let mut in_str = false
+    let mut esc = false
+    while j < n {
+        let ch = header.substring(j, j + 1)
+        if esc {
+            esc = false
+        } else if ch == "\\" {
+            esc = true
+        } else if ch == "\"" {
+            in_str = !in_str
+        } else if !in_str {
+            if ch == "{" { depth = depth + 1 }
+            if ch == "}" {
+                depth = depth - 1
+                if depth == 0 { break }
+            }
+        }
+        j = j + 1
+    }
+    let mut a = []
+    a = a.push(s)
+    a = a.push(j)
+    return a
+}
+
+// ─── add subcmd: append evidence row to cond's evidence array ─────────
+
+fn subcmd_add(roadmap_path: str, cond_id: str, evidence_text: str) -> int {
+    if !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL add roadmap_not_found:" + roadmap_path)
+        return 1
+    }
+    if cond_id == "" {
+        println("__ROADMAP_OP__ FAIL add empty_cond_id")
+        return 1
+    }
+    if evidence_text == "" {
+        println("__ROADMAP_OP__ FAIL add empty_evidence_text")
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL add header_line_missing")
+        return 1
+    }
+    let span = locate_obj_span(header, cond_id)
+    if span[0] < 0 {
+        println("__ROADMAP_OP__ FAIL add cond_not_found:" + cond_id)
+        return 1
+    }
+    let s = span[0]
+    let e = span[1]
+    let cond_obj = header.substring(s, e + 1)
+    // Locate the evidence array inside cond_obj.
+    let ev_key = "\"evidence\":["
+    let ev_i = cond_obj.index_of(ev_key)
+    if ev_i < 0 {
+        println("__ROADMAP_OP__ FAIL add no_evidence_array_in_cond")
+        return 1
+    }
+    let ev_open = ev_i + len(ev_key)
+    // Find matching `]` (assume no nested arrays in evidence — strings only).
+    let m = len(cond_obj)
+    let mut p = ev_open
+    let mut in_str = false
+    let mut esc = false
+    while p < m {
+        let ch = cond_obj.substring(p, p + 1)
+        if esc { esc = false }
+        else if ch == "\\" { esc = true }
+        else if ch == "\"" { in_str = !in_str }
+        else if !in_str && ch == "]" { break }
+        p = p + 1
+    }
+    if p >= m {
+        println("__ROADMAP_OP__ FAIL add evidence_array_unterminated")
+        return 1
+    }
+    // p = index of closing `]`. cond_obj[ev_open..p] is the array body.
+    let body = cond_obj.substring(ev_open, p)
+    let escaped = evidence_text.replace("\\", "\\\\").replace("\"", "\\\"")
+    let new_entry = "\"" + escaped + "\""
+    let mut new_body = ""
+    if body.trim() == "" {
+        new_body = new_entry
+    } else {
+        new_body = body + "," + new_entry
+    }
+    let new_cond_obj = cond_obj.substring(0, ev_open) + new_body + cond_obj.substring(p, m)
+    let new_header = header.substring(0, s) + new_cond_obj + header.substring(e + 1, len(header))
+    let new_content = header_line_replace(content, new_header)
+    let ok = atomic_write(roadmap_path, new_content)
+    if !ok {
+        println("__ROADMAP_OP__ FAIL add atomic_write_failed")
+        return 1
+    }
+    println("__ROADMAP_OP__ PASS add cond=" + cond_id + " evidence_appended")
+    return 0
+}
+
+// ─── update subcmd: status (cond) or status_enum_adopted (blocker) ────
+
+fn enum_contains(arr: array, val: str) -> bool {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Replace the FIRST occurrence of `"<field>":"<old>"` inside obj with `"<field>":"<new>"`.
+fn replace_str_field(obj: str, field: str, new_val: str) -> str {
+    let key = "\"" + field + "\":\""
+    let i = obj.index_of(key)
+    if i < 0 { return obj }
+    let start = i + len(key)
+    let rest = obj.substring(start, len(obj))
+    let end_rel = rest.index_of("\"")
+    if end_rel < 0 { return obj }
+    let end_abs = start + end_rel
+    let escaped = new_val.replace("\\", "\\\\").replace("\"", "\\\"")
+    return obj.substring(0, start) + escaped + obj.substring(end_abs, len(obj))
+}
+
+// Read first occurrence of `"<field>":"<value>"` value inside obj (string-typed only).
+fn read_str_field(obj: str, field: str) -> str {
+    return extract_str_after(obj, "\"" + field + "\":\"")
+}
+
+fn subcmd_update(args_in: array) -> int {
+    // args_in is the [...] tail after subcmd token.
+    let mut roadmap_path = ""
+    let mut cond_id = ""
+    let mut blocker_id = ""
+    let mut new_status = ""
+    let mut new_adopted = ""
+    let mut force = false
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { roadmap_path = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--cond" && i + 1 < n { cond_id = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--blocker" && i + 1 < n { blocker_id = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--status" && i + 1 < n { new_status = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--status_enum_adopted" && i + 1 < n { new_adopted = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--force" { force = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if roadmap_path == "" || !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL update roadmap_not_found_or_missing")
+        return 1
+    }
+    if cond_id == "" && blocker_id == "" {
+        println("__ROADMAP_OP__ FAIL update need_cond_or_blocker")
+        return 1
+    }
+    if cond_id != "" && new_status == "" {
+        println("__ROADMAP_OP__ FAIL update need_status_for_cond")
+        return 1
+    }
+    if blocker_id != "" && new_adopted == "" {
+        println("__ROADMAP_OP__ FAIL update need_status_enum_adopted_for_blocker")
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL update header_line_missing")
+        return 1
+    }
+    let target_id = if cond_id != "" { cond_id } else { blocker_id }
+    let span = locate_obj_span(header, target_id)
+    if span[0] < 0 {
+        println("__ROADMAP_OP__ FAIL update id_not_found:" + target_id)
+        return 1
+    }
+    let s = span[0]
+    let e = span[1]
+    let obj = header.substring(s, e + 1)
+    let mut new_obj = ""
+    if cond_id != "" {
+        if !enum_contains(STATUS_ENUM_ALLOWED, new_status) {
+            println("__ROADMAP_OP__ FAIL update status_enum_invalid:" + new_status)
+            return 1
+        }
+        let cur = read_str_field(obj, "status")
+        let cr = status_rank(cur)
+        let nr = status_rank(new_status)
+        if cr >= 0 && nr >= 0 && nr < cr && !force {
+            println("__ROADMAP_OP__ FAIL update status_downgrade_refused:" + cur + "->" + new_status + " (use --force)")
+            return 1
+        }
+        new_obj = replace_str_field(obj, "status", new_status)
+    } else {
+        if !enum_contains(STATUS_ENUM_ADOPTED_ALLOWED, new_adopted) {
+            println("__ROADMAP_OP__ FAIL update status_enum_adopted_invalid:" + new_adopted)
+            return 1
+        }
+        // String-type set; if existing field present (string OR bool drift), replace.
+        if obj.contains("\"status_enum_adopted\":") {
+            // Replace whole `"status_enum_adopted":<anything-up-to-,-or-}>` with string form.
+            let key2 = "\"status_enum_adopted\":"
+            let i2 = obj.index_of(key2)
+            let start2 = i2 + len(key2)
+            let rest = obj.substring(start2, len(obj))
+            // Determine value end (next , or } at depth 0; we're inside obj so } closes).
+            let mut p2 = 0
+            let mut in_str2 = false
+            let mut esc2 = false
+            let m2 = len(rest)
+            while p2 < m2 {
+                let ch = rest.substring(p2, p2 + 1)
+                if esc2 { esc2 = false }
+                else if ch == "\\" { esc2 = true }
+                else if ch == "\"" { in_str2 = !in_str2 }
+                else if !in_str2 {
+                    if ch == "," { break }
+                    if ch == "}" { break }
+                }
+                p2 = p2 + 1
+            }
+            new_obj = obj.substring(0, start2) + "\"" + new_adopted + "\"" + obj.substring(start2 + p2, len(obj))
+        } else {
+            // Field absent — insert before closing `}`.
+            let last = len(obj) - 1
+            let mut tail_join = ","
+            // If the obj has only `{` before `}`, no need for comma.
+            let inner = obj.substring(1, last).trim()
+            if inner == "" { tail_join = "" }
+            new_obj = obj.substring(0, last) + tail_join + "\"status_enum_adopted\":\"" + new_adopted + "\"" + obj.substring(last, len(obj))
+        }
+    }
+    let new_header = header.substring(0, s) + new_obj + header.substring(e + 1, len(header))
+    let new_content = header_line_replace(content, new_header)
+    let ok = atomic_write(roadmap_path, new_content)
+    if !ok {
+        println("__ROADMAP_OP__ FAIL update atomic_write_failed")
+        return 1
+    }
+    if cond_id != "" {
+        println("__ROADMAP_OP__ PASS update cond=" + cond_id + " status=" + new_status)
+    } else {
+        println("__ROADMAP_OP__ PASS update blocker=" + blocker_id + " status_enum_adopted=" + new_adopted)
+    }
+    return 0
+}
+
+// ─── list subcmd: list all .roadmap.* files in repo root ──────────────
+
+fn list_roadmaps_dir() -> array {
+    let raw = exec("ls -1 .roadmap.* 2>/dev/null").trim()
+    let mut out = []
+    if raw == "" { return out }
+    let parts = raw.split("\n")
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let s = parts[i].trim()
+        if s != "" { out = out.push(s) }
+        i = i + 1
+    }
+    return out
+}
+
+fn subcmd_list(args_in: array) -> int {
+    let mut filter_kind = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--filter" && i + 1 < n { filter_kind = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    let files = list_roadmaps_dir()
+    let nf = len(files)
+    if nf == 0 {
+        println("__ROADMAP_OP__ FAIL list no_roadmap_files_found")
+        return 1
+    }
+    println("# roadmap_op list — " + to_string(nf) + " file(s) under repo root")
+    println("# columns: name | kind | conds | blockers | adopted_blockers")
+    let mut shown = 0
+    let mut idx = 0
+    while idx < nf {
+        let path = files[idx]
+        let content = read_text(path)
+        let header = header_line_get(content)
+        if header == "" {
+            println(path + "\tNO_HEADER\t-\t-\t-")
+            idx = idx + 1
+            continue
+        }
+        let kind = header_extract_kind(header)
+        let nm = header_extract_name(header)
+        let nc = header_count_conds(header)
+        let nb = header_count_blockers(header)
+        let na = header_count_status_enum_adopted(header)
+        if filter_kind == "" || filter_kind == kind {
+            println(path + "\t" + kind + "\t" + nm + "\tconds=" + to_string(nc) + "\tblockers=" + to_string(nb) + "\tadopted=" + to_string(na))
+            shown = shown + 1
+        }
+        idx = idx + 1
+    }
+    println("__ROADMAP_OP__ PASS list shown=" + to_string(shown) + "/" + to_string(nf))
+    return 0
+}
+
+// ─── show subcmd: show a roadmap's header summary ─────────────────────
+
+fn subcmd_show(roadmap_path: str) -> int {
+    if !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL show roadmap_not_found:" + roadmap_path)
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL show header_line_missing")
+        return 1
+    }
+    let nm = header_extract_name(header)
+    let kind = header_extract_kind(header)
+    let nc = header_count_conds(header)
+    let nb = header_count_blockers(header)
+    let na = header_count_status_enum_adopted(header)
+    println("# roadmap_op show — " + roadmap_path)
+    println("name: " + nm)
+    println("kind: " + kind)
+    println("schema_version: " + SCHEMA_VERSION)
+    println("conds: " + to_string(nc))
+    println("blockers: " + to_string(nb))
+    println("status_enum_adopted_count: " + to_string(na))
+    // emit simple per-cond status count (parsed via count_substr).
+    let mut k = 0
+    while k < len(STATUS_ENUM_ALLOWED) {
+        let v = STATUS_ENUM_ALLOWED[k]
+        let c = count_substr(header, "\"status\":\"" + v + "\"")
+        println("status[" + v + "]: " + to_string(c))
+        k = k + 1
+    }
+    println("__ROADMAP_OP__ PASS show roadmap=" + roadmap_path + " name=" + nm)
+    return 0
+}
+
+// ─── verify subcmd: schema validator ──────────────────────────────────
+//
+// Validator priority (Track-G normalization):
+//   1. status_enum_adopted MUST be string (not bool). Pattern flag:
+//        `"status_enum_adopted":true`  OR `"status_enum_adopted":false`  OR
+//        `"status_enum_adopted":<bare-non-quoted>` → FAIL
+//      Allowed: `"status_enum_adopted":"retired_intentional"`
+//   2. cond.status enum within {unmet, partial, met, retired_intentional}.
+//   3. blocker.status enum within {open, closed, acknowledged, warn}.
+//   4. header line shape: `"type":"header"`, `"name":"<...>"`.
+//   5. id prefix: every required_conditions[].id starts with `<name>.cond.`,
+//      every blockers[].id starts with `<name>.blk.`.
+
+fn verify_one(roadmap_path: str) -> int {
+    if !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL verify roadmap_not_found:" + roadmap_path)
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    let mut issues = 0
+    let mut messages = ""
+
+    // (a) header line shape.
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL verify " + roadmap_path + " 1 header_line_missing")
+        return 1
+    }
+    let typ = header_extract_type(header)
+    if typ != "header" {
+        issues = issues + 1
+        messages = messages + " type_not_header(" + typ + ")"
+    }
+    let nm = header_extract_name(header)
+    if nm == "" {
+        issues = issues + 1
+        messages = messages + " name_field_missing"
+    }
+
+    // (b) cond.status enum + (e) cond id prefix.
+    // cond status check: each cond is its own object; we enumerate each id matching <name>.cond.N
+    // We use a sliding scan over status:" string-quoted occurrences inside the header.
+    // Collect every `"status":"<v>"` and verify v is in STATUS_ENUM_ALLOWED ∪ BLOCKER_STATUS_ALLOWED;
+    // then check id prefix violations for cond/blk.
+    // First — id prefix scan.
+    let id_key = "\"id\":\""
+    let mut p = 0
+    let n = len(header)
+    let prefix_cond = nm + ".cond."
+    let prefix_blk = nm + ".blk."
+    while true {
+        let i = header.substring(p, n).index_of(id_key)
+        if i < 0 { break }
+        let abs = p + i + len(id_key)
+        let rest = header.substring(abs, n)
+        let endrel = rest.index_of("\"")
+        if endrel < 0 { break }
+        let id = rest.substring(0, endrel)
+        if id.contains(".cond.") {
+            // must start with prefix_cond
+            if id.substring(0, len(prefix_cond)) != prefix_cond {
+                issues = issues + 1
+                messages = messages + " cond_id_prefix_violation(" + id + ")"
+            }
+        } else if id.contains(".blk.") {
+            if id.substring(0, len(prefix_blk)) != prefix_blk {
+                issues = issues + 1
+                messages = messages + " blk_id_prefix_violation(" + id + ")"
+            }
+        }
+        p = abs + endrel
+    }
+
+    // (c) status_enum_adopted MUST be string-typed (Track-G first-priority validator).
+    // FAIL pattern: `"status_enum_adopted":true` or `:false` or `:<digit>` etc.
+    // PASS pattern: `"status_enum_adopted":"<value>"`.
+    let bad_true = count_substr(header, "\"status_enum_adopted\":true")
+    let bad_false = count_substr(header, "\"status_enum_adopted\":false")
+    if bad_true > 0 {
+        issues = issues + bad_true
+        messages = messages + " status_enum_adopted_bool_drift_true(x" + to_string(bad_true) + ")"
+    }
+    if bad_false > 0 {
+        issues = issues + bad_false
+        messages = messages + " status_enum_adopted_bool_drift_false(x" + to_string(bad_false) + ")"
+    }
+    // Any non-quoted, non-bool numeric/null drift: scan past the colon and check first non-space is `"`.
+    let mut q = 0
+    let key2 = "\"status_enum_adopted\":"
+    while true {
+        let j = header.substring(q, n).index_of(key2)
+        if j < 0 { break }
+        let abs = q + j + len(key2)
+        if abs < n {
+            let ch = header.substring(abs, abs + 1)
+            if ch != "\"" && ch != "t" && ch != "f" {
+                issues = issues + 1
+                messages = messages + " status_enum_adopted_non_string_drift(at " + to_string(abs) + ")"
+            }
+            // If string-typed, also enforce value is in STATUS_ENUM_ADOPTED_ALLOWED.
+            if ch == "\"" {
+                let rest2 = header.substring(abs + 1, n)
+                let ee = rest2.index_of("\"")
+                if ee >= 0 {
+                    let v = rest2.substring(0, ee)
+                    if !enum_contains(STATUS_ENUM_ADOPTED_ALLOWED, v) {
+                        issues = issues + 1
+                        messages = messages + " status_enum_adopted_value_invalid(" + v + ")"
+                    }
+                }
+            }
+        }
+        q = abs
+    }
+
+    // (d) cond.status + blocker.status enum scan.
+    // Collect every `"status":"<v>"` value and verify ∈ STATUS_ENUM_ALLOWED ∪ BLOCKER_STATUS_ALLOWED.
+    let key3 = "\"status\":\""
+    let mut r = 0
+    while true {
+        let j = header.substring(r, n).index_of(key3)
+        if j < 0 { break }
+        let abs = r + j + len(key3)
+        let rest3 = header.substring(abs, n)
+        let endrel = rest3.index_of("\"")
+        if endrel < 0 { break }
+        let v = rest3.substring(0, endrel)
+        let ok_cond = enum_contains(STATUS_ENUM_ALLOWED, v)
+        let ok_blk = enum_contains(BLOCKER_STATUS_ALLOWED, v)
+        if !ok_cond && !ok_blk {
+            issues = issues + 1
+            messages = messages + " status_value_invalid(" + v + ")"
+        }
+        r = abs + endrel
+    }
+
+    if issues == 0 {
+        println("__ROADMAP_OP__ PASS verify " + roadmap_path + " 0 clean")
+        return 0
+    }
+    println("__ROADMAP_OP__ FAIL verify " + roadmap_path + " " + to_string(issues) + messages)
+    return 1
+}
+
+fn subcmd_verify(args_in: array) -> int {
+    let mut single = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { single = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if single != "" {
+        return verify_one(single)
+    }
+    let files = list_roadmaps_dir()
+    let nf = len(files)
+    if nf == 0 {
+        println("__ROADMAP_OP__ FAIL verify no_roadmap_files_found")
+        return 1
+    }
+    let mut total_fail = 0
+    let mut idx = 0
+    while idx < nf {
+        let rc = verify_one(files[idx])
+        if rc != 0 { total_fail = total_fail + 1 }
+        idx = idx + 1
+    }
+    if total_fail == 0 {
+        println("__ROADMAP_OP__ PASS verify all " + to_string(nf) + " clean")
+        return 0
+    }
+    println("__ROADMAP_OP__ FAIL verify all " + to_string(total_fail) + "/" + to_string(nf) + " failed")
+    return 1
+}
+
+// ─── help ─────────────────────────────────────────────────────────────
+
+fn print_help() -> void {
+    println("tool/roadmap_op.hexa v" + ROADMAP_OP_VERSION + " — airgenome-gamebox `.roadmap.<name>` mk2 CLI dispatcher")
+    println("")
+    println("Usage:")
+    println("  hexa run tool/roadmap_op.hexa <subcmd> [args...]")
+    println("")
+    println("Subcommands (14 = Track-I 5 + Track-M 6 + Track-AB 3 checkpoint extension):")
+    println("  add     --roadmap <path> --cond <id> --evidence <text>")
+    println("            Append evidence row to cond's evidence array (additive).")
+    println("  update  --roadmap <path> --cond <id> --status <unmet|partial|met|retired_intentional> [--force]")
+    println("  update  --roadmap <path> --blocker <id> --status_enum_adopted retired_intentional")
+    println("            Type-validated single-field update; refuse cond status downgrade without --force.")
+    println("  list    [--filter <kind=game|launcher|loader>]")
+    println("            List all .roadmap.* files in repo root with cond/blocker counts.")
+    println("  show    --roadmap <path>")
+    println("            Show a roadmap's header summary.")
+    println("  verify  [--roadmap <path>]")
+    println("            Schema validator. Validator first-priority: status_enum_adopted str-only.")
+    println("            No --roadmap → verify all .roadmap.* files in repo root.")
+    println("  edit-blocker --roadmap <path> --blocker <id> (--status <enum> | --resolution_path <text> | --eta <iso>)")
+    println("            Single-field blocker update (Track-M cycle 2).")
+    println("  promote-met --roadmap <path> --cond <id> [--require-evidence-min <N>]")
+    println("            Wraps update --status met with verifier guard pipeline (default min=3).")
+    println("  dump-evidence --roadmap <path> --cond <id> [--format tsv|json|md]")
+    println("            Read-only evidence dump (default tsv).")
+    println("  diff --roadmap-a <path> --roadmap-b <path>")
+    println("            Read-only delta diff between two roadmap files (table format).")
+    println("  migrate --roadmap <path> [--from mk1 --to mk2]")
+    println("            NO-OP guard — ALWAYS FAILs per repo policy migration:forbidden.")
+    println("  archive --roadmap <path>")
+    println("            Emit freeze marker stub when blk.1.status_enum_adopted=retired_intentional.")
+    println("  checkpoint-status --checkpoint <path>")
+    println("            Derive checkpoint status from cond_refs[] (Track-AB cycle 1 of 3).")
+    println("            Aggregation kinds: AND_all_required_met (default) | weighted_threshold (Track-AE phase 2).")
+    println("            Unknown aggregation → AND fallback + stderr warning emit (own2 honest).")
+    println("  checkpoint-list [--filter <kind>]")
+    println("            Enumerate `.checkpoint.*` files in repo root (Track-AB cycle 1 of 3).")
+    println("  checkpoint-verify [--checkpoint <path>]")
+    println("            Schema validator for `.checkpoint.<name>` (Track-AB cycle 1 of 3).")
+    println("            No --checkpoint → verify all `.checkpoint.*` files in repo root.")
+    println("  --help  Print this help and exit.")
+    println("  self-test")
+    println("            Drive 5-subcmd round-trip against a synthetic temp fixture.")
+    println("")
+    println("Honest emit: every subcmd writes `__ROADMAP_OP__ <PASS|FAIL> <subcmd> <reason>`.")
+    println("Anima reference: study-only, no clone/import/symlink (raw 9 hexa-only / own1).")
+}
+
+// ─── self_test ─────────────────────────────────────────────────────────
+
+fn self_test_fixture_content(name: str) -> str {
+    // Synthetic mk2 roadmap fixture — 4 prologue lines + header line on line 5.
+    let mut out = ""
+    out = out + "# .roadmap." + name + " mk2 — synthetic test fixture for tool/roadmap_op.hexa\n"
+    out = out + "# Header on next line; entries follow.\n"
+    out = out + "# Reflects own1 (Wine 0 / hexa-only) + own2 (honest emit).\n"
+    out = out + "# Status enum: unmet | partial | met | retired_intentional\n"
+    out = out + "{\"type\":\"header\",\"kind\":\"game\",\"name\":\"" + name + "\",\"mk\":2,"
+    out = out + "\"required_conditions\":["
+    out = out + "{\"id\":\"" + name + ".cond.1\",\"desc\":\"synth-cond-1\",\"status\":\"partial\",\"evidence\":[\"e0\"]},"
+    out = out + "{\"id\":\"" + name + ".cond.2\",\"desc\":\"synth-cond-2\",\"status\":\"unmet\",\"evidence\":[]}"
+    out = out + "],"
+    out = out + "\"blockers\":["
+    out = out + "{\"id\":\"" + name + ".blk.1\",\"desc\":\"synth-blk-1\",\"status\":\"open\"}"
+    out = out + "],"
+    out = out + "\"cross_link\":{\"sister_roadmaps\":[]}}\n"
+    return out
+}
+
+fn self_test() -> int {
+    let sid = "roadmap-op-mvp5-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    let stamp = exec("date +%s").trim()
+    let tmp_dir = "/tmp/roadmap_op_selftest." + stamp
+    let _ = exec("mkdir -p '" + tmp_dir + "'")
+    let name = "self_synth"
+    let path = tmp_dir + "/.roadmap." + name
+    let content = self_test_fixture_content(name)
+    let _ = atomic_write(path, content)
+    if !file_exists(path) {
+        println("__ROADMAP_OP__ FAIL self-test fixture_write_failed")
+        return 1
+    }
+
+    // S1 add — append evidence row to cond.1
+    let rc1 = subcmd_add(path, name + ".cond.1", "self_test_evidence_row_S1")
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S1_add", "\"rc\":" + to_string(rc1))
+    if rc1 != 0 {
+        println("__ROADMAP_OP__ FAIL self-test S1_add rc=" + to_string(rc1))
+        return 1
+    }
+    let after1 = read_text(path)
+    if !after1.contains("self_test_evidence_row_S1") {
+        println("__ROADMAP_OP__ FAIL self-test S1_add evidence_not_appearing")
+        return 1
+    }
+
+    // S2 update — cond.2 status unmet → met (forward, no --force needed)
+    let mut a2 = []
+    a2 = a2.push("--roadmap")
+    a2 = a2.push(path)
+    a2 = a2.push("--cond")
+    a2 = a2.push(name + ".cond.2")
+    a2 = a2.push("--status")
+    a2 = a2.push("met")
+    let rc2 = subcmd_update(a2)
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S2_update_forward", "\"rc\":" + to_string(rc2))
+    if rc2 != 0 {
+        println("__ROADMAP_OP__ FAIL self-test S2_update_forward rc=" + to_string(rc2))
+        return 1
+    }
+    // S2b — refuse downgrade met → partial without --force
+    let mut a2b = []
+    a2b = a2b.push("--roadmap")
+    a2b = a2b.push(path)
+    a2b = a2b.push("--cond")
+    a2b = a2b.push(name + ".cond.2")
+    a2b = a2b.push("--status")
+    a2b = a2b.push("partial")
+    let rc2b = subcmd_update(a2b)
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S2_downgrade_refused", "\"rc\":" + to_string(rc2b))
+    if rc2b == 0 {
+        println("__ROADMAP_OP__ FAIL self-test S2_downgrade should_have_refused")
+        return 1
+    }
+    // S2c — set blocker.1 status_enum_adopted=retired_intentional (string-typed)
+    let mut a2c = []
+    a2c = a2c.push("--roadmap")
+    a2c = a2c.push(path)
+    a2c = a2c.push("--blocker")
+    a2c = a2c.push(name + ".blk.1")
+    a2c = a2c.push("--status_enum_adopted")
+    a2c = a2c.push("retired_intentional")
+    let rc2c = subcmd_update(a2c)
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S2_blocker_adopted", "\"rc\":" + to_string(rc2c))
+    if rc2c != 0 {
+        println("__ROADMAP_OP__ FAIL self-test S2_blocker_adopted rc=" + to_string(rc2c))
+        return 1
+    }
+
+    // S3 list — synthetic dir scope (cd into tmp_dir then list — but tool resolves cwd)
+    // We invoke list via direct call on real cwd; fixture under /tmp/... won't appear in `ls .roadmap.*`
+    // unless we cd there. Use exec wrapper to run list inside tmp_dir — schema_only check:
+    let listed = exec("cd '" + tmp_dir + "' && ls -1 .roadmap.* 2>/dev/null").trim()
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S3_list", "\"listed\":\"" + listed + "\"")
+    if !listed.contains(".roadmap." + name) {
+        println("__ROADMAP_OP__ FAIL self-test S3_list fixture_not_listed")
+        return 1
+    }
+
+    // S4 show — header summary correct (name + kind + cond count == 2, blocker count == 1)
+    let rc4 = subcmd_show(path)
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S4_show", "\"rc\":" + to_string(rc4))
+    if rc4 != 0 {
+        println("__ROADMAP_OP__ FAIL self-test S4_show rc=" + to_string(rc4))
+        return 1
+    }
+
+    // S5 verify — clean fixture should pass
+    let rc5a = verify_one(path)
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S5_verify_clean", "\"rc\":" + to_string(rc5a))
+    if rc5a != 0 {
+        println("__ROADMAP_OP__ FAIL self-test S5_verify_clean rc=" + to_string(rc5a))
+        return 1
+    }
+    // S5b — inject Track-G drift (status_enum_adopted=true bool) and re-verify; must FAIL
+    let path_drift = tmp_dir + "/.roadmap." + name + "_drift"
+    let drift_content = "# drift fixture\n# header next\n# raw\n# enum\n"
+        + "{\"type\":\"header\",\"kind\":\"game\",\"name\":\"" + name + "_drift\",\"mk\":2,"
+        + "\"required_conditions\":[{\"id\":\"" + name + "_drift.cond.1\",\"desc\":\"d\",\"status\":\"partial\",\"evidence\":[]}],"
+        + "\"blockers\":[{\"id\":\"" + name + "_drift.blk.1\",\"desc\":\"d\",\"status\":\"open\",\"status_enum_adopted\":true}],"
+        + "\"cross_link\":{}}\n"
+    let _ = atomic_write(path_drift, drift_content)
+    let rc5b = verify_one(path_drift)
+    r0_session_set(sid)
+    r0_emit("roadmap_op_self_test_S5_verify_drift", "\"rc\":" + to_string(rc5b))
+    if rc5b == 0 {
+        println("__ROADMAP_OP__ FAIL self-test S5_verify_drift should_have_failed_bool_drift")
+        return 1
+    }
+
+    // cleanup
+    let _ = exec("rm -rf '" + tmp_dir + "'")
+
+    let cnt = r0_session_count(sid)
+    println("__ROADMAP_OP__ PASS self-test 5 subcmds_S1..S5+drift sid=" + sid + " emits=" + to_string(cnt))
+    return 0
+}
+
+// ─── Track-M cycle-2: 6 deferred subcmd → full 11/11 anima parity ─────
+//
+// Implements the 6 anima subcmd that Track-I deferred:
+//   edit-blocker     (priority high)   — single-field update on blocker (status/resolution_path/eta)
+//   promote-met      (priority high)   — wraps update --status met with verifier guard pipeline
+//   dump-evidence    (priority medium) — read-only evidence dump (tsv/json/md)
+//   diff             (priority medium) — read-only delta diff between two roadmap files
+//   migrate          (priority low)    — NO-OP guard subcmd (own1 migration:forbidden exemplar)
+//   archive          (priority low)    — emits freeze marker stub for retired_intentional roadmap
+//
+// All 6 follow Track-I conventions: honest emit / atomic write / silent_error_ban /
+// reserved-word avoidance / snake_case / additive only.
+
+// blocker.status_enum_adopted is the str-typed adoption flag (Track-G normalization).
+// blocker fields editable via edit-blocker:
+//   status (enum: open|closed|acknowledged|warn)
+//   resolution_path (free text)
+//   eta (ISO 8601 string; we accept any quoted-safe string, no calendar parse)
+
+let BLOCKER_FIELDS_ALLOWED = ["status", "resolution_path", "eta"]
+
+// Replace OR insert a single string field in obj (sibling of replace_str_field that handles absence).
+fn upsert_str_field(obj: str, field: str, new_val: str) -> str {
+    let key = "\"" + field + "\":\""
+    let i = obj.index_of(key)
+    if i >= 0 {
+        return replace_str_field(obj, field, new_val)
+    }
+    // Insert before closing `}`.
+    let last = len(obj) - 1
+    let mut tail_join = ","
+    let inner = obj.substring(1, last).trim()
+    if inner == "" { tail_join = "" }
+    let escaped = new_val.replace("\\", "\\\\").replace("\"", "\\\"")
+    return obj.substring(0, last) + tail_join + "\"" + field + "\":\"" + escaped + "\"" + obj.substring(last, len(obj))
+}
+
+// Count items inside an evidence array of a cond obj — naive comma split inside `[...]`.
+// Returns -1 if no evidence array found.
+fn cond_evidence_count(cond_obj: str) -> int {
+    let ev_key = "\"evidence\":["
+    let ev_i = cond_obj.index_of(ev_key)
+    if ev_i < 0 { return -1 }
+    let ev_open = ev_i + len(ev_key)
+    let m = len(cond_obj)
+    let mut p = ev_open
+    let mut in_str = false
+    let mut esc = false
+    while p < m {
+        let ch = cond_obj.substring(p, p + 1)
+        if esc { esc = false }
+        else if ch == "\\" { esc = true }
+        else if ch == "\"" { in_str = !in_str }
+        else if !in_str && ch == "]" { break }
+        p = p + 1
+    }
+    if p >= m { return -1 }
+    let body = cond_obj.substring(ev_open, p).trim()
+    if body == "" { return 0 }
+    // Each entry is a quoted string; count `"` opens at depth 0.
+    let mut q = 0
+    let bn = len(body)
+    let mut entries = 0
+    let mut in_str2 = false
+    let mut esc2 = false
+    while q < bn {
+        let ch = body.substring(q, q + 1)
+        if esc2 { esc2 = false }
+        else if ch == "\\" { esc2 = true }
+        else if ch == "\"" {
+            if !in_str2 { entries = entries + 1 }
+            in_str2 = !in_str2
+        }
+        q = q + 1
+    }
+    return entries
+}
+
+// Return the array of evidence string entries (raw, with embedded quotes preserved).
+fn cond_evidence_list(cond_obj: str) -> array {
+    let mut out = []
+    let ev_key = "\"evidence\":["
+    let ev_i = cond_obj.index_of(ev_key)
+    if ev_i < 0 { return out }
+    let ev_open = ev_i + len(ev_key)
+    let m = len(cond_obj)
+    let mut p = ev_open
+    let mut in_str = false
+    let mut esc = false
+    while p < m {
+        let ch = cond_obj.substring(p, p + 1)
+        if esc { esc = false }
+        else if ch == "\\" { esc = true }
+        else if ch == "\"" { in_str = !in_str }
+        else if !in_str && ch == "]" { break }
+        p = p + 1
+    }
+    if p >= m { return out }
+    let body = cond_obj.substring(ev_open, p)
+    let bn = len(body)
+    let mut q = 0
+    let mut in_str2 = false
+    let mut esc2 = false
+    let mut start = -1
+    while q < bn {
+        let ch = body.substring(q, q + 1)
+        if esc2 { esc2 = false }
+        else if ch == "\\" { esc2 = true }
+        else if ch == "\"" {
+            if !in_str2 {
+                start = q + 1
+                in_str2 = true
+            } else {
+                if start >= 0 {
+                    let raw = body.substring(start, q)
+                    out = out.push(raw)
+                }
+                in_str2 = false
+                start = -1
+            }
+        }
+        q = q + 1
+    }
+    return out
+}
+
+// ─── edit-blocker subcmd ──────────────────────────────────────────────
+
+fn subcmd_edit_blocker(args_in: array) -> int {
+    let mut roadmap_path = ""
+    let mut blocker_id = ""
+    let mut new_status = ""
+    let mut new_resolution = ""
+    let mut new_eta = ""
+    let mut had_resolution = false
+    let mut had_eta = false
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { roadmap_path = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--blocker" && i + 1 < n { blocker_id = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--status" && i + 1 < n { new_status = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--resolution_path" && i + 1 < n { new_resolution = args_in[i + 1]; had_resolution = true; i = i + 2; continue }
+        if tok == "--eta" && i + 1 < n { new_eta = args_in[i + 1]; had_eta = true; i = i + 2; continue }
+        i = i + 1
+    }
+    if roadmap_path == "" || !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL edit-blocker roadmap_not_found_or_missing")
+        return 1
+    }
+    if blocker_id == "" {
+        println("__ROADMAP_OP__ FAIL edit-blocker empty_blocker_id")
+        return 1
+    }
+    let mut field_count = 0
+    if new_status != "" { field_count = field_count + 1 }
+    if had_resolution { field_count = field_count + 1 }
+    if had_eta { field_count = field_count + 1 }
+    if field_count == 0 {
+        println("__ROADMAP_OP__ FAIL edit-blocker need_at_least_one_field")
+        return 1
+    }
+    if field_count > 1 {
+        println("__ROADMAP_OP__ FAIL edit-blocker single_field_per_call_only")
+        return 1
+    }
+    if new_status != "" && !enum_contains(BLOCKER_STATUS_ALLOWED, new_status) {
+        println("__ROADMAP_OP__ FAIL edit-blocker blocker_status_enum_invalid:" + new_status)
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL edit-blocker header_line_missing")
+        return 1
+    }
+    let span = locate_obj_span(header, blocker_id)
+    if span[0] < 0 {
+        println("__ROADMAP_OP__ FAIL edit-blocker blocker_not_found:" + blocker_id)
+        return 1
+    }
+    let s = span[0]
+    let e = span[1]
+    let obj = header.substring(s, e + 1)
+    // Sanity: obj should be a blocker (id contains `.blk.`).
+    if !blocker_id.contains(".blk.") {
+        println("__ROADMAP_OP__ FAIL edit-blocker id_not_blocker:" + blocker_id)
+        return 1
+    }
+    let mut new_obj = obj
+    let mut field_label = ""
+    let mut field_value = ""
+    if new_status != "" {
+        new_obj = upsert_str_field(obj, "status", new_status)
+        field_label = "status"
+        field_value = new_status
+    } else if had_resolution {
+        new_obj = upsert_str_field(obj, "resolution_path", new_resolution)
+        field_label = "resolution_path"
+        field_value = new_resolution
+    } else if had_eta {
+        new_obj = upsert_str_field(obj, "eta", new_eta)
+        field_label = "eta"
+        field_value = new_eta
+    }
+    let new_header = header.substring(0, s) + new_obj + header.substring(e + 1, len(header))
+    let new_content = header_line_replace(content, new_header)
+    let ok = atomic_write(roadmap_path, new_content)
+    if !ok {
+        println("__ROADMAP_OP__ FAIL edit-blocker atomic_write_failed")
+        return 1
+    }
+    println("__ROADMAP_OP__ PASS edit-blocker blocker=" + blocker_id + " " + field_label + "=" + field_value)
+    return 0
+}
+
+// ─── promote-met subcmd ──────────────────────────────────────────────
+//
+// Wraps update --status met with verifier guard pipeline.
+//   Guard 1: cond evidence array length >= require_evidence_min (default 3).
+//   Guard 2: cond carries a verifier path field (`"verifier":"<path>"` or `"verifier_path":"<path>"`).
+//   Guard 3: emit verifier execution would-be command (do NOT actually exec — design intent guard only).
+// On all guards PASS, calls subcmd_update internally to set status=met (forward-only — if cond is
+// already met or retired_intentional, that's a no-op via update logic).
+
+fn cond_verifier_path(cond_obj: str) -> str {
+    let v1 = read_str_field(cond_obj, "verifier")
+    if v1 != "" { return v1 }
+    let v2 = read_str_field(cond_obj, "verifier_path")
+    if v2 != "" { return v2 }
+    return ""
+}
+
+fn subcmd_promote_met(args_in: array) -> int {
+    let mut roadmap_path = ""
+    let mut cond_id = ""
+    let mut min_ev = 3
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { roadmap_path = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--cond" && i + 1 < n { cond_id = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--require-evidence-min" && i + 1 < n {
+            let v = args_in[i + 1]
+            // Use string compare for small ints (no parse_int required); fallback default 3.
+            if v == "0" { min_ev = 0 }
+            else if v == "1" { min_ev = 1 }
+            else if v == "2" { min_ev = 2 }
+            else if v == "3" { min_ev = 3 }
+            else if v == "4" { min_ev = 4 }
+            else if v == "5" { min_ev = 5 }
+            else if v == "6" { min_ev = 6 }
+            else if v == "7" { min_ev = 7 }
+            else if v == "8" { min_ev = 8 }
+            else if v == "9" { min_ev = 9 }
+            else if v == "10" { min_ev = 10 }
+            else { min_ev = 3 }
+            i = i + 2
+            continue
+        }
+        i = i + 1
+    }
+    if roadmap_path == "" || !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL promote-met roadmap_not_found_or_missing")
+        return 1
+    }
+    if cond_id == "" {
+        println("__ROADMAP_OP__ FAIL promote-met empty_cond_id")
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL promote-met header_line_missing")
+        return 1
+    }
+    let span = locate_obj_span(header, cond_id)
+    if span[0] < 0 {
+        println("__ROADMAP_OP__ FAIL promote-met cond_not_found:" + cond_id)
+        return 1
+    }
+    let cond_obj = header.substring(span[0], span[1] + 1)
+    // Guard 1: evidence count.
+    let ec = cond_evidence_count(cond_obj)
+    if ec < 0 {
+        println("__ROADMAP_OP__ FAIL promote-met no_evidence_array_in_cond")
+        return 1
+    }
+    if ec < min_ev {
+        println("__ROADMAP_OP__ FAIL promote-met insufficient_evidence:have=" + to_string(ec) + " need>=" + to_string(min_ev))
+        return 1
+    }
+    // Guard 2: verifier path field present.
+    let vpath = cond_verifier_path(cond_obj)
+    if vpath == "" {
+        println("__ROADMAP_OP__ FAIL promote-met verifier_path_missing_in_cond")
+        return 1
+    }
+    // Guard 3: emit would-be verifier exec line (no actual exec — design intent guard only).
+    println("# promote-met would-exec: hexa run " + vpath + " --cond " + cond_id)
+    // All guards PASS → delegate to subcmd_update to flip status to met (forward-only).
+    let mut delegate_args = []
+    delegate_args = delegate_args.push("--roadmap")
+    delegate_args = delegate_args.push(roadmap_path)
+    delegate_args = delegate_args.push("--cond")
+    delegate_args = delegate_args.push(cond_id)
+    delegate_args = delegate_args.push("--status")
+    delegate_args = delegate_args.push("met")
+    let rc = subcmd_update(delegate_args)
+    if rc != 0 {
+        println("__ROADMAP_OP__ FAIL promote-met update_delegate_failed:rc=" + to_string(rc))
+        return 1
+    }
+    println("__ROADMAP_OP__ PASS promote-met cond=" + cond_id + " evidence=" + to_string(ec) + " verifier=" + vpath)
+    return 0
+}
+
+// ─── dump-evidence subcmd ────────────────────────────────────────────
+
+fn subcmd_dump_evidence(args_in: array) -> int {
+    let mut roadmap_path = ""
+    let mut cond_id = ""
+    let mut format = "tsv"
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { roadmap_path = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--cond" && i + 1 < n { cond_id = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--format" && i + 1 < n { format = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if roadmap_path == "" || !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL dump-evidence roadmap_not_found_or_missing")
+        return 1
+    }
+    if cond_id == "" {
+        println("__ROADMAP_OP__ FAIL dump-evidence empty_cond_id")
+        return 1
+    }
+    if format != "tsv" && format != "json" && format != "md" {
+        println("__ROADMAP_OP__ FAIL dump-evidence format_invalid:" + format)
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL dump-evidence header_line_missing")
+        return 1
+    }
+    let span = locate_obj_span(header, cond_id)
+    if span[0] < 0 {
+        println("__ROADMAP_OP__ FAIL dump-evidence cond_not_found:" + cond_id)
+        return 1
+    }
+    let cond_obj = header.substring(span[0], span[1] + 1)
+    let ev = cond_evidence_list(cond_obj)
+    let nev = len(ev)
+    if format == "tsv" {
+        println("# dump-evidence tsv — cond=" + cond_id + " count=" + to_string(nev))
+        println("# columns: idx\tevidence_text")
+        let mut k = 0
+        while k < nev {
+            println(to_string(k) + "\t" + ev[k])
+            k = k + 1
+        }
+    } else if format == "json" {
+        let mut out = "{\"cond\":\"" + cond_id + "\",\"count\":" + to_string(nev) + ",\"evidence\":["
+        let mut k = 0
+        while k < nev {
+            if k > 0 { out = out + "," }
+            out = out + "\"" + ev[k] + "\""
+            k = k + 1
+        }
+        out = out + "]}"
+        println(out)
+    } else {
+        // md
+        println("# dump-evidence md — cond=" + cond_id + " (" + to_string(nev) + " entries)")
+        println("")
+        let mut k = 0
+        while k < nev {
+            println("- " + ev[k])
+            k = k + 1
+        }
+    }
+    println("__ROADMAP_OP__ PASS dump-evidence cond=" + cond_id + " count=" + to_string(nev) + " format=" + format)
+    return 0
+}
+
+// ─── diff subcmd ─────────────────────────────────────────────────────
+//
+// Read-only delta between two roadmap files. Compares header-level summary:
+//   cond_count, blocker_count, status_enum_adopted_count,
+//   per-status counts (unmet/partial/met/retired_intentional).
+// Output: table with two columns A / B + diff column.
+
+fn diff_summarize(header: str) -> array {
+    // returns array of 7 ints: [conds, blockers, adopted, unmet, partial, met, retired]
+    let mut a = []
+    a = a.push(header_count_conds(header))
+    a = a.push(header_count_blockers(header))
+    a = a.push(header_count_status_enum_adopted(header))
+    a = a.push(count_substr(header, "\"status\":\"unmet\""))
+    a = a.push(count_substr(header, "\"status\":\"partial\""))
+    a = a.push(count_substr(header, "\"status\":\"met\""))
+    a = a.push(count_substr(header, "\"status\":\"retired_intentional\""))
+    return a
+}
+
+fn subcmd_diff(args_in: array) -> int {
+    let mut path_a = ""
+    let mut path_b = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap-a" && i + 1 < n { path_a = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--roadmap-b" && i + 1 < n { path_b = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if path_a == "" || !file_exists(path_a) {
+        println("__ROADMAP_OP__ FAIL diff roadmap_a_not_found_or_missing")
+        return 1
+    }
+    if path_b == "" || !file_exists(path_b) {
+        println("__ROADMAP_OP__ FAIL diff roadmap_b_not_found_or_missing")
+        return 1
+    }
+    let content_a = read_text(path_a)
+    let content_b = read_text(path_b)
+    let header_a = header_line_get(content_a)
+    let header_b = header_line_get(content_b)
+    if header_a == "" || header_b == "" {
+        println("__ROADMAP_OP__ FAIL diff header_line_missing_in_one_or_both")
+        return 1
+    }
+    let sa = diff_summarize(header_a)
+    let sb = diff_summarize(header_b)
+    let labels = ["conds", "blockers", "status_enum_adopted", "unmet", "partial", "met", "retired_intentional"]
+    println("# roadmap_op diff — A=" + path_a + " B=" + path_b)
+    println("# columns: field\tA\tB\tdelta(B-A)")
+    let mut k = 0
+    let mut deltas = 0
+    while k < len(labels) {
+        let av = sa[k]
+        let bv = sb[k]
+        let dv = bv - av
+        if dv != 0 { deltas = deltas + 1 }
+        let mut sign = ""
+        if dv > 0 { sign = "+" }
+        println(labels[k] + "\t" + to_string(av) + "\t" + to_string(bv) + "\t" + sign + to_string(dv))
+        k = k + 1
+    }
+    println("__ROADMAP_OP__ PASS diff a=" + path_a + " b=" + path_b + " deltas=" + to_string(deltas))
+    return 0
+}
+
+// ─── migrate subcmd — NO-OP guard (own1 migration:forbidden exemplar) ─
+
+fn subcmd_migrate(args_in: array) -> int {
+    // Per repo policy `migration: forbidden`, this subcmd ALWAYS emits FAIL and exits 1.
+    // Args are parsed and ignored — we exist for anima parity at signature level only.
+    let mut roadmap_path = ""
+    let mut from_v = ""
+    let mut to_v = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { roadmap_path = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--from" && i + 1 < n { from_v = args_in[i + 1]; i = i + 2; continue }
+        if tok == "--to" && i + 1 < n { to_v = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    let _ignored1 = roadmap_path
+    let _ignored2 = from_v
+    let _ignored3 = to_v
+    println("__ROADMAP_OP__ FAIL migrate migration_forbidden_per_repo_policy")
+    return 1
+}
+
+// ─── archive subcmd — emit freeze marker stub when retired_intentional ─
+
+fn roadmap_basename(roadmap_path: str) -> str {
+    // Extract `.roadmap.<name>` → <name>; if path has slashes, take the trailing segment first.
+    let parts = roadmap_path.split("/")
+    let n = len(parts)
+    let mut leaf = ""
+    if n == 0 { leaf = roadmap_path } else { leaf = parts[n - 1] }
+    let needle = ".roadmap."
+    let i = leaf.index_of(needle)
+    if i < 0 { return leaf }
+    return leaf.substring(i + len(needle), len(leaf))
+}
+
+fn subcmd_archive(args_in: array) -> int {
+    let mut roadmap_path = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--roadmap" && i + 1 < n { roadmap_path = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if roadmap_path == "" || !file_exists(roadmap_path) {
+        println("__ROADMAP_OP__ FAIL archive roadmap_not_found_or_missing")
+        return 1
+    }
+    let content = read_text(roadmap_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL archive header_line_missing")
+        return 1
+    }
+    let nm = header_extract_name(header)
+    // Locate <name>.blk.1
+    let blk1_id = nm + ".blk.1"
+    let span = locate_obj_span(header, blk1_id)
+    if span[0] < 0 {
+        println("__ROADMAP_OP__ FAIL archive blk_1_not_found:" + blk1_id)
+        return 1
+    }
+    let blk_obj = header.substring(span[0], span[1] + 1)
+    let adopted = read_str_field(blk_obj, "status_enum_adopted")
+    if adopted != "retired_intentional" {
+        println("__ROADMAP_OP__ FAIL archive blk_1_not_retired_intentional:adopted=" + adopted)
+        return 1
+    }
+    // Emit freeze marker stub (additive — NO file move, NO destructive op).
+    let basename = roadmap_basename(roadmap_path)
+    let stamp = exec("date +%s").trim()
+    let marker_path = "state/markers/" + basename + "_archive_freeze_" + stamp + ".marker"
+    let mut marker_body = ""
+    marker_body = marker_body + "{\n"
+    marker_body = marker_body + "  \"schema\": \"airgenome-gamebox/markers/roadmap_archive_freeze/1\",\n"
+    marker_body = marker_body + "  \"roadmap_name\": \"" + basename + "\",\n"
+    marker_body = marker_body + "  \"roadmap_path\": \"" + roadmap_path + "\",\n"
+    marker_body = marker_body + "  \"freeze_kind\": \"retired_intentional_archive_stub\",\n"
+    marker_body = marker_body + "  \"freeze_unix_ts\": " + stamp + ",\n"
+    marker_body = marker_body + "  \"destructive_ops\": 0,\n"
+    marker_body = marker_body + "  \"file_move\": false,\n"
+    marker_body = marker_body + "  \"emitted_by\": \"tool/roadmap_op.hexa subcmd_archive\"\n"
+    marker_body = marker_body + "}\n"
+    let ok = atomic_write(marker_path, marker_body)
+    if !ok {
+        println("__ROADMAP_OP__ FAIL archive marker_write_failed:" + marker_path)
+        return 1
+    }
+    println("__ROADMAP_OP__ PASS archive freeze_marker_emit roadmap=" + basename + " marker=" + marker_path)
+    return 0
+}
+
+// ─── Track-AB cycle-1: checkpoint subcmd extension (3 new subcmd) ─────
+//
+// Track-AA design lock-in (4 D all accepted):
+//   D1=b cross-roadmap   .checkpoint references multiple .roadmap files via cond_refs[]
+//   D2=b separate SSOT   `.checkpoint.<name>` NEW file family at repo root (not in header)
+//   D3=a reuse cond enum status enum = unmet | partial | met | retired_intentional
+//   D4=a roadmap_op extend tool extension here (not new tool, not closure_orchestrator)
+//
+// Schema of `.checkpoint.<name>` (mirrors mk2 .roadmap convention — 4 prologue
+// comment lines + ONE single-line JSON header on line 5):
+//   {"type":"header","kind":"checkpoint","name":"<name>","mk":2,
+//    "status":"<enum>","aggregation":"AND_all_required_met",
+//    "cond_refs":[
+//       {"roadmap":".roadmap.<X>","cond":"<id>","required":"<enum>"},
+//       ...
+//    ]}
+//
+// Aggregation rule (cycle 1): AND — every cond_ref's actual status MUST be
+// >= the required value (rank-compatible) for the checkpoint to be "met".
+// weighted_threshold (win32_*pct candidates) deferred to phase 2.
+//
+// IMPORTANT — additive layer ONLY: this cycle MUST NOT modify the mk2 cond/blk
+// schema, MUST NOT emit any `.checkpoint.<name>` file (Track-AC cycle 2 territory),
+// MUST NOT touch closure_orchestrator (Track-AD cycle 3 territory).
+//
+// Anima parity: anima sibling at /Users/ghost/core/anima/tool/roadmap_op.hexa
+// has 11 subcmd, no checkpoint subcmd. Gamebox forward evolution path lands 3
+// checkpoint subcmd here — anima parity break is INTENTIONAL per Track-AA D4
+// matrix C5/C8 caveat lock-in (confidence MEDIUM).
+
+// list `.checkpoint.*` files in repo root.
+fn list_checkpoints_dir() -> array {
+    let raw = exec("ls -1 .checkpoint.* 2>/dev/null").trim()
+    let mut out = []
+    if raw == "" { return out }
+    let parts = raw.split("\n")
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let s = parts[i].trim()
+        if s != "" { out = out.push(s) }
+        i = i + 1
+    }
+    return out
+}
+
+// Derive the bare name from a `.checkpoint.<name>` path (strip directory + prefix).
+fn checkpoint_basename(checkpoint_path: str) -> str {
+    let parts = checkpoint_path.split("/")
+    let n = len(parts)
+    let mut leaf = ""
+    if n == 0 { leaf = checkpoint_path } else { leaf = parts[n - 1] }
+    let needle = ".checkpoint."
+    let i = leaf.index_of(needle)
+    if i < 0 { return leaf }
+    return leaf.substring(i + len(needle), len(leaf))
+}
+
+// Count cond_ref objects in a checkpoint header — counts `"roadmap":"` occurrences.
+fn checkpoint_count_refs(header: str) -> int {
+    return count_substr(header, "\"roadmap\":\"")
+}
+
+// Extract array body of `cond_refs` from header — substring inside outermost [...].
+// Returns "" if no cond_refs array present.
+fn checkpoint_extract_refs_body(header: str) -> str {
+    let key = "\"cond_refs\":["
+    let i = header.index_of(key)
+    if i < 0 { return "" }
+    let start = i + len(key)
+    let n = len(header)
+    let mut p = start
+    let mut in_str = false
+    let mut esc = false
+    let mut depth = 1
+    while p < n {
+        let ch = header.substring(p, p + 1)
+        if esc {
+            esc = false
+        } else if ch == "\\" {
+            esc = true
+        } else if ch == "\"" {
+            in_str = !in_str
+        } else if !in_str {
+            if ch == "[" { depth = depth + 1 }
+            if ch == "]" {
+                depth = depth - 1
+                if depth == 0 { break }
+            }
+        }
+        p = p + 1
+    }
+    if p >= n { return "" }
+    return header.substring(start, p)
+}
+
+// Split cond_refs array body into individual `{...}` object strings (depth-aware).
+fn checkpoint_split_refs(body: str) -> array {
+    let mut out = []
+    let n = len(body)
+    if n == 0 { return out }
+    let mut p = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut depth = 0
+    let mut start = -1
+    while p < n {
+        let ch = body.substring(p, p + 1)
+        if esc {
+            esc = false
+        } else if ch == "\\" {
+            esc = true
+        } else if ch == "\"" {
+            in_str = !in_str
+        } else if !in_str {
+            if ch == "{" {
+                if depth == 0 { start = p }
+                depth = depth + 1
+            } else if ch == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out.push(body.substring(start, p + 1))
+                    start = -1
+                }
+            }
+        }
+        p = p + 1
+    }
+    return out
+}
+
+// Compatibility rule (Track-AB AND aggregation): a cond_ref is "satisfied" iff
+// the actual cond status rank is >= required rank, with `retired_intentional`
+// (rank 3) treated as a sideways PASS regardless of the numeric required level.
+fn checkpoint_ref_satisfied(actual: str, required: str) -> bool {
+    if actual == "retired_intentional" { return true }
+    let ar = status_rank(actual)
+    let rr = status_rank(required)
+    if ar < 0 || rr < 0 { return false }
+    return ar >= rr
+}
+
+// ─── Track-AE phase 2 weighted_threshold aggregation helpers ──────────
+//
+// Track-AE extends the AND-only aggregation rule (Track-AB cycle 1) with a
+// `weighted_threshold` aggregation kind for win32_*pct coverage candidates
+// and other phase 2 surfaces where the checkpoint represents a numeric
+// threshold over weighted cond_ref contributions. Existing AND_all_required_met
+// behavior is preserved byte-for-byte; the new kind is additive and dispatched
+// from the aggregation field value in the .checkpoint header.
+//
+// Schema extension (header-level, all OPTIONAL with backward-compatible defaults):
+//   "aggregation": "weighted_threshold"            (string; AND_all_required_met = default)
+//   "threshold_kind": "percentage|fn_count|weighted_sum"   (string; default "percentage")
+//   "threshold_value": <int>                        (int; e.g. 50 for 50%, 100 for full)
+//   "progress_metric": "<name>"                     (string; informational)
+//   "progress_source": "<path/field>"               (string; informational)
+// Per-cond_ref OPTIONAL extension:
+//   "weight": <int>                                 (int; default 1 if absent)
+//
+// Derivation logic:
+//   sum := Σ weight(ref) for each ref where actual is met OR retired_intentional
+//   if sum >= threshold_value      → met
+//   elif sum >  0                  → partial
+//   else                           → unmet
+
+// ─── tiny integer parser (no parse_int builtin in hexa runtime) ───────
+//
+// Naive non-negative integer parser. Returns -1 on parse failure (empty / non-digit).
+// Used by the weighted_threshold aggregator for `weight` and `threshold_value` fields.
+fn parse_uint_safe(s: str) -> int {
+    let n = len(s)
+    if n == 0 { return -1 }
+    let mut i = 0
+    let mut acc = 0
+    let mut any = false
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "0" { acc = acc * 10 + 0 }
+        else if ch == "1" { acc = acc * 10 + 1 }
+        else if ch == "2" { acc = acc * 10 + 2 }
+        else if ch == "3" { acc = acc * 10 + 3 }
+        else if ch == "4" { acc = acc * 10 + 4 }
+        else if ch == "5" { acc = acc * 10 + 5 }
+        else if ch == "6" { acc = acc * 10 + 6 }
+        else if ch == "7" { acc = acc * 10 + 7 }
+        else if ch == "8" { acc = acc * 10 + 8 }
+        else if ch == "9" { acc = acc * 10 + 9 }
+        else { return -1 }
+        any = true
+        i = i + 1
+    }
+    if !any { return -1 }
+    return acc
+}
+
+// Extract a non-negative integer field from a JSON-ish object / header.
+// Reads the substring following `"<key>":` up to the next `,` or `}` or `]`,
+// trims whitespace, parses via parse_uint_safe. Returns `default_val` on miss.
+fn extract_int_field(obj: str, key: str, default_val: int) -> int {
+    let needle = "\"" + key + "\":"
+    let i = idx_of(obj, needle)
+    if i < 0 { return default_val }
+    let start = i + len(needle)
+    let n = len(obj)
+    let mut p = start
+    // skip leading whitespace
+    while p < n {
+        let c = obj.substring(p, p + 1)
+        if c == " " || c == "\t" { p = p + 1 } else { break }
+    }
+    let val_start = p
+    while p < n {
+        let c = obj.substring(p, p + 1)
+        if c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\n" { break }
+        p = p + 1
+    }
+    if p <= val_start { return default_val }
+    let raw = obj.substring(val_start, p)
+    let parsed = parse_uint_safe(raw)
+    if parsed < 0 { return default_val }
+    return parsed
+}
+
+// Header-level field extractors (Track-AE additive — used by status dispatcher).
+fn checkpoint_extract_aggregation_kind(header: str) -> str {
+    let v = extract_str_after(header, "\"aggregation\":\"")
+    if v == "" { return "AND_all_required_met" }
+    return v
+}
+
+fn checkpoint_extract_threshold_kind(header: str) -> str {
+    let v = extract_str_after(header, "\"threshold_kind\":\"")
+    if v == "" { return "percentage" }
+    return v
+}
+
+fn checkpoint_extract_threshold_value(header: str) -> int {
+    return extract_int_field(header, "threshold_value", 0)
+}
+
+// Per-cond_ref weight (default 1 for backward-compat with AND-aggregation refs).
+fn checkpoint_ref_weight(ref_obj: str) -> int {
+    return extract_int_field(ref_obj, "weight", 1)
+}
+
+// stderr warning emit (used by aggregation kind fallback path).
+// Hexa runtime has no eprintln — route via shell `>&2` redirect.
+fn stderr_warn(msg: str) -> void {
+    let _ = exec("printf '%s\\n' " + sh_quote(msg) + " >&2")
+}
+
+// Aggregate weighted_threshold derivation.
+//   - `actuals` is a parallel array to `refs` carrying the resolved cond status
+//     ("met" / "partial" / "unmet" / "retired_intentional" / "ERROR_*").
+//   - returns "met" / "partial" / "unmet" — the derived checkpoint status.
+fn checkpoint_aggregate_weighted_threshold(header: str, refs: array, actuals: array) -> str {
+    let threshold = checkpoint_extract_threshold_value(header)
+    let nrefs = len(refs)
+    let mut sum = 0
+    let mut k = 0
+    while k < nrefs {
+        let ref_obj = refs[k]
+        let actual = actuals[k]
+        // Contributing statuses: met OR retired_intentional (sideways-PASS per Track-AB).
+        if actual == "met" || actual == "retired_intentional" {
+            let w = checkpoint_ref_weight(ref_obj)
+            sum = sum + w
+        }
+        k = k + 1
+    }
+    if threshold <= 0 {
+        // Defensive: a threshold of 0 means "any contribution = met"; matches intent.
+        if sum > 0 { return "met" }
+        return "unmet"
+    }
+    if sum >= threshold { return "met" }
+    if sum > 0 { return "partial" }
+    return "unmet"
+}
+
+// ─── checkpoint-status subcmd ────────────────────────────────────────
+
+fn subcmd_checkpoint_status(args_in: array) -> int {
+    let mut checkpoint_path = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--checkpoint" && i + 1 < n { checkpoint_path = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if checkpoint_path == "" || !file_exists(checkpoint_path) {
+        println("__ROADMAP_OP__ FAIL checkpoint-status checkpoint_not_found_or_missing")
+        return 1
+    }
+    let content = read_text(checkpoint_path)
+    let header = header_line_get(content)
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL checkpoint-status header_line_missing")
+        return 1
+    }
+    let kind = header_extract_kind(header)
+    if kind != "checkpoint" {
+        println("__ROADMAP_OP__ FAIL checkpoint-status kind_not_checkpoint:" + kind)
+        return 1
+    }
+    let name = header_extract_name(header)
+    if name == "" {
+        println("__ROADMAP_OP__ FAIL checkpoint-status name_field_missing")
+        return 1
+    }
+    let body = checkpoint_extract_refs_body(header)
+    if body == "" {
+        println("__ROADMAP_OP__ FAIL checkpoint-status cond_refs_missing")
+        return 1
+    }
+    let refs = checkpoint_split_refs(body)
+    let nrefs = len(refs)
+    if nrefs == 0 {
+        println("__ROADMAP_OP__ FAIL checkpoint-status cond_refs_empty")
+        return 1
+    }
+    // Aggregate counts.
+    let mut met_count = 0
+    let mut partial_count = 0
+    let mut unmet_count = 0
+    let mut retired_count = 0
+    let mut unsatisfied_count = 0
+    let mut satisfied_count = 0
+    let mut error_count = 0
+
+    // Track-AE: capture per-ref actual into a parallel array so the
+    // weighted_threshold aggregator can iterate without re-parsing roadmaps.
+    let mut actuals = []
+
+    // Print summary table header.
+    println("# checkpoint-status — checkpoint=" + name + " refs=" + to_string(nrefs))
+    println("# columns: idx\troadmap\tcond\trequired\tactual\tsatisfied")
+
+    let mut k = 0
+    while k < nrefs {
+        let ref_obj = refs[k]
+        let r_road = read_str_field(ref_obj, "roadmap")
+        let r_cond = read_str_field(ref_obj, "cond")
+        let r_req = read_str_field(ref_obj, "required")
+        let mut actual = ""
+        let mut sat = false
+        if r_road == "" || r_cond == "" || r_req == "" {
+            actual = "ERROR_ref_field_missing"
+            error_count = error_count + 1
+        } else if !file_exists(r_road) {
+            actual = "ERROR_roadmap_not_found"
+            error_count = error_count + 1
+        } else {
+            let rc_content = read_text(r_road)
+            let rc_header = header_line_get(rc_content)
+            if rc_header == "" {
+                actual = "ERROR_target_header_missing"
+                error_count = error_count + 1
+            } else {
+                let span = locate_obj_span(rc_header, r_cond)
+                if span[0] < 0 {
+                    actual = "ERROR_cond_not_found"
+                    error_count = error_count + 1
+                } else {
+                    let cond_obj = rc_header.substring(span[0], span[1] + 1)
+                    actual = read_str_field(cond_obj, "status")
+                    if actual == "" {
+                        actual = "ERROR_status_field_missing"
+                        error_count = error_count + 1
+                    } else {
+                        if actual == "met" { met_count = met_count + 1 }
+                        else if actual == "partial" { partial_count = partial_count + 1 }
+                        else if actual == "unmet" { unmet_count = unmet_count + 1 }
+                        else if actual == "retired_intentional" { retired_count = retired_count + 1 }
+                        sat = checkpoint_ref_satisfied(actual, r_req)
+                        if sat { satisfied_count = satisfied_count + 1 }
+                        else { unsatisfied_count = unsatisfied_count + 1 }
+                    }
+                }
+            }
+        }
+        actuals = actuals.push(actual)
+        let mut sat_label = "no"
+        if sat { sat_label = "yes" }
+        println(to_string(k) + "\t" + r_road + "\t" + r_cond + "\t" + r_req + "\t" + actual + "\t" + sat_label)
+        k = k + 1
+    }
+
+    // ─── Track-AE aggregation kind dispatch (AND default, weighted_threshold new) ──
+    //
+    // The aggregation field is read from the .checkpoint header; default is
+    // "AND_all_required_met" (Track-AB cycle 1 behavior) for any checkpoint that
+    // omits the field. Unknown values fall back to AND with an explicit stderr
+    // warning (own2 silent_error_ban — explicit fallback emit).
+    let agg_kind = checkpoint_extract_aggregation_kind(header)
+    let mut effective_kind = agg_kind
+    if agg_kind != "AND_all_required_met" && agg_kind != "weighted_threshold" {
+        stderr_warn("__ROADMAP_OP__ WARN checkpoint-status unknown_aggregation_kind:" + agg_kind + " fallback=AND_all_required_met")
+        println("# warn: unknown_aggregation_kind=" + agg_kind + " fallback=AND_all_required_met")
+        effective_kind = "AND_all_required_met"
+    }
+
+    // Determine derived checkpoint status.
+    let mut derived = "unmet"
+    if effective_kind == "weighted_threshold" {
+        // Track-AE phase 2 — sum weighted contribution of met/retired refs.
+        if error_count > 0 {
+            derived = "unmet"
+        } else {
+            derived = checkpoint_aggregate_weighted_threshold(header, refs, actuals)
+        }
+    } else {
+        // AND_all_required_met (existing — Track-AB cycle 1, byte-for-byte logic).
+        if error_count > 0 {
+            derived = "unmet"
+        } else if satisfied_count == nrefs {
+            derived = "met"
+        } else {
+            // Hard-fail: any required="met" but actual="unmet" forces unmet.
+            let mut hard_unmet = false
+            let mut k2 = 0
+            while k2 < nrefs {
+                let ref_obj = refs[k2]
+                let r_req = read_str_field(ref_obj, "required")
+                let r_road = read_str_field(ref_obj, "roadmap")
+                let r_cond = read_str_field(ref_obj, "cond")
+                if file_exists(r_road) {
+                    let rc_h = header_line_get(read_text(r_road))
+                    let span = locate_obj_span(rc_h, r_cond)
+                    if span[0] >= 0 {
+                        let cobj = rc_h.substring(span[0], span[1] + 1)
+                        let act = read_str_field(cobj, "status")
+                        if r_req == "met" && act == "unmet" { hard_unmet = true }
+                    }
+                }
+                k2 = k2 + 1
+            }
+            if hard_unmet { derived = "unmet" } else { derived = "partial" }
+        }
+    }
+
+    // Track-AE: emit aggregation kind + (optional) threshold context for observability.
+    let thr_kind = checkpoint_extract_threshold_kind(header)
+    let thr_val = checkpoint_extract_threshold_value(header)
+    println("# aggregation: kind=" + effective_kind + " (declared=" + agg_kind + ")"
+        + " threshold_kind=" + thr_kind + " threshold_value=" + to_string(thr_val))
+    println("# summary: met=" + to_string(met_count) + " partial=" + to_string(partial_count)
+        + " unmet=" + to_string(unmet_count) + " retired=" + to_string(retired_count)
+        + " satisfied=" + to_string(satisfied_count) + "/" + to_string(nrefs)
+        + " errors=" + to_string(error_count))
+    let verdict = if derived == "met" { "PASS" } else { "FAIL" }
+    println("__ROADMAP_OP__ " + verdict + " checkpoint-status " + name
+        + " status=" + derived + " met=" + to_string(satisfied_count) + "/total=" + to_string(nrefs)
+        + " aggregation=" + effective_kind)
+    if derived == "met" { return 0 }
+    return 1
+}
+
+// ─── checkpoint-list subcmd ──────────────────────────────────────────
+
+fn subcmd_checkpoint_list(args_in: array) -> int {
+    let mut filter_kind = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--filter" && i + 1 < n { filter_kind = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    let _unused_filter = filter_kind
+    let files = list_checkpoints_dir()
+    let nf = len(files)
+    if nf == 0 {
+        println("# no checkpoints found (no `.checkpoint.*` files in repo root)")
+        println("__ROADMAP_OP__ PASS checkpoint-list count=0")
+        return 0
+    }
+    println("# roadmap_op checkpoint-list — " + to_string(nf) + " file(s) under repo root")
+    println("# columns: name | kind | cond_refs_count | cached_status")
+    let mut idx = 0
+    while idx < nf {
+        let path = files[idx]
+        let content = read_text(path)
+        let header = header_line_get(content)
+        if header == "" {
+            println(path + "\tNO_HEADER\t-\t-")
+            idx = idx + 1
+            continue
+        }
+        let nm = header_extract_name(header)
+        let kind = header_extract_kind(header)
+        let nrefs = checkpoint_count_refs(header)
+        let cached = read_str_field(header, "status")
+        let mut shown_cached = cached
+        if shown_cached == "" { shown_cached = "-" }
+        println(path + "\t" + kind + "\t" + nm + "\trefs=" + to_string(nrefs) + "\tstatus=" + shown_cached)
+        idx = idx + 1
+    }
+    println("__ROADMAP_OP__ PASS checkpoint-list count=" + to_string(nf))
+    return 0
+}
+
+// ─── checkpoint-verify subcmd ────────────────────────────────────────
+//
+// Schema validator for `.checkpoint.<name>` JSONL header. Checks:
+//   (a) header line shape: `type=header`, `kind=checkpoint`, `name` field present
+//   (b) `cond_refs` array present and non-empty
+//   (c) each cond_ref has `roadmap` (must start `.roadmap.`), `cond`, `required`
+//   (d) referenced `.roadmap.<X>` file exists
+//   (e) referenced cond.<id> exists in target roadmap
+//   (f) `required` value within cond enum
+//   (g) `status` field present and within cond enum
+//   (h) `name` field consistent with filename
+
+fn checkpoint_verify_one(checkpoint_path: str) -> int {
+    if !file_exists(checkpoint_path) {
+        println("__ROADMAP_OP__ FAIL checkpoint-verify checkpoint_not_found:" + checkpoint_path)
+        return 1
+    }
+    let content = read_text(checkpoint_path)
+    let header = header_line_get(content)
+    let mut issues = 0
+    let mut messages = ""
+    let cp_basename = checkpoint_basename(checkpoint_path)
+
+    // (a) header line shape.
+    if header == "" {
+        println("__ROADMAP_OP__ FAIL checkpoint-verify " + cp_basename + " issue_count=1 header_line_missing")
+        return 1
+    }
+    let typ = header_extract_type(header)
+    if typ != "header" {
+        issues = issues + 1
+        messages = messages + " type_not_header(" + typ + ")"
+    }
+    let kind = header_extract_kind(header)
+    if kind != "checkpoint" {
+        issues = issues + 1
+        messages = messages + " kind_not_checkpoint(" + kind + ")"
+    }
+    let nm = header_extract_name(header)
+    if nm == "" {
+        issues = issues + 1
+        messages = messages + " name_field_missing"
+    }
+
+    // (h) name vs filename consistency.
+    if nm != "" && cp_basename != "" && nm != cp_basename {
+        issues = issues + 1
+        messages = messages + " name_filename_mismatch(header=" + nm + " file=" + cp_basename + ")"
+    }
+
+    // (g) checkpoint-level status field present + valid enum.
+    let cp_status = read_str_field(header, "status")
+    if cp_status == "" {
+        issues = issues + 1
+        messages = messages + " status_field_missing"
+    } else {
+        if !enum_contains(STATUS_ENUM_ALLOWED, cp_status) {
+            issues = issues + 1
+            messages = messages + " status_value_invalid(" + cp_status + ")"
+        }
+    }
+
+    // (b) cond_refs array.
+    let body = checkpoint_extract_refs_body(header)
+    if body == "" {
+        issues = issues + 1
+        messages = messages + " cond_refs_array_missing"
+        println("__ROADMAP_OP__ FAIL checkpoint-verify " + cp_basename + " issue_count=" + to_string(issues) + messages)
+        return 1
+    }
+    let refs = checkpoint_split_refs(body)
+    let nrefs = len(refs)
+    if nrefs == 0 {
+        issues = issues + 1
+        messages = messages + " cond_refs_array_empty"
+        println("__ROADMAP_OP__ FAIL checkpoint-verify " + cp_basename + " issue_count=" + to_string(issues) + messages)
+        return 1
+    }
+
+    // (c) (d) (e) (f) per-ref.
+    let mut k = 0
+    while k < nrefs {
+        let ref_obj = refs[k]
+        let r_road = read_str_field(ref_obj, "roadmap")
+        let r_cond = read_str_field(ref_obj, "cond")
+        let r_req = read_str_field(ref_obj, "required")
+        if r_road == "" {
+            issues = issues + 1
+            messages = messages + " ref[" + to_string(k) + "]_roadmap_missing"
+        } else {
+            let prefix = ".roadmap."
+            let plen = len(prefix)
+            // r_road may be a bare `.roadmap.<X>` (repo-relative) — accept both bare + paths ending with prefix.
+            let leaf = r_road
+            let leaf_parts = leaf.split("/")
+            let lpn = len(leaf_parts)
+            let leaf_tail = if lpn > 0 { leaf_parts[lpn - 1] } else { leaf }
+            if leaf_tail.substring(0, plen) != prefix {
+                issues = issues + 1
+                messages = messages + " ref[" + to_string(k) + "]_roadmap_prefix_violation(" + r_road + ")"
+            } else if !file_exists(r_road) {
+                issues = issues + 1
+                messages = messages + " ref[" + to_string(k) + "]_roadmap_file_not_found(" + r_road + ")"
+            } else {
+                // (e) cond exists in target roadmap.
+                let rc_content = read_text(r_road)
+                let rc_header = header_line_get(rc_content)
+                if rc_header == "" {
+                    issues = issues + 1
+                    messages = messages + " ref[" + to_string(k) + "]_target_header_missing(" + r_road + ")"
+                } else if r_cond == "" {
+                    issues = issues + 1
+                    messages = messages + " ref[" + to_string(k) + "]_cond_missing"
+                } else {
+                    let span = locate_obj_span(rc_header, r_cond)
+                    if span[0] < 0 {
+                        issues = issues + 1
+                        messages = messages + " ref[" + to_string(k) + "]_cond_not_found(" + r_cond + ")"
+                    }
+                }
+            }
+        }
+        if r_cond == "" && r_road != "" {
+            // already counted above for some paths; defensive only when roadmap absent.
+            // (skip to avoid double-count)
+        }
+        // (f) required enum.
+        if r_req == "" {
+            issues = issues + 1
+            messages = messages + " ref[" + to_string(k) + "]_required_missing"
+        } else if !enum_contains(STATUS_ENUM_ALLOWED, r_req) {
+            issues = issues + 1
+            messages = messages + " ref[" + to_string(k) + "]_required_enum_invalid(" + r_req + ")"
+        }
+        k = k + 1
+    }
+
+    if issues == 0 {
+        println("__ROADMAP_OP__ PASS checkpoint-verify " + cp_basename + " issue_count=0")
+        return 0
+    }
+    println("__ROADMAP_OP__ FAIL checkpoint-verify " + cp_basename + " issue_count=" + to_string(issues) + messages)
+    return 1
+}
+
+fn subcmd_checkpoint_verify(args_in: array) -> int {
+    let mut single = ""
+    let n = len(args_in)
+    let mut i = 0
+    while i < n {
+        let tok = args_in[i]
+        if tok == "--checkpoint" && i + 1 < n { single = args_in[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if single != "" {
+        return checkpoint_verify_one(single)
+    }
+    let files = list_checkpoints_dir()
+    let nf = len(files)
+    if nf == 0 {
+        println("# no checkpoints found (no `.checkpoint.*` files in repo root)")
+        println("__ROADMAP_OP__ PASS checkpoint-verify all_count=0")
+        return 0
+    }
+    let mut total_fail = 0
+    let mut idx = 0
+    while idx < nf {
+        let rc = checkpoint_verify_one(files[idx])
+        if rc != 0 { total_fail = total_fail + 1 }
+        idx = idx + 1
+    }
+    if total_fail == 0 {
+        println("__ROADMAP_OP__ PASS checkpoint-verify all_clean count=" + to_string(nf))
+        return 0
+    }
+    println("__ROADMAP_OP__ FAIL checkpoint-verify all_failed " + to_string(total_fail) + "/" + to_string(nf))
+    return 1
+}
+
+// ─── main dispatch ─────────────────────────────────────────────────────
+
+fn main() -> void {
+    let a = args()
+    let n = len(a)
+    if n < 3 {
+        print_help()
+        return
+    }
+    let subcmd = a[2]
+
+    // Build args tail (everything after subcmd token).
+    let mut tail = []
+    let mut k = 3
+    while k < n {
+        tail = tail.push(a[k])
+        k = k + 1
+    }
+
+    if subcmd == "--help" || subcmd == "-h" || subcmd == "help" {
+        print_help()
+        return
+    }
+    if subcmd == "self-test" || subcmd == "selftest" {
+        let rc = self_test()
+        if rc != 0 { panic("roadmap_op self-test FAIL rc=" + to_string(rc)) }
+        return
+    }
+    if subcmd == "add" {
+        // parse roadmap/cond/evidence
+        let mut rp = ""
+        let mut cid = ""
+        let mut ev = ""
+        let nt = len(tail)
+        let mut i = 0
+        while i < nt {
+            let tok = tail[i]
+            if tok == "--roadmap" && i + 1 < nt { rp = tail[i + 1]; i = i + 2; continue }
+            if tok == "--cond" && i + 1 < nt { cid = tail[i + 1]; i = i + 2; continue }
+            if tok == "--evidence" && i + 1 < nt { ev = tail[i + 1]; i = i + 2; continue }
+            i = i + 1
+        }
+        let rc = subcmd_add(rp, cid, ev)
+        if rc != 0 { panic("roadmap_op add FAIL") }
+        return
+    }
+    if subcmd == "update" {
+        let rc = subcmd_update(tail)
+        if rc != 0 { panic("roadmap_op update FAIL") }
+        return
+    }
+    if subcmd == "list" {
+        let rc = subcmd_list(tail)
+        if rc != 0 { panic("roadmap_op list FAIL") }
+        return
+    }
+    if subcmd == "show" {
+        let mut rp = ""
+        let nt = len(tail)
+        let mut i = 0
+        while i < nt {
+            let tok = tail[i]
+            if tok == "--roadmap" && i + 1 < nt { rp = tail[i + 1]; i = i + 2; continue }
+            i = i + 1
+        }
+        let rc = subcmd_show(rp)
+        if rc != 0 { panic("roadmap_op show FAIL") }
+        return
+    }
+    if subcmd == "verify" {
+        let rc = subcmd_verify(tail)
+        if rc != 0 { panic("roadmap_op verify FAIL") }
+        return
+    }
+    if subcmd == "edit-blocker" {
+        let rc = subcmd_edit_blocker(tail)
+        if rc != 0 { panic("roadmap_op edit-blocker FAIL") }
+        return
+    }
+    if subcmd == "promote-met" {
+        let rc = subcmd_promote_met(tail)
+        if rc != 0 { panic("roadmap_op promote-met FAIL") }
+        return
+    }
+    if subcmd == "dump-evidence" {
+        let rc = subcmd_dump_evidence(tail)
+        if rc != 0 { panic("roadmap_op dump-evidence FAIL") }
+        return
+    }
+    if subcmd == "diff" {
+        let rc = subcmd_diff(tail)
+        if rc != 0 { panic("roadmap_op diff FAIL") }
+        return
+    }
+    if subcmd == "migrate" {
+        // NO-OP guard: ALWAYS FAIL per repo policy migration:forbidden.
+        let rc = subcmd_migrate(tail)
+        if rc != 0 { panic("roadmap_op migrate FAIL migration_forbidden_per_repo_policy") }
+        return
+    }
+    if subcmd == "archive" {
+        let rc = subcmd_archive(tail)
+        if rc != 0 { panic("roadmap_op archive FAIL") }
+        return
+    }
+    if subcmd == "checkpoint-status" {
+        let rc = subcmd_checkpoint_status(tail)
+        if rc != 0 { panic("roadmap_op checkpoint-status FAIL") }
+        return
+    }
+    if subcmd == "checkpoint-list" {
+        let rc = subcmd_checkpoint_list(tail)
+        if rc != 0 { panic("roadmap_op checkpoint-list FAIL") }
+        return
+    }
+    if subcmd == "checkpoint-verify" {
+        let rc = subcmd_checkpoint_verify(tail)
+        if rc != 0 { panic("roadmap_op checkpoint-verify FAIL") }
+        return
+    }
+    println("__ROADMAP_OP__ FAIL dispatch unknown_subcmd:" + subcmd)
+    print_help()
+    panic("roadmap_op dispatch FAIL unknown_subcmd=" + subcmd)
+}

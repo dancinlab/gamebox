@@ -1,0 +1,382 @@
+// lib/perf/c_heap_defrag.hexa — CN-8 C-HEAP-DEFRAG (15/15) — PSB-1 sketch 후보
+//
+// 무엇:
+//   c_heap.hexa 가 frag_critical / OOM_imminent / thrashing label 을 emit 하면
+//   *자동* (사용자 모르게) cold texture evict + heap compaction 수행.
+//   recently-unused texture (last_used 기준) 식별 → defrag plan → record 의
+//   3-stage workflow.
+//
+// 무기:
+//   - c_heap label trigger (frag_critical / OOM_imminent / thrashing 자동 분기)
+//   - columnar defrag history (history.jsonl: 트리거 이력)
+//   - cold candidate list (candidates.txt: recently-unused 후보)
+//
+// 효과:
+//   heap fragmentation 35%+ 감지 → 자동 evict → frag 회복 + 메모리 회수.
+//   사용자 개입 0, 게임 stutter 0 (background only).
+//
+// schema (history.jsonl row):
+//   {"ts":<unix>,"plan":"<json>","evicted":N,"freed_mb":N,"frag_after":N}
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X,
+// args() = [hexa, file, ...userargs] → a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. synthetic candidate
+// list (text-only) round-trip 검증.
+//
+// own 2 mandate: r0_emit ≥ 4 (defrag_trigger + defrag_skip + defrag_record +
+// defrag_stats), fn self_test() + main() dispatch, headless, panic 형식
+// "c_heap_defrag FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/heap_defrag/
+//     ├── history.jsonl    — defrag trigger 이력
+//     └── candidates.txt   — cold texture 후보 list (recently-unused)
+fn defrag_dir() -> str {
+    return GAMEBOX_HOME + "/persist/heap_defrag"
+}
+
+fn history_path() -> str {
+    return defrag_dir() + "/history.jsonl"
+}
+
+fn candidates_path() -> str {
+    return defrag_dir() + "/candidates.txt"
+}
+
+fn defrag_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + defrag_dir() + "'")
+}
+
+// ─── should_trigger ───
+//   true if frag_pct > 35 OR mem_pressure_label == "OOM_imminent" / "thrashing"
+//   (= c_heap.hexa 의 4 anomaly 중 자동 정리가 의미 있는 3 가지).
+fn should_trigger(frag_pct: int, mem_pressure_label: str) -> bool {
+    if frag_pct > 35 {
+        return true
+    }
+    if mem_pressure_label == "OOM_imminent" {
+        return true
+    }
+    if mem_pressure_label == "thrashing" {
+        return true
+    }
+    if mem_pressure_label == "frag_critical" {
+        return true
+    }
+    return false
+}
+
+// ─── identify_cold_candidates ───
+//   synthetic — last_used_ts 기반 cold list.
+//   "마지막 사용 > threshold_sec" = (now - last_used) > threshold.
+//   합성 5 후보: last_used = [200, 400, 600, 800, 950] (id = "tex_<i>").
+//   결과: array of [id, last_used] (cold 만).
+fn identify_cold_candidates(now_ts: int, threshold_sec: int) -> array {
+    let synthetic_ids = ["tex_0", "tex_1", "tex_2", "tex_3", "tex_4"]
+    let synthetic_lut = [200, 400, 600, 800, 950]
+
+    let out = []
+    let i = 0
+    while i < len(synthetic_lut) {
+        let last_used = synthetic_lut[i]
+        let age = now_ts - last_used
+        if age > threshold_sec {
+            out = out + [[synthetic_ids[i], last_used]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── candidates_persist ───
+//   cold candidate list 를 candidates.txt 에 저장 (recently-unused list 영속화).
+//   1 line per candidate: "<id> <last_used>"
+fn candidates_persist(candidates: array) -> void {
+    defrag_ensure_dir()
+    let body = ""
+    let i = 0
+    while i < len(candidates) {
+        let row = candidates[i]
+        body = body + to_string(row[0]) + " " + to_string(row[1]) + "\n"
+        i = i + 1
+    }
+    write_file(candidates_path(), body)
+}
+
+// ─── create_defrag_plan ───
+//   evict 할 candidates + 예상 회수 메모리 (synthetic: 후보 1개 = 50 MB 가정).
+//   결과: JSON plan string.
+fn create_defrag_plan(candidates: array, current_frag: int) -> str {
+    let n = len(candidates)
+    let est_freed_mb = n * 50
+
+    // candidate id list 직렬화 — "tex_0,tex_1,..."
+    let ids_str = ""
+    let i = 0
+    while i < n {
+        if i > 0 { ids_str = ids_str + "," }
+        let row = candidates[i]
+        ids_str = ids_str + to_string(row[0])
+        i = i + 1
+    }
+
+    let plan = "{\"action\":\"evict\""
+        + ",\"candidates\":\"" + ids_str + "\""
+        + ",\"count\":" + to_string(n)
+        + ",\"est_freed_mb\":" + to_string(est_freed_mb)
+        + ",\"current_frag\":" + to_string(current_frag)
+        + "}"
+    return plan
+}
+
+// ─── record_defrag ───
+//   trigger 실행 후 결과 history.jsonl append + emit.
+fn record_defrag(plan: str, evicted_count: int, memory_freed_mb: int, frag_after: int) -> void {
+    defrag_ensure_dir()
+    let ts = exec("date +%s").trim()
+    // plan 안의 "(") 들을 보존하기 위해 plan 을 raw embed (이미 JSON string).
+    // history.jsonl row schema: ts/plan(raw)/evicted/freed_mb/frag_after.
+    let line = "{\"ts\":" + ts
+        + ",\"plan\":" + plan
+        + ",\"evicted\":" + to_string(evicted_count)
+        + ",\"freed_mb\":" + to_string(memory_freed_mb)
+        + ",\"frag_after\":" + to_string(frag_after)
+        + "}"
+    r0_append_line(history_path(), line)
+    r0_emit("defrag_record",
+        "\"evicted\":" + to_string(evicted_count)
+        + ",\"freed_mb\":" + to_string(memory_freed_mb)
+        + ",\"frag_after\":" + to_string(frag_after))
+}
+
+// ─── auto_defrag_workflow ───
+//   c_heap label 호출 → should_trigger → plan → (실행은 호출자) → record.
+//   본 함수는 *trigger 결정* 까지 (record 는 caller 가 실제 evict 후 호출).
+//   결과: "TRIGGERED" or "SKIP:<reason>".
+fn auto_defrag_workflow(frag_pct: int, mem_label: str, candidates: array) -> str {
+    if should_trigger(frag_pct, mem_label) == false {
+        r0_emit("defrag_skip",
+            "\"reason\":\"below_threshold\""
+            + ",\"frag_pct\":" + to_string(frag_pct)
+            + ",\"mem_label\":\"" + mem_label + "\"")
+        return "SKIP:below_threshold"
+    }
+    if len(candidates) == 0 {
+        r0_emit("defrag_skip",
+            "\"reason\":\"no_candidates\""
+            + ",\"frag_pct\":" + to_string(frag_pct)
+            + ",\"mem_label\":\"" + mem_label + "\"")
+        return "SKIP:no_candidates"
+    }
+    let plan = create_defrag_plan(candidates, frag_pct)
+    candidates_persist(candidates)
+    r0_emit("defrag_trigger",
+        "\"frag_pct\":" + to_string(frag_pct)
+        + ",\"mem_label\":\"" + mem_label + "\""
+        + ",\"candidate_count\":" + to_string(len(candidates)))
+    return "TRIGGERED"
+}
+
+// ─── defrag_stats ───
+//   [total_triggers, total_freed_mb, avg_frag_reduction]
+//   avg_frag_reduction = (sum(initial_frag - frag_after)) / total_triggers.
+//   initial_frag 는 plan.current_frag 에 박혀있음 → sed 추출.
+fn defrag_stats() -> array {
+    defrag_ensure_dir()
+    let path = history_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" {
+        return [0, 0, 0]
+    }
+
+    let n_str = exec("wc -l < '" + path + "' 2>/dev/null | tr -d ' '").trim()
+    let n = 0
+    if n_str != "" { n = to_int(n_str) }
+    if n == 0 {
+        return [0, 0, 0]
+    }
+
+    // total freed
+    let freed_cmd = "sed -E 's/.*\"freed_mb\":([0-9]+).*/\\1/' '" + path
+        + "' 2>/dev/null | awk '{s+=$1} END{print s+0}'"
+    let f = exec(freed_cmd).trim()
+    let total_freed = 0
+    if f != "" { total_freed = to_int(f) }
+
+    // avg frag reduction = sum(current_frag - frag_after) / n
+    //   plan 안의 "current_frag" 는 trigger 시점 fragmentation, frag_after 는 record 시점.
+    //   sed 로 두 값 각각 추출 → awk 으로 차이 합 / n.
+    let reduce_cmd = "awk -F'[,:}]' 'BEGIN{s=0;c=0}"
+        + "{cf=0;fa=0;"
+        + "for(i=1;i<=NF;i++){"
+        + "if($i ~ /\"current_frag\"/){gsub(/[^0-9]/,\"\",$(i+1));cf=$(i+1)}"
+        + "if($i ~ /\"frag_after\"/){gsub(/[^0-9]/,\"\",$(i+1));fa=$(i+1)}"
+        + "}"
+        + "s+=(cf-fa);c++}"
+        + "END{if(c>0)print int(s/c);else print 0}' '" + path + "' 2>/dev/null"
+    let avg_str = exec(reduce_cmd).trim()
+    let avg_reduction = 0
+    if avg_str != "" { avg_reduction = to_int(avg_str) }
+
+    let stats = [n, total_freed, avg_reduction]
+    r0_emit("defrag_stats",
+        "\"total_triggers\":" + to_string(n)
+        + ",\"total_freed_mb\":" + to_string(total_freed)
+        + ",\"avg_frag_reduction\":" + to_string(avg_reduction))
+    return stats
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "cheapdefrag-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cache reset
+    defrag_ensure_dir()
+    let _rm_h = exec("rm -f '" + history_path() + "'")
+    let _rm_c = exec("rm -f '" + candidates_path() + "'")
+
+    // 2. should_trigger(40, "") → true (frag > 35)
+    let t1 = should_trigger(40, "")
+    if t1 == false {
+        panic("c_heap_defrag FAIL [trigger frag>35] expected=true got=false")
+    }
+
+    // 3. should_trigger(20, "OOM_imminent") → true (mem pressure)
+    let t2 = should_trigger(20, "OOM_imminent")
+    if t2 == false {
+        panic("c_heap_defrag FAIL [trigger OOM] expected=true got=false")
+    }
+
+    // 4. should_trigger(20, "") → false
+    let t3 = should_trigger(20, "")
+    if t3 == true {
+        panic("c_heap_defrag FAIL [trigger below threshold] expected=false got=true")
+    }
+
+    // bonus: thrashing & frag_critical label 도 trigger
+    let t4 = should_trigger(10, "thrashing")
+    if t4 == false {
+        panic("c_heap_defrag FAIL [trigger thrashing] expected=true got=false")
+    }
+    let t5 = should_trigger(10, "frag_critical")
+    if t5 == false {
+        panic("c_heap_defrag FAIL [trigger frag_critical label] expected=true got=false")
+    }
+
+    // 5. identify_cold_candidates(now=1000, threshold=300) — synthetic 5 with
+    //    last_used [200,400,600,800,950]. age = 1000 - last_used.
+    //    age > 300 → last_used < 700 → tex_0(200), tex_1(400), tex_2(600). = 3 cold.
+    let candidates = identify_cold_candidates(1000, 300)
+    if len(candidates) != 3 {
+        panic("c_heap_defrag FAIL [cold count] expected=3 got=" + to_string(len(candidates)))
+    }
+    // 첫 candidate = tex_0
+    let c0 = candidates[0]
+    if c0[0] != "tex_0" {
+        panic("c_heap_defrag FAIL [cold[0].id] expected=tex_0 got=" + to_string(c0[0]))
+    }
+    if c0[1] != 200 {
+        panic("c_heap_defrag FAIL [cold[0].last_used] expected=200 got=" + to_string(c0[1]))
+    }
+
+    // 6. plan = create_defrag_plan(candidates, 40) — JSON 안에 "evict" + "candidates"
+    let plan = create_defrag_plan(candidates, 40)
+    let has_evict = exec("printf '%s' '" + plan + "' | grep -c 'evict' | tr -d ' '").trim()
+    if to_int(has_evict) < 1 {
+        panic("c_heap_defrag FAIL [plan has evict] expected>=1 got=" + has_evict + " plan=" + plan)
+    }
+    let has_cand = exec("printf '%s' '" + plan + "' | grep -c 'candidates' | tr -d ' '").trim()
+    if to_int(has_cand) < 1 {
+        panic("c_heap_defrag FAIL [plan has candidates] expected>=1 got=" + has_cand + " plan=" + plan)
+    }
+
+    // 7. workflow_result = auto_defrag_workflow(40, "frag_critical", candidates)
+    //    → "TRIGGERED"
+    let wf1 = auto_defrag_workflow(40, "frag_critical", candidates)
+    if wf1 != "TRIGGERED" {
+        panic("c_heap_defrag FAIL [workflow trigger] expected=TRIGGERED got=" + wf1)
+    }
+    // candidates.txt 가 작성됐는지
+    let cand_ok = exec("test -s '" + candidates_path() + "' && echo ok").trim()
+    if cand_ok != "ok" {
+        panic("c_heap_defrag FAIL [candidates persisted] expected=ok got=" + cand_ok)
+    }
+
+    // 8. workflow_result_skip = auto_defrag_workflow(20, "", []) → "SKIP:..."
+    let wf2 = auto_defrag_workflow(20, "", [])
+    let starts_skip = exec("printf '%s' '" + wf2 + "' | grep -c '^SKIP' | tr -d ' '").trim()
+    if to_int(starts_skip) < 1 {
+        panic("c_heap_defrag FAIL [workflow skip] expected=SKIP:... got=" + wf2)
+    }
+
+    // 9. record_defrag(plan, 2, 100, 25) — actual values (frag 40→25)
+    //    NOTE: stats 검증을 위해 frag_after=25 (initial=40 in plan) → reduction = 15
+    record_defrag(plan, 2, 100, 25)
+
+    // 10. stats = defrag_stats() → [1, 100, 15]
+    let stats = defrag_stats()
+    if stats[0] != 1 {
+        panic("c_heap_defrag FAIL [stats triggers] expected=1 got=" + to_string(stats[0]))
+    }
+    if stats[1] != 100 {
+        panic("c_heap_defrag FAIL [stats freed] expected=100 got=" + to_string(stats[1]))
+    }
+    if stats[2] != 15 {
+        panic("c_heap_defrag FAIL [stats avg_reduction] expected=15 got=" + to_string(stats[2]))
+    }
+
+    // 11. r0_emit count check: defrag_skip(wf2) + defrag_trigger(wf1) +
+    //                         defrag_record + defrag_stats = ≥ 4
+    let evt = r0_session_count(sid)
+    if evt < 4 {
+        panic("c_heap_defrag FAIL [emit count] expected>=4 got=" + to_string(evt))
+    }
+
+    // 12. cleanup
+    let _h_rm = exec("rm -f '" + history_path() + "'")
+    let _c_rm = exec("rm -f '" + candidates_path() + "'")
+
+    // 13. ✅ banner
+    println("  ✅ c_heap_defrag self_test PASS (1 trigger, 100MB freed, -15 frag, emits=" + to_string(evt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "defrag-dir" {
+            println(defrag_dir())
+            return
+        }
+        if sub == "history-path" {
+            println(history_path())
+            return
+        }
+        if sub == "candidates-path" {
+            println(candidates_path())
+            return
+        }
+        if sub == "should-trigger" {
+            // should-trigger <frag_pct> <mem_label>
+            if len(a) >= 5 {
+                let r = should_trigger(to_int(a[3]), a[4])
+                if r { println("true") } else { println("false") }
+                return
+            }
+        }
+        if sub == "stats" {
+            let s = defrag_stats()
+            println("triggers=" + to_string(s[0]) + " freed_mb=" + to_string(s[1]) + " avg_reduction=" + to_string(s[2]))
+            return
+        }
+    }
+    println("usage: hexa run c_heap_defrag.hexa { self-test | defrag-dir | history-path | candidates-path | should-trigger <frag> <label> | stats }")
+}

@@ -1,0 +1,376 @@
+// lib/loader/pe_loader.hexa — Phase 0b — PE memory loader skeleton
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// Microsoft PE/COFF spec (https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) 만 참조.
+// own 2 mandate: r0_emit + self_test + main() dispatch + headless safe + panic 형식.
+//
+// 입력: Phase 0a 의 pe_parser 가 검증한 PE 파일 path
+// 출력: "loaded layout" — sections 별 (vaddr, vsize, raw_offset, raw_size, perms) +
+//       entry point absolute address (ImageBase + EntryPointRVA)
+//
+// stage1 우회:
+//   - mmap syscall 직접 binding 부재 → "memory map" = section 별 metadata 만 (실제 mapping 은 Phase 1+ 에서).
+//   - bit ops (& | << >>) 부재 → Characteristics field 의 R/W/X bits 추출은 division 사용:
+//       bit_n_set(x, n) ≡ (x / 2^n) % 2
+//
+// own 1 enforcement (test_apple_only.hexa test_loader_imports_clean):
+//   lib/loader/*.hexa 의 use 는 "../perf/r0_common" 또는 "./r0_common" 만.
+//   pe_parser.hexa 의 primitives 는 inline (아래 read_u8/read_u16/read_u32/read_str).
+//
+// upstream candidate (docs/HEXA_UPSTREAM.md):
+//   - native binary read (offset/length/typed)
+//   - bit ops (& | ^ << >>)
+//   - mmap binding (Phase 0b 의 진짜 memory mapping)
+
+use "../perf/r0_common"
+
+// ─── PE/COFF Section Characteristics flag bits (Microsoft PE/COFF spec) ───
+//   IMAGE_SCN_MEM_EXECUTE = 0x20000000 = 536870912   (bit 29)
+//   IMAGE_SCN_MEM_READ    = 0x40000000 = 1073741824  (bit 30)
+//   IMAGE_SCN_MEM_WRITE   = 0x80000000 = 2147483648  (bit 31)
+
+// ─── 저레벨 byte read 헬퍼 (pe_parser.hexa 의 primitives — inline 복제, own 1 enforcement) ───
+fn pl_read_u8(path: str, offset: int) -> int {
+    let cmd = "od -An -tu1 -N1 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn pl_read_u16(path: str, offset: int) -> int {
+    let cmd = "od -An -tu2 -N2 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn pl_read_u32(path: str, offset: int) -> int {
+    let cmd = "od -An -tu4 -N4 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn pl_read_str(path: str, offset: int, length: int) -> str {
+    let cmd = "dd if='" + path + "' bs=1 skip=" + to_string(offset) + " count=" + to_string(length) + " 2>/dev/null | tr -d '\\0'"
+    return exec(cmd).trim()
+}
+
+// ─── PE 헤더 walking — pe_parser 의 logic 을 재구성 (own 1 enforcement: own use 만) ───
+
+// DOS header: e_lfanew at offset 0x3C (60)
+fn pl_e_lfanew(path: str) -> int {
+    return pl_read_u32(path, 60)
+}
+
+// FileHeader fields:
+//   NumberOfSections (uint16) at e_lfanew + 4 + 2
+//   SizeOfOptionalHeader (uint16) at e_lfanew + 4 + 16
+fn pl_num_sections(path: str, e_lfanew: int) -> int {
+    return pl_read_u16(path, e_lfanew + 4 + 2)
+}
+
+fn pl_size_opt_header(path: str, e_lfanew: int) -> int {
+    return pl_read_u16(path, e_lfanew + 4 + 16)
+}
+
+// OptionalHeader: base = e_lfanew + 24
+//   Magic (uint16) at +0   — 0x10B = PE32, 0x20B = PE32+
+//   AddressOfEntryPoint (uint32) at +16
+//   ImageBase: PE32 = uint32 at +28, PE32+ = uint64 at +24 (low) / +28 (high)
+fn pl_opt_magic(path: str, e_lfanew: int) -> int {
+    return pl_read_u16(path, e_lfanew + 24)
+}
+
+fn pl_entry_rva(path: str, e_lfanew: int) -> int {
+    return pl_read_u32(path, e_lfanew + 24 + 16)
+}
+
+fn pl_image_base_lo(path: str, e_lfanew: int, opt_magic: int) -> int {
+    if opt_magic == 267 {  // PE32
+        return pl_read_u32(path, e_lfanew + 24 + 28)
+    }
+    if opt_magic == 523 {  // PE32+
+        return pl_read_u32(path, e_lfanew + 24 + 24)
+    }
+    return 0
+}
+
+// Section table offset: e_lfanew + 24 + SizeOfOptionalHeader
+//   Each section = 40 bytes:
+//     Name (8 bytes)        +0
+//     VirtualSize (uint32)  +8
+//     VirtualAddress(uint32) +12
+//     SizeOfRawData (uint32) +16
+//     PointerToRawData(uint32) +20
+//     Characteristics(uint32) +36
+fn pl_section_offset(e_lfanew: int, size_opt: int) -> int {
+    return e_lfanew + 24 + size_opt
+}
+
+// ─── section permissions decoding ───
+//   bit 29 (EXECUTE), bit 30 (READ), bit 31 (WRITE) → "R", "RW", "RX", "RWX", or "" if none
+//   Characteristics field 는 uint32, hexa stage1 bit ops 부재 → division 으로 bit 추출.
+fn section_perms(characteristics: int) -> str {
+    let exec_bit = (characteristics / 536870912) % 2
+    let read_bit = (characteristics / 1073741824) % 2
+    let write_bit = (characteristics / 2147483648) % 2
+    let s = ""
+    if read_bit == 1 {
+        s = s + "R"
+    }
+    if write_bit == 1 {
+        s = s + "W"
+    }
+    if exec_bit == 1 {
+        s = s + "X"
+    }
+    if s == "" {
+        return "-"
+    }
+    return s
+}
+
+// ─── loaded layout 계산 ───
+//   returns array of [name, vaddr, vsize, raw_offset, raw_size, perms, characteristics]
+//   각 row = nested array.
+fn load_layout(pe_path: str) -> array {
+    let e_lfanew = pl_e_lfanew(pe_path)
+    let num_sect = pl_num_sections(pe_path, e_lfanew)
+    let size_opt = pl_size_opt_header(pe_path, e_lfanew)
+    let sect_off = pl_section_offset(e_lfanew, size_opt)
+
+    let layout = []
+    let i = 0
+    while i < num_sect {
+        let row_off = sect_off + i * 40
+        let name = pl_read_str(pe_path, row_off + 0, 8)
+        let vsize = pl_read_u32(pe_path, row_off + 8)
+        let vaddr = pl_read_u32(pe_path, row_off + 12)
+        let raw_size = pl_read_u32(pe_path, row_off + 16)
+        let raw_off = pl_read_u32(pe_path, row_off + 20)
+        let chars = pl_read_u32(pe_path, row_off + 36)
+        let perms = section_perms(chars)
+        let row = [name, vaddr, vsize, raw_off, raw_size, perms, chars]
+        layout = layout + [row]
+        i = i + 1
+    }
+    return layout
+}
+
+// ─── entry point absolute address ───
+//   PE32:  return image_base_lo (uint32) + entry_rva (uint32)
+//   PE32+: high 32 bits 무시 (Phase 0b skeleton — full 64-bit math 은 stage1 밖).
+//          ImageBase 의 low 32 + EntryPointRVA 합 만 반환.
+//   주의: 실제 mapping 시 high 부분도 사용해야 — Phase 1 의 win32_abi 에서 합산.
+fn entry_point_addr(pe_path: str) -> int {
+    let e_lfanew = pl_e_lfanew(pe_path)
+    let opt_magic = pl_opt_magic(pe_path, e_lfanew)
+    let entry_rva = pl_entry_rva(pe_path, e_lfanew)
+    let image_base = pl_image_base_lo(pe_path, e_lfanew, opt_magic)
+    return image_base + entry_rva
+}
+
+// ─── layout 검증 (overlap, alignment) ───
+//   alignment: vaddr 가 0 이 아니어야 (첫 section 보통 0x1000)
+//   overlap: 두 section 의 [vaddr, vaddr+vsize) 범위가 겹치면 violation
+//   returns 0 if OK, > 0 if violation count
+fn validate_layout(layout: array) -> int {
+    let n = len(layout)
+    let violations = 0
+
+    // alignment check — vaddr / vsize sanity
+    let i = 0
+    while i < n {
+        let row = layout[i]
+        let vaddr = row[1]
+        let vsize = row[2]
+        if vaddr == 0 {
+            // 첫 section 도 RVA 0 이면 비정상 (PE/COFF 는 SectionAlignment ≥ 0x1000)
+            violations = violations + 1
+        }
+        if vsize == 0 {
+            // VirtualSize 0 도 의심 (uninitialized 전용 section 이 아닌 한)
+            violations = violations + 1
+        }
+        i = i + 1
+    }
+
+    // overlap check (O(n^2), n typically ≤ 96)
+    let a = 0
+    while a < n {
+        let row_a = layout[a]
+        let va_a = row_a[1]
+        let vs_a = row_a[2]
+        let end_a = va_a + vs_a
+        let b = a + 1
+        while b < n {
+            let row_b = layout[b]
+            let va_b = row_b[1]
+            let vs_b = row_b[2]
+            let end_b = va_b + vs_b
+            // overlap iff (va_a < end_b) AND (va_b < end_a)
+            if va_a < end_b {
+                if va_b < end_a {
+                    violations = violations + 1
+                }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    return violations
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "ploader-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. Battle.net-Setup.exe 로 검증
+    let test_pe = HOME + "/Downloads/gamebox/Battle.net-Setup.exe"
+    let exists = exec("test -f '" + test_pe + "' && echo ok").trim()
+    if exists != "ok" {
+        println("  ⚠ test PE not found at " + test_pe)
+        println("  ⚠ pe_loader self_test SKIP (PE binary absent)")
+        return
+    }
+
+    r0_emit("pe_loader_start", "\"path\":\"" + test_pe + "\"")
+
+    // 2. layout 추출
+    let layout = load_layout(test_pe)
+    let n_sect = len(layout)
+    if n_sect < 1 {
+        panic("pe_loader FAIL [load_layout] expected>=1 got=" + to_string(n_sect))
+    }
+    if n_sect > 96 {
+        panic("pe_loader FAIL [load_layout] expected<=96 got=" + to_string(n_sect))
+    }
+
+    // 3. r0_emit 각 section
+    let i = 0
+    while i < n_sect {
+        let row = layout[i]
+        r0_emit("pe_loader_layout",
+            "\"index\":" + to_string(i)
+            + ",\"name\":\"" + row[0] + "\""
+            + ",\"vaddr\":" + to_string(row[1])
+            + ",\"vsize\":" + to_string(row[2])
+            + ",\"raw_offset\":" + to_string(row[3])
+            + ",\"raw_size\":" + to_string(row[4])
+            + ",\"perms\":\"" + row[5] + "\""
+            + ",\"characteristics\":" + to_string(row[6])
+        )
+        i = i + 1
+    }
+
+    // 4. perms decoding 검증 — 적어도 1 section 은 R 권한 (data/text/rdata)
+    let any_r = 0
+    let j = 0
+    while j < n_sect {
+        let row = layout[j]
+        let p = row[5]
+        // crude substring check: "R" 포함하면 readable
+        let has_r = exec("printf '%s' '" + p + "' | grep -c 'R' || true").trim()
+        if has_r != "0" {
+            any_r = 1
+        }
+        j = j + 1
+    }
+    if any_r != 1 {
+        panic("pe_loader FAIL [perms decoding] expected>=1 readable section got=0")
+    }
+
+    // 5. entry_point_addr 계산
+    let e_lfanew = pl_e_lfanew(test_pe)
+    let opt_magic = pl_opt_magic(test_pe, e_lfanew)
+    let entry_rva = pl_entry_rva(test_pe, e_lfanew)
+    let image_base = pl_image_base_lo(test_pe, e_lfanew, opt_magic)
+    let entry_addr = entry_point_addr(test_pe)
+
+    if entry_rva == 0 {
+        panic("pe_loader FAIL [entry_rva] expected>0 got=0")
+    }
+    if image_base == 0 {
+        panic("pe_loader FAIL [image_base] expected>0 got=0")
+    }
+    if entry_addr != image_base + entry_rva {
+        panic("pe_loader FAIL [entry_addr sum] expected=" + to_string(image_base + entry_rva) + " got=" + to_string(entry_addr))
+    }
+
+    r0_emit("pe_loader_entry",
+        "\"opt_magic\":" + to_string(opt_magic)
+        + ",\"image_base\":" + to_string(image_base)
+        + ",\"entry_rva\":" + to_string(entry_rva)
+        + ",\"entry_addr\":" + to_string(entry_addr)
+    )
+
+    // 6. validate_layout
+    let v = validate_layout(layout)
+    if v != 0 {
+        panic("pe_loader FAIL [validate_layout] expected=0 got=" + to_string(v))
+    }
+
+    r0_emit("pe_loader_validate", "\"violations\":0,\"sections\":" + to_string(n_sect))
+
+    // 7. r0 events 개수 확인
+    //   pe_loader_start (1) + pe_loader_layout (n_sect) + pe_loader_entry (1) + pe_loader_validate (1)
+    //   = 3 + n_sect
+    let sess_cnt = r0_session_count(sid)
+    let expected_events = 3 + n_sect
+    if sess_cnt != expected_events {
+        panic("pe_loader FAIL [r0 events] expected=" + to_string(expected_events) + " got=" + to_string(sess_cnt))
+    }
+
+    println("  ✅ pe_loader self_test PASS (" + to_string(n_sect) + " sections, entry_addr=" + to_string(entry_addr) + ", sid=" + sid + ")")
+}
+
+// ─── human-readable summary ───
+fn pl_summary(path: str) -> void {
+    let layout = load_layout(path)
+    let n = len(layout)
+    println("PE loaded layout — " + to_string(n) + " sections")
+    println("idx  name        vaddr       vsize       raw_off     raw_size    perms")
+    let i = 0
+    while i < n {
+        let row = layout[i]
+        println("  " + to_string(i) + "  " + row[0]
+            + "  vaddr=" + to_string(row[1])
+            + "  vsize=" + to_string(row[2])
+            + "  raw_off=" + to_string(row[3])
+            + "  raw_size=" + to_string(row[4])
+            + "  perms=" + row[5])
+        i = i + 1
+    }
+    let entry = entry_point_addr(path)
+    println("entry_point_addr (ImageBase_lo + EntryPointRVA) = " + to_string(entry))
+    let v = validate_layout(layout)
+    println("validate_layout violations = " + to_string(v))
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "summary" {
+            if len(a) >= 4 {
+                pl_summary(a[3])
+                return
+            }
+        }
+        if sub == "layout" {
+            if len(a) >= 4 {
+                let layout = load_layout(a[3])
+                println("sections: " + to_string(len(layout)))
+                return
+            }
+        }
+        if sub == "entry" {
+            if len(a) >= 4 {
+                println(to_string(entry_point_addr(a[3])))
+                return
+            }
+        }
+    }
+    println("usage: hexa run pe_loader.hexa { self-test | summary <path> | layout <path> | entry <path> }")
+}

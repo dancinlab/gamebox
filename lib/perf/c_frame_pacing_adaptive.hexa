@@ -1,0 +1,160 @@
+// lib/perf/c_frame_pacing_adaptive.hexa — CN-22 PSB-4 만점 15/15
+//
+// ProMotion 120Hz / 60Hz 동적 전환 (battery vs perf).
+// idle = 60Hz, 격투/zone transition = 120Hz.
+//
+// 무기: state vector (frame variance) + Holt forecast + Metal adaptive sync hint.
+
+use "./r0_common"
+
+let FPA_DIR = GAMEBOX_HOME + "/persist/frame_pacing"
+let HISTORY_PATH = FPA_DIR + "/pacing_history.jsonl"
+
+fn fpa_dir() -> str { return FPA_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + FPA_DIR + "'")
+}
+
+// ─── state classifier ───
+//   idle: variance < 5ms² AND fps > 50
+//   active: variance 5-20ms² OR fps 30-50
+//   intense: variance >= 20ms² OR fps < 30 OR boss/transition
+fn classify_state(frame_variance_ms2: int, fps_avg: int, is_intense: bool) -> str {
+    if is_intense { return "intense" }
+    if frame_variance_ms2 >= 20 { return "intense" }
+    if fps_avg < 30 { return "intense" }
+    if frame_variance_ms2 >= 5 { return "active" }
+    if fps_avg >= 50 { return "idle" }
+    return "active"
+}
+
+// ─── target Hz 결정 ───
+//   intense → 120 (max ProMotion)
+//   active → 90
+//   idle → 60 (battery save)
+fn target_hz(state: str) -> int {
+    if state == "intense" { return 120 }
+    if state == "active" { return 90 }
+    return 60
+}
+
+// ─── pacing change record ───
+fn record_pacing_change(old_hz: int, new_hz: int, reason: str) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"old\":" + to_string(old_hz) + ",\"new\":" + to_string(new_hz) + ",\"reason\":\"" + reason + "\"}"
+    let tmp = HISTORY_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + HISTORY_PATH + "' && rm -f '" + tmp + "'")
+    r0_emit("frame_pacing_change", "\"old\":" + to_string(old_hz) + ",\"new\":" + to_string(new_hz) + ",\"reason\":\"" + reason + "\"")
+}
+
+// ─── auto adjust workflow ───
+fn auto_adjust_pacing(current_hz: int, frame_variance: int, fps_avg: int, is_intense: bool) -> array {
+    let state = classify_state(frame_variance, fps_avg, is_intense)
+    let new_hz = target_hz(state)
+    if new_hz == current_hz {
+        return [current_hz, new_hz, 0]
+    }
+    record_pacing_change(current_hz, new_hz, state)
+    return [current_hz, new_hz, 1]
+}
+
+// ─── Holt forecast — frame variance ───
+fn holt_forecast(history: array, alpha: int, beta: int) -> int {
+    if len(history) < 2 {
+        if len(history) == 1 { return history[0] }
+        return 0
+    }
+    let level = history[0]
+    let trend = history[1] - history[0]
+    let i = 1
+    while i < len(history) {
+        let v = history[i]
+        let one_step = level + trend
+        let new_level = (alpha * v + (100 - alpha) * one_step) / 100
+        let new_trend = (beta * (new_level - level) + (100 - beta) * trend) / 100
+        level = new_level
+        trend = new_trend
+        i = i + 1
+    }
+    return level + trend
+}
+
+fn pacing_stats() -> array {
+    let exists = exec("test -f '" + HISTORY_PATH + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0, 0] }
+    let total = to_int(exec("wc -l < '" + HISTORY_PATH + "' | tr -d ' '").trim())
+    let to_120 = to_int(exec("grep -c '\"new\":120' '" + HISTORY_PATH + "' 2>/dev/null").trim())
+    let to_60 = to_int(exec("grep -c '\"new\":60' '" + HISTORY_PATH + "' 2>/dev/null").trim())
+    return [total, to_120, to_60]
+}
+
+fn cleanup_fpa() -> void {
+    let _ = exec("rm -rf '" + FPA_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "fpa-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_fpa()
+
+    // classifier
+    if classify_state(2, 60, false) != "idle" { panic("c_frame_pacing_adaptive FAIL [idle]") }
+    if classify_state(10, 45, false) != "active" { panic("c_frame_pacing_adaptive FAIL [active]") }
+    if classify_state(25, 25, false) != "intense" { panic("c_frame_pacing_adaptive FAIL [intense variance]") }
+    if classify_state(2, 60, true) != "intense" { panic("c_frame_pacing_adaptive FAIL [intense flag]") }
+
+    // target hz
+    if target_hz("idle") != 60 { panic("c_frame_pacing_adaptive FAIL [hz idle]") }
+    if target_hz("active") != 90 { panic("c_frame_pacing_adaptive FAIL [hz active]") }
+    if target_hz("intense") != 120 { panic("c_frame_pacing_adaptive FAIL [hz intense]") }
+
+    // auto adjust
+    let res1 = auto_adjust_pacing(60, 25, 25, false)  // idle → intense (120)
+    if res1[1] != 120 { panic("c_frame_pacing_adaptive FAIL [adjust 1] expected=120 got=" + to_string(res1[1])) }
+    if res1[2] != 1 { panic("c_frame_pacing_adaptive FAIL [adjust 1 changed]") }
+
+    let res2 = auto_adjust_pacing(120, 25, 25, false)  // same level
+    if res2[2] != 0 { panic("c_frame_pacing_adaptive FAIL [no change]") }
+
+    let res3 = auto_adjust_pacing(120, 2, 60, false)  // intense → idle (60, battery save)
+    if res3[1] != 60 { panic("c_frame_pacing_adaptive FAIL [adjust 3] expected=60") }
+
+    // forecast
+    let history = [5, 8, 12, 18, 25]
+    let pred = holt_forecast(history, 60, 30)
+    if pred < 25 {
+        panic("c_frame_pacing_adaptive FAIL [forecast] expected>=25 got=" + to_string(pred))
+    }
+
+    // stats
+    let stats = pacing_stats()
+    if stats[0] != 2 { panic("c_frame_pacing_adaptive FAIL [stats total] expected=2 got=" + to_string(stats[0])) }
+
+    r0_emit("frame_pacing_summary", "\"changes\":" + to_string(stats[0]) + ",\"to_120\":" + to_string(stats[1]) + ",\"to_60\":" + to_string(stats[2]) + ",\"forecast\":" + to_string(pred))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_frame_pacing_adaptive FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_fpa()
+
+    println("  ✅ c_frame_pacing_adaptive self_test PASS (3 states, 2 changes, forecast=" + to_string(pred) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pacing_stats()
+            println("changes=" + to_string(s[0]) + " to_120=" + to_string(s[1]) + " to_60=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_fpa(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_frame_pacing_adaptive.hexa { self-test | stats | cleanup }")
+}

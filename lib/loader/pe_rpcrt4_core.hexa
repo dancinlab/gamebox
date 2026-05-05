@@ -1,0 +1,498 @@
+// lib/loader/pe_rpcrt4_core.hexa — RPCRT4.dll RPC runtime surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine rpcrt4 source 인용 0.
+//       rpcrt4.dll 직접 binding 0. macOS XPC / NSXPCConnection / mach_msg /
+//       mach_port_allocate / launchd / Foundation NSConnection 직접 binding 0.
+//       NOTE: RPCRT4 측 Battle.net Agent IPC + Warden long-horizon RPC binding +
+//       D2R/D4 service IPC; RpcStringBindingComposeW/RpcServerListen/NdrClientCall2/
+//       RpcBindingSetAuthInfoExW 측 RPC_BINDING_HANDLE/RPC_AUTH_IDENTITY round-trip
+//       baseline (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BH4 — RPCRT4 binding/server/client/auth surface 14 fn skeleton-tier.
+// cycle 54 338/435 (~77.70%) → cycle 55 ~352/435 (~80.92%) (+14 fn, BH bundled part 4/4).
+// **80% threshold breach milestone** at cycle 55 via BH4 RPCRT4.
+// Mission spec target ~340/435 (~78%) — actual reaches 352/435 (~80.92%).
+//
+// 대상 fn (14 fn — 4 group, fn_kind 0..13):
+//   BINDING (4): RpcStringBindingComposeW(0) / RpcBindingFromStringBindingW(1) /
+//                RpcBindingFree(2) / RpcStringFreeW(3)
+//   SERVER  (4): RpcServerListen(4) / RpcServerUseProtseqEpW(5) /
+//                RpcServerRegisterIf(6) / RpcMgmtStopServerListening(7)
+//   CLIENT  (3): NdrClientCall2(8) / NdrClientCall3(9) / RpcAsyncInitializeHandle(10)
+//   AUTH    (3): RpcBindingSetAuthInfoExW(11) / RpcImpersonateClient(12) / RpcRevertToSelf(13)
+//
+// synthetic struct families:
+//   RPC_BINDING_HANDLE 0xD0010100 opaque binding handle (synth).
+//   RPC_STRING_BINDING_W "ncalrpc:[BattleNet_Agent_RPC_endpoint_synth]" WCHAR LE.
+//   RPC_SERVER_INTERFACE 96B Length 96 + InterfaceId UUID 16B + TransferSyntax UUID 16B +
+//     DispatchTable + RpcProtseqEndpointCount 1 + RpcProtseqEndpoint + DefaultManagerEpv +
+//     InterpreterInfo + Flags 0.
+//   RPC_AUTH_IDENTITY_HANDLE 0xD0020100 opaque (synth).
+//   SEC_WINNT_AUTH_IDENTITY_W 32B User + UserLength + Domain + DomainLength + Password +
+//     PasswordLength + Flags SEC_WINNT_AUTH_IDENTITY_UNICODE_2.
+//   MIDL_STUB_DESC 80B + MIDL_STUB_MESSAGE 96B + RPC_CLIENT_INTERFACE 88B for NdrClientCall pattern.
+//   RPC_ASYNC_STATE 88B Size 88 + Signature 0xACE0FEE0 + Lock 0 + Flags + StubInfo +
+//     UserInfo + RuntimeInfo + Event + NotificationType + Reserved.
+//   RPC_PROTSEQ_VECTOR_W "ncalrpc" / "ncacn_np" / "ncacn_ip_tcp:24.105.62.129[443]" battle_net.
+//
+// persist schema (TSV — 5 table):
+//   syscall_invoke / binding_event / server_event / client_event / auth_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn prp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_rpcrt4_core"
+}
+
+fn prp_syscall_invoke_path() -> str {
+    return prp_dir() + "/syscall_invoke.tsv"
+}
+
+fn prp_binding_event_path() -> str {
+    return prp_dir() + "/binding_event.tsv"
+}
+
+fn prp_server_event_path() -> str {
+    return prp_dir() + "/server_event.tsv"
+}
+
+fn prp_client_event_path() -> str {
+    return prp_dir() + "/client_event.tsv"
+}
+
+fn prp_auth_event_path() -> str {
+    return prp_dir() + "/auth_event.tsv"
+}
+
+fn prp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + prp_dir() + "'")
+}
+
+fn cleanup_prp() -> void {
+    prp_ensure_dir()
+    let _ = exec("rm -f '" + prp_syscall_invoke_path() + "' '" + prp_binding_event_path()
+        + "' '" + prp_server_event_path() + "' '" + prp_client_event_path()
+        + "' '" + prp_auth_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prp_append_row(path: str, row: str) -> void {
+    prp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn prp_count_rows(path: str, min_cols: int) -> int {
+    let t = prp_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (14 fn coverage, fn_kind 0..13) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "RpcStringBindingComposeW" }
+    if k == 1 { return "RpcBindingFromStringBindingW" }
+    if k == 2 { return "RpcBindingFree" }
+    if k == 3 { return "RpcStringFreeW" }
+    if k == 4 { return "RpcServerListen" }
+    if k == 5 { return "RpcServerUseProtseqEpW" }
+    if k == 6 { return "RpcServerRegisterIf" }
+    if k == 7 { return "RpcMgmtStopServerListening" }
+    if k == 8 { return "NdrClientCall2" }
+    if k == 9 { return "NdrClientCall3" }
+    if k == 10 { return "RpcAsyncInitializeHandle" }
+    if k == 11 { return "RpcBindingSetAuthInfoExW" }
+    if k == 12 { return "RpcImpersonateClient" }
+    if k == 13 { return "RpcRevertToSelf" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (4 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "binding"
+        }
+    }
+    if k >= 4 {
+        if k <= 7 {
+            return "server"
+        }
+    }
+    if k >= 8 {
+        if k <= 10 {
+            return "client"
+        }
+    }
+    if k >= 11 {
+        if k <= 13 {
+            return "auth"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: RPCRT4 fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_rpcrt4_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_rpcrt4_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 13 {
+        panic("pe_rpcrt4_core FAIL [record_syscall_invoke] expected=fn_kind<=13 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_rpcrt4_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_rpcrt4_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    prp_append_row(prp_syscall_invoke_path(), row)
+}
+
+// ─── record_binding_event: StringBindingCompose/FromStringBinding/BindingFree/StringFree row ───
+fn record_binding_event(evt_id: int, b_kind: str, binding_str: str, handle_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_rpcrt4_core FAIL [record_binding_event] evt_id<=0") }
+    if b_kind == "" { panic("pe_rpcrt4_core FAIL [record_binding_event] b_kind=empty") }
+    if binding_str == "" { panic("pe_rpcrt4_core FAIL [record_binding_event] binding_str=empty") }
+    if handle_synth == "" { panic("pe_rpcrt4_core FAIL [record_binding_event] handle_synth=empty") }
+    if status == "" { panic("pe_rpcrt4_core FAIL [record_binding_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + b_kind + "\t" + binding_str + "\t" + handle_synth + "\t" + status + "\n"
+    prp_append_row(prp_binding_event_path(), row)
+}
+
+// ─── record_server_event: ServerListen/UseProtseqEp/RegisterIf/StopListening row ───
+fn record_server_event(evt_id: int, s_kind: str, protseq: str, iface_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_rpcrt4_core FAIL [record_server_event] evt_id<=0") }
+    if s_kind == "" { panic("pe_rpcrt4_core FAIL [record_server_event] s_kind=empty") }
+    if protseq == "" { panic("pe_rpcrt4_core FAIL [record_server_event] protseq=empty") }
+    if iface_synth == "" { panic("pe_rpcrt4_core FAIL [record_server_event] iface_synth=empty") }
+    if status == "" { panic("pe_rpcrt4_core FAIL [record_server_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + s_kind + "\t" + protseq + "\t" + iface_synth + "\t" + status + "\n"
+    prp_append_row(prp_server_event_path(), row)
+}
+
+// ─── record_client_event: NdrClientCall2/NdrClientCall3/AsyncInit row ───
+fn record_client_event(evt_id: int, c_kind: str, stub_synth: str, async_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_rpcrt4_core FAIL [record_client_event] evt_id<=0") }
+    if c_kind == "" { panic("pe_rpcrt4_core FAIL [record_client_event] c_kind=empty") }
+    if stub_synth == "" { panic("pe_rpcrt4_core FAIL [record_client_event] stub_synth=empty") }
+    if async_synth == "" { panic("pe_rpcrt4_core FAIL [record_client_event] async_synth=empty") }
+    if status == "" { panic("pe_rpcrt4_core FAIL [record_client_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + c_kind + "\t" + stub_synth + "\t" + async_synth + "\t" + status + "\n"
+    prp_append_row(prp_client_event_path(), row)
+}
+
+// ─── record_auth_event: SetAuthInfoEx/ImpersonateClient/RevertToSelf row ───
+fn record_auth_event(evt_id: int, a_kind: str, auth_svc: str, identity_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_rpcrt4_core FAIL [record_auth_event] evt_id<=0") }
+    if a_kind == "" { panic("pe_rpcrt4_core FAIL [record_auth_event] a_kind=empty") }
+    if auth_svc == "" { panic("pe_rpcrt4_core FAIL [record_auth_event] auth_svc=empty") }
+    if identity_synth == "" { panic("pe_rpcrt4_core FAIL [record_auth_event] identity_synth=empty") }
+    if status == "" { panic("pe_rpcrt4_core FAIL [record_auth_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + a_kind + "\t" + auth_svc + "\t" + identity_synth + "\t" + status + "\n"
+    prp_append_row(prp_auth_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return prp_count_rows(prp_syscall_invoke_path(), 4)
+}
+
+fn binding_event_count() -> int {
+    return prp_count_rows(prp_binding_event_path(), 5)
+}
+
+fn server_event_count() -> int {
+    return prp_count_rows(prp_server_event_path(), 5)
+}
+
+fn client_event_count() -> int {
+    return prp_count_rows(prp_client_event_path(), 5)
+}
+
+fn auth_event_count() -> int {
+    return prp_count_rows(prp_auth_event_path(), 5)
+}
+
+fn prp_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(binding_event_count())
+    out.push(server_event_count())
+    out.push(client_event_count())
+    out.push(auth_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "prp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_prp()
+
+    // ─── 1. syscall_invoke × 14 (one per fn, 4 group coverage) ───
+    //   BINDING group (4)
+    record_syscall_invoke(1, 0, "RpcStringBindingComposeW", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcStringBindingComposeW")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"RpcStringBindingComposeW\",\"fn_group\":\"binding\",\"status\":\"PARTIAL\",\"ObjUuid\":0,\"ProtSeq\":\"ncalrpc_WCHAR_LE\",\"NetworkAddr\":0,\"Endpoint\":\"BattleNet_Agent_RPC_synth\",\"Options\":0,\"out_StringBinding\":\"ncalrpc:[BattleNet_Agent_RPC_synth]\",\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(2, 1, "RpcBindingFromStringBindingW", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcBindingFromStringBindingW")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"RpcBindingFromStringBindingW\",\"fn_group\":\"binding\",\"status\":\"PARTIAL\",\"StringBinding\":\"ncalrpc:[BattleNet_Agent_RPC_synth]\",\"out_Binding\":\"0xD0010100_RPC_BINDING_HANDLE\",\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(3, 2, "RpcBindingFree", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcBindingFree")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"RpcBindingFree\",\"fn_group\":\"binding\",\"status\":\"PARTIAL\",\"Binding\":\"0xD0010100_RPC_BINDING_HANDLE\",\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(4, 3, "RpcStringFreeW", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcStringFreeW")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"RpcStringFreeW\",\"fn_group\":\"binding\",\"status\":\"PARTIAL\",\"String\":\"ncalrpc:[BattleNet_Agent_RPC_synth]\",\"return_dword\":\"RPC_S_OK_0\"")
+
+    //   SERVER group (4)
+    record_syscall_invoke(5, 4, "RpcServerListen", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcServerListen")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"RpcServerListen\",\"fn_group\":\"server\",\"status\":\"PARTIAL\",\"MinimumCallThreads\":1,\"MaxCalls\":\"RPC_C_LISTEN_MAX_CALLS_DEFAULT_1234\",\"DontWait\":1,\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(6, 5, "RpcServerUseProtseqEpW", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcServerUseProtseqEpW")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"RpcServerUseProtseqEpW\",\"fn_group\":\"server\",\"status\":\"PARTIAL\",\"Protseq\":\"ncalrpc_WCHAR_LE\",\"MaxCalls\":\"RPC_C_PROTSEQ_MAX_REQS_DEFAULT_10\",\"Endpoint\":\"BattleNet_Agent_RPC_synth\",\"SecurityDescriptor\":0,\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(7, 6, "RpcServerRegisterIf", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcServerRegisterIf")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"RpcServerRegisterIf\",\"fn_group\":\"server\",\"status\":\"PARTIAL\",\"IfSpec\":\"RPC_SERVER_INTERFACE_96B_battle_net_agent_v1_0\",\"MgrTypeUuid\":0,\"MgrEpv\":0,\"struct_bytes\":96,\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(8, 7, "RpcMgmtStopServerListening", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcMgmtStopServerListening")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"RpcMgmtStopServerListening\",\"fn_group\":\"server\",\"status\":\"PARTIAL\",\"Binding\":0,\"return_dword\":\"RPC_S_OK_0\",\"server_lifecycle_baseline\":true")
+
+    //   CLIENT group (3)
+    record_syscall_invoke(9, 8, "NdrClientCall2", "PARTIAL")
+    println("__RPCRT4__ PARTIAL NdrClientCall2")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"NdrClientCall2\",\"fn_group\":\"client\",\"status\":\"PARTIAL\",\"pStubDescriptor\":\"MIDL_STUB_DESC_80B_battle_net_agent_v1_0\",\"pFormat\":\"midl_proc_format_string_synth\",\"struct_bytes\":80,\"return_clientcall_status\":\"S_OK_0\"")
+    record_syscall_invoke(10, 9, "NdrClientCall3", "PARTIAL")
+    println("__RPCRT4__ PARTIAL NdrClientCall3")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"NdrClientCall3\",\"fn_group\":\"client\",\"status\":\"PARTIAL\",\"pProxyInfo\":\"MIDL_STUBLESS_PROXY_INFO_synth\",\"nProcNum\":3,\"pReturnValue\":\"out_dword_0\",\"return_clientcall_status\":\"S_OK_0\"")
+    record_syscall_invoke(11, 10, "RpcAsyncInitializeHandle", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcAsyncInitializeHandle")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"RpcAsyncInitializeHandle\",\"fn_group\":\"client\",\"status\":\"PARTIAL\",\"pAsync\":\"RPC_ASYNC_STATE_88B_Signature_0xACE0FEE0\",\"Size\":88,\"struct_bytes\":88,\"return_dword\":\"RPC_S_OK_0\"")
+
+    //   AUTH group (3)
+    record_syscall_invoke(12, 11, "RpcBindingSetAuthInfoExW", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcBindingSetAuthInfoExW")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"RpcBindingSetAuthInfoExW\",\"fn_group\":\"auth\",\"status\":\"PARTIAL\",\"Binding\":\"0xD0010100_RPC_BINDING_HANDLE\",\"ServerPrincName\":\"battle_net_agent_spn_WCHAR_LE\",\"AuthnLevel\":\"RPC_C_AUTHN_LEVEL_PKT_PRIVACY_6\",\"AuthnSvc\":\"RPC_C_AUTHN_GSS_NEGOTIATE_9\",\"AuthIdentity\":\"0xD0020100_SEC_WINNT_AUTH_IDENTITY_W_32B\",\"AuthzService\":\"RPC_C_AUTHZ_DEFAULT_neg1\",\"return_dword\":\"RPC_S_OK_0\"")
+    record_syscall_invoke(13, 12, "RpcImpersonateClient", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcImpersonateClient")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":13,\"fn_kind\":12,\"fn_name\":\"RpcImpersonateClient\",\"fn_group\":\"auth\",\"status\":\"PARTIAL\",\"BindingHandle\":\"0xD0010100_RPC_BINDING_HANDLE\",\"return_dword\":\"RPC_S_OK_0\",\"thread_token_synth\":\"impersonation_token_battle_net_user\"")
+    record_syscall_invoke(14, 13, "RpcRevertToSelf", "PARTIAL")
+    println("__RPCRT4__ PARTIAL RpcRevertToSelf")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":14,\"fn_kind\":13,\"fn_name\":\"RpcRevertToSelf\",\"fn_group\":\"auth\",\"status\":\"PARTIAL\",\"return_dword\":\"RPC_S_OK_0\",\"thread_token_synth\":\"revert_to_process_token\"")
+
+    // ─── 2. binding_event × 4 (compose/from_string/free_binding/free_string) ───
+    record_binding_event(1, "compose_ncalrpc_battlenet", "ncalrpc:[BattleNet_Agent_RPC_synth]", "RPC_STRING_BINDING_W_synth", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"binding_event\",\"evt_id\":1,\"b_kind\":\"compose_ncalrpc_battlenet\",\"binding_str\":\"ncalrpc:[BattleNet_Agent_RPC_synth]\",\"handle_synth\":\"RPC_STRING_BINDING_W_synth\",\"battle_net_agent_ipc_baseline\":true,\"status\":\"PARTIAL\"")
+    record_binding_event(2, "from_string_to_handle", "ncalrpc:[BattleNet_Agent_RPC_synth]", "0xD0010100_RPC_BINDING_HANDLE", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"binding_event\",\"evt_id\":2,\"b_kind\":\"from_string_to_handle\",\"binding_str\":\"ncalrpc:[BattleNet_Agent_RPC_synth]\",\"handle_synth\":\"0xD0010100_RPC_BINDING_HANDLE\",\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+    record_binding_event(3, "free_binding_handle", "release_handle", "0xD0010100_freed", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"binding_event\",\"evt_id\":3,\"b_kind\":\"free_binding_handle\",\"binding_str\":\"release_handle\",\"handle_synth\":\"0xD0010100_freed\",\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+    record_binding_event(4, "free_string_buffer", "ncalrpc:[BattleNet_Agent_RPC_synth]", "buffer_freed", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"binding_event\",\"evt_id\":4,\"b_kind\":\"free_string_buffer\",\"binding_str\":\"ncalrpc:[BattleNet_Agent_RPC_synth]\",\"handle_synth\":\"buffer_freed\",\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+
+    // ─── 3. server_event × 4 (listen/use_protseq/register_if/stop_listening) ───
+    record_server_event(1, "listen_max_default", "ncalrpc", "RPC_C_LISTEN_MAX_CALLS_DEFAULT_1234", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"server_event\",\"evt_id\":1,\"s_kind\":\"listen_max_default\",\"protseq\":\"ncalrpc\",\"iface_synth\":\"RPC_C_LISTEN_MAX_CALLS_DEFAULT_1234\",\"DontWait\":1,\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+    record_server_event(2, "use_protseq_ncalrpc_endpoint", "ncalrpc", "BattleNet_Agent_RPC_endpoint_synth", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"server_event\",\"evt_id\":2,\"s_kind\":\"use_protseq_ncalrpc_endpoint\",\"protseq\":\"ncalrpc\",\"iface_synth\":\"BattleNet_Agent_RPC_endpoint_synth\",\"battle_net_agent_endpoint_baseline\":true,\"status\":\"PARTIAL\"")
+    record_server_event(3, "register_if_battle_net_v1_0", "iface_uuid_synth", "RPC_SERVER_INTERFACE_96B_battle_net_agent_v1_0", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"server_event\",\"evt_id\":3,\"s_kind\":\"register_if_battle_net_v1_0\",\"protseq\":\"iface_uuid_synth\",\"iface_synth\":\"RPC_SERVER_INTERFACE_96B_battle_net_agent_v1_0\",\"struct_bytes\":96,\"status\":\"PARTIAL\"")
+    record_server_event(4, "mgmt_stop_listening", "all_protseq", "graceful_shutdown", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"server_event\",\"evt_id\":4,\"s_kind\":\"mgmt_stop_listening\",\"protseq\":\"all_protseq\",\"iface_synth\":\"graceful_shutdown\",\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+
+    // ─── 4. client_event × 3 (call2/call3/async_init) ───
+    record_client_event(1, "ndr_call2_battle_net_proc", "MIDL_STUB_DESC_80B_battle_net_agent_v1_0", "sync_call_no_async", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"client_event\",\"evt_id\":1,\"c_kind\":\"ndr_call2_battle_net_proc\",\"stub_synth\":\"MIDL_STUB_DESC_80B_battle_net_agent_v1_0\",\"async_synth\":\"sync_call_no_async\",\"struct_bytes\":80,\"status\":\"PARTIAL\"")
+    record_client_event(2, "ndr_call3_battle_net_proc_v3", "MIDL_STUBLESS_PROXY_INFO_synth", "proc_num_3", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"client_event\",\"evt_id\":2,\"c_kind\":\"ndr_call3_battle_net_proc_v3\",\"stub_synth\":\"MIDL_STUBLESS_PROXY_INFO_synth\",\"async_synth\":\"proc_num_3\",\"return_clientcall_status\":\"S_OK_0\",\"status\":\"PARTIAL\"")
+    record_client_event(3, "async_init_handle_signature", "RPC_ASYNC_STATE_88B", "Signature_0xACE0FEE0", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"client_event\",\"evt_id\":3,\"c_kind\":\"async_init_handle_signature\",\"stub_synth\":\"RPC_ASYNC_STATE_88B\",\"async_synth\":\"Signature_0xACE0FEE0\",\"struct_bytes\":88,\"status\":\"PARTIAL\"")
+
+    // ─── 5. auth_event × 3 (set_auth_info_ex/impersonate/revert) ───
+    record_auth_event(1, "set_auth_info_ex_pkt_privacy_negotiate", "RPC_C_AUTHN_GSS_NEGOTIATE_9", "0xD0020100_SEC_WINNT_AUTH_IDENTITY_W_32B", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"auth_event\",\"evt_id\":1,\"a_kind\":\"set_auth_info_ex_pkt_privacy_negotiate\",\"auth_svc\":\"RPC_C_AUTHN_GSS_NEGOTIATE_9\",\"identity_synth\":\"0xD0020100_SEC_WINNT_AUTH_IDENTITY_W_32B\",\"AuthnLevel\":\"RPC_C_AUTHN_LEVEL_PKT_PRIVACY_6\",\"struct_bytes\":32,\"warden_long_horizon_rpc_auth\":true,\"status\":\"PARTIAL\"")
+    record_auth_event(2, "impersonate_client_thread_token", "RPC_C_AUTHN_LEVEL_IMPERSONATION", "thread_impersonation_token_battle_net_user", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"auth_event\",\"evt_id\":2,\"a_kind\":\"impersonate_client_thread_token\",\"auth_svc\":\"RPC_C_AUTHN_LEVEL_IMPERSONATION\",\"identity_synth\":\"thread_impersonation_token_battle_net_user\",\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+    record_auth_event(3, "revert_to_self_process_token", "revert_self", "process_token_restored", "PARTIAL")
+    r0_emit("pe_rpcrt4_core_record", "\"kind\":\"auth_event\",\"evt_id\":3,\"a_kind\":\"revert_to_self_process_token\",\"auth_svc\":\"revert_self\",\"identity_synth\":\"process_token_restored\",\"return_dword\":\"RPC_S_OK_0\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 14 {
+        panic("pe_rpcrt4_core FAIL [syscall_invoke_count] expected=14 got=" + to_string(si))
+    }
+    let be = binding_event_count()
+    if be != 4 {
+        panic("pe_rpcrt4_core FAIL [binding_event_count] expected=4 got=" + to_string(be))
+    }
+    let se = server_event_count()
+    if se != 4 {
+        panic("pe_rpcrt4_core FAIL [server_event_count] expected=4 got=" + to_string(se))
+    }
+    let ce = client_event_count()
+    if ce != 3 {
+        panic("pe_rpcrt4_core FAIL [client_event_count] expected=3 got=" + to_string(ce))
+    }
+    let ae = auth_event_count()
+    if ae != 3 {
+        panic("pe_rpcrt4_core FAIL [auth_event_count] expected=3 got=" + to_string(ae))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "RpcStringBindingComposeW" { panic("pe_rpcrt4_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "RpcBindingFree" { panic("pe_rpcrt4_core FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "RpcServerListen" { panic("pe_rpcrt4_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(8) != "NdrClientCall2" { panic("pe_rpcrt4_core FAIL [fn_kind_name(8)]") }
+    if fn_kind_name(11) != "RpcBindingSetAuthInfoExW" { panic("pe_rpcrt4_core FAIL [fn_kind_name(11)]") }
+    if fn_kind_name(13) != "RpcRevertToSelf" { panic("pe_rpcrt4_core FAIL [fn_kind_name(13)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_rpcrt4_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "binding" { panic("pe_rpcrt4_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "server" { panic("pe_rpcrt4_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(8) != "client" { panic("pe_rpcrt4_core FAIL [fn_group_name(8)]") }
+    if fn_group_name(11) != "auth" { panic("pe_rpcrt4_core FAIL [fn_group_name(11)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_rpcrt4_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = prp_stats()
+    if len(s) != 5 { panic("pe_rpcrt4_core FAIL [stats len] expected=5 got=" + to_string(len(s))) }
+    if s[0] != 14 { panic("pe_rpcrt4_core FAIL [stats syscall_invoke_count] expected=14 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_rpcrt4_core FAIL [stats binding_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_rpcrt4_core FAIL [stats server_event_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_rpcrt4_core FAIL [stats client_event_count] expected=3 got=" + to_string(s[3])) }
+    if s[4] != 3 { panic("pe_rpcrt4_core FAIL [stats auth_event_count] expected=3 got=" + to_string(s[4])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_rpcrt4_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"binding_event_count\":" + to_string(s[1])
+        + ",\"server_event_count\":" + to_string(s[2])
+        + ",\"client_event_count\":" + to_string(s[3])
+        + ",\"auth_event_count\":" + to_string(s[4]))
+
+    r0_emit("pe_rpcrt4_core_summary",
+        "\"target\":\"RPCRT4.dll\",\"fn_total\":14,\"fn_emit_partial\":14,\"groups\":[\"binding\",\"server\",\"client\",\"auth\"],\"rpc_binding_handle_synth\":\"0xD0010100\",\"rpc_server_interface_synth_bytes\":96,\"midl_stub_desc_synth_bytes\":80,\"rpc_async_state_synth_bytes\":88,\"sec_winnt_auth_identity_w_synth_bytes\":32,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_rpcrt4_core_kpi",
+        "\"binding_emits\":4,\"server_emits\":4,\"client_emits\":3,\"auth_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"battle_net_agent_ipc_baseline\":true,\"d2r_d4_service_ipc_baseline\":true,\"warden_long_horizon_rpc_auth_baseline\":true,\"xpc_nsxpcconnection_machmsg_binding\":false,\"launchd_foundation_nsconnection_binding\":false")
+
+    // ─── cycle 54 → 55 RPCRT4 coverage progression evidence emit ───
+    r0_emit("pe_rpcrt4_core_coverage_progression",
+        "\"surface\":\"RPCRT4_full_435_fn\",\"cycle_54_count\":338,\"cycle_55_count\":352,\"delta\":14,\"cycle_54_percent\":77.70,\"cycle_55_percent\":80.92,\"cycle_55_module\":\"pe_rpcrt4_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bh4_cycle_increment\":14,\"track_bh_bundled_part_4_of_4\":true,\"threshold_80pct_breach_module\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_rpcrt4_core_round_trip_matrix",
+        "\"surface\":\"RPCRT4_core_14_fn\",\"fn_partial\":14,\"fn_groups\":4,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real RpcStringBindingComposeW + RpcServerListen + NdrClientCall2 + RpcBindingSetAuthInfoExW = XPC + NSXPCConnection + mach_msg + mach_port_allocate + launchd + Foundation NSConnection bridge pending separate cycle (long-horizon RPC pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BH4 expansion emit (cycle 55, RPCRT4 +14 fn) ───
+    r0_emit("pe_rpcrt4_core_bh4_expansion",
+        "\"track\":\"BH4\",\"cycle\":55,\"surface\":\"RPCRT4_new\",\"new_fn\":14,\"groups\":[\"binding\",\"server\",\"client\",\"auth\"],\"binding_count\":4,\"server_count\":4,\"client_count\":3,\"auth_count\":3,\"emit_format\":\"__RPCRT4__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_3_evidence_augment\":true,\"track_bh_bundled_part_4_of_4\":true,\"threshold_80pct_breach\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_rpcrt4_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_prp()
+    let s2 = prp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_rpcrt4_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_rpcrt4_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", binding_event=" + to_string(s[1])
+        + ", server_event=" + to_string(s[2]) + ", client_event=" + to_string(s[3])
+        + ", auth_event=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prp_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("binding_event_count\t" + to_string(s[1]))
+            println("server_event_count\t" + to_string(s[2]))
+            println("client_event_count\t" + to_string(s[3]))
+            println("auth_event_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_rpcrt4_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_rpcrt4_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_prp()
+            println("cleaned: " + prp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(prp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_rpcrt4_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

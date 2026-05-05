@@ -1,0 +1,379 @@
+// lib/loader/pe_registry_simulation.hexa — stage3 Win32 registry simulation skeleton
+//
+// Win32 registry (HKLM/HKCU 등) → ~/.airgenome/gamebox/registry/<hive>/<path>
+// directory tree. value 는 .json 또는 .txt file. RegOpenKeyEx/QueryValueEx/
+// SetValueEx/CloseKey 추적.
+//
+// own 1: only `use "../perf/r0_common"` (POSIX equivalent — Wine 0 줄).
+// own 2 mandate:
+//   - r0_emit ≥ 6 (record × 5 + pers_stats)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_registry_simulation FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (stage3 — instrumentation skeleton):
+//   stage3 = ledger only (record_reg_op / counts / per-op success).
+//   stage4 = 실 file-based registry tree (~/.airgenome/gamebox/registry/...)
+//            + RegOpenKeyEx → directory check, RegQueryValueEx → file read,
+//            RegSetValueEx → file write 별도 file.
+//
+// Persist layout (TSV, single file):
+//   $GAMEBOX_HOME/persist/pe_registry_simulation/reg_op_log.tsv
+//     op_id<int> \t hive_kind<int> \t op_kind<int> \t success<int>
+//
+//   hive_kind: 1=HKLM, 2=HKCU, 3=HKCR, 4=HKU
+//   op_kind  : 1=open, 2=query, 3=set, 4=delete, 5=enum
+//
+// 예약어 회피: type/mod/resume/handle 미사용.
+// 주의: cycle 60 pe_reloc_stage2.hexa 의 prs_stats 와 충돌 회피 →
+//       이 file 의 stats fn 은 pers_stats (PE Registry Simulation).
+
+use "../perf/r0_common"
+
+// ─── persist dir / file path ───
+fn pers_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_registry_simulation"
+}
+
+fn pers_log_path() -> str {
+    return pers_dir() + "/reg_op_log.tsv"
+}
+
+fn ensure_pers_dir() -> void {
+    let _ = exec("mkdir -p '" + pers_dir() + "'")
+}
+
+// ─── cleanup: log file 제거 ───
+fn cleanup_prs() -> void {
+    ensure_pers_dir()
+    let _ = exec("rm -f '" + pers_log_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pers_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pers_append_row(path: str, row: str) -> void {
+    ensure_pers_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_reg_op: 한 registry op 1 row 추가 ───
+//   op_id      — synthetic op 식별자 (87xxx).
+//   hive_kind  — 1=HKLM / 2=HKCU / 3=HKCR / 4=HKU.
+//   op_kind    — 1=open / 2=query / 3=set / 4=delete / 5=enum.
+//   success    — 1=success / 0=fail.
+fn record_reg_op(op_id: int, hive_kind: int, op_kind: int, success: int) -> void {
+    let row = to_string(op_id) + "\t" + to_string(hive_kind)
+        + "\t" + to_string(op_kind) + "\t" + to_string(success) + "\n"
+    pers_append_row(pers_log_path(), row)
+}
+
+// ─── op_count: reg_op_log.tsv 의 row 수 ───
+fn op_count() -> int {
+    let t = pers_read_table(pers_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── success_count: 모든 row 중 success==1 개수 ───
+fn success_count() -> int {
+    let t = pers_read_table(pers_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── count_by_hive: 특정 hive_kind 의 row 수 ───
+fn count_by_hive(kind: int) -> int {
+    let t = pers_read_table(pers_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 row 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pers_read_table(pers_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── op_success: 특정 op_id 의 success (없으면 0) ───
+fn op_success(op_id: int) -> int {
+    let t = pers_read_table(pers_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let key = to_string(op_id)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pers_stats: [op_count, success_count, count_by_hive(1), count_by_op_kind(2)] ───
+//   (cycle 60 pe_reloc_stage2 의 prs_stats 와의 collision 회피용 rename.)
+fn pers_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(success_count())
+    out.push(count_by_hive(1))
+    out.push(count_by_op_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pers-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prs()
+    if op_count() != 0 {
+        panic("pe_registry_simulation FAIL [cleanup] expected=0 got=" + to_string(op_count()))
+    }
+
+    // 2. 합성 5 ops
+    record_reg_op(87001, 1, 1, 1)   // HKLM open success
+    r0_emit("pers_record",
+        "\"op_id\":87001,\"hive_kind\":1,\"op_kind\":1,\"success\":1")
+
+    record_reg_op(87002, 1, 2, 1)   // HKLM query success
+    r0_emit("pers_record",
+        "\"op_id\":87002,\"hive_kind\":1,\"op_kind\":2,\"success\":1")
+
+    record_reg_op(87003, 2, 3, 1)   // HKCU set success
+    r0_emit("pers_record",
+        "\"op_id\":87003,\"hive_kind\":2,\"op_kind\":3,\"success\":1")
+
+    record_reg_op(87004, 1, 2, 0)   // HKLM query FAIL (key not found)
+    r0_emit("pers_record",
+        "\"op_id\":87004,\"hive_kind\":1,\"op_kind\":2,\"success\":0")
+
+    record_reg_op(87005, 2, 1, 1)   // HKCU open success
+    r0_emit("pers_record",
+        "\"op_id\":87005,\"hive_kind\":2,\"op_kind\":1,\"success\":1")
+
+    // 3. op_count = 5
+    let oc = op_count()
+    if oc != 5 {
+        panic("pe_registry_simulation FAIL [op_count] expected=5 got=" + to_string(oc))
+    }
+
+    // 4. success_count = 4
+    let sc = success_count()
+    if sc != 4 {
+        panic("pe_registry_simulation FAIL [success_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 5. count_by_hive
+    let h1 = count_by_hive(1)
+    if h1 != 3 {
+        panic("pe_registry_simulation FAIL [count_by_hive 1] expected=3 got=" + to_string(h1))
+    }
+    let h2 = count_by_hive(2)
+    if h2 != 2 {
+        panic("pe_registry_simulation FAIL [count_by_hive 2] expected=2 got=" + to_string(h2))
+    }
+    let h99 = count_by_hive(99)
+    if h99 != 0 {
+        panic("pe_registry_simulation FAIL [count_by_hive 99] expected=0 got=" + to_string(h99))
+    }
+
+    // 6. count_by_op_kind
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_registry_simulation FAIL [count_by_op_kind 1] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_registry_simulation FAIL [count_by_op_kind 2] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_registry_simulation FAIL [count_by_op_kind 3] expected=1 got=" + to_string(k3))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_registry_simulation FAIL [count_by_op_kind 99] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. op_success per id
+    let s1 = op_success(87001)
+    if s1 != 1 {
+        panic("pe_registry_simulation FAIL [op_success 87001] expected=1 got=" + to_string(s1))
+    }
+    let s4 = op_success(87004)
+    if s4 != 0 {
+        panic("pe_registry_simulation FAIL [op_success 87004] expected=0 got=" + to_string(s4))
+    }
+    let s_missing = op_success(9999)
+    if s_missing != 0 {
+        panic("pe_registry_simulation FAIL [op_success 9999] expected=0 got=" + to_string(s_missing))
+    }
+
+    // 8. pers_stats = [5, 4, 3, 2]
+    let st = pers_stats()
+    if len(st) != 4 {
+        panic("pe_registry_simulation FAIL [pers_stats len] expected=4 got=" + to_string(len(st)))
+    }
+    if st[0] != 5 {
+        panic("pe_registry_simulation FAIL [pers_stats[0]] expected=5 got=" + to_string(st[0]))
+    }
+    if st[1] != 4 {
+        panic("pe_registry_simulation FAIL [pers_stats[1]] expected=4 got=" + to_string(st[1]))
+    }
+    if st[2] != 3 {
+        panic("pe_registry_simulation FAIL [pers_stats[2]] expected=3 got=" + to_string(st[2]))
+    }
+    if st[3] != 2 {
+        panic("pe_registry_simulation FAIL [pers_stats[3]] expected=2 got=" + to_string(st[3]))
+    }
+
+    // 9. emit pers_stats
+    r0_emit("pers_stats",
+        "\"op_count\":" + to_string(st[0])
+        + ",\"success_count\":" + to_string(st[1])
+        + ",\"hklm\":" + to_string(st[2])
+        + ",\"queries\":" + to_string(st[3]))
+
+    // 10. r0 emit count >= 6
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_registry_simulation FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ pe_registry_simulation self_test PASS (" + to_string(st[0])
+        + " ops, " + to_string(st[1]) + " success, "
+        + to_string(st[2]) + " HKLM, " + to_string(st[3]) + " queries, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pers_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("success_count\t" + to_string(s[1]))
+            println("hklm\t" + to_string(s[2]))
+            println("queries\t" + to_string(s[3]))
+            return
+        }
+        if sub == "success" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println(to_string(op_success(oid)))
+                return
+            }
+        }
+        if sub == "count_hive" {
+            if len(a) >= 4 {
+                let hk = to_int(a[3])
+                println(to_string(count_by_hive(hk)))
+                return
+            }
+        }
+        if sub == "count_op" {
+            if len(a) >= 4 {
+                let ok = to_int(a[3])
+                println(to_string(count_by_op_kind(ok)))
+                return
+            }
+        }
+        if sub == "cleanup" {
+            cleanup_prs()
+            println("cleaned: " + pers_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_registry_simulation.hexa { self-test | stats | success <op_id> | count_hive <hive_kind> | count_op <op_kind> | cleanup }")
+}

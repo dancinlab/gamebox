@@ -1,0 +1,152 @@
+// lib/perf/c_correlate.hexa — C-CORRELATE (15/15)
+//
+// stutter 발생 시 동시에 일어난 다른 anomaly (PSO compile / heap pressure / draw burst)
+// 와의 *상관* 계산. 다중 source label fusion → 원인 분석.
+// 무기: label fusion + temporal sliding window.
+//
+// stage1 우회: 단순 시간 윈도우 매칭 (within ±N ms 안에 동시 발생 카운트).
+
+use "./r0_common"
+
+let RING_CORRELATE = GAMEBOX_HOME + "/forge/genomes-gptk-correlate.ring"
+
+// 단일 row 합성: ts_us, stutter_label, pso_event, heap_label, draw_burst, correlation_score
+fn append_correlation(ts_us: int, stutter_label: str, pso_event: str, heap_label: str, draw_burst: int, correlation_score: int) -> void {
+    let payload = "\"ts_us\":" + to_string(ts_us)
+        + ",\"stutter_label\":\"" + stutter_label + "\""
+        + ",\"pso_event\":\"" + pso_event + "\""
+        + ",\"heap_label\":\"" + heap_label + "\""
+        + ",\"draw_burst\":" + to_string(draw_burst)
+        + ",\"correlation_score\":" + to_string(correlation_score)
+    r0_emit("correlation", payload)
+
+    let _mk = exec("mkdir -p '" + GAMEBOX_HOME + "/forge'")
+    let line = "{\"axes\":5,\"rec_bytes\":30,\"component\":\"CORR\"," + payload + "}"
+    r0_append_line(RING_CORRELATE, line)
+}
+
+// correlation_score 계산 (0-100):
+//   stutter 가 있고 동시에 PSO compile 또는 heap label 또는 draw burst 가 활성 → score ↑
+fn compute_correlation_score(stutter_label: str, pso_event: str, heap_label: str, draw_burst: int) -> int {
+    if stutter_label == "" {
+        return 0
+    }
+    let score = 30  // base — stutter 단독
+    if pso_event != "" { score = score + 25 }
+    if heap_label != "" { score = score + 25 }
+    if draw_burst > 0 { score = score + 20 }
+    return score
+}
+
+// label fusion — 여러 source 의 timestamp + label 입력
+//   sources = array of [ts_us, kind, label/value]  (kind: "stutter"|"pso"|"heap"|"draw")
+//   window_us = 매칭 윈도우
+//   결과: array of [ts_us, stutter_label, pso_event, heap_label, draw_burst, score]
+fn fuse_labels(sources: array, window_us: int) -> array {
+    // stutter 이벤트 기준 — window 안에 다른 source 있는지 검색
+    let result = []
+    let i = 0
+    while i < len(sources) {
+        let s = sources[i]
+        if s[1] == "stutter" {
+            let ts_s = s[0]
+            let stutter_l = s[2]
+            let pso_l = ""
+            let heap_l = ""
+            let draw_b = 0
+            // window 안 다른 source 검색
+            let j = 0
+            while j < len(sources) {
+                let o = sources[j]
+                let dt = o[0] - ts_s
+                if dt < 0 { dt = 0 - dt }
+                if dt <= window_us {
+                    if o[1] == "pso"  { pso_l = o[2] }
+                    if o[1] == "heap" { heap_l = o[2] }
+                    if o[1] == "draw" { draw_b = to_int(o[2]) }
+                }
+                j = j + 1
+            }
+            let score = compute_correlation_score(stutter_l, pso_l, heap_l, draw_b)
+            result = result + [[ts_s, stutter_l, pso_l, heap_l, draw_b, score]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "ccorr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 합성 multi-source 시퀀스 — 1초 안에 다양한 anomaly
+    let sources = [
+        [1000000, "stutter", "spike"],
+        [1000500, "pso",     "compile_peak"],
+        [1001000, "heap",    "OOM_imminent"],
+        [1500000, "stutter", "sustained_drop"],
+        [1500200, "draw",    "150"],
+        [3000000, "stutter", "spike"],
+        [5000000, "heap",    "frag_critical"]
+    ]
+
+    // window = 100,000 us (100 ms)
+    let fused = fuse_labels(sources, 100000)
+
+    // 3 stutter event 모두 detect 되어야 함
+    if len(fused) != 3 {
+        panic("c_correlate FAIL [stutter count] expected=3 got=" + to_string(len(fused)))
+    }
+
+    // 첫 stutter (spike, ts=1000000) 의 score: stutter(30) + pso(+25) + heap(+25) = 80
+    let r0 = fused[0]
+    if r0[5] != 80 {
+        panic("c_correlate FAIL [score 0] expected=80 got=" + to_string(r0[5]))
+    }
+    if r0[2] != "compile_peak" {
+        panic("c_correlate FAIL [pso 0] expected=compile_peak got=" + r0[2])
+    }
+    if r0[3] != "OOM_imminent" {
+        panic("c_correlate FAIL [heap 0] expected=OOM_imminent got=" + r0[3])
+    }
+
+    // 두 번째 stutter (sustained_drop, ts=1500000) — draw burst 만 매칭, score = 30 + 20 = 50
+    let r1 = fused[1]
+    if r1[5] != 50 {
+        panic("c_correlate FAIL [score 1] expected=50 got=" + to_string(r1[5]))
+    }
+    if r1[4] != 150 {
+        panic("c_correlate FAIL [draw 1] expected=150 got=" + to_string(r1[4]))
+    }
+
+    // 세 번째 stutter (ts=3000000) — 단독, score = 30
+    let r2 = fused[2]
+    if r2[5] != 30 {
+        panic("c_correlate FAIL [score 2] expected=30 got=" + to_string(r2[5]))
+    }
+
+    // emit 검증 — append_correlation 호출
+    append_correlation(r0[0], r0[1], r0[2], r0[3], r0[4], r0[5])
+    append_correlation(r1[0], r1[1], r1[2], r1[3], r1[4], r1[5])
+    append_correlation(r2[0], r2[1], r2[2], r2[3], r2[4], r2[5])
+
+    let cnt = r0_session_count(sid)
+    if cnt != 3 {
+        panic("c_correlate FAIL [emit count] expected=3 got=" + to_string(cnt))
+    }
+
+    println("  ✅ c_correlate self_test PASS (3 fused: scores=80/50/30, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+    }
+    println("usage: hexa run c_correlate.hexa { self-test }")
+}

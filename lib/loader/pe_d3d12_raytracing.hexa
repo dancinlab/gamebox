@@ -1,0 +1,388 @@
+// lib/loader/pe_d3d12_raytracing.hexa — cycle 76 D3D12 DXR telemetry skeleton
+//
+// D3D12 DXR (DirectX Raytracing) op tracker — BLAS/TLAS build,
+// AS update/copy, DispatchRays calls. PE loader 가 raytracing pipeline
+// 호출을 intercept 하여 op_kind / as_size / ray_count 를 기록.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 op tracker — 실 DispatchRays / BuildRaytracingAccelerationStructure
+//   호출 X. 후속 stage 에서 native 측 D3D12 device 와 연결.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = blas_build
+//   2 = tlas_build
+//   3 = as_update
+//   4 = dispatch_rays
+//   5 = copy_as
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t as_size_kb<int> \t ray_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdrt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_raytracing"
+}
+
+fn pdrt_ops_path() -> str {
+    return pdrt_dir() + "/ops.tsv"
+}
+
+fn pdrt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdrt_dir() + "'")
+}
+
+fn cleanup_pdrt() -> void {
+    pdrt_ensure_dir()
+    let _ = exec("rm -f '" + pdrt_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdrt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdrt_append_row(path: str, row: str) -> void {
+    pdrt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: raytracing op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, as_size_kb: int, ray_count: int) -> void {
+    if op_id <= 0 {
+        panic("pe_d3d12_raytracing FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_d3d12_raytracing FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 5 {
+        panic("pe_d3d12_raytracing FAIL [record_op] expected=op_kind<=5 got=" + to_string(op_kind))
+    }
+    if as_size_kb < 0 {
+        panic("pe_d3d12_raytracing FAIL [record_op] expected=as_size_kb>=0 got=" + to_string(as_size_kb))
+    }
+    if ray_count < 0 {
+        panic("pe_d3d12_raytracing FAIL [record_op] expected=ray_count>=0 got=" + to_string(ray_count))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(as_size_kb) + "\t" + to_string(ray_count) + "\n"
+    pdrt_append_row(pdrt_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pdrt_read_table(pdrt_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_as_size_kb: 모든 op as_size_kb 합 ───
+fn total_as_size_kb() -> int {
+    let t = pdrt_read_table(pdrt_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_ray_count: 모든 op ray_count 합 ───
+fn total_ray_count() -> int {
+    let t = pdrt_read_table(pdrt_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pdrt_read_table(pdrt_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── op_ray_count: 특정 op_id 의 ray_count (없으면 0) ───
+fn op_ray_count(op_id: int) -> int {
+    let t = pdrt_read_table(pdrt_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdrt_stats: [op_count, total_as_size_kb, total_ray_count, count_by_op_kind(4)] ───
+fn pdrt_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_as_size_kb())
+    out.push(total_ray_count())
+    out.push(count_by_op_kind(4))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdrt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdrt()
+
+    // 2. record 5 ops across ≥3 op_kinds (1=blas, 2=tlas, 3=update, 4=dispatch)
+    record_op(760001, 1, 2048, 0)
+    r0_emit("pe_d3d12_raytracing_record",
+        "\"op_id\":760001,\"op_kind\":1,\"as_size_kb\":2048,\"ray_count\":0,\"target\":\"blas_build\"")
+
+    record_op(760002, 1, 1024, 0)
+    r0_emit("pe_d3d12_raytracing_record",
+        "\"op_id\":760002,\"op_kind\":1,\"as_size_kb\":1024,\"ray_count\":0,\"target\":\"blas_build\"")
+
+    record_op(760003, 2, 512, 0)
+    r0_emit("pe_d3d12_raytracing_record",
+        "\"op_id\":760003,\"op_kind\":2,\"as_size_kb\":512,\"ray_count\":0,\"target\":\"tlas_build\"")
+
+    record_op(760004, 3, 256, 0)
+    r0_emit("pe_d3d12_raytracing_record",
+        "\"op_id\":760004,\"op_kind\":3,\"as_size_kb\":256,\"ray_count\":0,\"target\":\"as_update\"")
+
+    record_op(760005, 4, 0, 2073600)
+    r0_emit("pe_d3d12_raytracing_record",
+        "\"op_id\":760005,\"op_kind\":4,\"as_size_kb\":0,\"ray_count\":2073600,\"target\":\"dispatch_rays\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_d3d12_raytracing FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_as_size_kb = 2048+1024+512+256+0 = 3840
+    let ts = total_as_size_kb()
+    if ts != 3840 {
+        panic("pe_d3d12_raytracing FAIL [total_as_size_kb] expected=3840 got=" + to_string(ts))
+    }
+
+    // 5. total_ray_count = 2073600
+    let tr = total_ray_count()
+    if tr != 2073600 {
+        panic("pe_d3d12_raytracing FAIL [total_ray_count] expected=2073600 got=" + to_string(tr))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_d3d12_raytracing FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d12_raytracing FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d12_raytracing FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d12_raytracing FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 0 {
+        panic("pe_d3d12_raytracing FAIL [count_by_op_kind(5)] expected=0 got=" + to_string(k5))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_d3d12_raytracing FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. op_ray_count sanity
+    let r5 = op_ray_count(760005)
+    if r5 != 2073600 {
+        panic("pe_d3d12_raytracing FAIL [op_ray_count(760005)] expected=2073600 got=" + to_string(r5))
+    }
+    let r1 = op_ray_count(760001)
+    if r1 != 0 {
+        panic("pe_d3d12_raytracing FAIL [op_ray_count(760001)] expected=0 got=" + to_string(r1))
+    }
+    let r_miss = op_ray_count(9999)
+    if r_miss != 0 {
+        panic("pe_d3d12_raytracing FAIL [op_ray_count(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 8. pdrt_stats() = [5, 3840, 2073600, 1]
+    let s = pdrt_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_raytracing FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d12_raytracing FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3840 {
+        panic("pe_d3d12_raytracing FAIL [stats total_as_size_kb] expected=3840 got=" + to_string(s[1]))
+    }
+    if s[2] != 2073600 {
+        panic("pe_d3d12_raytracing FAIL [stats total_ray_count] expected=2073600 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_d3d12_raytracing FAIL [stats count_kind(4)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_d3d12_raytracing_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_as_size_kb\":" + to_string(s[1])
+        + ",\"total_ray_count\":" + to_string(s[2])
+        + ",\"kind_dispatch_rays\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d12_raytracing FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pdrt()
+    let s2 = pdrt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d12_raytracing FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_raytracing self_test PASS (ops=" + to_string(s[0])
+        + ", as_kb=" + to_string(s[1]) + ", rays=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdrt_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_as_size_kb\t" + to_string(s[1]))
+            println("total_ray_count\t" + to_string(s[2]))
+            println("count_kind_dispatch_rays\t" + to_string(s[3]))
+            return
+        }
+        if sub == "rays" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_ray_count\t" + to_string(op_ray_count(oid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_raytracing.hexa rays <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_raytracing.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdrt()
+            println("cleaned: " + pdrt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdrt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_raytracing.hexa { self-test | stats | rays <op_id> | count <op_kind> | cleanup | dir }")
+}

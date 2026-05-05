@@ -1,0 +1,418 @@
+// lib/loader/pe_avrt_thread_priority.hexa — AvSetMmThreadCharacteristicsW priority bridge skeleton
+//
+// avrt.dll AvSetMmThreadCharacteristicsW → POSIX SCHED_FIFO / realtime QoS.
+// Windows audio/multimedia 스레드 priority 분류 (MMCSS task) 를 unix 환경에서
+// pthread realtime scheduling 으로 매핑하기 위한 set tracker.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 priority set tracker — 실 pthread_setschedparam() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// characteristic_kind code (MMCSS task name 매핑):
+//   1 = audio
+//   2 = games
+//   3 = playback
+//   4 = pro_audio
+//   5 = capture
+//
+// priority_level code (AvSetMmThreadPriority):
+//   1 = critical
+//   2 = high
+//   3 = normal
+//   4 = low
+//
+// persist schema (TSV — sets.tsv):
+//   set_id<int> \t characteristic_kind<int> \t priority_level<int> \t thread_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn patp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_avrt_thread_priority"
+}
+
+fn patp_sets_path() -> str {
+    return patp_dir() + "/sets.tsv"
+}
+
+fn patp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + patp_dir() + "'")
+}
+
+fn cleanup_patp() -> void {
+    patp_ensure_dir()
+    let _ = exec("rm -f '" + patp_sets_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn patp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn patp_append_row(path: str, row: str) -> void {
+    patp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_set: thread priority set 1 건 기록 ───
+fn record_set(set_id: int, characteristic_kind: int, priority_level: int, thread_id: int) -> void {
+    if set_id <= 0 {
+        panic("pe_avrt_thread_priority FAIL [record_set] expected=set_id>0 got=" + to_string(set_id))
+    }
+    if characteristic_kind < 1 {
+        panic("pe_avrt_thread_priority FAIL [record_set] expected=characteristic_kind>=1 got=" + to_string(characteristic_kind))
+    }
+    if characteristic_kind > 5 {
+        panic("pe_avrt_thread_priority FAIL [record_set] expected=characteristic_kind<=5 got=" + to_string(characteristic_kind))
+    }
+    if priority_level < 1 {
+        panic("pe_avrt_thread_priority FAIL [record_set] expected=priority_level>=1 got=" + to_string(priority_level))
+    }
+    if priority_level > 4 {
+        panic("pe_avrt_thread_priority FAIL [record_set] expected=priority_level<=4 got=" + to_string(priority_level))
+    }
+    if thread_id <= 0 {
+        panic("pe_avrt_thread_priority FAIL [record_set] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    let row = to_string(set_id) + "\t" + to_string(characteristic_kind)
+        + "\t" + to_string(priority_level) + "\t" + to_string(thread_id) + "\n"
+    patp_append_row(patp_sets_path(), row)
+}
+
+// ─── set_count: total set 수 ───
+fn set_count() -> int {
+    let t = patp_read_table(patp_sets_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_characteristic: 특정 characteristic_kind 의 set 수 ───
+fn count_by_characteristic(characteristic_kind: int) -> int {
+    let t = patp_read_table(patp_sets_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == characteristic_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_priority: 특정 priority_level 의 set 수 ───
+fn count_by_priority(priority_level: int) -> int {
+    let t = patp_read_table(patp_sets_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == priority_level {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 중복 제거된 thread_id 수 ───
+fn distinct_threads() -> int {
+    let t = patp_read_table(patp_sets_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[3])
+                let mut found = 0
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == tid {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── set_priority: 특정 set_id 의 priority_level (없으면 0) ───
+fn set_priority(set_id: int) -> int {
+    let t = patp_read_table(patp_sets_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == set_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── patp_stats: [set_count, distinct_threads, count_by_characteristic(1), count_by_priority(1)] ───
+fn patp_stats() -> array {
+    let mut out = []
+    out.push(set_count())
+    out.push(distinct_threads())
+    out.push(count_by_characteristic(1))
+    out.push(count_by_priority(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "patp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_patp()
+
+    // 2. record 5 sets across 4 characteristic_kinds (audio x2, games, pro_audio, capture)
+    record_set(120001, 1, 1, 7001)
+    r0_emit("pe_avrt_thread_priority_record",
+        "\"set_id\":120001,\"characteristic_kind\":1,\"priority_level\":1,\"thread_id\":7001,\"target\":\"audio_critical\"")
+
+    record_set(120002, 1, 2, 7002)
+    r0_emit("pe_avrt_thread_priority_record",
+        "\"set_id\":120002,\"characteristic_kind\":1,\"priority_level\":2,\"thread_id\":7002,\"target\":\"audio_high\"")
+
+    record_set(120003, 2, 3, 7003)
+    r0_emit("pe_avrt_thread_priority_record",
+        "\"set_id\":120003,\"characteristic_kind\":2,\"priority_level\":3,\"thread_id\":7003,\"target\":\"games_normal\"")
+
+    record_set(120004, 4, 1, 7004)
+    r0_emit("pe_avrt_thread_priority_record",
+        "\"set_id\":120004,\"characteristic_kind\":4,\"priority_level\":1,\"thread_id\":7004,\"target\":\"pro_audio_critical\"")
+
+    record_set(120005, 5, 4, 7005)
+    r0_emit("pe_avrt_thread_priority_record",
+        "\"set_id\":120005,\"characteristic_kind\":5,\"priority_level\":4,\"thread_id\":7005,\"target\":\"capture_low\"")
+
+    // 3. set_count = 5
+    let c = set_count()
+    if c != 5 {
+        panic("pe_avrt_thread_priority FAIL [set_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_characteristic sanity
+    let ck1 = count_by_characteristic(1)
+    if ck1 != 2 {
+        panic("pe_avrt_thread_priority FAIL [count_by_characteristic(1)] expected=2 got=" + to_string(ck1))
+    }
+    let ck2 = count_by_characteristic(2)
+    if ck2 != 1 {
+        panic("pe_avrt_thread_priority FAIL [count_by_characteristic(2)] expected=1 got=" + to_string(ck2))
+    }
+    let ck3 = count_by_characteristic(3)
+    if ck3 != 0 {
+        panic("pe_avrt_thread_priority FAIL [count_by_characteristic(3)] expected=0 got=" + to_string(ck3))
+    }
+    let ck4 = count_by_characteristic(4)
+    if ck4 != 1 {
+        panic("pe_avrt_thread_priority FAIL [count_by_characteristic(4)] expected=1 got=" + to_string(ck4))
+    }
+    let ck5 = count_by_characteristic(5)
+    if ck5 != 1 {
+        panic("pe_avrt_thread_priority FAIL [count_by_characteristic(5)] expected=1 got=" + to_string(ck5))
+    }
+
+    // 5. count_by_priority sanity
+    let pl1 = count_by_priority(1)
+    if pl1 != 2 {
+        panic("pe_avrt_thread_priority FAIL [count_by_priority(1)] expected=2 got=" + to_string(pl1))
+    }
+    let pl2 = count_by_priority(2)
+    if pl2 != 1 {
+        panic("pe_avrt_thread_priority FAIL [count_by_priority(2)] expected=1 got=" + to_string(pl2))
+    }
+    let pl3 = count_by_priority(3)
+    if pl3 != 1 {
+        panic("pe_avrt_thread_priority FAIL [count_by_priority(3)] expected=1 got=" + to_string(pl3))
+    }
+    let pl4 = count_by_priority(4)
+    if pl4 != 1 {
+        panic("pe_avrt_thread_priority FAIL [count_by_priority(4)] expected=1 got=" + to_string(pl4))
+    }
+
+    // 6. distinct_threads = 5
+    let dt = distinct_threads()
+    if dt != 5 {
+        panic("pe_avrt_thread_priority FAIL [distinct_threads] expected=5 got=" + to_string(dt))
+    }
+
+    // 7. set_priority sanity
+    let sp1 = set_priority(120001)
+    if sp1 != 1 {
+        panic("pe_avrt_thread_priority FAIL [set_priority(120001)] expected=1 got=" + to_string(sp1))
+    }
+    let sp3 = set_priority(120003)
+    if sp3 != 3 {
+        panic("pe_avrt_thread_priority FAIL [set_priority(120003)] expected=3 got=" + to_string(sp3))
+    }
+    let sp_miss = set_priority(9999)
+    if sp_miss != 0 {
+        panic("pe_avrt_thread_priority FAIL [set_priority(9999)] expected=0 got=" + to_string(sp_miss))
+    }
+
+    // 8. patp_stats() = [5, 5, 2, 2]
+    let s = patp_stats()
+    if len(s) != 4 {
+        panic("pe_avrt_thread_priority FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_avrt_thread_priority FAIL [stats set_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 5 {
+        panic("pe_avrt_thread_priority FAIL [stats distinct_threads] expected=5 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_avrt_thread_priority FAIL [stats count_characteristic(1)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_avrt_thread_priority FAIL [stats count_priority(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_avrt_thread_priority_stats",
+        "\"set_count\":" + to_string(s[0])
+        + ",\"distinct_threads\":" + to_string(s[1])
+        + ",\"audio_kind\":" + to_string(s[2])
+        + ",\"critical_priority\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_avrt_thread_priority FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_patp()
+    let s2 = patp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_avrt_thread_priority FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_avrt_thread_priority self_test PASS (sets=" + to_string(s[0])
+        + ", threads=" + to_string(s[1]) + ", audio=" + to_string(s[2])
+        + ", critical=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = patp_stats()
+            println("set_count\t" + to_string(s[0]))
+            println("distinct_threads\t" + to_string(s[1]))
+            println("count_characteristic_audio\t" + to_string(s[2]))
+            println("count_priority_critical\t" + to_string(s[3]))
+            return
+        }
+        if sub == "priority" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("set_priority\t" + to_string(set_priority(sid)))
+                return
+            }
+            println("usage: hexa run pe_avrt_thread_priority.hexa priority <set_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let ck = to_int(a[3])
+                println("count_by_characteristic\t" + to_string(count_by_characteristic(ck)))
+                return
+            }
+            println("usage: hexa run pe_avrt_thread_priority.hexa count <characteristic_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_patp()
+            println("cleaned: " + patp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(patp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_avrt_thread_priority.hexa { self-test | stats | priority <set_id> | count <characteristic_kind> | cleanup | dir }")
+}

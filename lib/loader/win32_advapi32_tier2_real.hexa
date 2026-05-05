@@ -1,0 +1,483 @@
+// lib/loader/win32_advapi32_tier2_real.hexa — cycle 82 R6 Tier 2 ADVAPI32 registry call tracker
+//
+// Tier 2 ADVAPI32 registry → own2 자체 hive 매니저:
+//   per-process hive: ~/.airgenome/gamebox/hive/HKLM_software.dat (TSV path/key/value)
+//   HKEY_LOCAL_MACHINE\SOFTWARE\Blizzard\D2R\Path 같은 key path 추적
+//   RegOpenKeyEx → 가짜 HKEY (uint64 sentinel + key path 저장)
+//   RegQueryValueEx → hive 검색 + REG_SZ/REG_DWORD/REG_BINARY 디코드
+//   RegSetValueEx → hive append + flush
+//   RegEnum* → key 자식 list iterate
+//   RegFlushKey → 즉시 fsync
+// own1: 자체 file-based registry — Wine reg.c / Windows DLL 0 줄
+//
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// func_kind code:
+//   1  = RegOpenKeyEx
+//   2  = RegCloseKey
+//   3  = RegQueryValueEx
+//   4  = RegSetValueEx
+//   5  = RegEnumKey
+//   6  = RegEnumValue
+//   7  = RegCreateKeyEx
+//   8  = RegDeleteKey
+//   9  = RegDeleteValue
+//   10 = RegFlushKey
+//
+// hkey_root code:
+//   0 = HKEY_LOCAL_MACHINE   (HKLM)
+//   1 = HKEY_CURRENT_USER    (HKCU)
+//   2 = HKEY_CLASSES_ROOT    (HKCR)
+//   3 = HKEY_USERS           (HKU)
+//   4 = HKEY_CURRENT_CONFIG  (HKCC)
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t func_kind<int> \t hkey_root<int> \t value_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn wat2_dir() -> str {
+    return GAMEBOX_HOME + "/persist/win32_advapi32_tier2_real"
+}
+
+fn wat2_calls_path() -> str {
+    return wat2_dir() + "/calls.tsv"
+}
+
+fn wat2_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + wat2_dir() + "'")
+}
+
+fn cleanup_wat2() -> void {
+    wat2_ensure_dir()
+    let _ = exec("rm -f '" + wat2_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn wat2_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn wat2_append_row(path: str, row: str) -> void {
+    wat2_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: ADVAPI32 registry call 1 건 기록 ───
+fn record_call(call_id: int, func_kind: int, hkey_root: int, value_size_bytes: int) -> void {
+    if call_id <= 0 {
+        panic("win32_advapi32_tier2_real FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if func_kind < 1 {
+        panic("win32_advapi32_tier2_real FAIL [record_call] expected=func_kind>=1 got=" + to_string(func_kind))
+    }
+    if func_kind > 10 {
+        panic("win32_advapi32_tier2_real FAIL [record_call] expected=func_kind<=10 got=" + to_string(func_kind))
+    }
+    if hkey_root < 0 {
+        panic("win32_advapi32_tier2_real FAIL [record_call] expected=hkey_root>=0 got=" + to_string(hkey_root))
+    }
+    if hkey_root > 4 {
+        panic("win32_advapi32_tier2_real FAIL [record_call] expected=hkey_root<=4 got=" + to_string(hkey_root))
+    }
+    if value_size_bytes < 0 {
+        panic("win32_advapi32_tier2_real FAIL [record_call] expected=value_size_bytes>=0 got=" + to_string(value_size_bytes))
+    }
+    let row = to_string(call_id) + "\t" + to_string(func_kind)
+        + "\t" + to_string(hkey_root) + "\t" + to_string(value_size_bytes) + "\n"
+    wat2_append_row(wat2_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = wat2_read_table(wat2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_func_kind: 특정 func_kind 의 call 수 ───
+fn count_by_func_kind(kind: int) -> int {
+    let t = wat2_read_table(wat2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_hkey_root: 특정 hkey_root 의 call 수 ───
+fn count_by_hkey_root(root: int) -> int {
+    let t = wat2_read_table(wat2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == root {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_value_size_bytes: 모든 call value_size 합 ───
+fn total_value_size_bytes() -> int {
+    let t = wat2_read_table(wat2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── read_op_count: query/enum_key/enum_value (func_kind 3+5+6) ───
+fn read_op_count() -> int {
+    return count_by_func_kind(3) + count_by_func_kind(5) + count_by_func_kind(6)
+}
+
+// ─── call_value_size: 특정 call_id 의 value_size_bytes (없으면 0) ───
+fn call_value_size(call_id: int) -> int {
+    let t = wat2_read_table(wat2_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── wat2_stats: [call_count, total_value_size_bytes, read_op_count, count_by_hkey_root(0)] ───
+fn wat2_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(total_value_size_bytes())
+    out.push(read_op_count())
+    out.push(count_by_hkey_root(0))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "wat2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_wat2()
+
+    // 2. record 6 ADVAPI32 registry calls (deterministic synthetic)
+    //    func_kinds covered: 1, 2, 3, 4, 5, 7 (6 distinct ≥ 4)
+    //    hkey_roots covered: 0, 1, 2     (3 distinct ≥ 3)
+    record_call(820001, 1, 0, 0)
+    r0_emit("win32_advapi32_tier2_real_record",
+        "\"call_id\":820001,\"func_kind\":1,\"hkey_root\":0,\"value_size_bytes\":0,\"target\":\"RegOpenKeyEx HKLM\\\\SOFTWARE\\\\Blizzard\\\\D2R\"")
+
+    record_call(820002, 3, 0, 256)
+    r0_emit("win32_advapi32_tier2_real_record",
+        "\"call_id\":820002,\"func_kind\":3,\"hkey_root\":0,\"value_size_bytes\":256,\"target\":\"RegQueryValueEx Path REG_SZ\"")
+
+    record_call(820003, 4, 1, 128)
+    r0_emit("win32_advapi32_tier2_real_record",
+        "\"call_id\":820003,\"func_kind\":4,\"hkey_root\":1,\"value_size_bytes\":128,\"target\":\"RegSetValueEx HKCU LastRun REG_DWORD\"")
+
+    record_call(820004, 5, 0, 64)
+    r0_emit("win32_advapi32_tier2_real_record",
+        "\"call_id\":820004,\"func_kind\":5,\"hkey_root\":0,\"value_size_bytes\":64,\"target\":\"RegEnumKey HKLM child\"")
+
+    record_call(820005, 7, 2, 0)
+    r0_emit("win32_advapi32_tier2_real_record",
+        "\"call_id\":820005,\"func_kind\":7,\"hkey_root\":2,\"value_size_bytes\":0,\"target\":\"RegCreateKeyEx HKCR FileExt\"")
+
+    record_call(820006, 2, 0, 0)
+    r0_emit("win32_advapi32_tier2_real_record",
+        "\"call_id\":820006,\"func_kind\":2,\"hkey_root\":0,\"value_size_bytes\":0,\"target\":\"RegCloseKey HKLM\"")
+
+    // 3. call_count = 6
+    let c = call_count()
+    if c != 6 {
+        panic("win32_advapi32_tier2_real FAIL [call_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. distinct func_kinds ≥ 4
+    let mut kinds_seen = 0
+    if count_by_func_kind(1) > 0 {
+        kinds_seen = kinds_seen + 1
+    }
+    if count_by_func_kind(2) > 0 {
+        kinds_seen = kinds_seen + 1
+    }
+    if count_by_func_kind(3) > 0 {
+        kinds_seen = kinds_seen + 1
+    }
+    if count_by_func_kind(4) > 0 {
+        kinds_seen = kinds_seen + 1
+    }
+    if count_by_func_kind(5) > 0 {
+        kinds_seen = kinds_seen + 1
+    }
+    if count_by_func_kind(7) > 0 {
+        kinds_seen = kinds_seen + 1
+    }
+    if kinds_seen < 4 {
+        panic("win32_advapi32_tier2_real FAIL [distinct func_kinds] expected=>=4 got=" + to_string(kinds_seen))
+    }
+
+    // 5. distinct hkey_roots ≥ 3
+    let mut roots_seen = 0
+    if count_by_hkey_root(0) > 0 {
+        roots_seen = roots_seen + 1
+    }
+    if count_by_hkey_root(1) > 0 {
+        roots_seen = roots_seen + 1
+    }
+    if count_by_hkey_root(2) > 0 {
+        roots_seen = roots_seen + 1
+    }
+    if count_by_hkey_root(3) > 0 {
+        roots_seen = roots_seen + 1
+    }
+    if count_by_hkey_root(4) > 0 {
+        roots_seen = roots_seen + 1
+    }
+    if roots_seen < 3 {
+        panic("win32_advapi32_tier2_real FAIL [distinct hkey_roots] expected=>=3 got=" + to_string(roots_seen))
+    }
+
+    // 6. count_by_func_kind sanity
+    let k_unused = count_by_func_kind(8)
+    if k_unused != 0 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_func_kind(8)] expected=0 got=" + to_string(k_unused))
+    }
+    let k1 = count_by_func_kind(1)
+    if k1 != 1 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_func_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k3 = count_by_func_kind(3)
+    if k3 != 1 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_func_kind(3)] expected=1 got=" + to_string(k3))
+    }
+
+    // 7. count_by_hkey_root sanity (HKLM=4, HKCU=1, HKCR=1, HKU=0, HKCC=0)
+    let r0v = count_by_hkey_root(0)
+    if r0v != 4 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_hkey_root(0)] expected=4 got=" + to_string(r0v))
+    }
+    let r1v = count_by_hkey_root(1)
+    if r1v != 1 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_hkey_root(1)] expected=1 got=" + to_string(r1v))
+    }
+    let r2v = count_by_hkey_root(2)
+    if r2v != 1 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_hkey_root(2)] expected=1 got=" + to_string(r2v))
+    }
+    let r3v = count_by_hkey_root(3)
+    if r3v != 0 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_hkey_root(3)] expected=0 got=" + to_string(r3v))
+    }
+    let r4v = count_by_hkey_root(4)
+    if r4v != 0 {
+        panic("win32_advapi32_tier2_real FAIL [count_by_hkey_root(4)] expected=0 got=" + to_string(r4v))
+    }
+
+    // 8. total_value_size_bytes = 256 + 128 + 64 = 448
+    let tvs = total_value_size_bytes()
+    if tvs != 448 {
+        panic("win32_advapi32_tier2_real FAIL [total_value_size_bytes] expected=448 got=" + to_string(tvs))
+    }
+
+    // 9. read_op_count = count(3)+count(5)+count(6) = 1+1+0 = 2
+    let roc = read_op_count()
+    if roc != 2 {
+        panic("win32_advapi32_tier2_real FAIL [read_op_count] expected=2 got=" + to_string(roc))
+    }
+
+    // 10. call_value_size sanity
+    let v2 = call_value_size(820002)
+    if v2 != 256 {
+        panic("win32_advapi32_tier2_real FAIL [call_value_size(820002)] expected=256 got=" + to_string(v2))
+    }
+    let v3 = call_value_size(820003)
+    if v3 != 128 {
+        panic("win32_advapi32_tier2_real FAIL [call_value_size(820003)] expected=128 got=" + to_string(v3))
+    }
+    let v_miss = call_value_size(99999)
+    if v_miss != 0 {
+        panic("win32_advapi32_tier2_real FAIL [call_value_size(99999)] expected=0 got=" + to_string(v_miss))
+    }
+
+    // 11. wat2_stats() = [6, 448, 2, 4]
+    let s = wat2_stats()
+    if len(s) != 4 {
+        panic("win32_advapi32_tier2_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("win32_advapi32_tier2_real FAIL [stats call_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 448 {
+        panic("win32_advapi32_tier2_real FAIL [stats total_value_size] expected=448 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("win32_advapi32_tier2_real FAIL [stats read_op_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("win32_advapi32_tier2_real FAIL [stats hklm_count] expected=4 got=" + to_string(s[3]))
+    }
+
+    // 12. emit stats (7th emit: 6 record + 1 stats)
+    r0_emit("win32_advapi32_tier2_real_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"total_value_size_bytes\":" + to_string(s[1])
+        + ",\"read_op_count\":" + to_string(s[2])
+        + ",\"hklm_count\":" + to_string(s[3]))
+
+    // 13. emit count >= 7
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("win32_advapi32_tier2_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 14. cleanup → stats 모두 0
+    cleanup_wat2()
+    let s2v = wat2_stats()
+    let i = 0
+    while i < len(s2v) {
+        if s2v[i] != 0 {
+            panic("win32_advapi32_tier2_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2v[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ win32_advapi32_tier2_real self_test PASS (calls=" + to_string(s[0])
+        + ", value_bytes=" + to_string(s[1]) + ", reads=" + to_string(s[2])
+        + ", hklm=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = wat2_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("total_value_size_bytes\t" + to_string(s[1]))
+            println("read_op_count\t" + to_string(s[2]))
+            println("count_hkey_root_hklm\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_value_size\t" + to_string(call_value_size(cid)))
+                return
+            }
+            println("usage: hexa run win32_advapi32_tier2_real.hexa size <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let k = to_int(a[4])
+                if dim == "func" {
+                    println("count_by_func_kind\t" + to_string(count_by_func_kind(k)))
+                    return
+                }
+                if dim == "root" {
+                    println("count_by_hkey_root\t" + to_string(count_by_hkey_root(k)))
+                    return
+                }
+                println("usage: hexa run win32_advapi32_tier2_real.hexa count { func | root } <code>")
+                return
+            }
+            println("usage: hexa run win32_advapi32_tier2_real.hexa count { func | root } <code>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_wat2()
+            println("cleaned: " + wat2_dir())
+            return
+        }
+        if sub == "dir" {
+            println(wat2_dir())
+            return
+        }
+    }
+    println("usage: hexa run win32_advapi32_tier2_real.hexa { self-test | stats | size <call_id> | count func <func_kind> | count root <hkey_root> | cleanup | dir }")
+}

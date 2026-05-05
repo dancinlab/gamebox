@@ -1,0 +1,406 @@
+// lib/loader/pe_native_pthread_real.hexa — cycle 80 R1 phase1 stage7 real pthread_create skeleton
+//
+// stage7 = stage4 wrapper 의 후속 — helper.mm IPC frame 을 통해 호스트의 실
+// pthread_create(3) 를 호출. 본 module 은 host helper 로 보낼 create
+// request 를 sequence-record 하는 tracker (실 IPC 송신 X — stage8).
+//
+// helper.mm IPC frame:
+//   request:  {kind: "pthread_create", stack_size: <size_t>, detached: <bool>, qos: <int>}
+//   response: {pthread_id: <opaque>, errno: <int>}
+// Win32 → POSIX 매핑:
+//   - CreateThread dwStackSize → pthread_attr_setstacksize
+//   - CREATE_SUSPENDED → suspend_main + signal-based resume (own2 자체 구현)
+//   - thread priority THREAD_PRIORITY_TIME_CRITICAL → QOS_CLASS_USER_INTERACTIVE
+// own1: pthread API 자체는 Apple SDK — Wine wineserver thread 코드 인용 X
+//
+// own 2 mandate:
+//   - r0_emit ≥ 6
+//   - fn self_test() + main() dispatch
+//   - headless (exec/cat/test/mkdir/rm only)
+//   - panic("pe_native_pthread_real FAIL [<sub>] expected=X got=Y")
+//
+// detach_state 정의:
+//   1 = joinable (PTHREAD_CREATE_JOINABLE)
+//   2 = detached (PTHREAD_CREATE_DETACHED)
+//
+// elevated 정의:
+//   0 = default QOS
+//   1 = QOS_CLASS_USER_INTERACTIVE (THREAD_PRIORITY_TIME_CRITICAL)
+//
+// persist schema (TSV — creates.tsv):
+//   create_id<int> \t stack_size_kb<int> \t detach_state<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnptr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_pthread_real"
+}
+
+fn pnptr_creates_path() -> str {
+    return pnptr_dir() + "/creates.tsv"
+}
+
+fn pnptr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnptr_dir() + "'")
+}
+
+fn cleanup_pnptr() -> void {
+    pnptr_ensure_dir()
+    let _ = exec("rm -f '" + pnptr_creates_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnptr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnptr_append_row(path: str, row: str) -> void {
+    pnptr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_create: pthread_create request 1 건 기록 ───
+fn record_create(create_id: int, stack_size_kb: int, detach_state: int, elevated: int) -> void {
+    if create_id <= 0 {
+        panic("pe_native_pthread_real FAIL [record_create] expected=create_id>0 got=" + to_string(create_id))
+    }
+    if stack_size_kb <= 0 {
+        panic("pe_native_pthread_real FAIL [record_create] expected=stack_size_kb>0 got=" + to_string(stack_size_kb))
+    }
+    if detach_state < 1 {
+        panic("pe_native_pthread_real FAIL [record_create] expected=detach_state>=1 got=" + to_string(detach_state))
+    }
+    if detach_state > 2 {
+        panic("pe_native_pthread_real FAIL [record_create] expected=detach_state<=2 got=" + to_string(detach_state))
+    }
+    if elevated < 0 {
+        panic("pe_native_pthread_real FAIL [record_create] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_native_pthread_real FAIL [record_create] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(create_id) + "\t" + to_string(stack_size_kb)
+        + "\t" + to_string(detach_state) + "\t" + to_string(elevated) + "\n"
+    pnptr_append_row(pnptr_creates_path(), row)
+}
+
+// ─── create_count: 총 create 수 ───
+fn create_count() -> int {
+    let t = pnptr_read_table(pnptr_creates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_stack_size_kb: 모든 create stack_size_kb 합 ───
+fn total_stack_size_kb() -> int {
+    let t = pnptr_read_table(pnptr_creates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_detach_state: 특정 detach_state create 수 ───
+fn count_by_detach_state(state: int) -> int {
+    let t = pnptr_read_table(pnptr_creates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == state {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── elevated_count: elevated=1 create 수 (QOS_CLASS_USER_INTERACTIVE) ───
+fn elevated_count() -> int {
+    let t = pnptr_read_table(pnptr_creates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── joinable_count: detach_state=1 create 수 (편의 wrapper) ───
+fn joinable_count() -> int {
+    return count_by_detach_state(1)
+}
+
+// ─── create_stack_size: 특정 create_id 의 stack_size_kb (없으면 0) ───
+fn create_stack_size(create_id: int) -> int {
+    let t = pnptr_read_table(pnptr_creates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == create_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pnptr_stats: [create_count, total_stack_size_kb, joinable_count, elevated_count] ───
+fn pnptr_stats() -> array {
+    let mut out = []
+    out.push(create_count())
+    out.push(total_stack_size_kb())
+    out.push(joinable_count())
+    out.push(elevated_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnptr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnptr()
+
+    // 2. record 5 creates — 양 detach_state 커버, elevated ≥ 2
+    //    create_id | stack_kb | detach_state | elevated
+    //    700001    |   512    |     1        |    0
+    //    700002    |  1024    |     2        |    1   ← elevated
+    //    700003    |   256    |     1        |    0
+    //    700004    |  2048    |     2        |    1   ← elevated
+    //    700005    |   512    |     1        |    1   ← elevated
+    //    합계: stack=4352, joinable=3, detached=2, elevated=3
+    record_create(700001, 512, 1, 0)
+    r0_emit("pe_native_pthread_real_record",
+        "\"create_id\":700001,\"stack_size_kb\":512,\"detach_state\":1,\"elevated\":0,\"target\":\"joinable_default\"")
+
+    record_create(700002, 1024, 2, 1)
+    r0_emit("pe_native_pthread_real_record",
+        "\"create_id\":700002,\"stack_size_kb\":1024,\"detach_state\":2,\"elevated\":1,\"target\":\"detached_user_interactive\"")
+
+    record_create(700003, 256, 1, 0)
+    r0_emit("pe_native_pthread_real_record",
+        "\"create_id\":700003,\"stack_size_kb\":256,\"detach_state\":1,\"elevated\":0,\"target\":\"joinable_default\"")
+
+    record_create(700004, 2048, 2, 1)
+    r0_emit("pe_native_pthread_real_record",
+        "\"create_id\":700004,\"stack_size_kb\":2048,\"detach_state\":2,\"elevated\":1,\"target\":\"detached_user_interactive\"")
+
+    record_create(700005, 512, 1, 1)
+    r0_emit("pe_native_pthread_real_record",
+        "\"create_id\":700005,\"stack_size_kb\":512,\"detach_state\":1,\"elevated\":1,\"target\":\"joinable_user_interactive\"")
+
+    // 3. create_count = 5
+    let c = create_count()
+    if c != 5 {
+        panic("pe_native_pthread_real FAIL [create_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_stack_size_kb = 4352
+    let ts = total_stack_size_kb()
+    if ts != 4352 {
+        panic("pe_native_pthread_real FAIL [total_stack_size_kb] expected=4352 got=" + to_string(ts))
+    }
+
+    // 5. count_by_detach_state sanity
+    let s1 = count_by_detach_state(1)
+    if s1 != 3 {
+        panic("pe_native_pthread_real FAIL [count_by_detach_state(1)] expected=3 got=" + to_string(s1))
+    }
+    let s2 = count_by_detach_state(2)
+    if s2 != 2 {
+        panic("pe_native_pthread_real FAIL [count_by_detach_state(2)] expected=2 got=" + to_string(s2))
+    }
+
+    // 6. joinable_count = 3 (= count_by_detach_state(1))
+    let jc = joinable_count()
+    if jc != 3 {
+        panic("pe_native_pthread_real FAIL [joinable_count] expected=3 got=" + to_string(jc))
+    }
+
+    // 7. elevated_count = 3
+    let ec = elevated_count()
+    if ec != 3 {
+        panic("pe_native_pthread_real FAIL [elevated_count] expected=3 got=" + to_string(ec))
+    }
+
+    // 8. create_stack_size sanity
+    let css2 = create_stack_size(700002)
+    if css2 != 1024 {
+        panic("pe_native_pthread_real FAIL [create_stack_size(700002)] expected=1024 got=" + to_string(css2))
+    }
+    let css4 = create_stack_size(700004)
+    if css4 != 2048 {
+        panic("pe_native_pthread_real FAIL [create_stack_size(700004)] expected=2048 got=" + to_string(css4))
+    }
+    let css_miss = create_stack_size(9999)
+    if css_miss != 0 {
+        panic("pe_native_pthread_real FAIL [create_stack_size(9999)] expected=0 got=" + to_string(css_miss))
+    }
+
+    // 9. pnptr_stats() = [5, 4352, 3, 3]
+    let s = pnptr_stats()
+    if len(s) != 4 {
+        panic("pe_native_pthread_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_native_pthread_real FAIL [stats create_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 4352 {
+        panic("pe_native_pthread_real FAIL [stats total_stack_size_kb] expected=4352 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_native_pthread_real FAIL [stats joinable_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_native_pthread_real FAIL [stats elevated_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_native_pthread_real_stats",
+        "\"create_count\":" + to_string(s[0])
+        + ",\"total_stack_size_kb\":" + to_string(s[1])
+        + ",\"joinable_count\":" + to_string(s[2])
+        + ",\"elevated_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_native_pthread_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pnptr()
+    let s_post = pnptr_stats()
+    let i = 0
+    while i < len(s_post) {
+        if s_post[i] != 0 {
+            panic("pe_native_pthread_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s_post[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_pthread_real self_test PASS (creates=" + to_string(s[0])
+        + ", stack_kb=" + to_string(s[1]) + ", joinable=" + to_string(s[2])
+        + ", elevated=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnptr_stats()
+            println("create_count\t" + to_string(s[0]))
+            println("total_stack_size_kb\t" + to_string(s[1]))
+            println("joinable_count\t" + to_string(s[2]))
+            println("elevated_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "stack" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("create_stack_size\t" + to_string(create_stack_size(cid)))
+                return
+            }
+            println("usage: hexa run pe_native_pthread_real.hexa stack <create_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let st = to_int(a[3])
+                println("count_by_detach_state\t" + to_string(count_by_detach_state(st)))
+                return
+            }
+            println("usage: hexa run pe_native_pthread_real.hexa count <detach_state>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnptr()
+            println("cleaned: " + pnptr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnptr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_pthread_real.hexa { self-test | stats | stack <create_id> | count <detach_state> | cleanup | dir }")
+}

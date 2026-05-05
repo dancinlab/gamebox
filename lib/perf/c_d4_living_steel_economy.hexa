@@ -1,0 +1,211 @@
+// lib/perf/c_d4_living_steel_economy.hexa — CN-193 skeleton manjeom 15/15
+//
+// D4 Helltide Living Steel + Aberrant Cinder token economy 추적 — 한정 자원
+// farming 효율을 정량화한다. Helltide 이벤트 동안 누적된 Aberrant Cinder 와
+// Mystery Chest 개봉을 통해 획득한 Living Steel 의 session × cinder ×
+// living_steel × duration 4-key 컬럼 로그를 모아 두면 다음 Living Steel
+// target 까지의 ETA 를 cinder/steel 비율로 추정할 수 있다. 본 모듈은 session
+// 단위 집계와 cinder-per-steel 비율 산출만 담당 — 실제 Helltide drop 측정은
+// host 측 책임.
+//
+// 무기: session × cinder × steel × duration 4-key columnar log + sum/ratio.
+// 효과: D4 Helltide farming 효율 정량화 → Living Steel ETA 예측 (cinder
+// 누적량 ÷ cinder_per_steel 으로 다음 steel drop 시점 추정).
+
+use "./r0_common"
+
+let DLSE_DIR = GAMEBOX_HOME + "/persist/d4_living_steel_economy"
+let SESSION_LOG = DLSE_DIR + "/sessions.tsv"
+
+fn dlse_dir() -> str { return DLSE_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DLSE_DIR + "'")
+}
+
+// ─── session 등록 ───
+//   session_id (Helltide 세션 식별자),
+//   cinder_count (이 세션에서 누적된 Aberrant Cinder 수),
+//   living_steel_count (Mystery Chest 등에서 획득한 Living Steel 수),
+//   duration_us (세션 지속 시간 마이크로초).
+fn record_session(session_id: int, cinder_count: int, living_steel_count: int, duration_us: int) -> void {
+    ensure_dir()
+    let line = to_string(session_id) + "\t" + to_string(cinder_count) + "\t" + to_string(living_steel_count) + "\t" + to_string(duration_us)
+    let tmp = SESSION_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SESSION_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("dlse_record", "\"session\":" + to_string(session_id) + ",\"cinder\":" + to_string(cinder_count) + ",\"steel\":" + to_string(living_steel_count) + ",\"duration_us\":" + to_string(duration_us))
+}
+
+// ─── session_count — 등록된 session 행 수 ───
+fn session_count() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + SESSION_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_cinder — 모든 session cinder_count 합 ───
+fn total_cinder() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_steel — 모든 session living_steel_count 합 ───
+fn total_steel() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_duration_us — 모든 session duration_us 합 ───
+fn total_duration_us() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── cinder_per_steel — total_cinder / total_steel (int trunc, 0-guard) ───
+//   Living Steel 1 개당 평균 cinder 비용 — 다음 steel ETA 예측 핵심 지표.
+fn cinder_per_steel() -> int {
+    let ts = total_steel()
+    if ts == 0 { return 0 }
+    let tc = total_cinder()
+    return tc / ts
+}
+
+// ─── session_steel — 특정 session_id 의 living_steel_count ───
+//   미등록 session 이면 0 반환.
+fn session_steel(session_id: int) -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v sid=" + to_string(session_id) + " '$1==sid {s+=$3} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── dlse_stats — [session_count, total_cinder, total_steel, total_duration_us] ───
+fn dlse_stats() -> array {
+    return [session_count(), total_cinder(), total_steel(), total_duration_us()]
+}
+
+fn cleanup_dlse() -> void {
+    let _ = exec("rm -rf '" + DLSE_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dlse-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dlse()
+
+    // 합성 Helltide 세션 3 종:
+    //   47001 — Helltide 1h normal     : 720 cinder / 4 steel / 3600s
+    //   47002 — Helltide 1h efficient  : 960 cinder / 8 steel / 3600s
+    //   47003 — Helltide 30min partial : 360 cinder / 2 steel / 1800s
+    record_session(47001, 720, 4, 3600000000)
+    record_session(47002, 960, 8, 3600000000)
+    record_session(47003, 360, 2, 1800000000)
+
+    // session_count = 3
+    let sc = session_count()
+    if sc != 3 { panic("c_d4_living_steel_economy FAIL [session_count] expected=3 got=" + to_string(sc)) }
+
+    // total_cinder = 720+960+360 = 2040
+    let tc = total_cinder()
+    if tc != 2040 { panic("c_d4_living_steel_economy FAIL [total_cinder] expected=2040 got=" + to_string(tc)) }
+
+    // total_steel = 4+8+2 = 14
+    let ts = total_steel()
+    if ts != 14 { panic("c_d4_living_steel_economy FAIL [total_steel] expected=14 got=" + to_string(ts)) }
+
+    // total_duration_us = 3600000000+3600000000+1800000000 = 9000000000
+    let td = total_duration_us()
+    if td != 9000000000 { panic("c_d4_living_steel_economy FAIL [total_duration_us] expected=9000000000 got=" + to_string(td)) }
+
+    // cinder_per_steel = 2040 / 14 = 145 (int trunc)
+    let cps = cinder_per_steel()
+    if cps != 145 { panic("c_d4_living_steel_economy FAIL [cinder_per_steel] expected=145 got=" + to_string(cps)) }
+
+    // session_steel:
+    //   47001 → 4, 47002 → 8, 47003 → 2, 9999 (미등록) → 0
+    let ss1 = session_steel(47001)
+    if ss1 != 4 { panic("c_d4_living_steel_economy FAIL [session_steel 47001] expected=4 got=" + to_string(ss1)) }
+    let ss2 = session_steel(47002)
+    if ss2 != 8 { panic("c_d4_living_steel_economy FAIL [session_steel 47002] expected=8 got=" + to_string(ss2)) }
+    let ss3 = session_steel(47003)
+    if ss3 != 2 { panic("c_d4_living_steel_economy FAIL [session_steel 47003] expected=2 got=" + to_string(ss3)) }
+    let ss4 = session_steel(9999)
+    if ss4 != 0 { panic("c_d4_living_steel_economy FAIL [session_steel unknown] expected=0 got=" + to_string(ss4)) }
+
+    let stats = dlse_stats()
+    if stats[0] != 3 { panic("c_d4_living_steel_economy FAIL [stats sessions] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 2040 { panic("c_d4_living_steel_economy FAIL [stats cinder] expected=2040 got=" + to_string(stats[1])) }
+    if stats[2] != 14 { panic("c_d4_living_steel_economy FAIL [stats steel] expected=14 got=" + to_string(stats[2])) }
+    if stats[3] != 9000000000 { panic("c_d4_living_steel_economy FAIL [stats duration_us] expected=9000000000 got=" + to_string(stats[3])) }
+
+    r0_emit("dlse_summary", "\"sessions\":" + to_string(stats[0]) + ",\"cinder\":" + to_string(stats[1]) + ",\"steel\":" + to_string(stats[2]) + ",\"duration_us\":" + to_string(stats[3]) + ",\"cinder_per_steel\":" + to_string(cps))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_d4_living_steel_economy FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic D4 economy retired_intentional posture annotation (Track BA) ───
+    //
+    // Track BA mission: extend Track V (7) + Track AJ (6) + Track AL (6) D4 retired_
+    // intentional posture annotation to 6 additional c_d4_* modules. cumulative
+    // coverage 25/27 = ~92.6%. .roadmap.diablo4 blk.1 status_enum_adopted = retired_
+    // intentional (Track A2 land 2026-05-03). 본 module 측 helltide cinder→steel
+    // currency exchange tracker = synthetic build analyzer — production live game
+    // state 측정 X (D4 always-online live session 진입 X, DRM bypass 0, Battle.net
+    // launcher 통과 X). cond.3 status `partial` 영구 유지 (retired_intentional
+    // posture per blk.1 영구 lock). pattern reference: lib/perf/c_d4_aspect_imprint
+    // _track.hexa (Track AL predecessor, identical schema).
+    //
+    // synthetic posture row column header:
+    //     domain                "living_steel_economy"
+    //     posture               "retired_intentional"  (NOT pass / NOT partial / NOT fail)
+    //     production_smoke      "no_attempt"           (no live game state acquire)
+    //     drm_bypass            "0"                    (own1 Wine 0 / no evasion)
+    //     always_online_evade   "0"                    (own1 honest acknowledgment)
+    //     blocker_ref           "diablo4.blk.1"        (always_online_drm)
+    //     adoption_iso          "2026-05-03"           (Track A2 retired_intentional adopt)
+    r0_emit("c_d4_living_steel_economy_retired_intentional",
+        "\"stage\":\"d4_economy_synthetic\",\"domain\":\"living_steel_economy\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"always_online_evade\":0,\"blocker_ref\":\"diablo4.blk.1\",\"blocker_class\":\"always_online_drm\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"diablo4.cond.3\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\",\"track\":\"BA\"")
+    println("__D4_LIVING_STEEL_ECONOMY__ RETIRED_INTENTIONAL d4_economy_synthetic")
+
+    cleanup_dlse()
+
+    println("  ✅ c_d4_living_steel_economy self_test PASS (3 sessions, 2040 cinder, 14 steel, 9000000000 us, cinder_per_steel=" + to_string(cps) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = dlse_stats()
+            println("sessions=" + to_string(s[0]) + " cinder=" + to_string(s[1]) + " steel=" + to_string(s[2]) + " duration_us=" + to_string(s[3]) + " cinder_per_steel=" + to_string(cinder_per_steel()))
+            return
+        }
+        if sub == "steel" {
+            if len(a) >= 4 {
+                let sid_arg = to_int(a[3])
+                let n = session_steel(sid_arg)
+                println(to_string(n))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_dlse(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_d4_living_steel_economy.hexa { self-test | stats | steel <session_id> | cleanup }")
+}

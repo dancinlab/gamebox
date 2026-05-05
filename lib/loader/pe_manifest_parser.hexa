@@ -1,0 +1,364 @@
+// lib/loader/pe_manifest_parser.hexa — stage3 PE XML manifest parser skeleton
+//
+// PE 의 embedded manifest XML: <requestedExecutionLevel> + <dpiAware> +
+// <supportedOS> + <dependentAssembly>. UAC 처리 + DPI 처리 + Win10/11
+// compat layer 결정.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Microsoft application manifest schema docs (MSDN) 만 참조.
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// uac_kind:
+//   1 = asInvoker            (no elevation — game launcher 일반)
+//   2 = requireAdministrator (Battle.net Setup elevation prompt)
+//   3 = highestAvailable     (admin 가능 시 admin, else asInvoker)
+//
+// dpi_aware:
+//   0 = unaware              (Windows scaling — old game)
+//   1 = PerMonitor           (Win8.1+ per monitor DPI)
+//   2 = PerMonitorV2         (Win10 1703+ — preferred)
+//   3 = System               (system-wide DPI — legacy)
+//
+// persist schema (TSV — pmnp_manifest.tsv):
+//   pe_id<int> \t uac_kind<int> \t dpi_aware<int> \t supported_os_count<int>
+//
+// NOTE: cycle 61 pe_mmap_protection.hexa 가 pmp_stats() 를 export 하므로
+//       본 모듈의 stats 함수는 pmnp_stats() 로 명명 (PE Manifest Parser).
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmnp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_manifest_parser"
+}
+
+fn pmnp_manifest_path() -> str {
+    return pmnp_dir() + "/pmnp_manifest.tsv"
+}
+
+fn pmnp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmnp_dir() + "'")
+}
+
+fn cleanup_pmp_manifest() -> void {
+    pmnp_ensure_dir()
+    let _ = exec("rm -f '" + pmnp_manifest_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmnp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmnp_append_row(path: str, row: str) -> void {
+    pmnp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_manifest: PE manifest 1 row ───
+fn record_manifest(pe_id: int, uac_kind: int, dpi_aware: int, supported_os_count: int) -> void {
+    if pe_id <= 0 {
+        panic("pe_manifest_parser FAIL [record_manifest] expected=pe_id>0 got=" + to_string(pe_id))
+    }
+    if uac_kind <= 0 {
+        panic("pe_manifest_parser FAIL [record_manifest] expected=uac_kind>0 got=" + to_string(uac_kind))
+    }
+    if uac_kind > 3 {
+        panic("pe_manifest_parser FAIL [record_manifest] expected=uac_kind<=3 got=" + to_string(uac_kind))
+    }
+    if dpi_aware < 0 {
+        panic("pe_manifest_parser FAIL [record_manifest] expected=dpi_aware>=0 got=" + to_string(dpi_aware))
+    }
+    if dpi_aware > 3 {
+        panic("pe_manifest_parser FAIL [record_manifest] expected=dpi_aware<=3 got=" + to_string(dpi_aware))
+    }
+    if supported_os_count < 0 {
+        panic("pe_manifest_parser FAIL [record_manifest] expected=supported_os_count>=0 got=" + to_string(supported_os_count))
+    }
+    let row = to_string(pe_id) + "\t" + to_string(uac_kind)
+        + "\t" + to_string(dpi_aware) + "\t" + to_string(supported_os_count) + "\n"
+    pmnp_append_row(pmnp_manifest_path(), row)
+}
+
+// ─── manifest_count: 전체 manifest row 수 ───
+fn manifest_count() -> int {
+    let mut cnt = 0
+    let t = pmnp_read_table(pmnp_manifest_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    cnt = cnt + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── count_by_uac_kind: 특정 uac_kind row 수 ───
+fn count_by_uac_kind(kind: int) -> int {
+    let mut cnt = 0
+    let t = pmnp_read_table(pmnp_manifest_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[1]) == kind {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── dpi_aware_count: dpi_aware != 0 row 수 ───
+fn dpi_aware_count() -> int {
+    let mut cnt = 0
+    let t = pmnp_read_table(pmnp_manifest_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[2]) != 0 {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── pe_uac_kind: 특정 pe_id 의 uac_kind (없으면 0) ───
+fn pe_uac_kind(pe_id: int) -> int {
+    let mut kind = 0
+    let t = pmnp_read_table(pmnp_manifest_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[0]) == pe_id {
+                        kind = to_int(parts[1])
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return kind
+}
+
+// ─── pmnp_stats: [manifest_count, count_by_uac_kind(1), count_by_uac_kind(2), dpi_aware_count] ───
+fn pmnp_stats() -> array {
+    let mut out = []
+    out.push(manifest_count())
+    out.push(count_by_uac_kind(1))
+    out.push(count_by_uac_kind(2))
+    out.push(dpi_aware_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmnp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmp_manifest()
+
+    // 2. record 4 synthetic manifests
+    record_manifest(91001, 2, 2, 4)
+    r0_emit("pe_manifest_parser_record",
+        "\"pe_id\":91001,\"uac_kind\":2,\"dpi_aware\":2,\"supported_os_count\":4,\"label\":\"battlenet_setup\"")
+
+    record_manifest(91002, 1, 1, 3)
+    r0_emit("pe_manifest_parser_record",
+        "\"pe_id\":91002,\"uac_kind\":1,\"dpi_aware\":1,\"supported_os_count\":3,\"label\":\"game_launcher\"")
+
+    record_manifest(91003, 1, 0, 2)
+    r0_emit("pe_manifest_parser_record",
+        "\"pe_id\":91003,\"uac_kind\":1,\"dpi_aware\":0,\"supported_os_count\":2,\"label\":\"old_game\"")
+
+    record_manifest(91004, 3, 2, 4)
+    r0_emit("pe_manifest_parser_record",
+        "\"pe_id\":91004,\"uac_kind\":3,\"dpi_aware\":2,\"supported_os_count\":4,\"label\":\"tool\"")
+
+    // 3. manifest_count = 4
+    let mc = manifest_count()
+    if mc != 4 {
+        panic("pe_manifest_parser FAIL [manifest_count] expected=4 got=" + to_string(mc))
+    }
+
+    // 4. count_by_uac_kind
+    let u1 = count_by_uac_kind(1)
+    if u1 != 2 {
+        panic("pe_manifest_parser FAIL [count_by_uac_kind(1)] expected=2 got=" + to_string(u1))
+    }
+    let u2 = count_by_uac_kind(2)
+    if u2 != 1 {
+        panic("pe_manifest_parser FAIL [count_by_uac_kind(2)] expected=1 got=" + to_string(u2))
+    }
+    let u3 = count_by_uac_kind(3)
+    if u3 != 1 {
+        panic("pe_manifest_parser FAIL [count_by_uac_kind(3)] expected=1 got=" + to_string(u3))
+    }
+    let u99 = count_by_uac_kind(99)
+    if u99 != 0 {
+        panic("pe_manifest_parser FAIL [count_by_uac_kind(99)] expected=0 got=" + to_string(u99))
+    }
+
+    // 5. dpi_aware_count = 3 (91001+91002+91004; 91003 is 0)
+    let dc = dpi_aware_count()
+    if dc != 3 {
+        panic("pe_manifest_parser FAIL [dpi_aware_count] expected=3 got=" + to_string(dc))
+    }
+
+    // 6. pe_uac_kind
+    let k1 = pe_uac_kind(91001)
+    if k1 != 2 {
+        panic("pe_manifest_parser FAIL [pe_uac_kind(91001)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = pe_uac_kind(91002)
+    if k2 != 1 {
+        panic("pe_manifest_parser FAIL [pe_uac_kind(91002)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = pe_uac_kind(91003)
+    if k3 != 1 {
+        panic("pe_manifest_parser FAIL [pe_uac_kind(91003)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = pe_uac_kind(91004)
+    if k4 != 3 {
+        panic("pe_manifest_parser FAIL [pe_uac_kind(91004)] expected=3 got=" + to_string(k4))
+    }
+    let kx = pe_uac_kind(9999)
+    if kx != 0 {
+        panic("pe_manifest_parser FAIL [pe_uac_kind(9999)] expected=0 got=" + to_string(kx))
+    }
+
+    // 7. pmnp_stats() = [4, 2, 1, 3]
+    let s = pmnp_stats()
+    if len(s) != 4 {
+        panic("pe_manifest_parser FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_manifest_parser FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_manifest_parser FAIL [stats[1]] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_manifest_parser FAIL [stats[2]] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_manifest_parser FAIL [stats[3]] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 8. emit stats
+    r0_emit("pe_manifest_parser_stats",
+        "\"manifest_count\":" + to_string(s[0])
+        + ",\"asInvoker\":" + to_string(s[1])
+        + ",\"requireAdministrator\":" + to_string(s[2])
+        + ",\"dpi_aware\":" + to_string(s[3]))
+
+    // 9. emit count >= 5 (4 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_manifest_parser FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 10. cleanup → stats 모두 0
+    cleanup_pmp_manifest()
+    let s2 = pmnp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_manifest_parser FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_manifest_parser self_test PASS (manifests=" + to_string(s[0])
+        + ", asInvoker=" + to_string(s[1]) + ", requireAdmin=" + to_string(s[2])
+        + ", dpi_aware=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmnp_stats()
+            println("manifest_count\t" + to_string(s[0]))
+            println("asInvoker\t" + to_string(s[1]))
+            println("requireAdministrator\t" + to_string(s[2]))
+            println("dpi_aware_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "uac" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("pe_uac_kind\t" + to_string(pe_uac_kind(pid)))
+                return
+            }
+            println("usage: hexa run pe_manifest_parser.hexa uac <pe_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println("count_by_uac_kind\t" + to_string(count_by_uac_kind(k)))
+                return
+            }
+            println("usage: hexa run pe_manifest_parser.hexa count <uac_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmp_manifest()
+            println("cleaned: " + pmnp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmnp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_manifest_parser.hexa { self-test | stats | uac <pe_id> | count <uac_kind> | cleanup | dir }")
+}

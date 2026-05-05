@@ -1,0 +1,440 @@
+// lib/loader/pe_d3d12_command_list.hexa — D3D12 ID3D12CommandList lifecycle tracker
+//
+// airgenome-gamebox cycle 81 R5 phase 2 — ID3D12CommandList Reset / Close /
+// ExecuteCommandLists / Clear* 추적. command list 1건 = TSV row 1개.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 command list op tracker — 실 ID3D12CommandList 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// D3D12 Command List → Metal Command Buffer:
+//   D3D12_COMMAND_LIST_TYPE_DIRECT  → MTLCommandQueue makeCommandBuffer
+//   D3D12_COMMAND_LIST_TYPE_BUNDLE  → MTLIndirectCommandBuffer (M1+)
+//   D3D12_COMMAND_LIST_TYPE_COMPUTE → MTLComputeCommandEncoder
+//   D3D12_COMMAND_LIST_TYPE_COPY    → MTLBlitCommandEncoder
+//   ExecuteCommandLists → MTLCommandBuffer commit + present
+//   Reset → MTLCommandBuffer 재할당 (Metal 은 1-shot 이라 N개 buffer pool)
+// own1: D3DMetal + Apple Metal SDK + MSDN ID3D12CommandList only
+//
+// list_kind code:
+//   1 = direct
+//   2 = bundle
+//   3 = compute
+//   4 = copy
+//   5 = video_decode
+//
+// operation code:
+//   1 = reset
+//   2 = close
+//   3 = execute
+//   4 = clear
+//
+// persist schema (TSV — cmds.tsv):
+//   cmd_id<int> \t list_kind<int> \t operation<int> \t command_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdcl_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_command_list"
+}
+
+fn pdcl_cmds_path() -> str {
+    return pdcl_dir() + "/cmds.tsv"
+}
+
+fn pdcl_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdcl_dir() + "'")
+}
+
+fn cleanup_pdcl() -> void {
+    pdcl_ensure_dir()
+    let _ = exec("rm -f '" + pdcl_cmds_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdcl_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdcl_append_row(path: str, row: str) -> void {
+    pdcl_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_cmd: command list op 1 건 기록 ───
+fn record_cmd(cmd_id: int, list_kind: int, operation: int, command_count: int) -> void {
+    if cmd_id <= 0 {
+        panic("pe_d3d12_command_list FAIL [record_cmd] expected=cmd_id>0 got=" + to_string(cmd_id))
+    }
+    if list_kind < 1 {
+        panic("pe_d3d12_command_list FAIL [record_cmd] expected=list_kind>=1 got=" + to_string(list_kind))
+    }
+    if list_kind > 5 {
+        panic("pe_d3d12_command_list FAIL [record_cmd] expected=list_kind<=5 got=" + to_string(list_kind))
+    }
+    if operation < 1 {
+        panic("pe_d3d12_command_list FAIL [record_cmd] expected=operation>=1 got=" + to_string(operation))
+    }
+    if operation > 4 {
+        panic("pe_d3d12_command_list FAIL [record_cmd] expected=operation<=4 got=" + to_string(operation))
+    }
+    if command_count < 0 {
+        panic("pe_d3d12_command_list FAIL [record_cmd] expected=command_count>=0 got=" + to_string(command_count))
+    }
+    let row = to_string(cmd_id) + "\t" + to_string(list_kind)
+        + "\t" + to_string(operation) + "\t" + to_string(command_count) + "\n"
+    pdcl_append_row(pdcl_cmds_path(), row)
+}
+
+// ─── cmd_count: total command list op 수 ───
+fn cmd_count() -> int {
+    let t = pdcl_read_table(pdcl_cmds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_command_count: 모든 row command_count 합 ───
+fn total_command_count() -> int {
+    let t = pdcl_read_table(pdcl_cmds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_list_kind: 특정 list_kind 의 row 수 ───
+fn count_by_list_kind(list_kind: int) -> int {
+    let t = pdcl_read_table(pdcl_cmds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == list_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_operation: 특정 operation 의 row 수 ───
+fn count_by_operation(operation: int) -> int {
+    let t = pdcl_read_table(pdcl_cmds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == operation {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── direct_count: list_kind=1 (direct) 의 row 수 ───
+fn direct_count() -> int {
+    return count_by_list_kind(1)
+}
+
+// ─── cmd_command_count: 특정 cmd_id 의 command_count (없으면 0) ───
+fn cmd_command_count(cmd_id: int) -> int {
+    let t = pdcl_read_table(pdcl_cmds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == cmd_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdcl_stats: [cmd_count, total_command_count, direct_count, count_by_operation(3)] ───
+fn pdcl_stats() -> array {
+    let mut out = []
+    out.push(cmd_count())
+    out.push(total_command_count())
+    out.push(direct_count())
+    out.push(count_by_operation(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdcl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdcl()
+
+    // 2. record 6 cmds — 4 list_kinds, 4 operations
+    record_cmd(810001, 1, 1, 0)
+    r0_emit("pe_d3d12_command_list_record",
+        "\"cmd_id\":810001,\"list_kind\":1,\"operation\":1,\"command_count\":0,\"target\":\"direct_reset\"")
+
+    record_cmd(810002, 1, 3, 128)
+    r0_emit("pe_d3d12_command_list_record",
+        "\"cmd_id\":810002,\"list_kind\":1,\"operation\":3,\"command_count\":128,\"target\":\"direct_execute\"")
+
+    record_cmd(810003, 2, 2, 32)
+    r0_emit("pe_d3d12_command_list_record",
+        "\"cmd_id\":810003,\"list_kind\":2,\"operation\":2,\"command_count\":32,\"target\":\"bundle_close\"")
+
+    record_cmd(810004, 3, 3, 64)
+    r0_emit("pe_d3d12_command_list_record",
+        "\"cmd_id\":810004,\"list_kind\":3,\"operation\":3,\"command_count\":64,\"target\":\"compute_execute\"")
+
+    record_cmd(810005, 4, 4, 16)
+    r0_emit("pe_d3d12_command_list_record",
+        "\"cmd_id\":810005,\"list_kind\":4,\"operation\":4,\"command_count\":16,\"target\":\"copy_clear\"")
+
+    record_cmd(810006, 1, 3, 256)
+    r0_emit("pe_d3d12_command_list_record",
+        "\"cmd_id\":810006,\"list_kind\":1,\"operation\":3,\"command_count\":256,\"target\":\"direct_execute\"")
+
+    // 3. cmd_count = 6
+    let c = cmd_count()
+    if c != 6 {
+        panic("pe_d3d12_command_list FAIL [cmd_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_command_count = 0+128+32+64+16+256 = 496
+    let tc = total_command_count()
+    if tc != 496 {
+        panic("pe_d3d12_command_list FAIL [total_command_count] expected=496 got=" + to_string(tc))
+    }
+
+    // 5. count_by_list_kind sanity (≥3 list_kinds: 1,2,3,4)
+    let k1 = count_by_list_kind(1)
+    if k1 != 3 {
+        panic("pe_d3d12_command_list FAIL [count_by_list_kind(1)] expected=3 got=" + to_string(k1))
+    }
+    let k2 = count_by_list_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d12_command_list FAIL [count_by_list_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_list_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d12_command_list FAIL [count_by_list_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_list_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d12_command_list FAIL [count_by_list_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_list_kind(5)
+    if k5 != 0 {
+        panic("pe_d3d12_command_list FAIL [count_by_list_kind(5)] expected=0 got=" + to_string(k5))
+    }
+
+    // 6. direct_count = 3 (list_kind=1)
+    let dc = direct_count()
+    if dc != 3 {
+        panic("pe_d3d12_command_list FAIL [direct_count] expected=3 got=" + to_string(dc))
+    }
+
+    // 7. count_by_operation sanity (≥3 operations: 1,2,3,4)
+    let o1 = count_by_operation(1)
+    if o1 != 1 {
+        panic("pe_d3d12_command_list FAIL [count_by_operation(1)] expected=1 got=" + to_string(o1))
+    }
+    let o2 = count_by_operation(2)
+    if o2 != 1 {
+        panic("pe_d3d12_command_list FAIL [count_by_operation(2)] expected=1 got=" + to_string(o2))
+    }
+    let o3 = count_by_operation(3)
+    if o3 != 3 {
+        panic("pe_d3d12_command_list FAIL [count_by_operation(3)] expected=3 got=" + to_string(o3))
+    }
+    let o4 = count_by_operation(4)
+    if o4 != 1 {
+        panic("pe_d3d12_command_list FAIL [count_by_operation(4)] expected=1 got=" + to_string(o4))
+    }
+    let o99 = count_by_operation(99)
+    if o99 != 0 {
+        panic("pe_d3d12_command_list FAIL [count_by_operation(99)] expected=0 got=" + to_string(o99))
+    }
+
+    // 8. cmd_command_count sanity
+    let cc2 = cmd_command_count(810002)
+    if cc2 != 128 {
+        panic("pe_d3d12_command_list FAIL [cmd_command_count(810002)] expected=128 got=" + to_string(cc2))
+    }
+    let cc6 = cmd_command_count(810006)
+    if cc6 != 256 {
+        panic("pe_d3d12_command_list FAIL [cmd_command_count(810006)] expected=256 got=" + to_string(cc6))
+    }
+    let cc_miss = cmd_command_count(9999)
+    if cc_miss != 0 {
+        panic("pe_d3d12_command_list FAIL [cmd_command_count(9999)] expected=0 got=" + to_string(cc_miss))
+    }
+
+    // 9. pdcl_stats() = [6, 496, 3, 3]
+    let s = pdcl_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_command_list FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d12_command_list FAIL [stats cmd_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 496 {
+        panic("pe_d3d12_command_list FAIL [stats total_command_count] expected=496 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_d3d12_command_list FAIL [stats direct_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_d3d12_command_list FAIL [stats op_execute] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d12_command_list_stats",
+        "\"cmd_count\":" + to_string(s[0])
+        + ",\"total_command_count\":" + to_string(s[1])
+        + ",\"direct_count\":" + to_string(s[2])
+        + ",\"op_execute\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d12_command_list FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdcl()
+    let s2 = pdcl_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d12_command_list FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_command_list self_test PASS (cmds=" + to_string(s[0])
+        + ", total_cmds=" + to_string(s[1]) + ", direct=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdcl_stats()
+            println("cmd_count\t" + to_string(s[0]))
+            println("total_command_count\t" + to_string(s[1]))
+            println("direct_count\t" + to_string(s[2]))
+            println("op_execute\t" + to_string(s[3]))
+            return
+        }
+        if sub == "commands" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("cmd_command_count\t" + to_string(cmd_command_count(cid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_command_list.hexa commands <cmd_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let v = to_int(a[4])
+                if dim == "list" {
+                    println("count_by_list_kind\t" + to_string(count_by_list_kind(v)))
+                    return
+                }
+                if dim == "op" {
+                    println("count_by_operation\t" + to_string(count_by_operation(v)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_d3d12_command_list.hexa count { list <list_kind> | op <operation> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdcl()
+            println("cleaned: " + pdcl_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdcl_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_command_list.hexa { self-test | stats | commands <cmd_id> | count list <list_kind> | count op <operation> | cleanup | dir }")
+}

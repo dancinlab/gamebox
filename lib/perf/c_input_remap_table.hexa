@@ -1,0 +1,335 @@
+// lib/perf/c_input_remap_table.hexa — CN-115 skeleton manjeom 15/15
+//
+// 무엇:
+//   macOS Cocoa key code → Windows Virtual Key code 매핑 테이블. D2R / D4 가
+//   Windows VK 기준으로 keybind 를 보관하기 때문에, mac 측 NSEvent 의 keyCode
+//   를 받아 Win VK 로 환산해 줘야 macOS 빌드에서도 동일한 키 입력 호환이
+//   된다.
+//
+// 무기:
+//   - 평행 array 3 개 (mac_code / vk_code / label) — stage1 dict X.
+//   - mac_to_vk_known() 6 개 코어 매핑 (a/space/shift/ctrl/esc/tab) 부트스트랩.
+//   - record_remap(mac, vk, label) 로 추가 매핑 동적 등록.
+//   - lookup_vk(mac) → vk (없으면 0).
+//   - collision_check() — 같은 mac 코드가 서로 다른 vk 두 개로 매핑되면 1.
+//
+// 효과:
+//   D2R / D4 keybind 호환 (PvP hotkey 동일성 + Cocoa NSEvent → Win VK 자동 환산
+//   파이프라인 기초). Phase 6 live tune (input) 의 입력 정렬 유틸.
+//
+// schema (JSONL row, columnar):
+//   {"mac_code":N,"vk_code":H,"label":"<name>","ts":<unix>}
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X,
+// args() = [hexa, file, ...userargs] → a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. 본 모듈은 NSEvent.
+// keyCode 와 Win VK 정수 상수만 평행 array 로 보관 — 외부 라이브러리 의존 0.
+//
+// own 2 mandate: r0_emit ≥ 5 (remap_seeded × 6 + remap_recorded + lookup_hit +
+// collision_detected + stats), fn self_test() + main() dispatch, headless,
+// panic 형식 "c_input_remap_table FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── Win VK 상수 (D2R/D4 keybind 호환) ───
+let VK_A       = 0x41
+let VK_SPACE   = 0x20
+let VK_SHIFT   = 0x10
+let VK_CONTROL = 0x11
+let VK_ESCAPE  = 0x1B
+let VK_TAB     = 0x09
+
+// ─── macOS NSEvent.keyCode 상수 (Apple HIToolbox/Events.h kVK_*) ───
+let MAC_A     = 0
+let MAC_SPACE = 49
+let MAC_SHIFT = 56
+let MAC_CTRL  = 59
+let MAC_ESC   = 53
+let MAC_TAB   = 48
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/input_remap/table.jsonl
+fn remap_dir() -> str {
+    return GAMEBOX_HOME + "/persist/input_remap"
+}
+
+fn remap_path() -> str {
+    return remap_dir() + "/table.jsonl"
+}
+
+fn remap_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + remap_dir() + "'")
+}
+
+// ─── in-memory remap table (3 평행 array) ───
+//   stage1 dict X → mac_code / vk_code / label 평행.
+let mut REMAP_MAC   = []
+let mut REMAP_VK    = []
+let mut REMAP_LABEL = []
+
+fn remap_clear() -> void {
+    REMAP_MAC   = []
+    REMAP_VK    = []
+    REMAP_LABEL = []
+}
+
+// ─── mac_to_vk_known ───
+//   부트스트랩용 6 매핑을 in-memory 에 적재 + jsonl append + emit.
+//   "a"/0 → "A"/0x41
+//   "space"/49 → "Space"/0x20
+//   "shift"/56 → "Shift"/0x10
+//   "ctrl"/59 → "Control"/0x11
+//   "esc"/53 → "Escape"/0x1B
+//   "tab"/48 → "Tab"/0x09
+fn mac_to_vk_known() -> void {
+    remap_ensure_dir()
+    record_remap(MAC_A,     VK_A,       "A")
+    record_remap(MAC_SPACE, VK_SPACE,   "Space")
+    record_remap(MAC_SHIFT, VK_SHIFT,   "Shift")
+    record_remap(MAC_CTRL,  VK_CONTROL, "Control")
+    record_remap(MAC_ESC,   VK_ESCAPE,  "Escape")
+    record_remap(MAC_TAB,   VK_TAB,     "Tab")
+    r0_emit("remap_seeded",
+        "\"count\":6,\"source\":\"mac_to_vk_known\"")
+}
+
+// ─── record_remap ───
+//   mac_code, vk_code, label 한 쌍을 in-memory + jsonl 에 기록.
+//   collision_check 는 별도 호출 — 여기서는 단순 append.
+fn record_remap(mac_code: int, vk_code: int, label: str) -> void {
+    remap_ensure_dir()
+    REMAP_MAC   = REMAP_MAC   + [mac_code]
+    REMAP_VK    = REMAP_VK    + [vk_code]
+    REMAP_LABEL = REMAP_LABEL + [label]
+
+    let ts_unix = exec("date +%s").trim()
+    let line = "{\"mac_code\":" + to_string(mac_code)
+        + ",\"vk_code\":" + to_string(vk_code)
+        + ",\"label\":\"" + label + "\""
+        + ",\"ts\":" + ts_unix
+        + "}"
+    r0_append_line(remap_path(), line)
+
+    r0_emit("remap_recorded",
+        "\"mac_code\":" + to_string(mac_code)
+        + ",\"vk_code\":" + to_string(vk_code)
+        + ",\"label\":\"" + label + "\"")
+}
+
+// ─── lookup_vk ───
+//   mac_code 를 받아 Win VK 를 반환. 없으면 0.
+//   첫 번째 매칭만 반환 (collision 은 collision_check 가 별도 검출).
+fn lookup_vk(mac_code: int) -> int {
+    let i = 0
+    while i < len(REMAP_MAC) {
+        if REMAP_MAC[i] == mac_code {
+            r0_emit("lookup_hit",
+                "\"mac_code\":" + to_string(mac_code)
+                + ",\"vk_code\":" + to_string(REMAP_VK[i])
+                + ",\"label\":\"" + REMAP_LABEL[i] + "\"")
+            return REMAP_VK[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── collision_check ───
+//   같은 mac_code 가 서로 다른 vk_code 로 두 번 등록되면 1, 아니면 0.
+//   동일 (mac, vk) 중복은 collision 아님 (idempotent re-seed 허용).
+fn collision_check() -> int {
+    let n = len(REMAP_MAC)
+    let i = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            if REMAP_MAC[i] == REMAP_MAC[j] {
+                if REMAP_VK[i] != REMAP_VK[j] {
+                    r0_emit("collision_detected",
+                        "\"mac_code\":" + to_string(REMAP_MAC[i])
+                        + ",\"vk_a\":" + to_string(REMAP_VK[i])
+                        + ",\"vk_b\":" + to_string(REMAP_VK[j]))
+                    return 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── remap_count ───
+//   in-memory 에 등록된 매핑 수.
+fn remap_count() -> int {
+    return len(REMAP_MAC)
+}
+
+// ─── remap_stats ───
+//   [count, collision_flag] + emit "stats".
+fn remap_stats() -> array {
+    let n = remap_count()
+    let c = collision_check()
+    r0_emit("stats",
+        "\"count\":" + to_string(n)
+        + ",\"collision\":" + to_string(c))
+    return [n, c]
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "cremap-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    let path = remap_path()
+    let _rm0 = exec("rm -f '" + path + "'")
+    remap_clear()
+
+    // 2. 6 매핑 시드
+    mac_to_vk_known()
+
+    // 3. count == 6
+    let n1 = remap_count()
+    if n1 != 6 {
+        panic("c_input_remap_table FAIL [count seed] expected=6 got=" + to_string(n1))
+    }
+
+    // 4. lookup 검증 — 6 개 모두
+    let v_a = lookup_vk(MAC_A)
+    if v_a != VK_A {
+        panic("c_input_remap_table FAIL [lookup A] expected=" + to_string(VK_A) + " got=" + to_string(v_a))
+    }
+    let v_sp = lookup_vk(MAC_SPACE)
+    if v_sp != VK_SPACE {
+        panic("c_input_remap_table FAIL [lookup Space] expected=" + to_string(VK_SPACE) + " got=" + to_string(v_sp))
+    }
+    let v_sh = lookup_vk(MAC_SHIFT)
+    if v_sh != VK_SHIFT {
+        panic("c_input_remap_table FAIL [lookup Shift] expected=" + to_string(VK_SHIFT) + " got=" + to_string(v_sh))
+    }
+    let v_ct = lookup_vk(MAC_CTRL)
+    if v_ct != VK_CONTROL {
+        panic("c_input_remap_table FAIL [lookup Control] expected=" + to_string(VK_CONTROL) + " got=" + to_string(v_ct))
+    }
+    let v_es = lookup_vk(MAC_ESC)
+    if v_es != VK_ESCAPE {
+        panic("c_input_remap_table FAIL [lookup Escape] expected=" + to_string(VK_ESCAPE) + " got=" + to_string(v_es))
+    }
+    let v_tb = lookup_vk(MAC_TAB)
+    if v_tb != VK_TAB {
+        panic("c_input_remap_table FAIL [lookup Tab] expected=" + to_string(VK_TAB) + " got=" + to_string(v_tb))
+    }
+
+    // 5. miss → 0
+    let v_miss = lookup_vk(9999)
+    if v_miss != 0 {
+        panic("c_input_remap_table FAIL [lookup miss] expected=0 got=" + to_string(v_miss))
+    }
+
+    // 6. collision_check — clean state 0
+    let c0 = collision_check()
+    if c0 != 0 {
+        panic("c_input_remap_table FAIL [collision clean] expected=0 got=" + to_string(c0))
+    }
+
+    // 7. 동일 (mac, vk) 재등록은 collision 아님
+    record_remap(MAC_A, VK_A, "A")
+    let c_dup = collision_check()
+    if c_dup != 0 {
+        panic("c_input_remap_table FAIL [collision dup-same] expected=0 got=" + to_string(c_dup))
+    }
+
+    // 8. 충돌 주입 — MAC_A → 0x42 (VK_A 가 아닌 다른 VK)
+    record_remap(MAC_A, 0x42, "B-conflict")
+    let c1 = collision_check()
+    if c1 != 1 {
+        panic("c_input_remap_table FAIL [collision detect] expected=1 got=" + to_string(c1))
+    }
+
+    // 9. count == 8 (6 시드 + 1 dup + 1 conflict)
+    let n2 = remap_count()
+    if n2 != 8 {
+        panic("c_input_remap_table FAIL [count after inject] expected=8 got=" + to_string(n2))
+    }
+
+    // 10. remap_stats → [8, 1]
+    let st = remap_stats()
+    if st[0] != 8 {
+        panic("c_input_remap_table FAIL [stats count] expected=8 got=" + to_string(st[0]))
+    }
+    if st[1] != 1 {
+        panic("c_input_remap_table FAIL [stats collision] expected=1 got=" + to_string(st[1]))
+    }
+
+    // 11. emit count 검증:
+    //   1 remap_seeded + 8 remap_recorded + 6 lookup_hit + 1 collision_detected
+    //   + 1 stats(collision) + 1 stats = 18 (≥ 5)
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 5 {
+        panic("c_input_remap_table FAIL [emit count] expected>=5 got=" + to_string(evt_cnt))
+    }
+
+    // 12. cleanup
+    let _rm = exec("rm -f '" + path + "'")
+    remap_clear()
+
+    // 13. PASS line
+    println("  ✅ c_input_remap_table self_test PASS (6 seed + 1 dup + 1 conflict, collision="
+        + to_string(c1) + ", emits=" + to_string(evt_cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "seed-known" {
+            mac_to_vk_known()
+            println("seeded: count=" + to_string(remap_count()))
+            return
+        }
+        if sub == "record" {
+            // record <mac_code> <vk_code> <label>
+            if len(a) >= 6 {
+                record_remap(to_int(a[3]), to_int(a[4]), a[5])
+                println("recorded: mac=" + a[3] + " vk=" + a[4] + " label=" + a[5])
+                return
+            }
+        }
+        if sub == "lookup" {
+            // lookup <mac_code>
+            if len(a) >= 4 {
+                let v = lookup_vk(to_int(a[3]))
+                println("vk_code=" + to_string(v))
+                return
+            }
+        }
+        if sub == "collision-check" {
+            println("collision=" + to_string(collision_check()))
+            return
+        }
+        if sub == "count" {
+            println("count=" + to_string(remap_count()))
+            return
+        }
+        if sub == "stats" {
+            let s = remap_stats()
+            println("count=" + to_string(s[0]) + " collision=" + to_string(s[1]))
+            return
+        }
+        if sub == "remap-dir" {
+            println(remap_dir())
+            return
+        }
+        if sub == "remap-path" {
+            println(remap_path())
+            return
+        }
+    }
+    println("usage: hexa run c_input_remap_table.hexa { self-test | seed-known | record <mac> <vk> <label> | lookup <mac> | collision-check | count | stats | remap-dir | remap-path }")
+}

@@ -1,0 +1,463 @@
+// lib/loader/pe_maplestory_track.hexa — MapleStory (Nexon) 전용 entry/loader 추적.
+//
+// MapleStory-specific launch chain (own2 자체 추적):
+//   process_attach     — MapleStory.exe entry, NT TLS_CALLBACK array fire
+//   wizet_engine_init  — Wizet 자체 2D 엔진 init (sprite/animation/WZ resource layer)
+//   hackshield_init    — HackShield (AhnLab) kernel-mode anti-cheat driver attach
+//   login              — Nexon login service IPC + 계정 token
+//   world_select       — World 선택 (스카니아/베라/루나 등 server pick)
+//   character_select   — Character slot select + WZ character data load
+//   field_load         — Field/map 진입 (.img WZ map asset 매핑)
+//   first_frame        — DX9 → DX11 swapchain Present 첫 호출
+//   각 phase 가 R1/R2/R3/R5 의 sub-system 의존
+//
+// MapleStory = 2D 액션 MMORPG, Wizet 자체 엔진. 2003+ Nexon 운영.
+// HackShield (AhnLab) kernel driver — Apple Silicon 차단 (kernel module 미호환).
+// KMS Reboot 서버 (HackShield 우회 path 별도) — closure path B 가능.
+// own1: 메이플스토리 공개 정보 + binary observation 만. Wine 인용 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 MapleStory-specific phase tracker — 실 MapleStory.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 9 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = process_attach    (MapleStory.exe entry + TLS_CALLBACK)
+//   2 = wizet_engine_init (Wizet 2D engine init + WZ resource)
+//   3 = hackshield_init   (HackShield kernel driver attach)
+//   4 = login             (Nexon login IPC + token)
+//   5 = world_select      (server pick)
+//   6 = character_select  (slot select + WZ character)
+//   7 = field_load        (.img WZ map asset)
+//   8 = first_frame       (DX9/DX11 Present first call)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t dll_loaded<int> \t hackshield_active<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmst_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_maplestory_track"
+}
+
+fn pmst_steps_path() -> str {
+    return pmst_dir() + "/steps.tsv"
+}
+
+fn pmst_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmst_dir() + "'")
+}
+
+fn cleanup_pmst() -> void {
+    pmst_ensure_dir()
+    let _ = exec("rm -f '" + pmst_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmst_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmst_append_row(path: str, row: str) -> void {
+    pmst_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: MapleStory launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, dll_loaded: int, hackshield_active: int) -> void {
+    if step_id <= 0 {
+        panic("pe_maplestory_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_maplestory_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 8 {
+        panic("pe_maplestory_track FAIL [record_step] expected=phase_kind<=8 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_maplestory_track FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_maplestory_track FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if hackshield_active < 0 {
+        panic("pe_maplestory_track FAIL [record_step] expected=hackshield_active>=0 got=" + to_string(hackshield_active))
+    }
+    if hackshield_active > 1 {
+        panic("pe_maplestory_track FAIL [record_step] expected=hackshield_active<=1 got=" + to_string(hackshield_active))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(hackshield_active) + "\n"
+    pmst_append_row(pmst_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = pmst_read_table(pmst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pmst_read_table(pmst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = pmst_read_table(pmst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── hackshield_active_count: hackshield_active=1 인 step 수 ───
+fn hackshield_active_count() -> int {
+    let t = pmst_read_table(pmst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── field_load_count: phase_kind=7 step 수 (≥1 이면 field 진입) ───
+fn field_load_count() -> int {
+    return count_by_phase_kind(7)
+}
+
+// ─── step_dll_loaded: 특정 step_id 의 dll_loaded (없으면 0) ───
+fn step_dll_loaded(step_id: int) -> int {
+    let t = pmst_read_table(pmst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pmst_stats: [step_count, loaded_count, hackshield_active_count, field_load_count, count_by_phase_kind(3)] ───
+fn pmst_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(hackshield_active_count())
+    out.push(field_load_count())
+    out.push(count_by_phase_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmst-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmst()
+
+    // 2. record 8 steps — MapleStory launch chain 전체, phase_kind 1..8 각 1건
+    //   id 140001: phase 1 process_attach     dll=0 hs=0  (entry, TLS_CALLBACK fire)
+    //   id 140002: phase 2 wizet_engine_init  dll=1 hs=0  (Wizet 2D engine + WZ resource)
+    //   id 140003: phase 3 hackshield_init    dll=1 hs=1  (HackShield kernel driver attach)
+    //   id 140004: phase 4 login              dll=1 hs=1  (Nexon login IPC + token)
+    //   id 140005: phase 5 world_select       dll=0 hs=1  (server pick)
+    //   id 140006: phase 6 character_select   dll=1 hs=1  (slot select + WZ character)
+    //   id 140007: phase 7 field_load         dll=0 hs=1  (.img WZ map asset)
+    //   id 140008: phase 8 first_frame        dll=0 hs=1  (DX9/DX11 Present first)
+    //   sums: steps=8, loaded=4, hackshield_active=6, field_load=1, count_kind(3)=1
+    record_step(140001, 1, 0, 0)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140001,\"phase_kind\":1,\"dll_loaded\":0,\"hackshield_active\":0,\"target\":\"process_attach\"")
+
+    record_step(140002, 2, 1, 0)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140002,\"phase_kind\":2,\"dll_loaded\":1,\"hackshield_active\":0,\"target\":\"wizet_engine_init\"")
+
+    record_step(140003, 3, 1, 1)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140003,\"phase_kind\":3,\"dll_loaded\":1,\"hackshield_active\":1,\"target\":\"hackshield_init\"")
+
+    record_step(140004, 4, 1, 1)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140004,\"phase_kind\":4,\"dll_loaded\":1,\"hackshield_active\":1,\"target\":\"login\"")
+
+    record_step(140005, 5, 0, 1)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140005,\"phase_kind\":5,\"dll_loaded\":0,\"hackshield_active\":1,\"target\":\"world_select\"")
+
+    record_step(140006, 6, 1, 1)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140006,\"phase_kind\":6,\"dll_loaded\":1,\"hackshield_active\":1,\"target\":\"character_select\"")
+
+    record_step(140007, 7, 0, 1)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140007,\"phase_kind\":7,\"dll_loaded\":0,\"hackshield_active\":1,\"target\":\"field_load\"")
+
+    record_step(140008, 8, 0, 1)
+    r0_emit("pe_maplestory_track_record",
+        "\"step_id\":140008,\"phase_kind\":8,\"dll_loaded\":0,\"hackshield_active\":1,\"target\":\"first_frame\"")
+
+    // 3. step_count = 8
+    let c = step_count()
+    if c != 8 {
+        panic("pe_maplestory_track FAIL [step_count] expected=8 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..8 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p8 = count_by_phase_kind(8)
+    if p8 != 1 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(p8))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_maplestory_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (140002,140003,140004,140006)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_maplestory_track FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. hackshield_active_count = 6 (140003..140008)
+    let hc = hackshield_active_count()
+    if hc != 6 {
+        panic("pe_maplestory_track FAIL [hackshield_active_count] expected=6 got=" + to_string(hc))
+    }
+
+    // 7. field_load_count = 1
+    let fl = field_load_count()
+    if fl != 1 {
+        panic("pe_maplestory_track FAIL [field_load_count] expected=1 got=" + to_string(fl))
+    }
+
+    // 8. step_dll_loaded sanity
+    let d2 = step_dll_loaded(140002)
+    if d2 != 1 {
+        panic("pe_maplestory_track FAIL [step_dll_loaded(140002)] expected=1 got=" + to_string(d2))
+    }
+    let d7 = step_dll_loaded(140007)
+    if d7 != 0 {
+        panic("pe_maplestory_track FAIL [step_dll_loaded(140007)] expected=0 got=" + to_string(d7))
+    }
+    let d_miss = step_dll_loaded(9999)
+    if d_miss != 0 {
+        panic("pe_maplestory_track FAIL [step_dll_loaded(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 9. pmst_stats() = [8, 4, 6, 1, 1]
+    let s = pmst_stats()
+    if len(s) != 5 {
+        panic("pe_maplestory_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_maplestory_track FAIL [stats step_count] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_maplestory_track FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 6 {
+        panic("pe_maplestory_track FAIL [stats hackshield_active_count] expected=6 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_maplestory_track FAIL [stats field_load_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_maplestory_track FAIL [stats count_phase(3)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_maplestory_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"hackshield_active_count\":" + to_string(s[2])
+        + ",\"field_load_count\":" + to_string(s[3])
+        + ",\"count_hackshield_init\":" + to_string(s[4]))
+
+    // 11. emit count >= 9 (8 records + 1 stats = 9)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 9 {
+        panic("pe_maplestory_track FAIL [r0 emit count] expected=>=9 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pmst()
+    let s2 = pmst_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_maplestory_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_maplestory_track self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", hackshield_active=" + to_string(s[2])
+        + ", field_load=" + to_string(s[3]) + ", hackshield_init=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmst_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("hackshield_active_count\t" + to_string(s[2]))
+            println("field_load_count\t" + to_string(s[3]))
+            println("count_hackshield_init\t" + to_string(s[4]))
+            return
+        }
+        if sub == "loaded" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_dll_loaded\t" + to_string(step_dll_loaded(sid)))
+                return
+            }
+            println("usage: hexa run pe_maplestory_track.hexa loaded <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_maplestory_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmst()
+            println("cleaned: " + pmst_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmst_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_maplestory_track.hexa { self-test | stats | loaded <step_id> | count <phase_kind> | cleanup | dir }")
+}

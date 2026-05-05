@@ -1,0 +1,621 @@
+// lib/loader/pe_msvc_dbt_block_real.hexa — Box86 FillBlock 4-pass DBT skeleton tracker (R3 Tier).
+//
+// Box86 (4 phase) DBT (Dynamic Binary Translation) FillBlock 알고리즘 추적기.
+// 본 project 는 interpreter mode 유지 정책 — 추적 layer 만 hexa 로 instrumentation.
+//
+// FillBlock 4-pass:
+//   pass 1 (scan):    barrier identify (jcc back-edge / call / ret / int3 / indirect)
+//   pass 2 (emit):    native 코드 emit (arm64) — basic block 별 1:1
+//   pass 3 (link):    forward branch patch (이전 block forward jcc → 현 block entry)
+//   pass 4 (protect): RX flip (W^X JIT — mprotect RW→RX)
+//
+// own1 enforcement: research-D Box86 FillBlock spec reference (algorithm only).
+//   Wine / CrossOver / GPTk / Whisky / community wine 0줄 인용. Box86 source
+//   line copy 없음 — 4-pass 골격 + barrier 분류 + W^X 시퀀스만 참고.
+//
+// own2 mandate:
+//   - r0_emit ≥ 14 (23 record + 5 stats emit + 1 helper-sanity-stats banner = 29)
+//   - panic 형식: "pe_msvc_dbt_block_real FAIL [<step>] expected=<x> got=<y>"
+//   - self_test() + main() dispatch + headless safe
+//
+// 5 record API:
+//   record_block(block_id, src_eip_hex, src_size_bytes, target_arch)
+//     — DBT block 1 건 (src eip + size + target arch)
+//     target_arch: 0=arm64 / 1=x86_64 / 2=interpreter (본 project 기본값)
+//   record_pass(pass_id, block_id, pass_kind, pass_status)
+//     — pass 1 건 (kind 0-3, status 0=ok 1=fail 2=skip)
+//   record_barrier(barrier_id, block_id, eip_hex, barrier_kind)
+//     — barrier 1 건 (kind 0=jcc_back 1=call 2=ret 3=int3 4=indirect)
+//   record_link_patch(patch_id, block_id, src_eip_hex, target_eip_hex)
+//     — forward branch 1 건 (src → target patch)
+//   record_protection_flip(flip_id, block_id, before_prot, after_prot)
+//     — mprotect 1 건 (prot 1=R 2=W 4=X 5=RX 7=RWX)
+//
+// 5 stats:
+//   block_count / pass_count / barrier_count / link_patch_count / protection_flip_count
+//
+// 4 helper:
+//   target_arch_name(int) -> str
+//   pass_kind_name(int) -> str
+//   barrier_kind_name(int) -> str
+//   prot_name(int) -> str
+//
+// persist schema (TSV — 5 tables):
+//   blocks.tsv           : block_id<int> \t src_eip_hex<str> \t src_size_bytes<int> \t target_arch<int>
+//   passes.tsv           : pass_id<int>  \t block_id<int>    \t pass_kind<int>      \t pass_status<int>
+//   barriers.tsv         : barrier_id<int> \t block_id<int>  \t eip_hex<str>        \t barrier_kind<int>
+//   link_patches.tsv     : patch_id<int> \t block_id<int>    \t src_eip_hex<str>    \t target_eip_hex<str>
+//   protection_flips.tsv : flip_id<int>  \t block_id<int>    \t before_prot<int>    \t after_prot<int>
+//
+// Hexa 예약어 회피: type / class / mod / handle 단독 식별자 금지 →
+//   target_arch / pass_kind / barrier_kind / pass_status 사용.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmdbr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_dbt_block_real"
+}
+
+fn pmdbr_blocks_path() -> str {
+    return pmdbr_dir() + "/blocks.tsv"
+}
+
+fn pmdbr_passes_path() -> str {
+    return pmdbr_dir() + "/passes.tsv"
+}
+
+fn pmdbr_barriers_path() -> str {
+    return pmdbr_dir() + "/barriers.tsv"
+}
+
+fn pmdbr_link_patches_path() -> str {
+    return pmdbr_dir() + "/link_patches.tsv"
+}
+
+fn pmdbr_protection_flips_path() -> str {
+    return pmdbr_dir() + "/protection_flips.tsv"
+}
+
+fn pmdbr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmdbr_dir() + "'")
+}
+
+fn cleanup_pmdbr() -> void {
+    pmdbr_ensure_dir()
+    let _ = exec("rm -f '" + pmdbr_blocks_path()
+        + "' '" + pmdbr_passes_path()
+        + "' '" + pmdbr_barriers_path()
+        + "' '" + pmdbr_link_patches_path()
+        + "' '" + pmdbr_protection_flips_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmdbr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmdbr_append_row(path: str, row: str) -> void {
+    pmdbr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmdbr_count_rows(path: str, min_cols: int) -> int {
+    let t = pmdbr_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_block: DBT block 1 건 ───
+//   target_arch: 0=arm64 / 1=x86_64 / 2=interpreter
+fn record_block(block_id: int, src_eip_hex: str, src_size_bytes: int, target_arch: int) -> void {
+    if block_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_block] expected=block_id>0 got=" + to_string(block_id))
+    }
+    if src_eip_hex == "" {
+        panic("pe_msvc_dbt_block_real FAIL [record_block] expected=src_eip_hex!=empty got=empty")
+    }
+    if src_size_bytes <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_block] expected=src_size_bytes>0 got=" + to_string(src_size_bytes))
+    }
+    if target_arch < 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_block] expected=target_arch>=0 got=" + to_string(target_arch))
+    }
+    if target_arch > 2 {
+        panic("pe_msvc_dbt_block_real FAIL [record_block] expected=target_arch<=2 got=" + to_string(target_arch))
+    }
+    let row = to_string(block_id) + "\t" + src_eip_hex
+        + "\t" + to_string(src_size_bytes)
+        + "\t" + to_string(target_arch) + "\n"
+    pmdbr_append_row(pmdbr_blocks_path(), row)
+}
+
+// ─── record_pass: pass 1 건 ───
+//   pass_kind: 0=scan / 1=emit / 2=link / 3=protect
+//   pass_status: 0=ok / 1=fail / 2=skip
+fn record_pass(pass_id: int, block_id: int, pass_kind: int, pass_status: int) -> void {
+    if pass_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_pass] expected=pass_id>0 got=" + to_string(pass_id))
+    }
+    if block_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_pass] expected=block_id>0 got=" + to_string(block_id))
+    }
+    if pass_kind < 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_pass] expected=pass_kind>=0 got=" + to_string(pass_kind))
+    }
+    if pass_kind > 3 {
+        panic("pe_msvc_dbt_block_real FAIL [record_pass] expected=pass_kind<=3 got=" + to_string(pass_kind))
+    }
+    if pass_status < 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_pass] expected=pass_status>=0 got=" + to_string(pass_status))
+    }
+    if pass_status > 2 {
+        panic("pe_msvc_dbt_block_real FAIL [record_pass] expected=pass_status<=2 got=" + to_string(pass_status))
+    }
+    let row = to_string(pass_id) + "\t" + to_string(block_id)
+        + "\t" + to_string(pass_kind)
+        + "\t" + to_string(pass_status) + "\n"
+    pmdbr_append_row(pmdbr_passes_path(), row)
+}
+
+// ─── record_barrier: barrier 1 건 ───
+//   barrier_kind: 0=jcc_back / 1=call / 2=ret / 3=int3 / 4=indirect
+fn record_barrier(barrier_id: int, block_id: int, eip_hex: str, barrier_kind: int) -> void {
+    if barrier_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_barrier] expected=barrier_id>0 got=" + to_string(barrier_id))
+    }
+    if block_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_barrier] expected=block_id>0 got=" + to_string(block_id))
+    }
+    if eip_hex == "" {
+        panic("pe_msvc_dbt_block_real FAIL [record_barrier] expected=eip_hex!=empty got=empty")
+    }
+    if barrier_kind < 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_barrier] expected=barrier_kind>=0 got=" + to_string(barrier_kind))
+    }
+    if barrier_kind > 4 {
+        panic("pe_msvc_dbt_block_real FAIL [record_barrier] expected=barrier_kind<=4 got=" + to_string(barrier_kind))
+    }
+    let row = to_string(barrier_id) + "\t" + to_string(block_id)
+        + "\t" + eip_hex
+        + "\t" + to_string(barrier_kind) + "\n"
+    pmdbr_append_row(pmdbr_barriers_path(), row)
+}
+
+// ─── record_link_patch: forward branch 1 건 ───
+fn record_link_patch(patch_id: int, block_id: int, src_eip_hex: str, target_eip_hex: str) -> void {
+    if patch_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_link_patch] expected=patch_id>0 got=" + to_string(patch_id))
+    }
+    if block_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_link_patch] expected=block_id>0 got=" + to_string(block_id))
+    }
+    if src_eip_hex == "" {
+        panic("pe_msvc_dbt_block_real FAIL [record_link_patch] expected=src_eip_hex!=empty got=empty")
+    }
+    if target_eip_hex == "" {
+        panic("pe_msvc_dbt_block_real FAIL [record_link_patch] expected=target_eip_hex!=empty got=empty")
+    }
+    let row = to_string(patch_id) + "\t" + to_string(block_id)
+        + "\t" + src_eip_hex
+        + "\t" + target_eip_hex + "\n"
+    pmdbr_append_row(pmdbr_link_patches_path(), row)
+}
+
+// ─── record_protection_flip: mprotect W^X flip 1 건 ───
+//   prot: 1=R / 2=W / 4=X / 5=RX / 7=RWX (POSIX PROT_* bitmask)
+fn record_protection_flip(flip_id: int, block_id: int, before_prot: int, after_prot: int) -> void {
+    if flip_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_protection_flip] expected=flip_id>0 got=" + to_string(flip_id))
+    }
+    if block_id <= 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_protection_flip] expected=block_id>0 got=" + to_string(block_id))
+    }
+    if before_prot < 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_protection_flip] expected=before_prot>=0 got=" + to_string(before_prot))
+    }
+    if before_prot > 7 {
+        panic("pe_msvc_dbt_block_real FAIL [record_protection_flip] expected=before_prot<=7 got=" + to_string(before_prot))
+    }
+    if after_prot < 0 {
+        panic("pe_msvc_dbt_block_real FAIL [record_protection_flip] expected=after_prot>=0 got=" + to_string(after_prot))
+    }
+    if after_prot > 7 {
+        panic("pe_msvc_dbt_block_real FAIL [record_protection_flip] expected=after_prot<=7 got=" + to_string(after_prot))
+    }
+    let row = to_string(flip_id) + "\t" + to_string(block_id)
+        + "\t" + to_string(before_prot)
+        + "\t" + to_string(after_prot) + "\n"
+    pmdbr_append_row(pmdbr_protection_flips_path(), row)
+}
+
+// ─── 5 종 통계 ───
+fn block_count() -> int {
+    return pmdbr_count_rows(pmdbr_blocks_path(), 4)
+}
+
+fn pass_count() -> int {
+    return pmdbr_count_rows(pmdbr_passes_path(), 4)
+}
+
+fn barrier_count() -> int {
+    return pmdbr_count_rows(pmdbr_barriers_path(), 4)
+}
+
+fn link_patch_count() -> int {
+    return pmdbr_count_rows(pmdbr_link_patches_path(), 4)
+}
+
+fn protection_flip_count() -> int {
+    return pmdbr_count_rows(pmdbr_protection_flips_path(), 4)
+}
+
+// ─── helper: code → name ───
+fn target_arch_name(target_arch: int) -> str {
+    if target_arch == 0 { return "arm64" }
+    if target_arch == 1 { return "x86_64" }
+    if target_arch == 2 { return "interpreter" }
+    return "unknown"
+}
+
+fn pass_kind_name(pass_kind: int) -> str {
+    if pass_kind == 0 { return "scan" }
+    if pass_kind == 1 { return "emit" }
+    if pass_kind == 2 { return "link" }
+    if pass_kind == 3 { return "protect" }
+    return "unknown"
+}
+
+fn barrier_kind_name(barrier_kind: int) -> str {
+    if barrier_kind == 0 { return "jcc_back" }
+    if barrier_kind == 1 { return "call" }
+    if barrier_kind == 2 { return "ret" }
+    if barrier_kind == 3 { return "int3" }
+    if barrier_kind == 4 { return "indirect" }
+    return "unknown"
+}
+
+fn prot_name(prot: int) -> str {
+    if prot == 1 { return "R" }
+    if prot == 2 { return "W" }
+    if prot == 4 { return "X" }
+    if prot == 5 { return "RX" }
+    if prot == 7 { return "RWX" }
+    return "unknown"
+}
+
+// ─── pmdbr_stats: [block, pass, barrier, link_patch, protection_flip] ───
+fn pmdbr_stats() -> array {
+    let mut out = []
+    out.push(block_count())
+    out.push(pass_count())
+    out.push(barrier_count())
+    out.push(link_patch_count())
+    out.push(protection_flip_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmdbr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmdbr()
+
+    // 2. helper sanity (이름 매핑) — panic 만 검증.
+    if target_arch_name(0) != "arm64" {
+        panic("pe_msvc_dbt_block_real FAIL [target_arch_name(0)] expected=arm64 got=" + target_arch_name(0))
+    }
+    if target_arch_name(1) != "x86_64" {
+        panic("pe_msvc_dbt_block_real FAIL [target_arch_name(1)] expected=x86_64 got=" + target_arch_name(1))
+    }
+    if target_arch_name(2) != "interpreter" {
+        panic("pe_msvc_dbt_block_real FAIL [target_arch_name(2)] expected=interpreter got=" + target_arch_name(2))
+    }
+    if target_arch_name(99) != "unknown" {
+        panic("pe_msvc_dbt_block_real FAIL [target_arch_name(99)] expected=unknown got=" + target_arch_name(99))
+    }
+    if pass_kind_name(0) != "scan" {
+        panic("pe_msvc_dbt_block_real FAIL [pass_kind_name(0)] expected=scan got=" + pass_kind_name(0))
+    }
+    if pass_kind_name(1) != "emit" {
+        panic("pe_msvc_dbt_block_real FAIL [pass_kind_name(1)] expected=emit got=" + pass_kind_name(1))
+    }
+    if pass_kind_name(2) != "link" {
+        panic("pe_msvc_dbt_block_real FAIL [pass_kind_name(2)] expected=link got=" + pass_kind_name(2))
+    }
+    if pass_kind_name(3) != "protect" {
+        panic("pe_msvc_dbt_block_real FAIL [pass_kind_name(3)] expected=protect got=" + pass_kind_name(3))
+    }
+    if barrier_kind_name(0) != "jcc_back" {
+        panic("pe_msvc_dbt_block_real FAIL [barrier_kind_name(0)] expected=jcc_back got=" + barrier_kind_name(0))
+    }
+    if barrier_kind_name(1) != "call" {
+        panic("pe_msvc_dbt_block_real FAIL [barrier_kind_name(1)] expected=call got=" + barrier_kind_name(1))
+    }
+    if barrier_kind_name(2) != "ret" {
+        panic("pe_msvc_dbt_block_real FAIL [barrier_kind_name(2)] expected=ret got=" + barrier_kind_name(2))
+    }
+    if barrier_kind_name(3) != "int3" {
+        panic("pe_msvc_dbt_block_real FAIL [barrier_kind_name(3)] expected=int3 got=" + barrier_kind_name(3))
+    }
+    if barrier_kind_name(4) != "indirect" {
+        panic("pe_msvc_dbt_block_real FAIL [barrier_kind_name(4)] expected=indirect got=" + barrier_kind_name(4))
+    }
+    if prot_name(1) != "R" {
+        panic("pe_msvc_dbt_block_real FAIL [prot_name(1)] expected=R got=" + prot_name(1))
+    }
+    if prot_name(5) != "RX" {
+        panic("pe_msvc_dbt_block_real FAIL [prot_name(5)] expected=RX got=" + prot_name(5))
+    }
+    if prot_name(7) != "RWX" {
+        panic("pe_msvc_dbt_block_real FAIL [prot_name(7)] expected=RWX got=" + prot_name(7))
+    }
+    if prot_name(99) != "unknown" {
+        panic("pe_msvc_dbt_block_real FAIL [prot_name(99)] expected=unknown got=" + prot_name(99))
+    }
+
+    // 3. record 3 block (각 src_eip 다름, target=interpreter (=2))
+    //    block 7001 = entry @ 0x004013F0 (28 bytes)  — WinMain prologue
+    //    block 7002 = loop @ 0x00401450 (40 bytes)  — for-loop body
+    //    block 7003 = exit @ 0x004014B0 (16 bytes)  — RET path
+    record_block(7001, "0x004013F0", 28, 2)
+    r0_emit("pe_msvc_dbt_block_real_record_block",
+        "\"block_id\":7001,\"src_eip_hex\":\"0x004013F0\",\"src_size_bytes\":28,\"target_arch\":2,\"target_arch_name\":\"interpreter\"")
+
+    record_block(7002, "0x00401450", 40, 2)
+    r0_emit("pe_msvc_dbt_block_real_record_block",
+        "\"block_id\":7002,\"src_eip_hex\":\"0x00401450\",\"src_size_bytes\":40,\"target_arch\":2,\"target_arch_name\":\"interpreter\"")
+
+    record_block(7003, "0x004014B0", 16, 2)
+    r0_emit("pe_msvc_dbt_block_real_record_block",
+        "\"block_id\":7003,\"src_eip_hex\":\"0x004014B0\",\"src_size_bytes\":16,\"target_arch\":2,\"target_arch_name\":\"interpreter\"")
+
+    // 4. record 12 pass (3 block × 4 pass = 12, all status=0 ok)
+    //    pass id pattern: 8000 + (block_idx * 10) + pass_kind
+    //    block 7001:  8011 scan / 8012 emit / 8013 link / 8014 protect
+    //    block 7002:  8021 scan / 8022 emit / 8023 link / 8024 protect
+    //    block 7003:  8031 scan / 8032 emit / 8033 link / 8034 protect
+    record_pass(8011, 7001, 0, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8011,\"block_id\":7001,\"pass_kind\":0,\"pass_kind_name\":\"scan\",\"pass_status\":0")
+    record_pass(8012, 7001, 1, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8012,\"block_id\":7001,\"pass_kind\":1,\"pass_kind_name\":\"emit\",\"pass_status\":0")
+    record_pass(8013, 7001, 2, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8013,\"block_id\":7001,\"pass_kind\":2,\"pass_kind_name\":\"link\",\"pass_status\":0")
+    record_pass(8014, 7001, 3, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8014,\"block_id\":7001,\"pass_kind\":3,\"pass_kind_name\":\"protect\",\"pass_status\":0")
+
+    record_pass(8021, 7002, 0, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8021,\"block_id\":7002,\"pass_kind\":0,\"pass_kind_name\":\"scan\",\"pass_status\":0")
+    record_pass(8022, 7002, 1, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8022,\"block_id\":7002,\"pass_kind\":1,\"pass_kind_name\":\"emit\",\"pass_status\":0")
+    record_pass(8023, 7002, 2, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8023,\"block_id\":7002,\"pass_kind\":2,\"pass_kind_name\":\"link\",\"pass_status\":0")
+    record_pass(8024, 7002, 3, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8024,\"block_id\":7002,\"pass_kind\":3,\"pass_kind_name\":\"protect\",\"pass_status\":0")
+
+    record_pass(8031, 7003, 0, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8031,\"block_id\":7003,\"pass_kind\":0,\"pass_kind_name\":\"scan\",\"pass_status\":0")
+    record_pass(8032, 7003, 1, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8032,\"block_id\":7003,\"pass_kind\":1,\"pass_kind_name\":\"emit\",\"pass_status\":0")
+    record_pass(8033, 7003, 2, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8033,\"block_id\":7003,\"pass_kind\":2,\"pass_kind_name\":\"link\",\"pass_status\":0")
+    record_pass(8034, 7003, 3, 0)
+    r0_emit("pe_msvc_dbt_block_real_record_pass",
+        "\"pass_id\":8034,\"block_id\":7003,\"pass_kind\":3,\"pass_kind_name\":\"protect\",\"pass_status\":0")
+
+    // 5. record 4 barrier — 각 kind 1 개 (jcc_back / call / ret / int3)
+    //    barrier 9001 → block 7002, jcc back-edge @ 0x00401478 (loop tail)
+    //    barrier 9002 → block 7001, call           @ 0x004013FE
+    //    barrier 9003 → block 7003, ret            @ 0x004014BD
+    //    barrier 9004 → block 7001, int3           @ 0x004013F0 (ASLR cookie debug)
+    record_barrier(9001, 7002, "0x00401478", 0)
+    r0_emit("pe_msvc_dbt_block_real_record_barrier",
+        "\"barrier_id\":9001,\"block_id\":7002,\"eip_hex\":\"0x00401478\",\"barrier_kind\":0,\"barrier_kind_name\":\"jcc_back\"")
+    record_barrier(9002, 7001, "0x004013FE", 1)
+    r0_emit("pe_msvc_dbt_block_real_record_barrier",
+        "\"barrier_id\":9002,\"block_id\":7001,\"eip_hex\":\"0x004013FE\",\"barrier_kind\":1,\"barrier_kind_name\":\"call\"")
+    record_barrier(9003, 7003, "0x004014BD", 2)
+    r0_emit("pe_msvc_dbt_block_real_record_barrier",
+        "\"barrier_id\":9003,\"block_id\":7003,\"eip_hex\":\"0x004014BD\",\"barrier_kind\":2,\"barrier_kind_name\":\"ret\"")
+    record_barrier(9004, 7001, "0x004013F0", 3)
+    r0_emit("pe_msvc_dbt_block_real_record_barrier",
+        "\"barrier_id\":9004,\"block_id\":7001,\"eip_hex\":\"0x004013F0\",\"barrier_kind\":3,\"barrier_kind_name\":\"int3\"")
+
+    // 6. record 2 link_patch (forward branch resolution)
+    //    patch 10001 → block 7001, src 0x004013FE → target 0x00401450 (entry → loop)
+    //    patch 10002 → block 7002, src 0x00401478 → target 0x004014B0 (loop exit → ret block)
+    record_link_patch(10001, 7001, "0x004013FE", "0x00401450")
+    r0_emit("pe_msvc_dbt_block_real_record_link_patch",
+        "\"patch_id\":10001,\"block_id\":7001,\"src_eip_hex\":\"0x004013FE\",\"target_eip_hex\":\"0x00401450\"")
+    record_link_patch(10002, 7002, "0x00401478", "0x004014B0")
+    r0_emit("pe_msvc_dbt_block_real_record_link_patch",
+        "\"patch_id\":10002,\"block_id\":7002,\"src_eip_hex\":\"0x00401478\",\"target_eip_hex\":\"0x004014B0\"")
+
+    // 7. record 2 protection_flip (W^X JIT)
+    //    flip 11001 → block 7001, RW (3) → RX (5)  — emit 후 protect
+    //    flip 11002 → block 7002, RW (3) → RX (5)  — emit 후 protect
+    //    NOTE: prot=3 (R|W=1+2) 는 enum 상 unknown 이지만 raw bitmask 값으로 허용.
+    //          0..7 범위 허용 — POSIX PROT_* bitmask.
+    record_protection_flip(11001, 7001, 3, 5)
+    r0_emit("pe_msvc_dbt_block_real_record_protection_flip",
+        "\"flip_id\":11001,\"block_id\":7001,\"before_prot\":3,\"after_prot\":5,\"after_prot_name\":\"RX\"")
+    record_protection_flip(11002, 7002, 3, 5)
+    r0_emit("pe_msvc_dbt_block_real_record_protection_flip",
+        "\"flip_id\":11002,\"block_id\":7002,\"before_prot\":3,\"after_prot\":5,\"after_prot_name\":\"RX\"")
+
+    // 8. row count 검증 — 3 block / 12 pass / 4 barrier / 2 link_patch / 2 protection_flip
+    let bc = block_count()
+    if bc != 3 {
+        panic("pe_msvc_dbt_block_real FAIL [block_count] expected=3 got=" + to_string(bc))
+    }
+    let pc = pass_count()
+    if pc != 12 {
+        panic("pe_msvc_dbt_block_real FAIL [pass_count] expected=12 got=" + to_string(pc))
+    }
+    let brc = barrier_count()
+    if brc != 4 {
+        panic("pe_msvc_dbt_block_real FAIL [barrier_count] expected=4 got=" + to_string(brc))
+    }
+    let lpc = link_patch_count()
+    if lpc != 2 {
+        panic("pe_msvc_dbt_block_real FAIL [link_patch_count] expected=2 got=" + to_string(lpc))
+    }
+    let pfc = protection_flip_count()
+    if pfc != 2 {
+        panic("pe_msvc_dbt_block_real FAIL [protection_flip_count] expected=2 got=" + to_string(pfc))
+    }
+
+    // 9. pmdbr_stats() = [3, 12, 4, 2, 2]
+    let s = pmdbr_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_dbt_block_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_msvc_dbt_block_real FAIL [stats block_count] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 12 {
+        panic("pe_msvc_dbt_block_real FAIL [stats pass_count] expected=12 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_dbt_block_real FAIL [stats barrier_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_dbt_block_real FAIL [stats link_patch_count] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_dbt_block_real FAIL [stats protection_flip_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 10. emit 5 종 stats line — 분리하여 r0_emit ≥ 14 보장
+    //     (23 record + 5 stats = 28 ≥ 14)
+    r0_emit("pe_msvc_dbt_block_real_stats_block",
+        "\"block_count\":" + to_string(s[0]))
+    r0_emit("pe_msvc_dbt_block_real_stats_pass",
+        "\"pass_count\":" + to_string(s[1]))
+    r0_emit("pe_msvc_dbt_block_real_stats_barrier",
+        "\"barrier_count\":" + to_string(s[2]))
+    r0_emit("pe_msvc_dbt_block_real_stats_link_patch",
+        "\"link_patch_count\":" + to_string(s[3]))
+    r0_emit("pe_msvc_dbt_block_real_stats_protection_flip",
+        "\"protection_flip_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 14
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_dbt_block_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → 5 stats 모두 0
+    cleanup_pmdbr()
+    let s2 = pmdbr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_dbt_block_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_dbt_block_real self_test PASS (block=" + to_string(s[0])
+        + ", pass=" + to_string(s[1]) + ", barrier=" + to_string(s[2])
+        + ", link_patch=" + to_string(s[3]) + ", protection_flip=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmdbr_stats()
+            println("block_count\t" + to_string(s[0]))
+            println("pass_count\t" + to_string(s[1]))
+            println("barrier_count\t" + to_string(s[2]))
+            println("link_patch_count\t" + to_string(s[3]))
+            println("protection_flip_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "target-arch-name" {
+            if len(a) >= 4 {
+                println(target_arch_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_dbt_block_real.hexa target-arch-name <target_arch>")
+            return
+        }
+        if sub == "pass-kind-name" {
+            if len(a) >= 4 {
+                println(pass_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_dbt_block_real.hexa pass-kind-name <pass_kind>")
+            return
+        }
+        if sub == "barrier-kind-name" {
+            if len(a) >= 4 {
+                println(barrier_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_dbt_block_real.hexa barrier-kind-name <barrier_kind>")
+            return
+        }
+        if sub == "prot-name" {
+            if len(a) >= 4 {
+                println(prot_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_dbt_block_real.hexa prot-name <prot>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmdbr()
+            println("cleaned: " + pmdbr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmdbr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_dbt_block_real.hexa { self-test | stats | target-arch-name <n> | pass-kind-name <n> | barrier-kind-name <n> | prot-name <n> | cleanup | dir }")
+}

@@ -1,0 +1,364 @@
+// lib/loader/pe_ipc_tcp_loopback.hexa — stage6 TCP 127.0.0.1 IPC skeleton
+//
+// AF_INET TCP on 127.0.0.1. universal fallback when AF_UNIX/XPC 불가.
+// SO_REUSEADDR + non-blocking + select 일반 패턴.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 tcp loopback op tracker — 실 socket() / bind() / listen() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — tcp_ops.tsv):
+//   conn_id<int> \t port<int> \t bytes_transferred<int> \t latency_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pitl_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_tcp_loopback"
+}
+
+fn pitl_ops_path() -> str {
+    return pitl_dir() + "/tcp_ops.tsv"
+}
+
+fn pitl_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pitl_dir() + "'")
+}
+
+fn cleanup_pitl() -> void {
+    pitl_ensure_dir()
+    let _ = exec("rm -f '" + pitl_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pitl_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pitl_append_row(path: str, row: str) -> void {
+    pitl_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_tcp_op: TCP loopback op 1 건 기록 ───
+fn record_tcp_op(conn_id: int, port: int, bytes_transferred: int, latency_us: int) -> void {
+    if conn_id <= 0 {
+        panic("pe_ipc_tcp_loopback FAIL [record_tcp_op] expected=conn_id>0 got=" + to_string(conn_id))
+    }
+    if port <= 0 {
+        panic("pe_ipc_tcp_loopback FAIL [record_tcp_op] expected=port>0 got=" + to_string(port))
+    }
+    if port > 65535 {
+        panic("pe_ipc_tcp_loopback FAIL [record_tcp_op] expected=port<=65535 got=" + to_string(port))
+    }
+    if bytes_transferred < 0 {
+        panic("pe_ipc_tcp_loopback FAIL [record_tcp_op] expected=bytes_transferred>=0 got=" + to_string(bytes_transferred))
+    }
+    if latency_us < 0 {
+        panic("pe_ipc_tcp_loopback FAIL [record_tcp_op] expected=latency_us>=0 got=" + to_string(latency_us))
+    }
+    let row = to_string(conn_id) + "\t" + to_string(port)
+        + "\t" + to_string(bytes_transferred) + "\t" + to_string(latency_us) + "\n"
+    pitl_append_row(pitl_ops_path(), row)
+}
+
+// ─── tcp_count: total op 수 ───
+fn tcp_count() -> int {
+    let t = pitl_read_table(pitl_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes: 모든 op bytes_transferred 합 ───
+fn total_bytes() -> int {
+    let t = pitl_read_table(pitl_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_latency_us: 모든 op latency_us 합 ───
+fn total_latency_us() -> int {
+    let t = pitl_read_table(pitl_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── port_count: 특정 port 의 op 수 ───
+fn port_count(port_int: int) -> int {
+    let t = pitl_read_table(pitl_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == port_int {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── conn_bytes: 특정 conn_id 의 bytes_transferred (없으면 0) ───
+fn conn_bytes(conn_id: int) -> int {
+    let t = pitl_read_table(pitl_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == conn_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pitl_stats: [tcp_count, total_bytes, total_latency_us, port_count(7777)] ───
+fn pitl_stats() -> array {
+    let mut out = []
+    out.push(tcp_count())
+    out.push(total_bytes())
+    out.push(total_latency_us())
+    out.push(port_count(7777))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pitl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pitl()
+
+    // 2. record 4 tcp loopback ops (deterministic synthetic)
+    record_tcp_op(124001, 7777, 1024, 240)
+    r0_emit("pe_ipc_tcp_loopback_record",
+        "\"conn_id\":124001,\"port\":7777,\"bytes_transferred\":1024,\"latency_us\":240")
+
+    record_tcp_op(124002, 7777, 2048, 320)
+    r0_emit("pe_ipc_tcp_loopback_record",
+        "\"conn_id\":124002,\"port\":7777,\"bytes_transferred\":2048,\"latency_us\":320")
+
+    record_tcp_op(124003, 8888, 512, 180)
+    r0_emit("pe_ipc_tcp_loopback_record",
+        "\"conn_id\":124003,\"port\":8888,\"bytes_transferred\":512,\"latency_us\":180")
+
+    record_tcp_op(124004, 7777, 4096, 480)
+    r0_emit("pe_ipc_tcp_loopback_record",
+        "\"conn_id\":124004,\"port\":7777,\"bytes_transferred\":4096,\"latency_us\":480")
+
+    // 3. tcp_count = 4
+    let c = tcp_count()
+    if c != 4 {
+        panic("pe_ipc_tcp_loopback FAIL [tcp_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_bytes = 7680
+    let tb = total_bytes()
+    if tb != 7680 {
+        panic("pe_ipc_tcp_loopback FAIL [total_bytes] expected=7680 got=" + to_string(tb))
+    }
+
+    // 5. total_latency_us = 1220
+    let tl = total_latency_us()
+    if tl != 1220 {
+        panic("pe_ipc_tcp_loopback FAIL [total_latency_us] expected=1220 got=" + to_string(tl))
+    }
+
+    // 6. port_count sanity
+    let p7777 = port_count(7777)
+    if p7777 != 3 {
+        panic("pe_ipc_tcp_loopback FAIL [port_count(7777)] expected=3 got=" + to_string(p7777))
+    }
+    let p8888 = port_count(8888)
+    if p8888 != 1 {
+        panic("pe_ipc_tcp_loopback FAIL [port_count(8888)] expected=1 got=" + to_string(p8888))
+    }
+    let p9999 = port_count(9999)
+    if p9999 != 0 {
+        panic("pe_ipc_tcp_loopback FAIL [port_count(9999)] expected=0 got=" + to_string(p9999))
+    }
+
+    // 7. conn_bytes sanity
+    let b1 = conn_bytes(124001)
+    if b1 != 1024 {
+        panic("pe_ipc_tcp_loopback FAIL [conn_bytes(124001)] expected=1024 got=" + to_string(b1))
+    }
+    let b3 = conn_bytes(124003)
+    if b3 != 512 {
+        panic("pe_ipc_tcp_loopback FAIL [conn_bytes(124003)] expected=512 got=" + to_string(b3))
+    }
+    let b_miss = conn_bytes(9999)
+    if b_miss != 0 {
+        panic("pe_ipc_tcp_loopback FAIL [conn_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 8. pitl_stats() = [4, 7680, 1220, 3]
+    let s = pitl_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_tcp_loopback FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_ipc_tcp_loopback FAIL [stats tcp_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 7680 {
+        panic("pe_ipc_tcp_loopback FAIL [stats total_bytes] expected=7680 got=" + to_string(s[1]))
+    }
+    if s[2] != 1220 {
+        panic("pe_ipc_tcp_loopback FAIL [stats total_latency_us] expected=1220 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_ipc_tcp_loopback FAIL [stats port_count(7777)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_tcp_loopback_stats",
+        "\"tcp_count\":" + to_string(s[0])
+        + ",\"total_bytes\":" + to_string(s[1])
+        + ",\"total_latency_us\":" + to_string(s[2])
+        + ",\"port_7777\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_ipc_tcp_loopback FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pitl()
+    let s2 = pitl_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_tcp_loopback FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_tcp_loopback self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", latency_us=" + to_string(s[2])
+        + ", port_7777=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pitl_stats()
+            println("tcp_count\t" + to_string(s[0]))
+            println("total_bytes\t" + to_string(s[1]))
+            println("total_latency_us\t" + to_string(s[2]))
+            println("port_count_7777\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("conn_bytes\t" + to_string(conn_bytes(cid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_tcp_loopback.hexa bytes <conn_id>")
+            return
+        }
+        if sub == "port" {
+            if len(a) >= 4 {
+                let p = to_int(a[3])
+                println("port_count\t" + to_string(port_count(p)))
+                return
+            }
+            println("usage: hexa run pe_ipc_tcp_loopback.hexa port <port>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pitl()
+            println("cleaned: " + pitl_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pitl_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_tcp_loopback.hexa { self-test | stats | bytes <conn_id> | port <port> | cleanup | dir }")
+}

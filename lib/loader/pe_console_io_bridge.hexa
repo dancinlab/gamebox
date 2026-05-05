@@ -1,0 +1,232 @@
+// lib/loader/pe_console_io_bridge.hexa — stage3 Win32 console I/O bridge skeleton
+//
+// AllocConsole / WriteConsoleA/W / ReadConsoleA → POSIX stdio. console
+// screen buffer (CHAR_INFO[]) ↔ Terminal escape sequences. cursor / color /
+// title 추적.
+//
+// own 1 enforcement: Wine / CrossOver / ReactOS console host 0 줄.
+//   참조 only — Microsoft 공식 Console API spec:
+//     - AllocConsole:              https://learn.microsoft.com/en-us/windows/console/allocconsole
+//     - WriteConsole:              https://learn.microsoft.com/en-us/windows/console/writeconsole
+//     - ReadConsole:               https://learn.microsoft.com/en-us/windows/console/readconsole
+//     - GetConsoleScreenBufferInfo:https://learn.microsoft.com/en-us/windows/console/getconsolescreenbufferinfo
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5 (record × 4 + summary)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_console_io_bridge FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — Battle.net Setup console output 처리):
+//   stage3 = bridge instrumentation skeleton (op record + count + bytes/elapsed).
+//   stage4 = 실 console emulation — CHAR_INFO ↔ ANSI escape, cursor/color/title.
+//
+// op_kind 정의:
+//   1 = AllocConsole
+//   2 = WriteConsoleA
+//   3 = WriteConsoleW
+//   4 = ReadConsoleA
+//   5 = GetConsoleScreenBufferInfo
+//
+// schema (console_ops.tsv): op_id<int> | op_kind<int> | byte_count<int> | elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 ───
+fn pcib_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_console_io_bridge"
+}
+
+fn console_ops_path() -> str {
+    return pcib_dir() + "/console_ops.tsv"
+}
+
+fn ensure_pcib_dir() -> void {
+    let _ = exec("mkdir -p '" + pcib_dir() + "'")
+}
+
+fn cleanup_pcib() -> void {
+    let _ = exec("rm -rf '" + pcib_dir() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_pcib_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_pcib_row(path: str, row: str) -> void {
+    ensure_pcib_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_console_op ───
+//   op_kind: 1=AllocConsole, 2=WriteConsoleA, 3=WriteConsoleW,
+//            4=ReadConsoleA, 5=GetConsoleScreenBufferInfo
+fn record_console_op(op_id: int, op_kind: int, byte_count: int, elapsed_us: int) -> void {
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(byte_count) + "\t" + to_string(elapsed_us) + "\n"
+    append_pcib_row(console_ops_path(), row)
+    r0_emit("pcib_record", "\"op_id\":" + to_string(op_id)
+        + ",\"op_kind\":" + to_string(op_kind)
+        + ",\"bytes\":" + to_string(byte_count)
+        + ",\"elapsed_us\":" + to_string(elapsed_us))
+}
+
+// ─── op_count: 전체 row 수 ───
+fn op_count() -> int {
+    let t = read_pcib_table(console_ops_path())
+    if t == "" {
+        return 0
+    }
+    let r = exec("wc -l < '" + console_ops_path() + "' | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_bytes: byte_count 합계 ───
+fn total_bytes() -> int {
+    let t = read_pcib_table(console_ops_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + console_ops_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_elapsed_us: elapsed_us 합계 ───
+fn total_elapsed_us() -> int {
+    let t = read_pcib_table(console_ops_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + console_ops_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── count_by_op_kind: 특정 kind 카운트 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = read_pcib_table(console_ops_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v k=" + to_string(kind) + " '$2==k' '" + console_ops_path() + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── op_bytes: op_id 의 byte_count lookup ───
+fn op_bytes(op_id: int) -> int {
+    let t = read_pcib_table(console_ops_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v i=" + to_string(op_id) + " '$1==i {print $3; exit}' '" + console_ops_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── pcib_stats: [op_count, total_bytes, write_a_cnt, write_w_cnt] ───
+fn pcib_stats() -> array {
+    return [op_count(), total_bytes(), count_by_op_kind(2), count_by_op_kind(3)]
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcib-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pcib()
+
+    // 합성 4 ops — Battle.net Setup console flow
+    record_console_op(86001, 1, 0, 240)     // AllocConsole
+    record_console_op(86002, 2, 1024, 80)   // WriteConsoleA 1KB
+    record_console_op(86003, 3, 2048, 120)  // WriteConsoleW 2KB (UTF-16)
+    record_console_op(86004, 4, 256, 100)   // ReadConsoleA 256
+
+    // op_count
+    let oc = op_count()
+    if oc != 4 { panic("pe_console_io_bridge FAIL [op_count] expected=4 got=" + to_string(oc)) }
+
+    // total_bytes
+    let tb = total_bytes()
+    if tb != 3328 { panic("pe_console_io_bridge FAIL [total_bytes] expected=3328 got=" + to_string(tb)) }
+
+    // total_elapsed_us
+    let te = total_elapsed_us()
+    if te != 540 { panic("pe_console_io_bridge FAIL [total_elapsed_us] expected=540 got=" + to_string(te)) }
+
+    // count_by_op_kind
+    let c1 = count_by_op_kind(1)
+    if c1 != 1 { panic("pe_console_io_bridge FAIL [count kind=1] expected=1 got=" + to_string(c1)) }
+    let c2 = count_by_op_kind(2)
+    if c2 != 1 { panic("pe_console_io_bridge FAIL [count kind=2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_op_kind(3)
+    if c3 != 1 { panic("pe_console_io_bridge FAIL [count kind=3] expected=1 got=" + to_string(c3)) }
+    let c4 = count_by_op_kind(4)
+    if c4 != 1 { panic("pe_console_io_bridge FAIL [count kind=4] expected=1 got=" + to_string(c4)) }
+    let c99 = count_by_op_kind(99)
+    if c99 != 0 { panic("pe_console_io_bridge FAIL [count kind=99] expected=0 got=" + to_string(c99)) }
+
+    // op_bytes lookup
+    let b2 = op_bytes(86002)
+    if b2 != 1024 { panic("pe_console_io_bridge FAIL [op_bytes 86002] expected=1024 got=" + to_string(b2)) }
+    let b3 = op_bytes(86003)
+    if b3 != 2048 { panic("pe_console_io_bridge FAIL [op_bytes 86003] expected=2048 got=" + to_string(b3)) }
+    let b_missing = op_bytes(9999)
+    if b_missing != 0 { panic("pe_console_io_bridge FAIL [op_bytes 9999] expected=0 got=" + to_string(b_missing)) }
+
+    // pcib_stats
+    let s = pcib_stats()
+    if len(s) != 4 { panic("pe_console_io_bridge FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 4 { panic("pe_console_io_bridge FAIL [stats op_count] expected=4 got=" + to_string(s[0])) }
+    if s[1] != 3328 { panic("pe_console_io_bridge FAIL [stats total_bytes] expected=3328 got=" + to_string(s[1])) }
+    if s[2] != 1 { panic("pe_console_io_bridge FAIL [stats writeA] expected=1 got=" + to_string(s[2])) }
+    if s[3] != 1 { panic("pe_console_io_bridge FAIL [stats writeW] expected=1 got=" + to_string(s[3])) }
+
+    // summary emit
+    r0_emit("pcib_summary", "\"ops\":" + to_string(s[0])
+        + ",\"bytes\":" + to_string(s[1])
+        + ",\"writeA\":" + to_string(s[2])
+        + ",\"writeW\":" + to_string(s[3]))
+
+    // emit count >= 5 (4 record + 1 summary)
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("pe_console_io_bridge FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    cleanup_pcib()
+
+    println("  ✅ pe_console_io_bridge self_test PASS (4 ops, bytes=3328 elapsed=540us, AllocConsole=1 WriteA=1 WriteW=1 ReadA=1, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pcib_stats()
+            println("op_count=" + to_string(s[0]) + " total_bytes=" + to_string(s[1]) + " writeA=" + to_string(s[2]) + " writeW=" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println(to_string(op_bytes(oid)))
+                return
+            }
+            println("usage: hexa run pe_console_io_bridge.hexa bytes <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(to_string(count_by_op_kind(k)))
+                return
+            }
+            println("usage: hexa run pe_console_io_bridge.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" { cleanup_pcib(); println("cleaned"); return }
+    }
+    println("usage: hexa run pe_console_io_bridge.hexa { self-test | stats | bytes <op_id> | count <op_kind> | cleanup }")
+}

@@ -1,0 +1,500 @@
+// lib/loader/pe_i386_fpu_sse.hexa — i386 x87 FPU stack + SSE/SSE2 XMM register tracker
+//
+// Phase 후속 interpreter 가 i386 32-bit native float / SIMD 영역을 다룰 때
+// 사용할 hexa 측 추적 skeleton. Apple SDK 호출 / Wine / Box86 / QEMU / Bochs /
+// CrossOver / community 코드 0줄. Intel SDM Volume 1 §8 (x87 FPU) 와 §10
+// (Streaming SIMD Extensions) 만 참조하여 구현한다.
+//
+// x87 FPU topology:
+//   - ST(0)..ST(7) : 8개의 80-bit extended precision register (stack)
+//   - TOP pointer  : status word bit 11..13 (0..7) — relative addressing 에 사용
+//   - tag word     : 각 ST 의 상태 — 00=Valid, 01=Zero, 10=Special, 11=Empty
+//   - control word : precision / rounding mode / exception mask
+//   - status word  : C0/C1/C2/C3 condition flag + exception flags
+//
+// SSE/SSE2 topology (i386 32-bit mode):
+//   - XMM0..XMM7 : 8개의 128-bit register (low_bytes_hex/high_bytes_hex 16 byte split)
+//   - MXCSR      : SSE control + status register (32-bit, default 0x1F80)
+//   - SSE  → float scalar / packed
+//   - SSE2 → double + integer extension
+//
+// state snapshot: interpreter 한 step 단위로 (snapshot_id, top, c0..c3) status
+// row 를 남기면 condition flag 변화율을 회귀 분석할 수 있다.
+//
+// own 1: Wine winecrt0 / CrossOver / community 0 줄. SDM spec 자체 구현.
+// own 2: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — 5 separate tables):
+//   fpu_push.tsv  : st_idx<int> \t value_repr<str> \t snapshot_id<int>
+//   fpu_pop.tsv   : top_after<int> \t snapshot_id<int>
+//   xmm.tsv       : xmm_idx<int> \t low_bytes_hex<str> \t high_bytes_hex<str> \t snapshot_id<int>
+//   mxcsr.tsv     : mxcsr_value<int> \t snapshot_id<int>
+//   status.tsv    : top<int> \t c0<int> \t c1<int> \t c2<int> \t c3<int> \t snapshot_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pifs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_fpu_sse"
+}
+
+fn pifs_state_path() -> str {
+    return pifs_dir() + "/state.tsv"
+}
+
+fn pifs_fpu_push_path() -> str {
+    return pifs_dir() + "/fpu_push.tsv"
+}
+
+fn pifs_fpu_pop_path() -> str {
+    return pifs_dir() + "/fpu_pop.tsv"
+}
+
+fn pifs_xmm_path() -> str {
+    return pifs_dir() + "/xmm.tsv"
+}
+
+fn pifs_mxcsr_path() -> str {
+    return pifs_dir() + "/mxcsr.tsv"
+}
+
+fn pifs_status_path() -> str {
+    return pifs_dir() + "/status.tsv"
+}
+
+fn pifs_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pifs_dir() + "'")
+}
+
+fn cleanup_pifs() -> void {
+    pifs_ensure_dir()
+    let _ = exec("rm -f '" + pifs_fpu_push_path() + "' '" + pifs_fpu_pop_path()
+        + "' '" + pifs_xmm_path() + "' '" + pifs_mxcsr_path()
+        + "' '" + pifs_status_path() + "' '" + pifs_state_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pifs_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pifs_append_row(path: str, row: str) -> void {
+    pifs_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pifs_count_rows(path: str, min_cols: int) -> int {
+    let t = pifs_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+fn st_name(idx: int) -> str {
+    if idx == 0 { return "ST(0)" }
+    if idx == 1 { return "ST(1)" }
+    if idx == 2 { return "ST(2)" }
+    if idx == 3 { return "ST(3)" }
+    if idx == 4 { return "ST(4)" }
+    if idx == 5 { return "ST(5)" }
+    if idx == 6 { return "ST(6)" }
+    if idx == 7 { return "ST(7)" }
+    return "?"
+}
+
+fn xmm_name(idx: int) -> str {
+    if idx == 0 { return "XMM0" }
+    if idx == 1 { return "XMM1" }
+    if idx == 2 { return "XMM2" }
+    if idx == 3 { return "XMM3" }
+    if idx == 4 { return "XMM4" }
+    if idx == 5 { return "XMM5" }
+    if idx == 6 { return "XMM6" }
+    if idx == 7 { return "XMM7" }
+    return "?"
+}
+
+fn tag_name(t: int) -> str {
+    if t == 0 { return "Valid" }
+    if t == 1 { return "Zero" }
+    if t == 2 { return "Special" }
+    if t == 3 { return "Empty" }
+    return "?"
+}
+
+// ─── record_fpu_push: ST(st_idx) 에 80-bit extended precision value 적재 ───
+fn record_fpu_push(snapshot_id: int, st_idx: int, value_repr: str) -> void {
+    if snapshot_id <= 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_push] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    if st_idx < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_push] expected=st_idx>=0 got=" + to_string(st_idx))
+    }
+    if st_idx > 7 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_push] expected=st_idx<=7 got=" + to_string(st_idx))
+    }
+    if value_repr == "" {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_push] expected=value_repr!=empty got=empty")
+    }
+    let row = to_string(st_idx) + "\t" + value_repr + "\t" + to_string(snapshot_id) + "\n"
+    pifs_append_row(pifs_fpu_push_path(), row)
+}
+
+// ─── record_fpu_pop: FPU stack pop — top_after 는 pop 직후 TOP pointer 값 ───
+fn record_fpu_pop(snapshot_id: int, top_after: int) -> void {
+    if snapshot_id <= 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_pop] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    if top_after < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_pop] expected=top_after>=0 got=" + to_string(top_after))
+    }
+    if top_after > 7 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_pop] expected=top_after<=7 got=" + to_string(top_after))
+    }
+    let row = to_string(top_after) + "\t" + to_string(snapshot_id) + "\n"
+    pifs_append_row(pifs_fpu_pop_path(), row)
+}
+
+// ─── record_xmm_write: XMMn 128-bit value 기록 (low / high 16 byte hex split) ───
+fn record_xmm_write(snapshot_id: int, xmm_idx: int, low_bytes_hex: str, high_bytes_hex: str) -> void {
+    if snapshot_id <= 0 {
+        panic("pe_i386_fpu_sse FAIL [record_xmm_write] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    if xmm_idx < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_xmm_write] expected=xmm_idx>=0 got=" + to_string(xmm_idx))
+    }
+    if xmm_idx > 7 {
+        panic("pe_i386_fpu_sse FAIL [record_xmm_write] expected=xmm_idx<=7 got=" + to_string(xmm_idx))
+    }
+    // 16 byte = 32 hex chars 보장 (XMM 의 low / high 64-bit half 각각)
+    if len(low_bytes_hex) != 16 {
+        panic("pe_i386_fpu_sse FAIL [record_xmm_write] expected=low_bytes_hex len=16 got=" + to_string(len(low_bytes_hex)))
+    }
+    if len(high_bytes_hex) != 16 {
+        panic("pe_i386_fpu_sse FAIL [record_xmm_write] expected=high_bytes_hex len=16 got=" + to_string(len(high_bytes_hex)))
+    }
+    let row = to_string(xmm_idx) + "\t" + low_bytes_hex + "\t" + high_bytes_hex
+        + "\t" + to_string(snapshot_id) + "\n"
+    pifs_append_row(pifs_xmm_path(), row)
+}
+
+// ─── record_mxcsr: MXCSR 32-bit control + status 기록 ───
+fn record_mxcsr(snapshot_id: int, mxcsr_value: int) -> void {
+    if snapshot_id <= 0 {
+        panic("pe_i386_fpu_sse FAIL [record_mxcsr] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    if mxcsr_value < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_mxcsr] expected=mxcsr_value>=0 got=" + to_string(mxcsr_value))
+    }
+    // MXCSR 는 32-bit unsigned — 상위 bit 는 reserved 이지만 spec 상 4294967295 까지 허용
+    if mxcsr_value > 4294967295 {
+        panic("pe_i386_fpu_sse FAIL [record_mxcsr] expected=mxcsr_value<=4294967295 got=" + to_string(mxcsr_value))
+    }
+    let row = to_string(mxcsr_value) + "\t" + to_string(snapshot_id) + "\n"
+    pifs_append_row(pifs_mxcsr_path(), row)
+}
+
+// ─── record_fpu_status: FPU status word — TOP + C0/C1/C2/C3 condition flag ───
+fn record_fpu_status(snapshot_id: int, top: int, c0: int, c1: int, c2: int, c3: int) -> void {
+    if snapshot_id <= 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    if top < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=top>=0 got=" + to_string(top))
+    }
+    if top > 7 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=top<=7 got=" + to_string(top))
+    }
+    if c0 < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c0>=0 got=" + to_string(c0))
+    }
+    if c0 > 1 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c0<=1 got=" + to_string(c0))
+    }
+    if c1 < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c1>=0 got=" + to_string(c1))
+    }
+    if c1 > 1 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c1<=1 got=" + to_string(c1))
+    }
+    if c2 < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c2>=0 got=" + to_string(c2))
+    }
+    if c2 > 1 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c2<=1 got=" + to_string(c2))
+    }
+    if c3 < 0 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c3>=0 got=" + to_string(c3))
+    }
+    if c3 > 1 {
+        panic("pe_i386_fpu_sse FAIL [record_fpu_status] expected=c3<=1 got=" + to_string(c3))
+    }
+    let row = to_string(top) + "\t" + to_string(c0) + "\t" + to_string(c1)
+        + "\t" + to_string(c2) + "\t" + to_string(c3) + "\t" + to_string(snapshot_id) + "\n"
+    pifs_append_row(pifs_status_path(), row)
+}
+
+// ─── statistics ───
+fn fpu_push_count() -> int {
+    return pifs_count_rows(pifs_fpu_push_path(), 3)
+}
+
+fn fpu_pop_count() -> int {
+    return pifs_count_rows(pifs_fpu_pop_path(), 2)
+}
+
+fn xmm_write_count() -> int {
+    return pifs_count_rows(pifs_xmm_path(), 4)
+}
+
+fn mxcsr_count() -> int {
+    return pifs_count_rows(pifs_mxcsr_path(), 2)
+}
+
+fn status_count() -> int {
+    return pifs_count_rows(pifs_status_path(), 6)
+}
+
+fn pifs_stats() -> array {
+    let mut out = []
+    out.push(fpu_push_count())
+    out.push(fpu_pop_count())
+    out.push(xmm_write_count())
+    out.push(mxcsr_count())
+    out.push(status_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pifs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pifs()
+
+    let snap = 920501
+
+    // 1. FPU push 4 record (st_idx 0..3) — 80-bit extended precision value
+    record_fpu_push(snap, 0, "3.14")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"fpu_push\",\"st_idx\":0,\"st\":\"ST(0)\",\"value_repr\":\"3.14\",\"snapshot_id\":920501")
+
+    record_fpu_push(snap, 1, "2.71")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"fpu_push\",\"st_idx\":1,\"st\":\"ST(1)\",\"value_repr\":\"2.71\",\"snapshot_id\":920501")
+
+    record_fpu_push(snap, 2, "1.41")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"fpu_push\",\"st_idx\":2,\"st\":\"ST(2)\",\"value_repr\":\"1.41\",\"snapshot_id\":920501")
+
+    record_fpu_push(snap, 3, "1.62")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"fpu_push\",\"st_idx\":3,\"st\":\"ST(3)\",\"value_repr\":\"1.62\",\"snapshot_id\":920501")
+
+    // 2. FPU pop 1 record — push 4 후 pop 1 → TOP = 3
+    record_fpu_pop(snap, 3)
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"fpu_pop\",\"top_after\":3,\"snapshot_id\":920501")
+
+    // 3. XMM write 8 record (xmm 0..7) — 각자 16 byte (32 hex char) low / high
+    record_xmm_write(snap, 0, "00000000000000ff", "deadbeefcafef00d")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":0,\"xmm\":\"XMM0\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 1, "1122334455667788", "99aabbccddeeff00")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":1,\"xmm\":\"XMM1\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 2, "0000000000000000", "0000000000000000")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":2,\"xmm\":\"XMM2\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 3, "ffffffffffffffff", "ffffffffffffffff")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":3,\"xmm\":\"XMM3\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 4, "3ff0000000000000", "4000000000000000")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":4,\"xmm\":\"XMM4\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 5, "4008000000000000", "4010000000000000")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":5,\"xmm\":\"XMM5\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 6, "0123456789abcdef", "fedcba9876543210")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":6,\"xmm\":\"XMM6\",\"snapshot_id\":920501")
+
+    record_xmm_write(snap, 7, "aabbccddeeff0011", "2233445566778899")
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"xmm_write\",\"xmm_idx\":7,\"xmm\":\"XMM7\",\"snapshot_id\":920501")
+
+    // 4. MXCSR 1 record — default 0x1F80 (모든 SSE exception masked, RC=00)
+    record_mxcsr(snap, 8064)
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"mxcsr\",\"mxcsr_value\":8064,\"snapshot_id\":920501")
+
+    // 5. FPU status 1 record — top=3, c0..c3 = 0
+    record_fpu_status(snap, 3, 0, 0, 0, 0)
+    r0_emit("pe_i386_fpu_sse_record",
+        "\"kind\":\"status\",\"top\":3,\"c0\":0,\"c1\":0,\"c2\":0,\"c3\":0,\"snapshot_id\":920501")
+
+    // ─── assertions ───
+    let pu = fpu_push_count()
+    if pu != 4 {
+        panic("pe_i386_fpu_sse FAIL [fpu_push_count] expected=4 got=" + to_string(pu))
+    }
+    let po = fpu_pop_count()
+    if po != 1 {
+        panic("pe_i386_fpu_sse FAIL [fpu_pop_count] expected=1 got=" + to_string(po))
+    }
+    let xw = xmm_write_count()
+    if xw != 8 {
+        panic("pe_i386_fpu_sse FAIL [xmm_write_count] expected=8 got=" + to_string(xw))
+    }
+    let mx = mxcsr_count()
+    if mx != 1 {
+        panic("pe_i386_fpu_sse FAIL [mxcsr_count] expected=1 got=" + to_string(mx))
+    }
+    let st = status_count()
+    if st != 1 {
+        panic("pe_i386_fpu_sse FAIL [status_count] expected=1 got=" + to_string(st))
+    }
+
+    // ─── name lookup assertions ───
+    let n_st0 = st_name(0)
+    if n_st0 != "ST(0)" {
+        panic("pe_i386_fpu_sse FAIL [st_name(0)] expected=ST(0) got=" + n_st0)
+    }
+    let n_st7 = st_name(7)
+    if n_st7 != "ST(7)" {
+        panic("pe_i386_fpu_sse FAIL [st_name(7)] expected=ST(7) got=" + n_st7)
+    }
+    let n_x0 = xmm_name(0)
+    if n_x0 != "XMM0" {
+        panic("pe_i386_fpu_sse FAIL [xmm_name(0)] expected=XMM0 got=" + n_x0)
+    }
+    let n_x7 = xmm_name(7)
+    if n_x7 != "XMM7" {
+        panic("pe_i386_fpu_sse FAIL [xmm_name(7)] expected=XMM7 got=" + n_x7)
+    }
+    let n_v = tag_name(0)
+    if n_v != "Valid" {
+        panic("pe_i386_fpu_sse FAIL [tag_name(0)] expected=Valid got=" + n_v)
+    }
+    let n_z = tag_name(1)
+    if n_z != "Zero" {
+        panic("pe_i386_fpu_sse FAIL [tag_name(1)] expected=Zero got=" + n_z)
+    }
+    let n_sp = tag_name(2)
+    if n_sp != "Special" {
+        panic("pe_i386_fpu_sse FAIL [tag_name(2)] expected=Special got=" + n_sp)
+    }
+    let n_e = tag_name(3)
+    if n_e != "Empty" {
+        panic("pe_i386_fpu_sse FAIL [tag_name(3)] expected=Empty got=" + n_e)
+    }
+
+    // ─── stats sanity ───
+    let s = pifs_stats()
+    if len(s) != 5 {
+        panic("pe_i386_fpu_sse FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_i386_fpu_sse FAIL [stats fpu_push] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_i386_fpu_sse FAIL [stats fpu_pop] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 8 {
+        panic("pe_i386_fpu_sse FAIL [stats xmm_write] expected=8 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_fpu_sse FAIL [stats mxcsr] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_i386_fpu_sse FAIL [stats status] expected=1 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (전체 emit ≥ 12 보장: 위 record 15 + 이 1 = 16) ───
+    r0_emit("pe_i386_fpu_sse_stats",
+        "\"fpu_push_count\":" + to_string(s[0])
+        + ",\"fpu_pop_count\":" + to_string(s[1])
+        + ",\"xmm_write_count\":" + to_string(s[2])
+        + ",\"mxcsr_count\":" + to_string(s[3])
+        + ",\"status_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_i386_fpu_sse FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pifs()
+    let s2 = pifs_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_fpu_sse FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_fpu_sse self_test PASS (fpu_push=" + to_string(s[0])
+        + ", fpu_pop=" + to_string(s[1]) + ", xmm_write=" + to_string(s[2])
+        + ", mxcsr=" + to_string(s[3]) + ", status=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pifs_stats()
+            println("fpu_push_count\t" + to_string(s[0]))
+            println("fpu_pop_count\t" + to_string(s[1]))
+            println("xmm_write_count\t" + to_string(s[2]))
+            println("mxcsr_count\t" + to_string(s[3]))
+            println("status_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pifs()
+            println("cleaned: " + pifs_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pifs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_fpu_sse.hexa { self-test | stats | cleanup | dir }")
+}

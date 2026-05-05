@@ -1,0 +1,429 @@
+// lib/loader/pe_pipe_named.hexa — cycle 73 Win32 named pipe → POSIX FIFO + AF_UNIX bridge skeleton
+//
+// Win32 CreateNamedPipe / ConnectNamedPipe / TransactNamedPipe / DisconnectNamedPipe
+// 호출을 POSIX FIFO + AF_UNIX socket 조합으로 대체. Battle.net agent IPC 가
+// named pipe 기반이므로 stage1 tracker 없이는 D2R / D4 cold launch 불가.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 op tracker — 실 mkfifo() / socket() 호출 X (stage6 native bridge).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// pipe_mode code (Win32 PIPE_TYPE_* + PIPE_READMODE_* 합성):
+//   1 = byte_message  (PIPE_TYPE_BYTE    | PIPE_READMODE_MESSAGE)
+//   2 = byte_byte     (PIPE_TYPE_BYTE    | PIPE_READMODE_BYTE)
+//   3 = message_byte  (PIPE_TYPE_MESSAGE | PIPE_READMODE_BYTE)
+//   4 = message_message (PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE)
+//
+// op_kind code:
+//   1 = create      (CreateNamedPipe)
+//   2 = connect     (ConnectNamedPipe)
+//   3 = transact    (TransactNamedPipe)
+//   4 = disconnect  (DisconnectNamedPipe)
+//
+// persist schema (TSV — ops.tsv):
+//   pipe_id<int> \t pipe_mode<int> \t op_kind<int> \t instance_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ppn_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_pipe_named"
+}
+
+fn ppn_ops_path() -> str {
+    return ppn_dir() + "/ops.tsv"
+}
+
+fn ppn_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ppn_dir() + "'")
+}
+
+fn cleanup_ppn() -> void {
+    ppn_ensure_dir()
+    let _ = exec("rm -f '" + ppn_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ppn_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ppn_append_row(path: str, row: str) -> void {
+    ppn_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: named pipe op 1 건 기록 ───
+fn record_op(pipe_id: int, pipe_mode: int, op_kind: int, instance_count: int) -> void {
+    if pipe_id <= 0 {
+        panic("pe_pipe_named FAIL [record_op] expected=pipe_id>0 got=" + to_string(pipe_id))
+    }
+    if pipe_mode < 1 {
+        panic("pe_pipe_named FAIL [record_op] expected=pipe_mode>=1 got=" + to_string(pipe_mode))
+    }
+    if pipe_mode > 4 {
+        panic("pe_pipe_named FAIL [record_op] expected=pipe_mode<=4 got=" + to_string(pipe_mode))
+    }
+    if op_kind < 1 {
+        panic("pe_pipe_named FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_pipe_named FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if instance_count < 0 {
+        panic("pe_pipe_named FAIL [record_op] expected=instance_count>=0 got=" + to_string(instance_count))
+    }
+    let row = to_string(pipe_id) + "\t" + to_string(pipe_mode)
+        + "\t" + to_string(op_kind) + "\t" + to_string(instance_count) + "\n"
+    ppn_append_row(ppn_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = ppn_read_table(ppn_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_instances: 모든 op instance_count 합 ───
+fn total_instances() -> int {
+    let t = ppn_read_table(ppn_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_pipe_mode: 특정 pipe_mode op 수 ───
+fn count_by_pipe_mode(pm: int) -> int {
+    let t = ppn_read_table(ppn_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == pm {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = ppn_read_table(ppn_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pipe_instance_count: 특정 pipe_id 의 마지막 instance_count (없으면 0) ───
+fn pipe_instance_count(pipe_id: int) -> int {
+    let t = ppn_read_table(ppn_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut last = 0
+    let mut found = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == pipe_id {
+                    last = to_int(parts[3])
+                    found = 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if found == 0 {
+        return 0
+    }
+    return last
+}
+
+// ─── ppn_stats: [op_count, total_instances, count_by_pipe_mode(2), count_by_op_kind(3)] ───
+fn ppn_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_instances())
+    out.push(count_by_pipe_mode(2))
+    out.push(count_by_op_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ppn-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ppn()
+
+    // 2. record 6 ops across ≥3 pipe_modes (1, 2, 3, 4)
+    //    pipe_id 901001 — bnet agent pipe (byte_byte)
+    //    pipe_id 901002 — bnet rpc pipe (message_message)
+    //    pipe_id 901003 — overlay pipe (byte_message)
+    record_op(901001, 2, 1, 1)  // create byte_byte agent
+    r0_emit("pe_pipe_named_record",
+        "\"pipe_id\":901001,\"pipe_mode\":2,\"op_kind\":1,\"instance_count\":1,\"target\":\"create_agent\"")
+
+    record_op(901001, 2, 2, 1)  // connect agent
+    r0_emit("pe_pipe_named_record",
+        "\"pipe_id\":901001,\"pipe_mode\":2,\"op_kind\":2,\"instance_count\":1,\"target\":\"connect_agent\"")
+
+    record_op(901002, 4, 1, 2)  // create message_message rpc, instance 2
+    r0_emit("pe_pipe_named_record",
+        "\"pipe_id\":901002,\"pipe_mode\":4,\"op_kind\":1,\"instance_count\":2,\"target\":\"create_rpc\"")
+
+    record_op(901002, 4, 3, 2)  // transact rpc
+    r0_emit("pe_pipe_named_record",
+        "\"pipe_id\":901002,\"pipe_mode\":4,\"op_kind\":3,\"instance_count\":2,\"target\":\"transact_rpc\"")
+
+    record_op(901003, 1, 1, 1)  // create byte_message overlay
+    r0_emit("pe_pipe_named_record",
+        "\"pipe_id\":901003,\"pipe_mode\":1,\"op_kind\":1,\"instance_count\":1,\"target\":\"create_overlay\"")
+
+    record_op(901001, 2, 4, 0)  // disconnect agent
+    r0_emit("pe_pipe_named_record",
+        "\"pipe_id\":901001,\"pipe_mode\":2,\"op_kind\":4,\"instance_count\":0,\"target\":\"disconnect_agent\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_pipe_named FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_instances = 1+1+2+2+1+0 = 7
+    let ti = total_instances()
+    if ti != 7 {
+        panic("pe_pipe_named FAIL [total_instances] expected=7 got=" + to_string(ti))
+    }
+
+    // 5. count_by_pipe_mode sanity
+    let m1 = count_by_pipe_mode(1)
+    if m1 != 1 {
+        panic("pe_pipe_named FAIL [count_by_pipe_mode(1)] expected=1 got=" + to_string(m1))
+    }
+    let m2 = count_by_pipe_mode(2)
+    if m2 != 3 {
+        panic("pe_pipe_named FAIL [count_by_pipe_mode(2)] expected=3 got=" + to_string(m2))
+    }
+    let m3 = count_by_pipe_mode(3)
+    if m3 != 0 {
+        panic("pe_pipe_named FAIL [count_by_pipe_mode(3)] expected=0 got=" + to_string(m3))
+    }
+    let m4 = count_by_pipe_mode(4)
+    if m4 != 2 {
+        panic("pe_pipe_named FAIL [count_by_pipe_mode(4)] expected=2 got=" + to_string(m4))
+    }
+    let m99 = count_by_pipe_mode(99)
+    if m99 != 0 {
+        panic("pe_pipe_named FAIL [count_by_pipe_mode(99)] expected=0 got=" + to_string(m99))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 3 {
+        panic("pe_pipe_named FAIL [count_by_op_kind(1)] expected=3 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_pipe_named FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_pipe_named FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_pipe_named FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+
+    // 7. pipe_instance_count sanity
+    let ic1 = pipe_instance_count(901001)
+    if ic1 != 0 {
+        panic("pe_pipe_named FAIL [pipe_instance_count(901001)] expected=0 got=" + to_string(ic1))
+    }
+    let ic2 = pipe_instance_count(901002)
+    if ic2 != 2 {
+        panic("pe_pipe_named FAIL [pipe_instance_count(901002)] expected=2 got=" + to_string(ic2))
+    }
+    let ic3 = pipe_instance_count(901003)
+    if ic3 != 1 {
+        panic("pe_pipe_named FAIL [pipe_instance_count(901003)] expected=1 got=" + to_string(ic3))
+    }
+    let ic_miss = pipe_instance_count(9999)
+    if ic_miss != 0 {
+        panic("pe_pipe_named FAIL [pipe_instance_count(9999)] expected=0 got=" + to_string(ic_miss))
+    }
+
+    // 8. ppn_stats() = [6, 7, 3, 1]
+    let s = ppn_stats()
+    if len(s) != 4 {
+        panic("pe_pipe_named FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_pipe_named FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 7 {
+        panic("pe_pipe_named FAIL [stats total_instances] expected=7 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_pipe_named FAIL [stats count_pipe_mode(2)] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_pipe_named FAIL [stats count_op_kind(3)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats (7th r0_emit)
+    r0_emit("pe_pipe_named_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_instances\":" + to_string(s[1])
+        + ",\"pipe_mode_byte_byte\":" + to_string(s[2])
+        + ",\"op_kind_transact\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_pipe_named FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_ppn()
+    let s2 = ppn_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_pipe_named FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_pipe_named self_test PASS (ops=" + to_string(s[0])
+        + ", instances=" + to_string(s[1]) + ", pipe_mode_byte_byte=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ppn_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_instances\t" + to_string(s[1]))
+            println("count_pipe_mode_byte_byte\t" + to_string(s[2]))
+            println("count_op_kind_transact\t" + to_string(s[3]))
+            return
+        }
+        if sub == "instances" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("pipe_instance_count\t" + to_string(pipe_instance_count(pid)))
+                return
+            }
+            println("usage: hexa run pe_pipe_named.hexa instances <pipe_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let axis = a[3]
+                let val = to_int(a[4])
+                if axis == "mode" {
+                    println("count_by_pipe_mode\t" + to_string(count_by_pipe_mode(val)))
+                    return
+                }
+                if axis == "op" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_pipe_named.hexa count { mode <pipe_mode> | op <op_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ppn()
+            println("cleaned: " + ppn_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ppn_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_pipe_named.hexa { self-test | stats | instances <pipe_id> | count mode <pipe_mode> | count op <op_kind> | cleanup | dir }")
+}

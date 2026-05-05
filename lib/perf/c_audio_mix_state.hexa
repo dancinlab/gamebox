@@ -1,0 +1,300 @@
+// lib/perf/c_audio_mix_state.hexa — CN-114 skeleton manjeom 15/15
+//
+// Phase 6 live tune — game audio bus mixing state tracker.
+// 5 bus (master/music/sfx/voice/ambience) 의 dB level + 시계열 샘플 collect →
+// 평균 / clipping count 분석. dB 0 (full-scale) 초과 = clipping 즉시 검출.
+//
+// 무엇:
+//   - 5 standard audio bus 정의 (master/music/sfx/voice/ambience).
+//   - record_level(bus, db, ts) — single sample append, columnar TSV.
+//   - avg_level(bus) — bus 별 평균 dB (정수 truncate).
+//   - clipping_count(bus) — db > 0 sample 수 (full-scale 초과 = clip).
+//   - record_count() — 전체 sample 수.
+//
+// 무기:
+//   columnar TSV (samples.tsv) — bus<TAB>db<TAB>ts. awk 1-pass 통계.
+//   동일 패턴: c_live_telemetry_pulse.hexa (TSV log + awk reduce).
+//
+// 효과:
+//   live tune 단계에서 mix 균형 검사. master/music 평균 비교, sfx clip 폭주
+//   검출. 5 bus × 시계열 → trend (volume drift) 추적 기반.
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X.
+//
+// own 2 mandate: r0_emit ≥ 4 (mix_recorded × 15 + mix_summary × 5 + mix_audit),
+// fn self_test() + main() dispatch, headless,
+// panic 형식 "c_audio_mix_state FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/audio_mix_state/samples.tsv
+let MIX_DIR = GAMEBOX_HOME + "/persist/audio_mix_state"
+let MIX_LOG = MIX_DIR + "/samples.tsv"
+
+fn mix_dir() -> str { return MIX_DIR }
+fn mix_log() -> str { return MIX_LOG }
+
+fn mix_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + MIX_DIR + "'")
+}
+
+// ─── buses() — canonical 5 bus list ───
+fn buses() -> array {
+    return ["master", "music", "sfx", "voice", "ambience"]
+}
+
+fn is_known_bus(name: str) -> bool {
+    let bs = buses()
+    let i = 0
+    while i < len(bs) {
+        if bs[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── record_level(bus, db, ts) ───
+//   single sample append. db 는 정수 dB (e.g. -30 = -30 dB, 0 = full scale,
+//   양수 = clipping). ts 는 unix sec.
+//   unknown bus → panic (mis-tag 즉시 검출).
+fn record_level(bus: str, db: int, ts: int) -> void {
+    if !is_known_bus(bus) {
+        panic("c_audio_mix_state FAIL [unknown bus] got=" + bus)
+    }
+    mix_ensure_dir()
+    let line = bus + "\t" + to_string(db) + "\t" + to_string(ts)
+    let tmp = MIX_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + MIX_LOG + "' && rm -f '" + tmp + "'")
+
+    r0_emit("mix_recorded",
+        "\"bus\":\"" + bus + "\",\"db\":" + to_string(db) + ",\"ts\":" + to_string(ts))
+}
+
+// ─── record_count() — 전체 sample 수 ───
+fn record_count() -> int {
+    let exists = exec("test -f '" + MIX_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let c = exec("wc -l < '" + MIX_LOG + "' | tr -d ' '").trim()
+    if c == "" { return 0 }
+    return to_int(c)
+}
+
+// ─── avg_level(bus) — bus 별 평균 dB (정수 truncate, sample 0 → 0) ───
+fn avg_level(bus: str) -> int {
+    if !is_known_bus(bus) {
+        panic("c_audio_mix_state FAIL [unknown bus avg] got=" + bus)
+    }
+    let exists = exec("test -f '" + MIX_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let cmd = "awk -F'\\t' -v b='" + bus
+        + "' '$1==b {s+=$2; n++} END{if(n>0){if(s>=0) print int(s/n); else print -int((-s+n-1)/n)} else print 0}' '"
+        + MIX_LOG + "'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── clipping_count(bus) — db > 0 sample (full-scale 초과 = clip) ───
+fn clipping_count(bus: str) -> int {
+    if !is_known_bus(bus) {
+        panic("c_audio_mix_state FAIL [unknown bus clip] got=" + bus)
+    }
+    let exists = exec("test -f '" + MIX_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let cmd = "awk -F'\\t' -v b='" + bus
+        + "' '$1==b && $2>0 {n++} END{print n+0}' '"
+        + MIX_LOG + "'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── bus_sample_count(bus) — 해당 bus 만 count (audit 용) ───
+fn bus_sample_count(bus: str) -> int {
+    if !is_known_bus(bus) {
+        panic("c_audio_mix_state FAIL [unknown bus count] got=" + bus)
+    }
+    let exists = exec("test -f '" + MIX_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let cmd = "awk -F'\\t' -v b='" + bus
+        + "' '$1==b {n++} END{print n+0}' '" + MIX_LOG + "'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn cleanup_mix() -> void {
+    let _ = exec("rm -rf '" + MIX_DIR + "'")
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "cmix-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_mix()
+
+    // 5 bus × 3 sample 합성 — bus 별 dB 시계열.
+    //   master:  -6, -6, -6   → avg -6,  clip 0
+    //   music:   -12, -10, -8 → avg -10, clip 0
+    //   sfx:     -3, -3,  3   → avg -1   (sum=-3, n=3, -1), clip 1 (db=3>0)
+    //   voice:   -20, -18, -16→ avg -18, clip 0
+    //   ambience:-30, -30, -30→ avg -30, clip 0
+    //
+    // total: 15 sample, clipping 총 1 (sfx).
+    let bs = buses()
+    if len(bs) != 5 {
+        panic("c_audio_mix_state FAIL [buses count] expected=5 got=" + to_string(len(bs)))
+    }
+    if bs[0] != "master"   { panic("c_audio_mix_state FAIL [bus0] expected=master got=" + bs[0]) }
+    if bs[1] != "music"    { panic("c_audio_mix_state FAIL [bus1] expected=music got=" + bs[1]) }
+    if bs[2] != "sfx"      { panic("c_audio_mix_state FAIL [bus2] expected=sfx got=" + bs[2]) }
+    if bs[3] != "voice"    { panic("c_audio_mix_state FAIL [bus3] expected=voice got=" + bs[3]) }
+    if bs[4] != "ambience" { panic("c_audio_mix_state FAIL [bus4] expected=ambience got=" + bs[4]) }
+
+    // synthetic timeline t=1000..1014 (15 sec)
+    record_level("master", -6, 1000)
+    record_level("master", -6, 1001)
+    record_level("master", -6, 1002)
+
+    record_level("music", -12, 1003)
+    record_level("music", -10, 1004)
+    record_level("music", -8,  1005)
+
+    record_level("sfx", -3, 1006)
+    record_level("sfx", -3, 1007)
+    record_level("sfx",  3, 1008)   // clipping sample
+
+    record_level("voice", -20, 1009)
+    record_level("voice", -18, 1010)
+    record_level("voice", -16, 1011)
+
+    record_level("ambience", -30, 1012)
+    record_level("ambience", -30, 1013)
+    record_level("ambience", -30, 1014)
+
+    // 1. record_count == 15
+    let total = record_count()
+    if total != 15 {
+        panic("c_audio_mix_state FAIL [record_count] expected=15 got=" + to_string(total))
+    }
+
+    // 2. bus_sample_count per bus == 3
+    let i = 0
+    while i < len(bs) {
+        let c = bus_sample_count(bs[i])
+        if c != 3 {
+            panic("c_audio_mix_state FAIL [bus count " + bs[i] + "] expected=3 got=" + to_string(c))
+        }
+        i = i + 1
+    }
+
+    // 3. avg_level checks
+    let av_m = avg_level("master")
+    if av_m != -6 {
+        panic("c_audio_mix_state FAIL [avg master] expected=-6 got=" + to_string(av_m))
+    }
+    let av_mu = avg_level("music")
+    if av_mu != -10 {
+        panic("c_audio_mix_state FAIL [avg music] expected=-10 got=" + to_string(av_mu))
+    }
+    let av_s = avg_level("sfx")
+    // sum = -3 + -3 + 3 = -3, n=3, avg = -1 (truncate toward zero or ceil-toward-zero)
+    if av_s != -1 {
+        panic("c_audio_mix_state FAIL [avg sfx] expected=-1 got=" + to_string(av_s))
+    }
+    let av_v = avg_level("voice")
+    if av_v != -18 {
+        panic("c_audio_mix_state FAIL [avg voice] expected=-18 got=" + to_string(av_v))
+    }
+    let av_a = avg_level("ambience")
+    if av_a != -30 {
+        panic("c_audio_mix_state FAIL [avg ambience] expected=-30 got=" + to_string(av_a))
+    }
+
+    // 4. clipping_count — sfx 만 1, 나머지 0
+    if clipping_count("master")   != 0 { panic("c_audio_mix_state FAIL [clip master]") }
+    if clipping_count("music")    != 0 { panic("c_audio_mix_state FAIL [clip music]") }
+    let cs = clipping_count("sfx")
+    if cs != 1 {
+        panic("c_audio_mix_state FAIL [clip sfx] expected=1 got=" + to_string(cs))
+    }
+    if clipping_count("voice")    != 0 { panic("c_audio_mix_state FAIL [clip voice]") }
+    if clipping_count("ambience") != 0 { panic("c_audio_mix_state FAIL [clip ambience]") }
+
+    // 5. summary emit per bus (5)
+    let j = 0
+    while j < len(bs) {
+        let b = bs[j]
+        r0_emit("mix_summary",
+            "\"bus\":\"" + b + "\",\"avg_db\":" + to_string(avg_level(b))
+            + ",\"clip\":" + to_string(clipping_count(b))
+            + ",\"n\":" + to_string(bus_sample_count(b)))
+        j = j + 1
+    }
+
+    // 6. audit emit (overall)
+    r0_emit("mix_audit",
+        "\"total\":" + to_string(total) + ",\"clip_total\":1,\"buses\":5")
+
+    // emit count 검증:
+    //   15 mix_recorded + 5 mix_summary + 1 mix_audit = 21 (≥ 4)
+    let cnt = r0_session_count(sid)
+    if cnt < 4 {
+        panic("c_audio_mix_state FAIL [emit count] expected>=4 got=" + to_string(cnt))
+    }
+
+    cleanup_mix()
+
+    println("  ✅ c_audio_mix_state self_test PASS (15 samples, 5 buses, sfx clip=1, emits="
+        + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "buses" {
+            let bs = buses()
+            let i = 0
+            while i < len(bs) {
+                println(bs[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "record" {
+            // record <bus> <db> <ts>
+            if len(a) >= 6 {
+                record_level(a[3], to_int(a[4]), to_int(a[5]))
+                println("recorded: bus=" + a[3] + " db=" + a[4] + " ts=" + a[5])
+                return
+            }
+        }
+        if sub == "avg" {
+            // avg <bus>
+            if len(a) >= 4 {
+                println(to_string(avg_level(a[3])))
+                return
+            }
+        }
+        if sub == "clip" {
+            // clip <bus>
+            if len(a) >= 4 {
+                println(to_string(clipping_count(a[3])))
+                return
+            }
+        }
+        if sub == "count" {
+            println(to_string(record_count()))
+            return
+        }
+        if sub == "mix-dir"  { println(mix_dir()); return }
+        if sub == "mix-log"  { println(mix_log()); return }
+        if sub == "cleanup"  { cleanup_mix(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_audio_mix_state.hexa { self-test | buses | record <bus> <db> <ts> | avg <bus> | clip <bus> | count | mix-dir | mix-log | cleanup }")
+}

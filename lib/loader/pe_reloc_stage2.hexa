@@ -1,0 +1,307 @@
+// lib/loader/pe_reloc_stage2.hexa — stage2 base relocation skeleton
+//
+// PE 의 .reloc section 을 walk + delta (actual_base - preferred_base)
+// 반영해서 absolute address 들을 fixup. 본 파일은 instrumentation —
+// 실 fixup 은 stage3.
+//
+// own 1: only `use "../perf/r0_common"` (POSIX equivalent — Wine 0 줄).
+//   참조 only — Microsoft PE/COFF spec (Base Relocation Table, DataDir[5]).
+// own 2 mandate:
+//   - r0_emit ≥ 4
+//     (실제: prs_record × 3 + prs_stats = 4)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_reloc_stage2 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — PE base relocations instrumentation):
+//   stage1 = pe_relocations.hexa 가 .reloc section parser.
+//   stage2 = 적용 결과 ledger (record_reloc / stats / per-pe count).
+//   stage3 = 실 page 단위 fixup write-back (별도 file).
+//
+// Persist layout (TSV, single file):
+//   $GAMEBOX_HOME/persist/pe_reloc_stage2/reloc_log.tsv
+//     pe_id<int> \t reloc_count<int> \t delta_bytes<int> \t applied<int>
+//
+//   delta_bytes = actual_base - preferred_base.
+//   applied = reloc_count 와 동일 일반 (모두 적용); skipped = reloc_count - applied.
+//
+// 예약어 회피: type/mod/resume/handle 미사용.
+
+use "../perf/r0_common"
+
+// ─── persist dir / file path ───
+fn prs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_reloc_stage2"
+}
+
+fn prs_log_path() -> str {
+    return prs_dir() + "/reloc_log.tsv"
+}
+
+fn ensure_prs_dir() -> void {
+    let _ = exec("mkdir -p '" + prs_dir() + "'")
+}
+
+// ─── cleanup: log file 제거 ───
+fn cleanup_prs() -> void {
+    ensure_prs_dir()
+    let _ = exec("rm -f '" + prs_log_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prs_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prs_append_row(path: str, row: str) -> void {
+    ensure_prs_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_reloc: 한 PE 의 reloc 적용 결과 1 row 추가 ───
+//   pe_id        — synthetic PE 식별자 (74xxx).
+//   reloc_count  — .reloc 안 entry 수.
+//   delta_bytes  — actual_base - preferred_base (0 이면 적용 불필요).
+//   applied      — 실제 적용된 reloc 수 (= reloc_count if all applied).
+fn record_reloc(pe_id: int, reloc_count: int, delta_bytes: int, applied: int) -> void {
+    let row = to_string(pe_id) + "\t" + to_string(reloc_count)
+        + "\t" + to_string(delta_bytes) + "\t" + to_string(applied) + "\n"
+    prs_append_row(prs_log_path(), row)
+}
+
+// ─── reloc_count: reloc_log.tsv 의 row 수 (= record_reloc 호출 수) ───
+fn reloc_count() -> int {
+    let t = prs_read_table(prs_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total_relocs: 모든 row 의 reloc_count 합 ───
+fn total_relocs() -> int {
+    let t = prs_read_table(prs_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_applied: 모든 row 의 applied 합 ───
+fn total_applied() -> int {
+    let t = prs_read_table(prs_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── pe_reloc_count(pe_id): 특정 pe_id 의 reloc_count (없으면 0) ───
+fn pe_reloc_count(pe_id: int) -> int {
+    let t = prs_read_table(prs_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let key = to_string(pe_id)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── prs_stats: [reloc_count_recs, total_relocs, total_applied, total_relocs - total_applied] ───
+fn prs_stats() -> array {
+    let mut out = []
+    let recs = reloc_count()
+    let tot = total_relocs()
+    let app = total_applied()
+    out.push(recs)
+    out.push(tot)
+    out.push(app)
+    out.push(tot - app)
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "prs2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prs()
+    if reloc_count() != 0 {
+        panic("pe_reloc_stage2 FAIL [cleanup] expected=0 got=" + to_string(reloc_count()))
+    }
+
+    // 2. 합성 3 PE — Battle.net Setup / D2R / D4
+    record_reloc(74001, 1200, 0, 1200)
+    r0_emit("prs_record",
+        "\"pe_id\":74001,\"reloc_count\":1200,\"delta_bytes\":0,\"applied\":1200")
+
+    record_reloc(74002, 800, 65536, 800)
+    r0_emit("prs_record",
+        "\"pe_id\":74002,\"reloc_count\":800,\"delta_bytes\":65536,\"applied\":800")
+
+    record_reloc(74003, 2400, 1048576, 2400)
+    r0_emit("prs_record",
+        "\"pe_id\":74003,\"reloc_count\":2400,\"delta_bytes\":1048576,\"applied\":2400")
+
+    // 3. reloc_count = 3
+    let rc = reloc_count()
+    if rc != 3 {
+        panic("pe_reloc_stage2 FAIL [reloc_count] expected=3 got=" + to_string(rc))
+    }
+
+    // 4. total_relocs = 1200 + 800 + 2400 = 4400
+    let tot = total_relocs()
+    if tot != 4400 {
+        panic("pe_reloc_stage2 FAIL [total_relocs] expected=4400 got=" + to_string(tot))
+    }
+
+    // 5. total_applied = 4400
+    let app = total_applied()
+    if app != 4400 {
+        panic("pe_reloc_stage2 FAIL [total_applied] expected=4400 got=" + to_string(app))
+    }
+
+    // 6. pe_reloc_count per id
+    let c1 = pe_reloc_count(74001)
+    if c1 != 1200 {
+        panic("pe_reloc_stage2 FAIL [pe_reloc_count 74001] expected=1200 got=" + to_string(c1))
+    }
+    let c2 = pe_reloc_count(74002)
+    if c2 != 800 {
+        panic("pe_reloc_stage2 FAIL [pe_reloc_count 74002] expected=800 got=" + to_string(c2))
+    }
+    let c3 = pe_reloc_count(74003)
+    if c3 != 2400 {
+        panic("pe_reloc_stage2 FAIL [pe_reloc_count 74003] expected=2400 got=" + to_string(c3))
+    }
+    let c0 = pe_reloc_count(9999)
+    if c0 != 0 {
+        panic("pe_reloc_stage2 FAIL [pe_reloc_count 9999] expected=0 got=" + to_string(c0))
+    }
+
+    // 7. prs_stats = [3, 4400, 4400, 0]
+    let s = prs_stats()
+    if len(s) != 4 {
+        panic("pe_reloc_stage2 FAIL [prs_stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_reloc_stage2 FAIL [prs_stats[0]] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 4400 {
+        panic("pe_reloc_stage2 FAIL [prs_stats[1]] expected=4400 got=" + to_string(s[1]))
+    }
+    if s[2] != 4400 {
+        panic("pe_reloc_stage2 FAIL [prs_stats[2]] expected=4400 got=" + to_string(s[2]))
+    }
+    if s[3] != 0 {
+        panic("pe_reloc_stage2 FAIL [prs_stats[3]] expected=0 got=" + to_string(s[3]))
+    }
+
+    // 8. emit prs_stats
+    r0_emit("prs_stats",
+        "\"recs\":" + to_string(s[0])
+        + ",\"total_relocs\":" + to_string(s[1])
+        + ",\"total_applied\":" + to_string(s[2])
+        + ",\"skipped\":" + to_string(s[3]))
+
+    // 9. r0 emit count >= 4
+    let emit_n = r0_session_count(sid)
+    if emit_n < 4 {
+        panic("pe_reloc_stage2 FAIL [r0 emit count] expected=>=4 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ pe_reloc_stage2 self_test PASS (" + to_string(s[0])
+        + " PEs, " + to_string(s[1]) + " total relocs, "
+        + to_string(s[2]) + " applied, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prs_stats()
+            println("recs\t" + to_string(s[0]))
+            println("total_relocs\t" + to_string(s[1]))
+            println("total_applied\t" + to_string(s[2]))
+            println("skipped\t" + to_string(s[3]))
+            return
+        }
+        if sub == "reloc" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println(to_string(pe_reloc_count(pid)))
+                return
+            }
+        }
+        if sub == "cleanup" {
+            cleanup_prs()
+            println("cleaned: " + prs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_reloc_stage2.hexa { self-test | stats | reloc <pe_id> | cleanup }")
+}

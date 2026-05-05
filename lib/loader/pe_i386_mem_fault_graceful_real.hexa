@@ -1,0 +1,565 @@
+// lib/loader/pe_i386_mem_fault_graceful_real.hexa — i386 PE shim mem_fault graceful skip tracker
+//
+// Phase 16 (shim memory access — mem_read / mem_write 인터프리터 hook) 가 인터프리터
+// 가 디코드한 i386 instruction 의 effective address 가 우리 shim 의 등록된 region
+// (.text / .rdata / .data / .bss / TEB / PEB / 임의 mmap region) 어디에도 속하지
+// 않을 때 (region miss) 다음 graceful 정책을 적용한다:
+//
+//   - read  (op_kind 0) → zero return       (action_kind 0 = zero_read)
+//   - write (op_kind 1) → no-op 무시          (action_kind 1 = noop_write)
+//   - 특정 address pattern (예: 0xFF000000~ 의 fake TLS / FS-base extension) →
+//     해당 region 을 zero-filled 로 lazily extend (action_kind 2 = fake_region_extend)
+//   - exec  (op_kind 2) — code fetch fault 는 graceful skip 불가 → halt
+//                                              (action_kind 3 = halt)
+//
+// 본 hexa module 은 phase 16 의 graceful 결정을 기록하는 instrumentation tracker.
+// 실제 shim 의 mem_read / mem_write 는 native side (pe_to_macho_shim.cpp) 에서 결정하고
+// 결과만 record_*() API 로 hexa 측 persist 에 흘려 보낸다 — Hexa pure module + Apple
+// SDK 호출 X.
+//
+// 정책 임계값 (policy_decision):
+//   - threshold_kind 0 = under_max  → graceful skip 횟수 가 모듈 max 이하 → decision 0 = skip
+//   - threshold_kind 1 = over_max   → graceful skip 횟수 가 모듈 max 초과 → decision 1 = halt
+//
+// own 1 enforcement: Wine / CrossOver / Box86 / GPTK / Whisky / Hangover / FEX / community 0 줄.
+//   - Wine wine/dlls/ntdll/unix/virtual.c 인용 X
+//   - Box86 dynarec_arm64_helper.c (signal handler 기반 region miss) 인용 X
+//   - QEMU softmmu/cputlb.c 인용 X
+//   - Microsoft 공식 docs (Windows Internals / PE/COFF spec / Intel SDM Vol 3 §5 Page Fault)
+//     자체 구현만 OK
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종 — fault.tsv + graceful_action.tsv + recovery.tsv +
+//                              region_extend.tsv + policy.tsv):
+//   fault.tsv          : fault_id<int>     \t va<int>          \t op_kind<int>        \t size_bytes<int>
+//   graceful_action.tsv: action_id<int>    \t fault_id<int>    \t action_kind<int>
+//   recovery.tsv       : recovery_id<int>  \t fault_id<int>    \t instructions_continued<int> \t halted<int>
+//   region_extend.tsv  : extend_id<int>    \t va_start<int>    \t length<int>         \t reason<str>
+//   policy.tsv         : policy_id<int>    \t fault_id<int>    \t threshold_kind<int> \t decision<int>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지.
+//   식별자: fault_id / va / op_kind / size_bytes
+//           action_id / action_kind
+//           recovery_id / instructions_continued / halted
+//           extend_id / va_start / length / reason
+//           policy_id / threshold_kind / decision
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmfg_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_mem_fault_graceful_real"
+}
+
+fn pmfg_fault_path() -> str {
+    return pmfg_dir() + "/fault.tsv"
+}
+
+fn pmfg_action_path() -> str {
+    return pmfg_dir() + "/graceful_action.tsv"
+}
+
+fn pmfg_recovery_path() -> str {
+    return pmfg_dir() + "/recovery.tsv"
+}
+
+fn pmfg_extend_path() -> str {
+    return pmfg_dir() + "/region_extend.tsv"
+}
+
+fn pmfg_policy_path() -> str {
+    return pmfg_dir() + "/policy.tsv"
+}
+
+fn pmfg_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmfg_dir() + "'")
+}
+
+fn cleanup_pmfg() -> void {
+    pmfg_ensure_dir()
+    let _ = exec("rm -f '" + pmfg_fault_path()
+        + "' '" + pmfg_action_path()
+        + "' '" + pmfg_recovery_path()
+        + "' '" + pmfg_extend_path()
+        + "' '" + pmfg_policy_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmfg_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmfg_append_row(path: str, row: str) -> void {
+    pmfg_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int (lowercase or uppercase, no 0x prefix) ───
+fn pmfg_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_i386_mem_fault_graceful_real FAIL [pmfg_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── op_kind_name: 0/1/2 → read/write/exec ───
+fn op_kind_name(k: int) -> str {
+    if k == 0 { return "read"  }
+    if k == 1 { return "write" }
+    if k == 2 { return "exec"  }
+    return ""
+}
+
+// ─── action_kind_name: 0..3 → zero_read / noop_write / fake_region_extend / halt ───
+fn action_kind_name(k: int) -> str {
+    if k == 0 { return "zero_read"           }
+    if k == 1 { return "noop_write"          }
+    if k == 2 { return "fake_region_extend"  }
+    if k == 3 { return "halt"                }
+    return ""
+}
+
+// ─── record_fault: shim 의 region miss 발생 ───
+//   op_kind 0 = read / 1 = write / 2 = exec
+fn record_fault(fault_id: int, va_hex: str, op_kind: int, size_bytes: int) -> void {
+    if fault_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_fault] expected=fault_id>0 got=" + to_string(fault_id))
+    }
+    let va = pmfg_hex_to_int(va_hex)
+    if va < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_fault] expected=va>=0 got=" + to_string(va))
+    }
+    if op_kind < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_fault] expected=op_kind>=0 got=" + to_string(op_kind))
+    }
+    if op_kind > 2 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_fault] expected=op_kind<=2 got=" + to_string(op_kind))
+    }
+    if size_bytes <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_fault] expected=size_bytes>0 got=" + to_string(size_bytes))
+    }
+    if size_bytes > 16 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_fault] expected=size_bytes<=16 got=" + to_string(size_bytes))
+    }
+    let row = to_string(fault_id) + "\t" + to_string(va) + "\t"
+        + to_string(op_kind) + "\t" + to_string(size_bytes) + "\n"
+    pmfg_append_row(pmfg_fault_path(), row)
+}
+
+// ─── record_graceful_action: graceful 정책 결정 결과 ───
+//   action_kind 0 = zero_read / 1 = noop_write / 2 = fake_region_extend / 3 = halt
+fn record_graceful_action(action_id: int, fault_id: int, action_kind: int) -> void {
+    if action_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_graceful_action] expected=action_id>0 got=" + to_string(action_id))
+    }
+    if fault_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_graceful_action] expected=fault_id>0 got=" + to_string(fault_id))
+    }
+    if action_kind < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_graceful_action] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 3 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_graceful_action] expected=action_kind<=3 got=" + to_string(action_kind))
+    }
+    let row = to_string(action_id) + "\t" + to_string(fault_id) + "\t"
+        + to_string(action_kind) + "\n"
+    pmfg_append_row(pmfg_action_path(), row)
+}
+
+// ─── record_recovery: graceful skip 후 인터프리터 진행 결과 ───
+//   instructions_continued = 다음 halt 까지 진행한 instruction 수 (0 면 skip 즉시 중단)
+//   halted 0 = 계속 진행 / 1 = halt
+fn record_recovery(recovery_id: int, fault_id: int, instructions_continued: int, halted: int) -> void {
+    if recovery_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_recovery] expected=recovery_id>0 got=" + to_string(recovery_id))
+    }
+    if fault_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_recovery] expected=fault_id>0 got=" + to_string(fault_id))
+    }
+    if instructions_continued < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_recovery] expected=instructions_continued>=0 got=" + to_string(instructions_continued))
+    }
+    if halted < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_recovery] expected=halted>=0 got=" + to_string(halted))
+    }
+    if halted > 1 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_recovery] expected=halted<=1 got=" + to_string(halted))
+    }
+    let row = to_string(recovery_id) + "\t" + to_string(fault_id) + "\t"
+        + to_string(instructions_continued) + "\t" + to_string(halted) + "\n"
+    pmfg_append_row(pmfg_recovery_path(), row)
+}
+
+// ─── record_region_extend: fake_region_extend 시 lazy zero-fill region 등록 ───
+fn record_region_extend(extend_id: int, va_start_hex: str, length: int, reason: str) -> void {
+    if extend_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_region_extend] expected=extend_id>0 got=" + to_string(extend_id))
+    }
+    let va_start = pmfg_hex_to_int(va_start_hex)
+    if va_start < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_region_extend] expected=va_start>=0 got=" + to_string(va_start))
+    }
+    if length <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_region_extend] expected=length>0 got=" + to_string(length))
+    }
+    if reason == "" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_region_extend] expected=reason!=empty got=empty")
+    }
+    let row = to_string(extend_id) + "\t" + to_string(va_start) + "\t"
+        + to_string(length) + "\t" + reason + "\n"
+    pmfg_append_row(pmfg_extend_path(), row)
+}
+
+// ─── record_policy_decision: under_max / over_max 임계값 기반 skip / halt 결정 ───
+//   threshold_kind 0 = under_max  → decision 0 = skip
+//   threshold_kind 1 = over_max   → decision 1 = halt
+fn record_policy_decision(policy_id: int, fault_id: int, threshold_kind: int, decision: int) -> void {
+    if policy_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_policy_decision] expected=policy_id>0 got=" + to_string(policy_id))
+    }
+    if fault_id <= 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_policy_decision] expected=fault_id>0 got=" + to_string(fault_id))
+    }
+    if threshold_kind < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_policy_decision] expected=threshold_kind>=0 got=" + to_string(threshold_kind))
+    }
+    if threshold_kind > 1 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_policy_decision] expected=threshold_kind<=1 got=" + to_string(threshold_kind))
+    }
+    if decision < 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_policy_decision] expected=decision>=0 got=" + to_string(decision))
+    }
+    if decision > 1 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [record_policy_decision] expected=decision<=1 got=" + to_string(decision))
+    }
+    let row = to_string(policy_id) + "\t" + to_string(fault_id) + "\t"
+        + to_string(threshold_kind) + "\t" + to_string(decision) + "\n"
+    pmfg_append_row(pmfg_policy_path(), row)
+}
+
+// ─── 통계 헬퍼 ───
+fn pmfg_count_rows(path: str, min_cols: int) -> int {
+    let t = pmfg_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn fault_count() -> int {
+    return pmfg_count_rows(pmfg_fault_path(), 4)
+}
+
+fn graceful_action_count() -> int {
+    return pmfg_count_rows(pmfg_action_path(), 3)
+}
+
+fn recovery_count() -> int {
+    return pmfg_count_rows(pmfg_recovery_path(), 4)
+}
+
+fn region_extend_count() -> int {
+    return pmfg_count_rows(pmfg_extend_path(), 4)
+}
+
+fn policy_count() -> int {
+    return pmfg_count_rows(pmfg_policy_path(), 4)
+}
+
+// ─── pmfg_stats: [fault, graceful_action, recovery, region_extend, policy] ───
+fn pmfg_stats() -> array {
+    let mut out = []
+    out.push(fault_count())
+    out.push(graceful_action_count())
+    out.push(recovery_count())
+    out.push(region_extend_count())
+    out.push(policy_count())
+    return out
+}
+
+// ─── self_test (≥ 12 record + ≥ 14 r0 emit) ───
+fn self_test() -> void {
+    let sid = "pmfg-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmfg()
+
+    // 2. record_fault 4종
+    //    fault_id=1: read at 0xFF8BC301 size=4 (TEB FS:[0x18] beyond TEB region)
+    //    fault_id=2: write at 0x0 size=4 (NULL deref by uninit pointer)
+    //    fault_id=3: read at 0x80000000 size=1 (high userland memory unmapped)
+    //    fault_id=4: read at 0xC0000000 size=4 (kernel space — never mapped in user)
+    record_fault(1, "FF8BC301", 0, 4)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_fault",
+        "\"fault_id\":1,\"va\":\"0xFF8BC301\",\"op_kind\":0,\"op_name\":\"read\",\"size_bytes\":4")
+
+    record_fault(2, "0", 1, 4)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_fault",
+        "\"fault_id\":2,\"va\":\"0x0\",\"op_kind\":1,\"op_name\":\"write\",\"size_bytes\":4")
+
+    record_fault(3, "80000000", 0, 1)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_fault",
+        "\"fault_id\":3,\"va\":\"0x80000000\",\"op_kind\":0,\"op_name\":\"read\",\"size_bytes\":1")
+
+    record_fault(4, "C0000000", 0, 4)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_fault",
+        "\"fault_id\":4,\"va\":\"0xC0000000\",\"op_kind\":0,\"op_name\":\"read\",\"size_bytes\":4")
+
+    // 3. record_graceful_action 4종
+    //    action_id=1 → fault_id=1 zero_read
+    //    action_id=2 → fault_id=3 zero_read
+    //    action_id=3 → fault_id=1 fake_region_extend (FS-base extension at 0xFF000000)
+    //                  (동일 fault 에 대해 zero_read fallback 후 fake region 등록)
+    //    action_id=4 → fault_id=4 halt (kernel space — graceful skip 불가)
+    record_graceful_action(1, 1, 0)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_graceful_action",
+        "\"action_id\":1,\"fault_id\":1,\"action_kind\":0,\"action_name\":\"zero_read\"")
+
+    record_graceful_action(2, 3, 0)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_graceful_action",
+        "\"action_id\":2,\"fault_id\":3,\"action_kind\":0,\"action_name\":\"zero_read\"")
+
+    record_graceful_action(3, 1, 2)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_graceful_action",
+        "\"action_id\":3,\"fault_id\":1,\"action_kind\":2,\"action_name\":\"fake_region_extend\"")
+
+    record_graceful_action(4, 4, 3)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_graceful_action",
+        "\"action_id\":4,\"fault_id\":4,\"action_kind\":3,\"action_name\":\"halt\"")
+
+    // 4. record_recovery 3종
+    //    recovery_id=1 → fault_id=1 instructions_continued=10 halted=0 (skip 후 정상 진행)
+    //    recovery_id=2 → fault_id=3 instructions_continued=15 halted=0
+    //    recovery_id=3 → fault_id=4 instructions_continued=0  halted=1 (halt 즉시 중단)
+    record_recovery(1, 1, 10, 0)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_recovery",
+        "\"recovery_id\":1,\"fault_id\":1,\"instructions_continued\":10,\"halted\":0")
+
+    record_recovery(2, 3, 15, 0)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_recovery",
+        "\"recovery_id\":2,\"fault_id\":3,\"instructions_continued\":15,\"halted\":0")
+
+    record_recovery(3, 4, 0, 1)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_recovery",
+        "\"recovery_id\":3,\"fault_id\":4,\"instructions_continued\":0,\"halted\":1")
+
+    // 5. record_region_extend 1종
+    //    extend_id=1 → va_start=0xFF000000 length=0x10000 reason=fake_fs_base
+    record_region_extend(1, "FF000000", 65536, "fake_fs_base")
+    r0_emit("pe_i386_mem_fault_graceful_real_record_region_extend",
+        "\"extend_id\":1,\"va_start\":\"0xFF000000\",\"length\":65536,\"reason\":\"fake_fs_base\"")
+
+    // 6. record_policy_decision 2종
+    //    policy_id=1 → fault_id=1 under_max → skip
+    //    policy_id=2 → fault_id=4 over_max  → halt
+    record_policy_decision(1, 1, 0, 0)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_policy_decision",
+        "\"policy_id\":1,\"fault_id\":1,\"threshold_kind\":0,\"threshold_name\":\"under_max\",\"decision\":0,\"decision_name\":\"skip\"")
+
+    record_policy_decision(2, 4, 1, 1)
+    r0_emit("pe_i386_mem_fault_graceful_real_record_policy_decision",
+        "\"policy_id\":2,\"fault_id\":4,\"threshold_kind\":1,\"threshold_name\":\"over_max\",\"decision\":1,\"decision_name\":\"halt\"")
+
+    // 7. assertion: fault_count == 4
+    let fc = fault_count()
+    if fc != 4 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [fault_count] expected=4 got=" + to_string(fc))
+    }
+
+    // 8. assertion: graceful_action_count == 4
+    let ac = graceful_action_count()
+    if ac != 4 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [graceful_action_count] expected=4 got=" + to_string(ac))
+    }
+
+    // 9. assertion: recovery_count == 3
+    let rc = recovery_count()
+    if rc != 3 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [recovery_count] expected=3 got=" + to_string(rc))
+    }
+
+    // 10. assertion: region_extend_count == 1
+    let ec = region_extend_count()
+    if ec != 1 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [region_extend_count] expected=1 got=" + to_string(ec))
+    }
+
+    // 11. assertion: policy_count == 2
+    let pc = policy_count()
+    if pc != 2 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [policy_count] expected=2 got=" + to_string(pc))
+    }
+
+    // 12. op_kind_name sanity (0..2 + invalid)
+    if op_kind_name(0) != "read" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [op_kind_name(0)] expected=read got=" + op_kind_name(0))
+    }
+    if op_kind_name(1) != "write" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [op_kind_name(1)] expected=write got=" + op_kind_name(1))
+    }
+    if op_kind_name(2) != "exec" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [op_kind_name(2)] expected=exec got=" + op_kind_name(2))
+    }
+    if op_kind_name(3) != "" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [op_kind_name(3)] expected=empty got=" + op_kind_name(3))
+    }
+
+    // 13. action_kind_name sanity (0..3 + invalid)
+    if action_kind_name(0) != "zero_read" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [action_kind_name(0)] expected=zero_read got=" + action_kind_name(0))
+    }
+    if action_kind_name(1) != "noop_write" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [action_kind_name(1)] expected=noop_write got=" + action_kind_name(1))
+    }
+    if action_kind_name(2) != "fake_region_extend" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [action_kind_name(2)] expected=fake_region_extend got=" + action_kind_name(2))
+    }
+    if action_kind_name(3) != "halt" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [action_kind_name(3)] expected=halt got=" + action_kind_name(3))
+    }
+    if action_kind_name(4) != "" {
+        panic("pe_i386_mem_fault_graceful_real FAIL [action_kind_name(4)] expected=empty got=" + action_kind_name(4))
+    }
+
+    // 14. hex parser sanity
+    let h_ff = pmfg_hex_to_int("FF000000")
+    if h_ff != 4278190080 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [pmfg_hex_to_int(FF000000)] expected=4278190080 got=" + to_string(h_ff))
+    }
+    let h_zero = pmfg_hex_to_int("0")
+    if h_zero != 0 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [pmfg_hex_to_int(0)] expected=0 got=" + to_string(h_zero))
+    }
+
+    // 15. pmfg_stats() = [4, 4, 3, 1, 2]
+    let s = pmfg_stats()
+    if len(s) != 5 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [stats fault_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [stats graceful_action_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [stats recovery_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [stats region_extend_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [stats policy_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 16. emit stats summary
+    r0_emit("pe_i386_mem_fault_graceful_real_stats",
+        "\"fault_count\":" + to_string(s[0])
+        + ",\"graceful_action_count\":" + to_string(s[1])
+        + ",\"recovery_count\":" + to_string(s[2])
+        + ",\"region_extend_count\":" + to_string(s[3])
+        + ",\"policy_count\":" + to_string(s[4]))
+
+    // 17. r0 emit count assertion (≥ 14)
+    //     실제 emit: 4 fault + 4 action + 3 recovery + 1 extend + 2 policy + 1 stats = 15
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_mem_fault_graceful_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 18. cleanup → stats 모두 0
+    cleanup_pmfg()
+    let s2 = pmfg_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_mem_fault_graceful_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_mem_fault_graceful_real self_test PASS (fault=" + to_string(s[0])
+        + ", action=" + to_string(s[1]) + ", recovery=" + to_string(s[2])
+        + ", extend=" + to_string(s[3]) + ", policy=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmfg_stats()
+            println("fault_count\t" + to_string(s[0]))
+            println("graceful_action_count\t" + to_string(s[1]))
+            println("recovery_count\t" + to_string(s[2]))
+            println("region_extend_count\t" + to_string(s[3]))
+            println("policy_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmfg()
+            println("cleaned: " + pmfg_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmfg_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_mem_fault_graceful_real.hexa { self-test | stats | cleanup | dir }")
+}

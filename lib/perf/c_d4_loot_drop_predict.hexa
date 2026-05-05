@@ -1,0 +1,177 @@
+// lib/perf/c_d4_loot_drop_predict.hexa — CN-76 skeleton manjeom 15/15
+//
+// D4 loot drop prediction — Phase 5 gameplay loop preparation.
+// monster_level + magic_find → drop tier 분포 (common/magic/rare/legendary/unique).
+//
+// 무기: lookup table (mlvl × mf bucket → tier weights) + columnar (drops/sec).
+// 효과: D4 farming session 분석 — 어느 mob 가 legendary 잘 나오는지.
+
+use "./r0_common"
+
+let DLOOT_DIR = GAMEBOX_HOME + "/persist/d4_loot_predict"
+let DROP_LOG = DLOOT_DIR + "/drops.tsv"
+
+fn dloot_dir() -> str { return DLOOT_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DLOOT_DIR + "'")
+}
+
+fn tiers() -> array {
+    return ["common", "magic", "rare", "legendary", "unique"]
+}
+
+// drop weight: tier × (mlvl bucket low/mid/high) → weight (out of 1000)
+// low mlvl 1-30, mid 31-60, high 61-100
+fn weight(tier: str, mlvl: int) -> int {
+    let bucket = "low"
+    if mlvl >= 31 && mlvl <= 60 { bucket = "mid" }
+    if mlvl >= 61 { bucket = "high" }
+    if tier == "common" {
+        if bucket == "low" { return 600 }
+        if bucket == "mid" { return 400 }
+        return 200
+    }
+    if tier == "magic" {
+        if bucket == "low" { return 250 }
+        if bucket == "mid" { return 350 }
+        return 350
+    }
+    if tier == "rare" {
+        if bucket == "low" { return 100 }
+        if bucket == "mid" { return 180 }
+        return 300
+    }
+    if tier == "legendary" {
+        if bucket == "low" { return 40 }
+        if bucket == "mid" { return 60 }
+        return 130
+    }
+    if tier == "unique" {
+        if bucket == "low" { return 10 }
+        if bucket == "mid" { return 10 }
+        return 20
+    }
+    return 0
+}
+
+// magic find % 적용 — rare+ 가중치 증가
+fn weight_with_mf(tier: str, mlvl: int, mf_pct: int) -> int {
+    let w = weight(tier, mlvl)
+    if tier == "rare" || tier == "legendary" || tier == "unique" {
+        return w + w * mf_pct / 100
+    }
+    return w
+}
+
+fn record_drop(monster: str, mlvl: int, mf_pct: int, tier: str) -> void {
+    ensure_dir()
+    let w = weight_with_mf(tier, mlvl, mf_pct)
+    let line = monster + "\t" + to_string(mlvl) + "\t" + to_string(mf_pct) + "\t" + tier + "\t" + to_string(w)
+    let tmp = DROP_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + DROP_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("d4_drop", "\"mob\":\"" + monster + "\",\"tier\":\"" + tier + "\",\"w\":" + to_string(w))
+}
+
+fn drops_total() -> int {
+    let exists = exec("test -f '" + DROP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    return to_int(exec("wc -l < '" + DROP_LOG + "' | tr -d ' '").trim())
+}
+
+fn tier_count(tier: str) -> int {
+    let exists = exec("test -f '" + DROP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v t='" + tier + "' '$4==t' '" + DROP_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn cleanup_dloot() -> void {
+    let _ = exec("rm -rf '" + DLOOT_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dloot-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dloot()
+
+    let t = tiers()
+    if len(t) != 5 { panic("c_d4_loot_drop_predict FAIL [tiers] expected=5 got=" + to_string(len(t))) }
+
+    // weight invariants — sum over tiers per bucket = 1000
+    let sum_low = weight("common", 10) + weight("magic", 10) + weight("rare", 10) + weight("legendary", 10) + weight("unique", 10)
+    if sum_low != 1000 { panic("c_d4_loot_drop_predict FAIL [low sum] expected=1000 got=" + to_string(sum_low)) }
+    let sum_mid = weight("common", 50) + weight("magic", 50) + weight("rare", 50) + weight("legendary", 50) + weight("unique", 50)
+    if sum_mid != 1000 { panic("c_d4_loot_drop_predict FAIL [mid sum] expected=1000 got=" + to_string(sum_mid)) }
+    let sum_high = weight("common", 80) + weight("magic", 80) + weight("rare", 80) + weight("legendary", 80) + weight("unique", 80)
+    if sum_high != 1000 { panic("c_d4_loot_drop_predict FAIL [high sum] expected=1000 got=" + to_string(sum_high)) }
+
+    // mf 100% — rare+ 가중치 2배
+    let leg_no_mf = weight_with_mf("legendary", 80, 0)
+    let leg_mf100 = weight_with_mf("legendary", 80, 100)
+    if leg_mf100 != leg_no_mf * 2 { panic("c_d4_loot_drop_predict FAIL [mf] expected=" + to_string(leg_no_mf*2) + " got=" + to_string(leg_mf100)) }
+
+    record_drop("Butcher", 50, 100, "legendary")
+    record_drop("Butcher", 50, 100, "rare")
+    record_drop("Butcher", 50, 100, "common")
+    record_drop("Andariel", 80, 200, "unique")
+
+    let total = drops_total()
+    if total != 4 { panic("c_d4_loot_drop_predict FAIL [drops] expected=4 got=" + to_string(total)) }
+
+    let unq = tier_count("unique")
+    if unq != 1 { panic("c_d4_loot_drop_predict FAIL [unique count] expected=1 got=" + to_string(unq)) }
+
+    r0_emit("d4_loot_summary", "\"drops\":" + to_string(total) + ",\"unique\":" + to_string(unq))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_d4_loot_drop_predict FAIL [emit] got=" + to_string(cnt)) }
+
+    // ─── synthetic D4 economy retired_intentional posture annotation (Track AL) ───
+    //
+    // Track AL mission: extend Track V (7) + Track AJ (6) D4 retired_intentional posture
+    // annotation to 6 additional c_d4_* modules (aspect_imprint_track + dungeon_sigil_
+    // inventory + dxr_first_frame_trace + helltide_event + infernal_horde_wave + loot_
+    // drop_predict). .roadmap.diablo4 blk.1 status_enum_adopted = retired_intentional
+    // (Track A2 land 2026-05-03). 본 module 측 loot drop tier weight + magic find forecast
+    // = synthetic drop analyzer — production live game state 측정 X (D4 always-online
+    // live session 진입 X, DRM bypass 0, Battle.net launcher 통과 X). 본 cycle 측 module
+    // self_test() 측 honest annotation row 추가 only — cond.3 status `partial` 영구 유지
+    // (retired_intentional posture per blk.1 영구 lock). pattern reference:
+    //     lib/perf/c_d4_paragon_track.hexa (Track AJ predecessor, identical schema)
+    //
+    // synthetic posture row column header:
+    //     domain                "loot_drop_predict"
+    //     posture               "retired_intentional"  (NOT pass / NOT partial / NOT fail)
+    //     production_smoke      "no_attempt"           (no live game state acquire)
+    //     drm_bypass            "0"                    (own1 Wine 0 / no evasion)
+    //     always_online_evade   "0"                    (own1 honest acknowledgment)
+    //     blocker_ref           "diablo4.blk.1"        (always_online_drm)
+    //     adoption_iso          "2026-05-03"           (Track A2 retired_intentional adopt)
+    r0_emit("c_d4_loot_drop_predict_retired_intentional",
+        "\"stage\":\"d4_economy_synthetic\",\"domain\":\"loot_drop_predict\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"always_online_evade\":0,\"blocker_ref\":\"diablo4.blk.1\",\"blocker_class\":\"always_online_drm\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"diablo4.cond.3\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\"")
+    println("__D4_LOOT_DROP_PREDICT__ RETIRED_INTENTIONAL d4_economy_synthetic")
+
+    cleanup_dloot()
+
+    println("  ✅ c_d4_loot_drop_predict self_test PASS (5 tiers, 3 mlvl buckets, mf 2x, 4 drops, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "weight" && len(a) >= 6 {
+            let w = weight_with_mf(a[3], to_int(a[4]), to_int(a[5]))
+            println(to_string(w))
+            return
+        }
+        if sub == "stats" { println("drops=" + to_string(drops_total())); return }
+        if sub == "cleanup" { cleanup_dloot(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_d4_loot_drop_predict.hexa { self-test | weight <tier> <mlvl> <mf_pct> | stats | cleanup }")
+}

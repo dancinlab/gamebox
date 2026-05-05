@@ -1,0 +1,401 @@
+// lib/loader/pe_ime_input_context.hexa — cycle 79 Win32 IME → NSTextInputClient bridge telemetry
+//
+// Win32 ImmGetContext / ImmSetCompositionString → macOS NSTextInputClient
+// composition event tracker. Korean / Japanese / Chinese IME composition
+// lifecycle (start → update → end → result_str) + cursor_pos telemetry.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 IME composition event tracker — 실 ImmGetContext() / NSTextInputClient
+//   호출 X (stage6 native bridge 에서 wire-up).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// event_kind code:
+//   1 = composition_start
+//   2 = composition_update
+//   3 = composition_end
+//   4 = result_str
+//   5 = cursor_pos
+//
+// persist schema (TSV — events.tsv):
+//   event_id<int> \t event_kind<int> \t composition_chars<int> \t hwnd_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piic_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ime_input_context"
+}
+
+fn piic_events_path() -> str {
+    return piic_dir() + "/events.tsv"
+}
+
+fn piic_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piic_dir() + "'")
+}
+
+fn cleanup_piic() -> void {
+    piic_ensure_dir()
+    let _ = exec("rm -f '" + piic_events_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piic_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piic_append_row(path: str, row: str) -> void {
+    piic_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_event: IME composition event 1 건 기록 ───
+fn record_event(event_id: int, event_kind: int, composition_chars: int, hwnd_id: int) -> void {
+    if event_id <= 0 {
+        panic("pe_ime_input_context FAIL [record_event] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if event_kind < 1 {
+        panic("pe_ime_input_context FAIL [record_event] expected=event_kind>=1 got=" + to_string(event_kind))
+    }
+    if event_kind > 5 {
+        panic("pe_ime_input_context FAIL [record_event] expected=event_kind<=5 got=" + to_string(event_kind))
+    }
+    if composition_chars < 0 {
+        panic("pe_ime_input_context FAIL [record_event] expected=composition_chars>=0 got=" + to_string(composition_chars))
+    }
+    if hwnd_id <= 0 {
+        panic("pe_ime_input_context FAIL [record_event] expected=hwnd_id>0 got=" + to_string(hwnd_id))
+    }
+    let row = to_string(event_id) + "\t" + to_string(event_kind)
+        + "\t" + to_string(composition_chars) + "\t" + to_string(hwnd_id) + "\n"
+    piic_append_row(piic_events_path(), row)
+}
+
+// ─── event_count: total event 수 ───
+fn event_count() -> int {
+    let t = piic_read_table(piic_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_composition_chars: 모든 event composition_chars 합 ───
+fn total_composition_chars() -> int {
+    let t = piic_read_table(piic_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_event_kind: 특정 event_kind 의 event 수 ───
+fn count_by_event_kind(kind: int) -> int {
+    let t = piic_read_table(piic_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_hwnds: 고유 hwnd_id 수 ───
+fn distinct_hwnds() -> int {
+    let t = piic_read_table(piic_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let h = to_int(parts[3])
+                let mut j = 0
+                let mut found = 0
+                while j < len(seen) {
+                    if seen[j] == h {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(h)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── event_chars: 특정 event_id 의 composition_chars (없으면 0) ───
+fn event_chars(event_id: int) -> int {
+    let t = piic_read_table(piic_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == event_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── piic_stats: [event_count, total_composition_chars, distinct_hwnds, count_by_event_kind(2)] ───
+fn piic_stats() -> array {
+    let mut out = []
+    out.push(event_count())
+    out.push(total_composition_chars())
+    out.push(distinct_hwnds())
+    out.push(count_by_event_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piic-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_piic()
+
+    // 2. record 5 events across ≥3 event_kinds and ≥2 hwnd_ids
+    //    hwnd 7001 (Korean composer) — start → update → update → end
+    //    hwnd 7002 (Japanese composer) — result_str
+    record_event(790001, 1, 0, 7001)
+    r0_emit("pe_ime_input_context_record",
+        "\"event_id\":790001,\"event_kind\":1,\"composition_chars\":0,\"hwnd_id\":7001,\"target\":\"composition_start\"")
+
+    record_event(790002, 2, 1, 7001)
+    r0_emit("pe_ime_input_context_record",
+        "\"event_id\":790002,\"event_kind\":2,\"composition_chars\":1,\"hwnd_id\":7001,\"target\":\"composition_update\"")
+
+    record_event(790003, 2, 3, 7001)
+    r0_emit("pe_ime_input_context_record",
+        "\"event_id\":790003,\"event_kind\":2,\"composition_chars\":3,\"hwnd_id\":7001,\"target\":\"composition_update\"")
+
+    record_event(790004, 3, 3, 7001)
+    r0_emit("pe_ime_input_context_record",
+        "\"event_id\":790004,\"event_kind\":3,\"composition_chars\":3,\"hwnd_id\":7001,\"target\":\"composition_end\"")
+
+    record_event(790005, 4, 5, 7002)
+    r0_emit("pe_ime_input_context_record",
+        "\"event_id\":790005,\"event_kind\":4,\"composition_chars\":5,\"hwnd_id\":7002,\"target\":\"result_str\"")
+
+    // 3. event_count = 5
+    let c = event_count()
+    if c != 5 {
+        panic("pe_ime_input_context FAIL [event_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_composition_chars = 0+1+3+3+5 = 12
+    let tc = total_composition_chars()
+    if tc != 12 {
+        panic("pe_ime_input_context FAIL [total_composition_chars] expected=12 got=" + to_string(tc))
+    }
+
+    // 5. count_by_event_kind sanity
+    let k1 = count_by_event_kind(1)
+    if k1 != 1 {
+        panic("pe_ime_input_context FAIL [count_by_event_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_event_kind(2)
+    if k2 != 2 {
+        panic("pe_ime_input_context FAIL [count_by_event_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_event_kind(3)
+    if k3 != 1 {
+        panic("pe_ime_input_context FAIL [count_by_event_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_event_kind(4)
+    if k4 != 1 {
+        panic("pe_ime_input_context FAIL [count_by_event_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_event_kind(5)
+    if k5 != 0 {
+        panic("pe_ime_input_context FAIL [count_by_event_kind(5)] expected=0 got=" + to_string(k5))
+    }
+    let k99 = count_by_event_kind(99)
+    if k99 != 0 {
+        panic("pe_ime_input_context FAIL [count_by_event_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_hwnds = 2
+    let dh = distinct_hwnds()
+    if dh != 2 {
+        panic("pe_ime_input_context FAIL [distinct_hwnds] expected=2 got=" + to_string(dh))
+    }
+
+    // 7. event_chars sanity
+    let e2 = event_chars(790002)
+    if e2 != 1 {
+        panic("pe_ime_input_context FAIL [event_chars(790002)] expected=1 got=" + to_string(e2))
+    }
+    let e5 = event_chars(790005)
+    if e5 != 5 {
+        panic("pe_ime_input_context FAIL [event_chars(790005)] expected=5 got=" + to_string(e5))
+    }
+    let e_miss = event_chars(9999)
+    if e_miss != 0 {
+        panic("pe_ime_input_context FAIL [event_chars(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 8. piic_stats() = [5, 12, 2, 2]
+    let s = piic_stats()
+    if len(s) != 4 {
+        panic("pe_ime_input_context FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ime_input_context FAIL [stats event_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 12 {
+        panic("pe_ime_input_context FAIL [stats total_composition_chars] expected=12 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_ime_input_context FAIL [stats distinct_hwnds] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ime_input_context FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ime_input_context_stats",
+        "\"event_count\":" + to_string(s[0])
+        + ",\"total_composition_chars\":" + to_string(s[1])
+        + ",\"distinct_hwnds\":" + to_string(s[2])
+        + ",\"kind_update\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ime_input_context FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_piic()
+    let s2 = piic_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ime_input_context FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ime_input_context self_test PASS (events=" + to_string(s[0])
+        + ", chars=" + to_string(s[1]) + ", hwnds=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piic_stats()
+            println("event_count\t" + to_string(s[0]))
+            println("total_composition_chars\t" + to_string(s[1]))
+            println("distinct_hwnds\t" + to_string(s[2]))
+            println("count_kind_update\t" + to_string(s[3]))
+            return
+        }
+        if sub == "chars" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println("event_chars\t" + to_string(event_chars(eid)))
+                return
+            }
+            println("usage: hexa run pe_ime_input_context.hexa chars <event_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_event_kind\t" + to_string(count_by_event_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_ime_input_context.hexa count <event_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piic()
+            println("cleaned: " + piic_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piic_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ime_input_context.hexa { self-test | stats | chars <event_id> | count <event_kind> | cleanup | dir }")
+}

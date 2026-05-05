@@ -1,0 +1,453 @@
+// lib/loader/pe_section_mapper_real.hexa — cycle 80 R2 phase 1 PE32+ section mapper skeleton
+//
+// PE32+ section mapping (R1 pe_native_mmap_real 의존):
+//   - IMAGE_SECTION_HEADER VirtualAddress + VirtualSize → mmap addr/length
+//   - characteristics → mprotect prot bits
+//   - Apple Silicon 16KB page → small section padding (cycle 79 cross-ref pe_page_adapter_16k)
+//   - .text = R+X (W^X 위반 — RW 매핑 후 reloc/IAT 패치 후 RX 전환)
+//   - .reloc 는 매핑 X — 파싱만 하고 폐기
+// own1: PE/COFF spec only, Wine pe_load_section 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄. 본 module 은
+// section mapping tracker — 실 mmap()/mprotect() 호출 X (R1 pe_native_mmap_real wrapper).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// section_kind code:
+//   1 = text   (.text)
+//   2 = data   (.data)
+//   3 = rdata  (.rdata)
+//   4 = bss    (.bss)
+//   5 = rsrc   (.rsrc)
+//   6 = reloc  (.reloc)
+//   7 = tls    (.tls)
+//   8 = pdata  (.pdata)
+//
+// characteristics bitmask (PE/COFF spec subset):
+//   0x00000020 = IMAGE_SCN_CNT_CODE
+//   0x00000040 = IMAGE_SCN_CNT_INITIALIZED_DATA
+//   0x00000080 = IMAGE_SCN_CNT_UNINITIALIZED_DATA
+//   0x20000000 = IMAGE_SCN_MEM_EXECUTE
+//   0x40000000 = IMAGE_SCN_MEM_READ
+//   0x80000000 = IMAGE_SCN_MEM_WRITE
+//
+// persist schema (TSV — maps.tsv):
+//   map_id<int> \t section_kind<int> \t size_kb<int> \t characteristics<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psmr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_section_mapper_real"
+}
+
+fn psmr_maps_path() -> str {
+    return psmr_dir() + "/maps.tsv"
+}
+
+fn psmr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psmr_dir() + "'")
+}
+
+fn cleanup_psmr() -> void {
+    psmr_ensure_dir()
+    let _ = exec("rm -f '" + psmr_maps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psmr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psmr_append_row(path: str, row: str) -> void {
+    psmr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_map: section mapping 1 건 기록 ───
+fn record_map(map_id: int, section_kind: int, size_kb: int, characteristics: int) -> void {
+    if map_id <= 0 {
+        panic("pe_section_mapper_real FAIL [record_map] expected=map_id>0 got=" + to_string(map_id))
+    }
+    if section_kind < 1 {
+        panic("pe_section_mapper_real FAIL [record_map] expected=section_kind>=1 got=" + to_string(section_kind))
+    }
+    if section_kind > 8 {
+        panic("pe_section_mapper_real FAIL [record_map] expected=section_kind<=8 got=" + to_string(section_kind))
+    }
+    if size_kb < 0 {
+        panic("pe_section_mapper_real FAIL [record_map] expected=size_kb>=0 got=" + to_string(size_kb))
+    }
+    if characteristics < 0 {
+        panic("pe_section_mapper_real FAIL [record_map] expected=characteristics>=0 got=" + to_string(characteristics))
+    }
+    let row = to_string(map_id) + "\t" + to_string(section_kind)
+        + "\t" + to_string(size_kb) + "\t" + to_string(characteristics) + "\n"
+    psmr_append_row(psmr_maps_path(), row)
+}
+
+// ─── map_count: total mapping 수 ───
+fn map_count() -> int {
+    let t = psmr_read_table(psmr_maps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_kb: 모든 mapping 의 size_kb 합 ───
+fn total_size_kb() -> int {
+    let t = psmr_read_table(psmr_maps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_section_kind: 특정 section_kind 의 mapping 수 ───
+fn count_by_section_kind(section_kind: int) -> int {
+    let t = psmr_read_table(psmr_maps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == section_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_executable: characteristics & 0x20000000 != 0 인 mapping 수 ───
+fn count_executable() -> int {
+    let t = psmr_read_table(psmr_maps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    let exec_bit = 536870912  // 0x20000000
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let ch = to_int(parts[3])
+                if (ch & exec_bit) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_writable: characteristics & 0x80000000 != 0 인 mapping 수 ───
+fn count_writable() -> int {
+    let t = psmr_read_table(psmr_maps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    // 0x80000000 = 2147483648, but signed 32-bit overflow safe → use bit position
+    // Hexa int is 64-bit so direct constant ok.
+    let write_bit = 2147483648  // 0x80000000
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let ch = to_int(parts[3])
+                if (ch & write_bit) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── map_size_kb: 특정 map_id 의 size_kb (없으면 0) ───
+fn map_size_kb(map_id: int) -> int {
+    let t = psmr_read_table(psmr_maps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == map_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psmr_stats: [map_count, total_size_kb, count_executable, count_writable] ───
+fn psmr_stats() -> array {
+    let mut out = []
+    out.push(map_count())
+    out.push(total_size_kb())
+    out.push(count_executable())
+    out.push(count_writable())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psmr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psmr()
+
+    // 2. record 6 maps covering 5 section_kinds (text/data/rdata/rsrc/reloc)
+    //    characteristics 조합: PE/COFF spec 표준 attribute set
+    //    0x60000020 = CODE | EXECUTE | READ            (.text)
+    //    0xC0000040 = INIT_DATA | READ | WRITE         (.data)
+    //    0x40000040 = INIT_DATA | READ                 (.rdata)
+    //    0x40000040 = INIT_DATA | READ                 (.rsrc)
+    //    0x42000040 = INIT_DATA | READ | DISCARDABLE   (.reloc — 매핑 안 하지만 기록)
+    //    0x60000020 = CODE | EXECUTE | READ            (.text 두 번째 — 합쳐진 케이스)
+    record_map(80101, 1, 256, 1610612768)  // .text 256KB R+X
+    r0_emit("pe_section_mapper_real_record",
+        "\"map_id\":80101,\"section_kind\":1,\"size_kb\":256,\"target\":\"text\"")
+
+    record_map(80102, 2, 64, 3221225536)  // .data 64KB R+W 0xC0000040
+    r0_emit("pe_section_mapper_real_record",
+        "\"map_id\":80102,\"section_kind\":2,\"size_kb\":64,\"target\":\"data\"")
+
+    record_map(80103, 3, 128, 1073741888)  // .rdata 128KB R 0x40000040
+    r0_emit("pe_section_mapper_real_record",
+        "\"map_id\":80103,\"section_kind\":3,\"size_kb\":128,\"target\":\"rdata\"")
+
+    record_map(80104, 5, 32, 1073741888)  // .rsrc 32KB R 0x40000040
+    r0_emit("pe_section_mapper_real_record",
+        "\"map_id\":80104,\"section_kind\":5,\"size_kb\":32,\"target\":\"rsrc\"")
+
+    record_map(80105, 6, 16, 1107296320)  // .reloc 16KB R 0x42000040
+    r0_emit("pe_section_mapper_real_record",
+        "\"map_id\":80105,\"section_kind\":6,\"size_kb\":16,\"target\":\"reloc\"")
+
+    record_map(80106, 1, 96, 1610612768)  // .text(2) 96KB R+X 0x60000020
+    r0_emit("pe_section_mapper_real_record",
+        "\"map_id\":80106,\"section_kind\":1,\"size_kb\":96,\"target\":\"text\"")
+
+    // 3. map_count = 6
+    let c = map_count()
+    if c != 6 {
+        panic("pe_section_mapper_real FAIL [map_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_size_kb = 256+64+128+32+16+96 = 592
+    let ts = total_size_kb()
+    if ts != 592 {
+        panic("pe_section_mapper_real FAIL [total_size_kb] expected=592 got=" + to_string(ts))
+    }
+
+    // 5. count_by_section_kind sanity
+    let k1 = count_by_section_kind(1)
+    if k1 != 2 {
+        panic("pe_section_mapper_real FAIL [count_by_section_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_section_kind(2)
+    if k2 != 1 {
+        panic("pe_section_mapper_real FAIL [count_by_section_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_section_kind(3)
+    if k3 != 1 {
+        panic("pe_section_mapper_real FAIL [count_by_section_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k5 = count_by_section_kind(5)
+    if k5 != 1 {
+        panic("pe_section_mapper_real FAIL [count_by_section_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_section_kind(6)
+    if k6 != 1 {
+        panic("pe_section_mapper_real FAIL [count_by_section_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k7 = count_by_section_kind(7)
+    if k7 != 0 {
+        panic("pe_section_mapper_real FAIL [count_by_section_kind(7)] expected=0 got=" + to_string(k7))
+    }
+
+    // 6. count_executable = 2 (.text 80101 + .text 80106)
+    let ce = count_executable()
+    if ce != 2 {
+        panic("pe_section_mapper_real FAIL [count_executable] expected=2 got=" + to_string(ce))
+    }
+
+    // 7. count_writable = 1 (.data 80102)
+    let cw = count_writable()
+    if cw != 1 {
+        panic("pe_section_mapper_real FAIL [count_writable] expected=1 got=" + to_string(cw))
+    }
+
+    // 8. map_size_kb sanity
+    let s101 = map_size_kb(80101)
+    if s101 != 256 {
+        panic("pe_section_mapper_real FAIL [map_size_kb(80101)] expected=256 got=" + to_string(s101))
+    }
+    let s103 = map_size_kb(80103)
+    if s103 != 128 {
+        panic("pe_section_mapper_real FAIL [map_size_kb(80103)] expected=128 got=" + to_string(s103))
+    }
+    let s_miss = map_size_kb(99999)
+    if s_miss != 0 {
+        panic("pe_section_mapper_real FAIL [map_size_kb(99999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 9. psmr_stats() = [6, 592, 2, 1]
+    let s = psmr_stats()
+    if len(s) != 4 {
+        panic("pe_section_mapper_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_section_mapper_real FAIL [stats map_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 592 {
+        panic("pe_section_mapper_real FAIL [stats total_size_kb] expected=592 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_section_mapper_real FAIL [stats count_executable] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_section_mapper_real FAIL [stats count_writable] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit — 6 records + stats)
+    r0_emit("pe_section_mapper_real_stats",
+        "\"map_count\":" + to_string(s[0])
+        + ",\"total_size_kb\":" + to_string(s[1])
+        + ",\"count_executable\":" + to_string(s[2])
+        + ",\"count_writable\":" + to_string(s[3]))
+
+    // 11. emit count >= 7
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_section_mapper_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_psmr()
+    let s2 = psmr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_section_mapper_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_section_mapper_real self_test PASS (maps=" + to_string(s[0])
+        + ", size_kb=" + to_string(s[1]) + ", exec=" + to_string(s[2])
+        + ", write=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psmr_stats()
+            println("map_count\t" + to_string(s[0]))
+            println("total_size_kb\t" + to_string(s[1]))
+            println("count_executable\t" + to_string(s[2]))
+            println("count_writable\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("map_size_kb\t" + to_string(map_size_kb(mid)))
+                return
+            }
+            println("usage: hexa run pe_section_mapper_real.hexa size <map_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let sk = to_int(a[3])
+                println("count_by_section_kind\t" + to_string(count_by_section_kind(sk)))
+                return
+            }
+            println("usage: hexa run pe_section_mapper_real.hexa count <section_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psmr()
+            println("cleaned: " + psmr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psmr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_section_mapper_real.hexa { self-test | stats | size <map_id> | count <section_kind> | cleanup | dir }")
+}

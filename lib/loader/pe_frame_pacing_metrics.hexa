@@ -1,0 +1,385 @@
+// lib/loader/pe_frame_pacing_metrics.hexa — frame pacing histogram skeleton
+//
+// gamebox cycle 67 — per-frame pacing delta (delta_us = actual - target_us)
+// 를 4-bucket histogram (under / on-target / over / way_over) 으로 묶어
+// 누적 metric 을 TSV persist. real GPU swap 측정은 stage2 (native bridge).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 pacing tracker — render-loop 호출 X (stage2).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// pacing_bucket code:
+//   1 = under     (delta_us < -1000)        — 목표보다 일찍 도착
+//   2 = ontarget  (-1000 <= delta_us <= 1000)
+//   3 = over      (1000 < delta_us <= 5000) — 1ms~5ms late
+//   4 = way_over  (delta_us > 5000)         — 5ms+ late (stutter)
+//
+// persist schema (TSV — frames.tsv):
+//   frame_id<int> \t pacing_bucket<int> \t delta_us<int> \t target_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pfpm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_frame_pacing_metrics"
+}
+
+fn pfpm_frames_path() -> str {
+    return pfpm_dir() + "/frames.tsv"
+}
+
+fn pfpm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pfpm_dir() + "'")
+}
+
+fn cleanup_pfpm() -> void {
+    pfpm_ensure_dir()
+    let _ = exec("rm -f '" + pfpm_frames_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pfpm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pfpm_append_row(path: str, row: str) -> void {
+    pfpm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_pacing: pacing sample 1 건 기록 ───
+fn record_pacing(frame_id: int, pacing_bucket: int, delta_us: int, target_us: int) -> void {
+    if frame_id <= 0 {
+        panic("pe_frame_pacing_metrics FAIL [record_pacing] expected=frame_id>0 got=" + to_string(frame_id))
+    }
+    if pacing_bucket < 1 {
+        panic("pe_frame_pacing_metrics FAIL [record_pacing] expected=pacing_bucket>=1 got=" + to_string(pacing_bucket))
+    }
+    if pacing_bucket > 4 {
+        panic("pe_frame_pacing_metrics FAIL [record_pacing] expected=pacing_bucket<=4 got=" + to_string(pacing_bucket))
+    }
+    if target_us <= 0 {
+        panic("pe_frame_pacing_metrics FAIL [record_pacing] expected=target_us>0 got=" + to_string(target_us))
+    }
+    let row = to_string(frame_id) + "\t" + to_string(pacing_bucket)
+        + "\t" + to_string(delta_us) + "\t" + to_string(target_us) + "\n"
+    pfpm_append_row(pfpm_frames_path(), row)
+}
+
+// ─── pacing_count: total frame 수 ───
+fn pacing_count() -> int {
+    let t = pfpm_read_table(pfpm_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_delta_us: 모든 frame delta_us 합 ───
+fn total_delta_us() -> int {
+    let t = pfpm_read_table(pfpm_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_bucket: 특정 pacing_bucket 의 frame 수 ───
+fn count_by_bucket(bucket: int) -> int {
+    let t = pfpm_read_table(pfpm_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == bucket {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_target_us: 모든 frame target_us 합 ───
+fn total_target_us() -> int {
+    let t = pfpm_read_table(pfpm_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── frame_delta_us: 특정 frame_id 의 delta_us (없으면 0) ───
+fn frame_delta_us(frame_id: int) -> int {
+    let t = pfpm_read_table(pfpm_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == frame_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pfpm_stats: [pacing_count, total_delta_us, total_target_us, count_by_bucket(2)] ───
+fn pfpm_stats() -> array {
+    let mut out = []
+    out.push(pacing_count())
+    out.push(total_delta_us())
+    out.push(total_target_us())
+    out.push(count_by_bucket(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pfpm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pfpm()
+
+    // 2. record 6 frames spanning ≥3 buckets
+    //    target_us = 16667 (≈60fps frame budget) for all frames.
+    //    frames: under / ontarget / ontarget / over / over / way_over
+    record_pacing(670001, 1, -2000, 16667)
+    r0_emit("pe_frame_pacing_metrics_record",
+        "\"frame_id\":670001,\"pacing_bucket\":1,\"delta_us\":-2000,\"target_us\":16667")
+
+    record_pacing(670002, 2, 0, 16667)
+    r0_emit("pe_frame_pacing_metrics_record",
+        "\"frame_id\":670002,\"pacing_bucket\":2,\"delta_us\":0,\"target_us\":16667")
+
+    record_pacing(670003, 2, 500, 16667)
+    r0_emit("pe_frame_pacing_metrics_record",
+        "\"frame_id\":670003,\"pacing_bucket\":2,\"delta_us\":500,\"target_us\":16667")
+
+    record_pacing(670004, 3, 2500, 16667)
+    r0_emit("pe_frame_pacing_metrics_record",
+        "\"frame_id\":670004,\"pacing_bucket\":3,\"delta_us\":2500,\"target_us\":16667")
+
+    record_pacing(670005, 3, 4000, 16667)
+    r0_emit("pe_frame_pacing_metrics_record",
+        "\"frame_id\":670005,\"pacing_bucket\":3,\"delta_us\":4000,\"target_us\":16667")
+
+    record_pacing(670006, 4, 8000, 16667)
+    r0_emit("pe_frame_pacing_metrics_record",
+        "\"frame_id\":670006,\"pacing_bucket\":4,\"delta_us\":8000,\"target_us\":16667")
+
+    // 3. pacing_count = 6
+    let c = pacing_count()
+    if c != 6 {
+        panic("pe_frame_pacing_metrics FAIL [pacing_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_delta_us = -2000 + 0 + 500 + 2500 + 4000 + 8000 = 13000
+    let td = total_delta_us()
+    if td != 13000 {
+        panic("pe_frame_pacing_metrics FAIL [total_delta_us] expected=13000 got=" + to_string(td))
+    }
+
+    // 5. count_by_bucket sanity (3 buckets covered: 1,2,3,4 — ≥3 buckets)
+    let b1 = count_by_bucket(1)
+    if b1 != 1 {
+        panic("pe_frame_pacing_metrics FAIL [count_by_bucket(1)] expected=1 got=" + to_string(b1))
+    }
+    let b2 = count_by_bucket(2)
+    if b2 != 2 {
+        panic("pe_frame_pacing_metrics FAIL [count_by_bucket(2)] expected=2 got=" + to_string(b2))
+    }
+    let b3 = count_by_bucket(3)
+    if b3 != 2 {
+        panic("pe_frame_pacing_metrics FAIL [count_by_bucket(3)] expected=2 got=" + to_string(b3))
+    }
+    let b4 = count_by_bucket(4)
+    if b4 != 1 {
+        panic("pe_frame_pacing_metrics FAIL [count_by_bucket(4)] expected=1 got=" + to_string(b4))
+    }
+    let b99 = count_by_bucket(99)
+    if b99 != 0 {
+        panic("pe_frame_pacing_metrics FAIL [count_by_bucket(99)] expected=0 got=" + to_string(b99))
+    }
+
+    // 6. total_target_us = 16667 * 6 = 100002
+    let tt = total_target_us()
+    if tt != 100002 {
+        panic("pe_frame_pacing_metrics FAIL [total_target_us] expected=100002 got=" + to_string(tt))
+    }
+
+    // 7. frame_delta_us sanity
+    let d1 = frame_delta_us(670001)
+    if d1 != -2000 {
+        panic("pe_frame_pacing_metrics FAIL [frame_delta_us(670001)] expected=-2000 got=" + to_string(d1))
+    }
+    let d6 = frame_delta_us(670006)
+    if d6 != 8000 {
+        panic("pe_frame_pacing_metrics FAIL [frame_delta_us(670006)] expected=8000 got=" + to_string(d6))
+    }
+    let d_miss = frame_delta_us(9999)
+    if d_miss != 0 {
+        panic("pe_frame_pacing_metrics FAIL [frame_delta_us(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 8. pfpm_stats() = [6, 13000, 100002, 2]
+    let s = pfpm_stats()
+    if len(s) != 4 {
+        panic("pe_frame_pacing_metrics FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_frame_pacing_metrics FAIL [stats pacing_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 13000 {
+        panic("pe_frame_pacing_metrics FAIL [stats total_delta_us] expected=13000 got=" + to_string(s[1]))
+    }
+    if s[2] != 100002 {
+        panic("pe_frame_pacing_metrics FAIL [stats total_target_us] expected=100002 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_frame_pacing_metrics FAIL [stats count_bucket(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats (7th r0_emit — meets ≥7 mandate)
+    r0_emit("pe_frame_pacing_metrics_stats",
+        "\"pacing_count\":" + to_string(s[0])
+        + ",\"total_delta_us\":" + to_string(s[1])
+        + ",\"total_target_us\":" + to_string(s[2])
+        + ",\"bucket_ontarget\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_frame_pacing_metrics FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pfpm()
+    let s2 = pfpm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_frame_pacing_metrics FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_frame_pacing_metrics self_test PASS (frames=" + to_string(s[0])
+        + ", delta_us=" + to_string(s[1]) + ", target_us=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pfpm_stats()
+            println("pacing_count\t" + to_string(s[0]))
+            println("total_delta_us\t" + to_string(s[1]))
+            println("total_target_us\t" + to_string(s[2]))
+            println("count_bucket_ontarget\t" + to_string(s[3]))
+            return
+        }
+        if sub == "delta" {
+            if len(a) >= 4 {
+                let fid = to_int(a[3])
+                println("frame_delta_us\t" + to_string(frame_delta_us(fid)))
+                return
+            }
+            println("usage: hexa run pe_frame_pacing_metrics.hexa delta <frame_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let bucket = to_int(a[3])
+                println("count_by_bucket\t" + to_string(count_by_bucket(bucket)))
+                return
+            }
+            println("usage: hexa run pe_frame_pacing_metrics.hexa count <bucket>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pfpm()
+            println("cleaned: " + pfpm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pfpm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_frame_pacing_metrics.hexa { self-test | stats | delta <frame_id> | count <bucket> | cleanup | dir }")
+}

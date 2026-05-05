@@ -1,0 +1,606 @@
+// lib/loader/pe_msvc_catch_frame_layout_v2.hexa — Wine 정합 catch frame layout 추적기 (r3 wave 17-B)
+//
+// 본 module 은 wave 17-A 의 후속. 17-A 시점에는 catch handler 진입 후 register 복원에서
+// ESP = frame_va + 8 로 가정 (부정확). MSVCRT 의 5 종 layout (v6/v7/v8/v9/v10) 에 따른
+// continue_after_catch 정합 spec 을 추적 (algorithm direction reference only — Wine code 0 줄):
+//
+//   research-3 (Wine MSVCRT continue_after_catch — algorithm direction):
+//     - saved_esp 는 EH frame 의 [frame-4] 위치에 저장
+//     - ESP   = *(uint32_t*)(frame_va - 4)    (frame 직전 saved slot)
+//     - EBP   = frame_va + 12                 (callee 가 push 한 직후 EBP base)
+//     - EIP   = catch_handler_continuation_va (handler return address)
+//
+//   wave 17-A 본 wave 가정 (잘못):
+//     - ESP   = frame_va + 8     ← +8 은 try block 진입 직후 prologue 임시 SP
+//
+//   본 module 은 layout_kind 별 frame layout / register restore / handler invocation /
+//   our-vs-Wine divergence / continue_action 을 빈 cell 로 record (실 dispatch X).
+//
+// own 1 enforcement: Wine/CrossOver/GPTK/Whisky/Box86/QEMU 코드 0 줄 import.
+//   research 는 Microsoft x86 MSVCRT EH ABI spec + 동일 spec 의 Wine reverse 결과 의
+//   "방향 (direction)" 만 참조. 코드 복제 X. 본 module 은 pure tracker — 실 dispatch X.
+// own 2 mandate: panic + r0_emit ≥ 14 + self_test() + main() dispatch.
+//
+// persist schema (TSV — records.tsv):
+//   record_id<int> \t kind<str> \t a<int> \t b<int> \t c<int> \t d<int> \t e<int> \t f<int>
+//
+//   kind 별 의미:
+//     "frame_layout"      — a=layout_id, b=frame_va, c=saved_esp_va, d=ebp_offset, e=expected_layout
+//     "register_restore"  — a=restore_id, b=layout_id, c=register_kind, d=value
+//     "handler_invoke"    — a=invoke_id, b=layout_id, c=handler_va, d=args_count, e=disposition
+//     "layout_divergence" — a=divergence_id, b=layout_id, c=our_kind, d=wine_kind, e=fix_applied
+//     "continue_action"   — a=action_id, b=layout_id, c=action_kind, d=success
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcfl_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_catch_frame_layout_v2"
+}
+
+fn pcfl_records_path() -> str {
+    return pcfl_dir() + "/records.tsv"
+}
+
+fn pcfl_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcfl_dir() + "'")
+}
+
+fn cleanup_pcfl() -> void {
+    pcfl_ensure_dir()
+    let _ = exec("rm -f '" + pcfl_records_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcfl_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcfl_append_row(path: str, row: str) -> void {
+    pcfl_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int ───
+fn pcfl_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_catch_frame_layout_v2 FAIL [pcfl_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── expected_layout_name: 0..4 → MSVCRT layout 이름 ───
+//   0 = msvcrt_v6   (legacy VS6  — saved_esp at [frame-4], ebp = frame+12)
+//   1 = msvcrt_v7   (VS2003       — same pattern, /GS cookie 추가)
+//   2 = msvcrt_v8   (VS2005       — SEH4 + scope table)
+//   3 = msvcrt_v9   (VS2008       — same as v8)
+//   4 = msvcrt_v10  (VS2010+      — SEH4 cookie + encoded handler)
+fn expected_layout_name(k: int) -> str {
+    if k == 0 { return "msvcrt_v6" }
+    if k == 1 { return "msvcrt_v7" }
+    if k == 2 { return "msvcrt_v8" }
+    if k == 3 { return "msvcrt_v9" }
+    if k == 4 { return "msvcrt_v10" }
+    return "?"
+}
+
+// ─── register_name: 0..7 → x86 register 이름 ───
+fn register_name(k: int) -> str {
+    if k == 0 { return "esp" }
+    if k == 1 { return "ebp" }
+    if k == 2 { return "eip" }
+    if k == 3 { return "eax" }
+    if k == 4 { return "ebx" }
+    if k == 5 { return "ecx" }
+    if k == 6 { return "edx" }
+    if k == 7 { return "esi" }
+    if k == 8 { return "edi" }
+    return "?"
+}
+
+// ─── continue_action_kind_name: 0..3 → action 이름 ───
+//   0 = resume_caller   (catch return → caller 의 다음 instruction)
+//   1 = catch_block     (catch handler 본문 진입)
+//   2 = unwind_continue (다음 try frame 으로 unwind 계속)
+//   3 = halt            (terminate — std::terminate 호출)
+fn continue_action_kind_name(k: int) -> str {
+    if k == 0 { return "resume_caller" }
+    if k == 1 { return "catch_block" }
+    if k == 2 { return "unwind_continue" }
+    if k == 3 { return "halt" }
+    return "?"
+}
+
+// ─── record_frame_layout: catch frame 의 saved_esp / ebp_offset / layout_id ───
+fn record_frame_layout(layout_id: int, frame_va_hex: str, saved_esp_va_hex: str, ebp_offset: int, expected_layout: int) -> void {
+    if layout_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_frame_layout] expected=layout_id>0 got=" + to_string(layout_id))
+    }
+    let f = pcfl_hex_to_int(frame_va_hex)
+    if f <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_frame_layout] expected=frame_va>0 got=" + to_string(f))
+    }
+    let s = pcfl_hex_to_int(saved_esp_va_hex)
+    if s < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_frame_layout] expected=saved_esp_va>=0 got=" + to_string(s))
+    }
+    if expected_layout < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_frame_layout] expected=expected_layout>=0 got=" + to_string(expected_layout))
+    }
+    if expected_layout > 4 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_frame_layout] expected=expected_layout<=4 got=" + to_string(expected_layout))
+    }
+    let row = to_string(layout_id) + "\tframe_layout"
+        + "\t" + to_string(layout_id) + "\t" + to_string(f) + "\t" + to_string(s)
+        + "\t" + to_string(ebp_offset) + "\t" + to_string(expected_layout) + "\t0\n"
+    pcfl_append_row(pcfl_records_path(), row)
+}
+
+// ─── record_register_restore: catch handler 진입 시 register 복원 값 ───
+fn record_register_restore(restore_id: int, layout_id: int, register_kind: int, value_hex: str) -> void {
+    if restore_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_register_restore] expected=restore_id>0 got=" + to_string(restore_id))
+    }
+    if layout_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_register_restore] expected=layout_id>0 got=" + to_string(layout_id))
+    }
+    if register_kind < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_register_restore] expected=register_kind>=0 got=" + to_string(register_kind))
+    }
+    if register_kind > 8 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_register_restore] expected=register_kind<=8 got=" + to_string(register_kind))
+    }
+    let v = pcfl_hex_to_int(value_hex)
+    if v < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_register_restore] expected=value>=0 got=" + to_string(v))
+    }
+    let row = to_string(restore_id) + "\tregister_restore"
+        + "\t" + to_string(restore_id) + "\t" + to_string(layout_id) + "\t" + to_string(register_kind)
+        + "\t" + to_string(v) + "\t0\t0\n"
+    pcfl_append_row(pcfl_records_path(), row)
+}
+
+// ─── record_handler_invoke: catch handler 호출 ───
+fn record_handler_invoke(invoke_id: int, layout_id: int, handler_va_hex: str, args_count: int, returned_disposition: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_handler_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if layout_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_handler_invoke] expected=layout_id>0 got=" + to_string(layout_id))
+    }
+    let h = pcfl_hex_to_int(handler_va_hex)
+    if h <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_handler_invoke] expected=handler_va>0 got=" + to_string(h))
+    }
+    if args_count < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_handler_invoke] expected=args_count>=0 got=" + to_string(args_count))
+    }
+    if returned_disposition < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_handler_invoke] expected=returned_disposition>=0 got=" + to_string(returned_disposition))
+    }
+    if returned_disposition > 3 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_handler_invoke] expected=returned_disposition<=3 got=" + to_string(returned_disposition))
+    }
+    let row = to_string(invoke_id) + "\thandler_invoke"
+        + "\t" + to_string(invoke_id) + "\t" + to_string(layout_id) + "\t" + to_string(h)
+        + "\t" + to_string(args_count) + "\t" + to_string(returned_disposition) + "\t0\n"
+    pcfl_append_row(pcfl_records_path(), row)
+}
+
+// ─── record_layout_divergence: 본 wave (17-A) 가 잘못 가정한 layout 과 Wine 정합 layout 차이 ───
+fn record_layout_divergence(divergence_id: int, layout_id: int, our_layout_kind: int, wine_layout_kind: int, fix_applied: int) -> void {
+    if divergence_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=divergence_id>0 got=" + to_string(divergence_id))
+    }
+    if layout_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=layout_id>0 got=" + to_string(layout_id))
+    }
+    if our_layout_kind < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=our_layout_kind>=0 got=" + to_string(our_layout_kind))
+    }
+    if wine_layout_kind < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=wine_layout_kind>=0 got=" + to_string(wine_layout_kind))
+    }
+    if our_layout_kind == wine_layout_kind {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=our!=wine got=" + to_string(our_layout_kind))
+    }
+    if fix_applied < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=fix_applied>=0 got=" + to_string(fix_applied))
+    }
+    if fix_applied > 1 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_layout_divergence] expected=fix_applied<=1 got=" + to_string(fix_applied))
+    }
+    let row = to_string(divergence_id) + "\tlayout_divergence"
+        + "\t" + to_string(divergence_id) + "\t" + to_string(layout_id) + "\t" + to_string(our_layout_kind)
+        + "\t" + to_string(wine_layout_kind) + "\t" + to_string(fix_applied) + "\t0\n"
+    pcfl_append_row(pcfl_records_path(), row)
+}
+
+// ─── record_continue_action: handler return 후 continue_after_catch 의 4 결과 ───
+fn record_continue_action(action_id: int, layout_id: int, action_kind: int, success: int) -> void {
+    if action_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_continue_action] expected=action_id>0 got=" + to_string(action_id))
+    }
+    if layout_id <= 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_continue_action] expected=layout_id>0 got=" + to_string(layout_id))
+    }
+    if action_kind < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_continue_action] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 3 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_continue_action] expected=action_kind<=3 got=" + to_string(action_kind))
+    }
+    if success < 0 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_continue_action] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [record_continue_action] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(action_id) + "\tcontinue_action"
+        + "\t" + to_string(action_id) + "\t" + to_string(layout_id) + "\t" + to_string(action_kind)
+        + "\t" + to_string(success) + "\t0\t0\n"
+    pcfl_append_row(pcfl_records_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn pcfl_count_kind(kind_filter: str) -> int {
+    let t = pcfl_read_table(pcfl_records_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 8 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn frame_layout_count() -> int {
+    return pcfl_count_kind("frame_layout")
+}
+
+fn register_restore_count() -> int {
+    return pcfl_count_kind("register_restore")
+}
+
+fn handler_invoke_count() -> int {
+    return pcfl_count_kind("handler_invoke")
+}
+
+fn layout_divergence_count() -> int {
+    return pcfl_count_kind("layout_divergence")
+}
+
+fn continue_action_count() -> int {
+    return pcfl_count_kind("continue_action")
+}
+
+fn pcfl_stats() -> array {
+    let mut out = []
+    out.push(frame_layout_count())
+    out.push(register_restore_count())
+    out.push(handler_invoke_count())
+    out.push(layout_divergence_count())
+    out.push(continue_action_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions, r0 emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pcfl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pcfl()
+
+    // ─── 5 frame_layout — 5 layout_kind (msvcrt_v6 ~ v10) ───
+    //   본 wave (17-A) 의 잘못된 가정 에는 saved_esp = frame + 8.
+    //   본 module 은 Wine 정합: saved_esp = frame - 4 (실제로는 *(frame-4) 의 값).
+    //   여기서는 saved_esp_va_hex 를 그 위치에 든 값으로 추적.
+    record_frame_layout(1, "0012FF80", "0012FFC8", 12, 0)  // v6
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"frame_layout\",\"layout_id\":1,\"frame_va\":\"0x0012FF80\",\"saved_esp\":\"0x0012FFC8\",\"ebp_offset\":12,\"expected_layout\":0,\"name\":\"msvcrt_v6\"")
+
+    record_frame_layout(2, "0012FF60", "0012FFA8", 12, 1)  // v7
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"frame_layout\",\"layout_id\":2,\"frame_va\":\"0x0012FF60\",\"saved_esp\":\"0x0012FFA8\",\"ebp_offset\":12,\"expected_layout\":1,\"name\":\"msvcrt_v7\"")
+
+    record_frame_layout(3, "0012FF40", "0012FF88", 12, 2)  // v8
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"frame_layout\",\"layout_id\":3,\"frame_va\":\"0x0012FF40\",\"saved_esp\":\"0x0012FF88\",\"ebp_offset\":12,\"expected_layout\":2,\"name\":\"msvcrt_v8\"")
+
+    record_frame_layout(4, "0012FF20", "0012FF68", 12, 3)  // v9
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"frame_layout\",\"layout_id\":4,\"frame_va\":\"0x0012FF20\",\"saved_esp\":\"0x0012FF68\",\"ebp_offset\":12,\"expected_layout\":3,\"name\":\"msvcrt_v9\"")
+
+    record_frame_layout(5, "0012FF00", "0012FF48", 12, 4)  // v10
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"frame_layout\",\"layout_id\":5,\"frame_va\":\"0x0012FF00\",\"saved_esp\":\"0x0012FF48\",\"ebp_offset\":12,\"expected_layout\":4,\"name\":\"msvcrt_v10\"")
+
+    // ─── 6 register_restore — esp / ebp / eip / eax / ebx / ecx ───
+    record_register_restore(1, 1, 0, "0012FFC8")  // esp = saved_esp (Wine 정합)
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"register_restore\",\"restore_id\":1,\"layout_id\":1,\"register\":\"esp\",\"value\":\"0x0012FFC8\"")
+
+    record_register_restore(2, 1, 1, "0012FF8C")  // ebp = frame + 12
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"register_restore\",\"restore_id\":2,\"layout_id\":1,\"register\":\"ebp\",\"value\":\"0x0012FF8C\"")
+
+    record_register_restore(3, 1, 2, "00401400")  // eip = catch handler continuation
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"register_restore\",\"restore_id\":3,\"layout_id\":1,\"register\":\"eip\",\"value\":\"0x00401400\"")
+
+    record_register_restore(4, 2, 3, "00000000")  // eax = 0 (catch return)
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"register_restore\",\"restore_id\":4,\"layout_id\":2,\"register\":\"eax\",\"value\":\"0x00000000\"")
+
+    record_register_restore(5, 2, 4, "DEADBEEF")  // ebx 보존
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"register_restore\",\"restore_id\":5,\"layout_id\":2,\"register\":\"ebx\",\"value\":\"0xDEADBEEF\"")
+
+    record_register_restore(6, 3, 5, "CAFEBABE")  // ecx 보존
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"register_restore\",\"restore_id\":6,\"layout_id\":3,\"register\":\"ecx\",\"value\":\"0xCAFEBABE\"")
+
+    // ─── 3 handler_invoke ───
+    record_handler_invoke(1, 1, "00401400", 1, 0)  // ContinueExecution
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"handler_invoke\",\"invoke_id\":1,\"layout_id\":1,\"handler_va\":\"0x00401400\",\"args\":1,\"disposition\":0")
+
+    record_handler_invoke(2, 2, "00401700", 2, 1)  // ContinueSearch
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"handler_invoke\",\"invoke_id\":2,\"layout_id\":2,\"handler_va\":\"0x00401700\",\"args\":2,\"disposition\":1")
+
+    record_handler_invoke(3, 5, "00401D00", 3, 0)  // ContinueExecution (v10)
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"handler_invoke\",\"invoke_id\":3,\"layout_id\":5,\"handler_va\":\"0x00401D00\",\"args\":3,\"disposition\":0")
+
+    // ─── 2 layout_divergence — wave 17-A 의 잘못된 가정 ↔ Wine 정합 ───
+    //   our=0 (frame+8 가정 — 잘못), wine=1 (frame-4 saved_esp — 정합), fix_applied=1
+    record_layout_divergence(1, 1, 0, 1, 1)
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"layout_divergence\",\"divergence_id\":1,\"layout_id\":1,\"our\":0,\"wine\":1,\"fix_applied\":1,\"note\":\"esp_frame+8_to_saved_esp\"")
+
+    //   our=2, wine=3, fix_applied=0 (아직 미반영)
+    record_layout_divergence(2, 4, 2, 3, 0)
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"layout_divergence\",\"divergence_id\":2,\"layout_id\":4,\"our\":2,\"wine\":3,\"fix_applied\":0,\"note\":\"v9_seh4_cookie_pending\"")
+
+    // ─── 4 continue_action — 4 action_kind ───
+    record_continue_action(1, 1, 0, 1)  // resume_caller success
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"continue_action\",\"action_id\":1,\"layout_id\":1,\"action\":0,\"name\":\"resume_caller\",\"success\":1")
+
+    record_continue_action(2, 2, 1, 1)  // catch_block success
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"continue_action\",\"action_id\":2,\"layout_id\":2,\"action\":1,\"name\":\"catch_block\",\"success\":1")
+
+    record_continue_action(3, 3, 2, 1)  // unwind_continue success
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"continue_action\",\"action_id\":3,\"layout_id\":3,\"action\":2,\"name\":\"unwind_continue\",\"success\":1")
+
+    record_continue_action(4, 4, 3, 0)  // halt — std::terminate (success=0 = 의도적 halt)
+    r0_emit("pe_msvc_catch_frame_layout_v2_record",
+        "\"kind\":\"continue_action\",\"action_id\":4,\"layout_id\":4,\"action\":3,\"name\":\"halt\",\"success\":0")
+
+    // ─── assertions ───
+    let fl = frame_layout_count()
+    if fl != 5 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [frame_layout_count] expected=5 got=" + to_string(fl))
+    }
+    let rr = register_restore_count()
+    if rr != 6 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [register_restore_count] expected=6 got=" + to_string(rr))
+    }
+    let hi = handler_invoke_count()
+    if hi != 3 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [handler_invoke_count] expected=3 got=" + to_string(hi))
+    }
+    let ld = layout_divergence_count()
+    if ld != 2 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [layout_divergence_count] expected=2 got=" + to_string(ld))
+    }
+    let ca = continue_action_count()
+    if ca != 4 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [continue_action_count] expected=4 got=" + to_string(ca))
+    }
+
+    // ─── expected_layout_name lookups ───
+    let n_v6 = expected_layout_name(0)
+    if n_v6 != "msvcrt_v6" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [expected_layout_name(0)] expected=msvcrt_v6 got=" + n_v6)
+    }
+    let n_v7 = expected_layout_name(1)
+    if n_v7 != "msvcrt_v7" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [expected_layout_name(1)] expected=msvcrt_v7 got=" + n_v7)
+    }
+    let n_v8 = expected_layout_name(2)
+    if n_v8 != "msvcrt_v8" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [expected_layout_name(2)] expected=msvcrt_v8 got=" + n_v8)
+    }
+    let n_v9 = expected_layout_name(3)
+    if n_v9 != "msvcrt_v9" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [expected_layout_name(3)] expected=msvcrt_v9 got=" + n_v9)
+    }
+    let n_v10 = expected_layout_name(4)
+    if n_v10 != "msvcrt_v10" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [expected_layout_name(4)] expected=msvcrt_v10 got=" + n_v10)
+    }
+
+    // ─── register_name lookups ───
+    let r_esp = register_name(0)
+    if r_esp != "esp" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [register_name(0)] expected=esp got=" + r_esp)
+    }
+    let r_ebp = register_name(1)
+    if r_ebp != "ebp" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [register_name(1)] expected=ebp got=" + r_ebp)
+    }
+    let r_eip = register_name(2)
+    if r_eip != "eip" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [register_name(2)] expected=eip got=" + r_eip)
+    }
+    let r_edi = register_name(8)
+    if r_edi != "edi" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [register_name(8)] expected=edi got=" + r_edi)
+    }
+
+    // ─── continue_action_kind_name lookups ───
+    let a_rc = continue_action_kind_name(0)
+    if a_rc != "resume_caller" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [continue_action_kind_name(0)] expected=resume_caller got=" + a_rc)
+    }
+    let a_cb = continue_action_kind_name(1)
+    if a_cb != "catch_block" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [continue_action_kind_name(1)] expected=catch_block got=" + a_cb)
+    }
+    let a_uc = continue_action_kind_name(2)
+    if a_uc != "unwind_continue" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [continue_action_kind_name(2)] expected=unwind_continue got=" + a_uc)
+    }
+    let a_hl = continue_action_kind_name(3)
+    if a_hl != "halt" {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [continue_action_kind_name(3)] expected=halt got=" + a_hl)
+    }
+
+    // ─── hex parser sanity ───
+    let h_db = pcfl_hex_to_int("DEADBEEF")
+    if h_db != 3735928559 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [pcfl_hex_to_int(DEADBEEF)] expected=3735928559 got=" + to_string(h_db))
+    }
+
+    // ─── stats sanity ───
+    let s = pcfl_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [stats frame_layout] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 6 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [stats register_restore] expected=6 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [stats handler_invoke] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [stats layout_divergence] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [stats continue_action] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (record 20 + stats 1 + summary 1 = 22 ≥ 14) ───
+    r0_emit("pe_msvc_catch_frame_layout_v2_stats",
+        "\"frame_layout_count\":" + to_string(s[0])
+        + ",\"register_restore_count\":" + to_string(s[1])
+        + ",\"handler_invoke_count\":" + to_string(s[2])
+        + ",\"layout_divergence_count\":" + to_string(s[3])
+        + ",\"continue_action_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_catch_frame_layout_v2_summary",
+        "\"phase\":\"catch_frame_layout_v2_complete\""
+        + ",\"research\":\"wine_continue_after_catch_direction\""
+        + ",\"layout_kinds\":5"
+        + ",\"register_kinds\":9"
+        + ",\"action_kinds\":4"
+        + ",\"divergences_fixed\":1"
+        + ",\"divergences_pending\":1")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_catch_frame_layout_v2 FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pcfl()
+    let s2 = pcfl_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_catch_frame_layout_v2 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_catch_frame_layout_v2 self_test PASS (frame=" + to_string(s[0])
+        + ", reg=" + to_string(s[1]) + ", invoke=" + to_string(s[2])
+        + ", divergence=" + to_string(s[3]) + ", action=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcfl_stats()
+            println("frame_layout_count\t" + to_string(s[0]))
+            println("register_restore_count\t" + to_string(s[1]))
+            println("handler_invoke_count\t" + to_string(s[2]))
+            println("layout_divergence_count\t" + to_string(s[3]))
+            println("continue_action_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcfl()
+            println("cleaned: " + pcfl_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcfl_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_catch_frame_layout_v2.hexa { self-test | stats | cleanup | dir }")
+}

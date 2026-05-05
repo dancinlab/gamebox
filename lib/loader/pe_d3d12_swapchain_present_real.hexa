@@ -1,0 +1,430 @@
+// lib/loader/pe_d3d12_swapchain_present_real.hexa — cycle 81 R5 phase 2
+// D3D12 IDXGISwapChain::Present (D3D12 specific path) 추적.
+//
+// IDXGISwapChain::Present → CAMetalLayer nextDrawable + commandBuffer presentDrawable + commit.
+// ALLOW_TEARING → presentDrawable:afterMinimumDuration:0 (immediate).
+// own1: D3DMetal + MSDN DXGI.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 swapchain present tracker — 실 IDXGISwapChain 호출 X (D3DMetal 위임 stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// sync_interval code:
+//   0 = immediate (no vsync)
+//   1 = vsync (1 refresh)
+//   2 = half_vsync (every 2nd refresh)
+//
+// flags bitmask (DXGI_PRESENT_*):
+//   0x001 = TEST
+//   0x002 = DO_NOT_SEQUENCE
+//   0x004 = RESTART
+//   0x200 = ALLOW_TEARING
+//
+// persist schema (TSV — presents.tsv):
+//   present_id<int> \t sync_interval<int> \t flags<int> \t actual_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdsp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_swapchain_present_real"
+}
+
+fn pdsp_presents_path() -> str {
+    return pdsp_dir() + "/presents.tsv"
+}
+
+fn pdsp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdsp_dir() + "'")
+}
+
+fn cleanup_pdsp() -> void {
+    pdsp_ensure_dir()
+    let _ = exec("rm -f '" + pdsp_presents_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdsp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdsp_append_row(path: str, row: str) -> void {
+    pdsp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_present: present 1 건 기록 ───
+fn record_present(present_id: int, sync_interval: int, flags: int, actual_us: int) -> void {
+    if present_id <= 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [record_present] expected=present_id>0 got=" + to_string(present_id))
+    }
+    if sync_interval < 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [record_present] expected=sync_interval>=0 got=" + to_string(sync_interval))
+    }
+    if sync_interval > 2 {
+        panic("pe_d3d12_swapchain_present_real FAIL [record_present] expected=sync_interval<=2 got=" + to_string(sync_interval))
+    }
+    if flags < 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [record_present] expected=flags>=0 got=" + to_string(flags))
+    }
+    if actual_us < 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [record_present] expected=actual_us>=0 got=" + to_string(actual_us))
+    }
+    let row = to_string(present_id) + "\t" + to_string(sync_interval)
+        + "\t" + to_string(flags) + "\t" + to_string(actual_us) + "\n"
+    pdsp_append_row(pdsp_presents_path(), row)
+}
+
+// ─── present_count: total present 수 ───
+fn present_count() -> int {
+    let t = pdsp_read_table(pdsp_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_sync_interval: 특정 sync_interval 의 present 수 ───
+fn count_by_sync_interval(sync_interval: int) -> int {
+    let t = pdsp_read_table(pdsp_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == sync_interval {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_flag_bit: rows where (flags AND bit) != 0 ───
+fn count_by_flag_bit(bit: int) -> int {
+    let t = pdsp_read_table(pdsp_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let f = to_int(parts[2])
+                if (f & bit) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_actual_us: 모든 present actual_us 합 ───
+fn total_actual_us() -> int {
+    let t = pdsp_read_table(pdsp_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── tearing_count: ALLOW_TEARING (0x200=512) bit 가 set 된 present 수 ───
+fn tearing_count() -> int {
+    return count_by_flag_bit(512)
+}
+
+// ─── present_actual_us: 특정 present_id 의 actual_us (없으면 0) ───
+fn present_actual_us(present_id: int) -> int {
+    let t = pdsp_read_table(pdsp_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == present_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdsp_stats: [present_count, total_actual_us, tearing_count, vsync_count] ───
+fn pdsp_stats() -> array {
+    let mut out = []
+    out.push(present_count())
+    out.push(total_actual_us())
+    out.push(tearing_count())
+    out.push(count_by_sync_interval(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdsp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdsp()
+
+    // 2. record 6 presents covering ≥2 sync_intervals + ≥2 flag combinations
+    //    sync_interval: 0=immediate, 1=vsync, 2=half_vsync
+    //    flags: 0=none, 0x200=ALLOW_TEARING, 0x1=TEST, 0x202=TEST|ALLOW_TEARING
+    record_present(330001, 1, 0, 16500)
+    r0_emit("pe_d3d12_swapchain_present_real_record",
+        "\"present_id\":330001,\"sync_interval\":1,\"flags\":0,\"actual_us\":16500,\"target\":\"presentDrawable\"")
+
+    record_present(330002, 1, 0, 16400)
+    r0_emit("pe_d3d12_swapchain_present_real_record",
+        "\"present_id\":330002,\"sync_interval\":1,\"flags\":0,\"actual_us\":16400,\"target\":\"presentDrawable\"")
+
+    record_present(330003, 0, 512, 8200)
+    r0_emit("pe_d3d12_swapchain_present_real_record",
+        "\"present_id\":330003,\"sync_interval\":0,\"flags\":512,\"actual_us\":8200,\"target\":\"presentDrawable:afterMinimumDuration:0\"")
+
+    record_present(330004, 0, 512, 7800)
+    r0_emit("pe_d3d12_swapchain_present_real_record",
+        "\"present_id\":330004,\"sync_interval\":0,\"flags\":512,\"actual_us\":7800,\"target\":\"presentDrawable:afterMinimumDuration:0\"")
+
+    record_present(330005, 2, 1, 33100)
+    r0_emit("pe_d3d12_swapchain_present_real_record",
+        "\"present_id\":330005,\"sync_interval\":2,\"flags\":1,\"actual_us\":33100,\"target\":\"presentDrawable_test\"")
+
+    record_present(330006, 0, 514, 9000)
+    r0_emit("pe_d3d12_swapchain_present_real_record",
+        "\"present_id\":330006,\"sync_interval\":0,\"flags\":514,\"actual_us\":9000,\"target\":\"presentDrawable:afterMinimumDuration:0|DO_NOT_SEQUENCE\"")
+
+    // 3. present_count = 6
+    let c = present_count()
+    if c != 6 {
+        panic("pe_d3d12_swapchain_present_real FAIL [present_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_actual_us = 16500+16400+8200+7800+33100+9000 = 91000
+    let ta = total_actual_us()
+    if ta != 91000 {
+        panic("pe_d3d12_swapchain_present_real FAIL [total_actual_us] expected=91000 got=" + to_string(ta))
+    }
+
+    // 5. count_by_sync_interval sanity
+    let s0 = count_by_sync_interval(0)
+    if s0 != 3 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_sync_interval(0)] expected=3 got=" + to_string(s0))
+    }
+    let s1 = count_by_sync_interval(1)
+    if s1 != 2 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_sync_interval(1)] expected=2 got=" + to_string(s1))
+    }
+    let s2 = count_by_sync_interval(2)
+    if s2 != 1 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_sync_interval(2)] expected=1 got=" + to_string(s2))
+    }
+    let s99 = count_by_sync_interval(99)
+    if s99 != 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_sync_interval(99)] expected=0 got=" + to_string(s99))
+    }
+
+    // 6. count_by_flag_bit sanity
+    //    ALLOW_TEARING (0x200=512): rows 330003, 330004, 330006 → 3
+    let bt = count_by_flag_bit(512)
+    if bt != 3 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_flag_bit(512)] expected=3 got=" + to_string(bt))
+    }
+    //    TEST (0x1): rows 330005 → 1
+    let b1 = count_by_flag_bit(1)
+    if b1 != 1 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_flag_bit(1)] expected=1 got=" + to_string(b1))
+    }
+    //    DO_NOT_SEQUENCE (0x2): rows 330006 (514=512|2) → 1
+    let b2 = count_by_flag_bit(2)
+    if b2 != 1 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_flag_bit(2)] expected=1 got=" + to_string(b2))
+    }
+    //    RESTART (0x4): 0
+    let b4 = count_by_flag_bit(4)
+    if b4 != 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [count_by_flag_bit(4)] expected=0 got=" + to_string(b4))
+    }
+
+    // 7. tearing_count = count_by_flag_bit(0x200) = count_by_flag_bit(512) = 3
+    let tc = tearing_count()
+    if tc != 3 {
+        panic("pe_d3d12_swapchain_present_real FAIL [tearing_count] expected=3 got=" + to_string(tc))
+    }
+
+    // 8. present_actual_us sanity
+    let pa1 = present_actual_us(330001)
+    if pa1 != 16500 {
+        panic("pe_d3d12_swapchain_present_real FAIL [present_actual_us(330001)] expected=16500 got=" + to_string(pa1))
+    }
+    let pa6 = present_actual_us(330006)
+    if pa6 != 9000 {
+        panic("pe_d3d12_swapchain_present_real FAIL [present_actual_us(330006)] expected=9000 got=" + to_string(pa6))
+    }
+    let pa_miss = present_actual_us(9999)
+    if pa_miss != 0 {
+        panic("pe_d3d12_swapchain_present_real FAIL [present_actual_us(9999)] expected=0 got=" + to_string(pa_miss))
+    }
+
+    // 9. pdsp_stats() = [6, 91000, 3, 2]
+    let s = pdsp_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_swapchain_present_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d12_swapchain_present_real FAIL [stats present_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 91000 {
+        panic("pe_d3d12_swapchain_present_real FAIL [stats total_actual_us] expected=91000 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_d3d12_swapchain_present_real FAIL [stats tearing_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d12_swapchain_present_real FAIL [stats vsync_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d12_swapchain_present_real_stats",
+        "\"present_count\":" + to_string(s[0])
+        + ",\"total_actual_us\":" + to_string(s[1])
+        + ",\"tearing_count\":" + to_string(s[2])
+        + ",\"vsync_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d12_swapchain_present_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdsp()
+    let s2c = pdsp_stats()
+    let i = 0
+    while i < len(s2c) {
+        if s2c[i] != 0 {
+            panic("pe_d3d12_swapchain_present_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2c[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_swapchain_present_real self_test PASS (presents=" + to_string(s[0])
+        + ", actual_us=" + to_string(s[1]) + ", tearing=" + to_string(s[2])
+        + ", vsync=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdsp_stats()
+            println("present_count\t" + to_string(s[0]))
+            println("total_actual_us\t" + to_string(s[1]))
+            println("tearing_count\t" + to_string(s[2]))
+            println("vsync_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "actual" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("present_actual_us\t" + to_string(present_actual_us(pid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_swapchain_present_real.hexa actual <present_id>")
+            return
+        }
+        if sub == "sync" {
+            if len(a) >= 4 {
+                let si = to_int(a[3])
+                println("count_by_sync_interval\t" + to_string(count_by_sync_interval(si)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_swapchain_present_real.hexa sync <sync_interval>")
+            return
+        }
+        if sub == "flag" {
+            if len(a) >= 4 {
+                let bit = to_int(a[3])
+                println("count_by_flag_bit\t" + to_string(count_by_flag_bit(bit)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_swapchain_present_real.hexa flag <bit>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdsp()
+            println("cleaned: " + pdsp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdsp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_swapchain_present_real.hexa { self-test | stats | actual <present_id> | sync <sync_interval> | flag <bit> | cleanup | dir }")
+}

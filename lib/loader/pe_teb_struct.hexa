@@ -1,0 +1,412 @@
+// lib/loader/pe_teb_struct.hexa — Thread Environment Block (TEB) layout telemetry
+//
+// Win32 threads access TEB via FS:[0] (i386) / GS:[0] (x64). 본 module 은
+// thread 별 TEB field access 를 추적 — host 측 syscall bridge / wow64
+// trampoline 이 record_access() 로 emit, 통계는 host UI / docker hexa 양쪽에서
+// 조회.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 TEB access tracker — 실 FS/GS segment register 접근 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// field_kind code:
+//   1 = ProcessEnvironmentBlock  (TEB+0x60 x64 / TEB+0x30 i386)
+//   2 = LastErrorValue           (TEB+0x68 x64 / TEB+0x34 i386)
+//   3 = StackBase                (TEB+0x08 x64 / TEB+0x04 i386)
+//   4 = StackLimit               (TEB+0x10 x64 / TEB+0x08 i386)
+//   5 = TlsSlots                 (TEB+0x1480 x64 / TEB+0x0E10 i386)
+//
+// persist schema (TSV — accesses.tsv):
+//   access_id<int> \t field_kind<int> \t offset<int> \t thread_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pts_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_teb_struct"
+}
+
+fn pts_accesses_path() -> str {
+    return pts_dir() + "/accesses.tsv"
+}
+
+fn pts_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pts_dir() + "'")
+}
+
+fn cleanup_pts() -> void {
+    pts_ensure_dir()
+    let _ = exec("rm -f '" + pts_accesses_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pts_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pts_append_row(path: str, row: str) -> void {
+    pts_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_access: TEB field access 1 건 기록 ───
+fn record_access(access_id: int, field_kind: int, offset: int, thread_id: int) -> void {
+    if access_id <= 0 {
+        panic("pe_teb_struct FAIL [record_access] expected=access_id>0 got=" + to_string(access_id))
+    }
+    if field_kind < 1 {
+        panic("pe_teb_struct FAIL [record_access] expected=field_kind>=1 got=" + to_string(field_kind))
+    }
+    if field_kind > 5 {
+        panic("pe_teb_struct FAIL [record_access] expected=field_kind<=5 got=" + to_string(field_kind))
+    }
+    if offset < 0 {
+        panic("pe_teb_struct FAIL [record_access] expected=offset>=0 got=" + to_string(offset))
+    }
+    if thread_id <= 0 {
+        panic("pe_teb_struct FAIL [record_access] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    let row = to_string(access_id) + "\t" + to_string(field_kind)
+        + "\t" + to_string(offset) + "\t" + to_string(thread_id) + "\n"
+    pts_append_row(pts_accesses_path(), row)
+}
+
+// ─── access_count: total access 수 ───
+fn access_count() -> int {
+    let t = pts_read_table(pts_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_field: 특정 field_kind 의 access 수 ───
+fn count_by_field(field_kind: int) -> int {
+    let t = pts_read_table(pts_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == field_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_thread: 특정 thread_id 의 access 수 ───
+fn count_by_thread(thread_id: int) -> int {
+    let t = pts_read_table(pts_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == thread_id {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 등장한 thread_id 의 distinct count ───
+fn distinct_threads() -> int {
+    let t = pts_read_table(pts_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[3])
+                let mut found = 0
+                let j = 0
+                let m = len(seen)
+                let mut k = 0
+                while k < m {
+                    if seen[k] == tid {
+                        found = 1
+                    }
+                    k = k + 1
+                }
+                if found == 0 {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── access_offset: 특정 access_id 의 offset (없으면 0) ───
+fn access_offset(access_id: int) -> int {
+    let t = pts_read_table(pts_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == access_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pts_stats: [access_count, count_by_field(1), distinct_threads, count_by_field(5)] ───
+fn pts_stats() -> array {
+    let mut out = []
+    out.push(access_count())
+    out.push(count_by_field(1))
+    out.push(distinct_threads())
+    out.push(count_by_field(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pts-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pts()
+
+    // 2. record 5 accesses across ≥3 fields + ≥2 threads (deterministic synthetic)
+    record_access(120001, 1, 96, 4001)
+    r0_emit("pe_teb_struct_record",
+        "\"access_id\":120001,\"field_kind\":1,\"offset\":96,\"thread_id\":4001,\"target\":\"PEB\"")
+
+    record_access(120002, 2, 104, 4001)
+    r0_emit("pe_teb_struct_record",
+        "\"access_id\":120002,\"field_kind\":2,\"offset\":104,\"thread_id\":4001,\"target\":\"LastError\"")
+
+    record_access(120003, 3, 8, 4002)
+    r0_emit("pe_teb_struct_record",
+        "\"access_id\":120003,\"field_kind\":3,\"offset\":8,\"thread_id\":4002,\"target\":\"StackBase\"")
+
+    record_access(120004, 5, 5248, 4002)
+    r0_emit("pe_teb_struct_record",
+        "\"access_id\":120004,\"field_kind\":5,\"offset\":5248,\"thread_id\":4002,\"target\":\"TlsSlots\"")
+
+    record_access(120005, 1, 96, 4003)
+    r0_emit("pe_teb_struct_record",
+        "\"access_id\":120005,\"field_kind\":1,\"offset\":96,\"thread_id\":4003,\"target\":\"PEB\"")
+
+    // 3. access_count = 5
+    let c = access_count()
+    if c != 5 {
+        panic("pe_teb_struct FAIL [access_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_field sanity
+    let f1 = count_by_field(1)
+    if f1 != 2 {
+        panic("pe_teb_struct FAIL [count_by_field(1)] expected=2 got=" + to_string(f1))
+    }
+    let f2 = count_by_field(2)
+    if f2 != 1 {
+        panic("pe_teb_struct FAIL [count_by_field(2)] expected=1 got=" + to_string(f2))
+    }
+    let f3 = count_by_field(3)
+    if f3 != 1 {
+        panic("pe_teb_struct FAIL [count_by_field(3)] expected=1 got=" + to_string(f3))
+    }
+    let f4 = count_by_field(4)
+    if f4 != 0 {
+        panic("pe_teb_struct FAIL [count_by_field(4)] expected=0 got=" + to_string(f4))
+    }
+    let f5 = count_by_field(5)
+    if f5 != 1 {
+        panic("pe_teb_struct FAIL [count_by_field(5)] expected=1 got=" + to_string(f5))
+    }
+
+    // 5. count_by_thread sanity
+    let t1 = count_by_thread(4001)
+    if t1 != 2 {
+        panic("pe_teb_struct FAIL [count_by_thread(4001)] expected=2 got=" + to_string(t1))
+    }
+    let t2 = count_by_thread(4002)
+    if t2 != 2 {
+        panic("pe_teb_struct FAIL [count_by_thread(4002)] expected=2 got=" + to_string(t2))
+    }
+    let t3 = count_by_thread(4003)
+    if t3 != 1 {
+        panic("pe_teb_struct FAIL [count_by_thread(4003)] expected=1 got=" + to_string(t3))
+    }
+    let t_miss = count_by_thread(9999)
+    if t_miss != 0 {
+        panic("pe_teb_struct FAIL [count_by_thread(9999)] expected=0 got=" + to_string(t_miss))
+    }
+
+    // 6. distinct_threads = 3
+    let dt = distinct_threads()
+    if dt != 3 {
+        panic("pe_teb_struct FAIL [distinct_threads] expected=3 got=" + to_string(dt))
+    }
+
+    // 7. access_offset sanity
+    let o3 = access_offset(120003)
+    if o3 != 8 {
+        panic("pe_teb_struct FAIL [access_offset(120003)] expected=8 got=" + to_string(o3))
+    }
+    let o4 = access_offset(120004)
+    if o4 != 5248 {
+        panic("pe_teb_struct FAIL [access_offset(120004)] expected=5248 got=" + to_string(o4))
+    }
+    let o_miss = access_offset(99999)
+    if o_miss != 0 {
+        panic("pe_teb_struct FAIL [access_offset(99999)] expected=0 got=" + to_string(o_miss))
+    }
+
+    // 8. pts_stats() = [5, 2, 3, 1]
+    let s = pts_stats()
+    if len(s) != 4 {
+        panic("pe_teb_struct FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_teb_struct FAIL [stats access_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_teb_struct FAIL [stats count_field(1)] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_teb_struct FAIL [stats distinct_threads] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_teb_struct FAIL [stats count_field(5)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_teb_struct_stats",
+        "\"access_count\":" + to_string(s[0])
+        + ",\"field_peb\":" + to_string(s[1])
+        + ",\"distinct_threads\":" + to_string(s[2])
+        + ",\"field_tls\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_teb_struct FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pts()
+    let s2 = pts_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_teb_struct FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_teb_struct self_test PASS (accesses=" + to_string(s[0])
+        + ", fields=" + to_string(s[1]) + "/" + to_string(s[3])
+        + ", threads=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pts_stats()
+            println("access_count\t" + to_string(s[0]))
+            println("field_peb\t" + to_string(s[1]))
+            println("distinct_threads\t" + to_string(s[2]))
+            println("field_tls\t" + to_string(s[3]))
+            return
+        }
+        if sub == "offset" {
+            if len(a) >= 4 {
+                let aid = to_int(a[3])
+                println("access_offset\t" + to_string(access_offset(aid)))
+                return
+            }
+            println("usage: hexa run pe_teb_struct.hexa offset <access_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let fk = to_int(a[3])
+                println("count_by_field\t" + to_string(count_by_field(fk)))
+                return
+            }
+            println("usage: hexa run pe_teb_struct.hexa count <field_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pts()
+            println("cleaned: " + pts_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pts_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_teb_struct.hexa { self-test | stats | offset <access_id> | count <field_kind> | cleanup | dir }")
+}

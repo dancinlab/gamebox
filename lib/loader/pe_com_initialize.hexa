@@ -1,0 +1,431 @@
+// lib/loader/pe_com_initialize.hexa — Win32 CoInitializeEx threading model telemetry
+//
+// Win32 game/app code 가 thread 마다 CoInitializeEx() 로 COM apartment 를
+// 등록한다. 본 module 은 per-thread apartment 등록을 추적 — apartment_kind
+// (STA/MTA/FREE_THREADED) + init_flags bitmask + thread_id 별 통계.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 init record tracker — 실 CoInitializeEx() 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// apartment_kind code:
+//   1 = sta  (single-threaded apartment)
+//   2 = mta  (multi-threaded apartment)
+//   3 = na   (neutral apartment / not applicable)
+//
+// init_flags bitmask (Win32 COINIT 유사):
+//   0x1  = APARTMENTTHREADED
+//   0x2  = MULTITHREADED
+//   0x4  = DISABLE_OLE1DDE
+//   0x8  = SPEED_OVER_MEMORY
+//
+// persist schema (TSV — inits.tsv):
+//   init_id<int> \t apartment_kind<int> \t init_flags<int> \t thread_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pci_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_com_initialize"
+}
+
+fn pci_inits_path() -> str {
+    return pci_dir() + "/inits.tsv"
+}
+
+fn pci_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pci_dir() + "'")
+}
+
+fn cleanup_pci() -> void {
+    pci_ensure_dir()
+    let _ = exec("rm -f '" + pci_inits_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pci_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pci_append_row(path: str, row: str) -> void {
+    pci_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_init: COM init 1 건 기록 ───
+fn record_init(init_id: int, apartment_kind: int, init_flags: int, thread_id: int) -> void {
+    if init_id <= 0 {
+        panic("pe_com_initialize FAIL [record_init] expected=init_id>0 got=" + to_string(init_id))
+    }
+    if apartment_kind < 1 {
+        panic("pe_com_initialize FAIL [record_init] expected=apartment_kind>=1 got=" + to_string(apartment_kind))
+    }
+    if apartment_kind > 3 {
+        panic("pe_com_initialize FAIL [record_init] expected=apartment_kind<=3 got=" + to_string(apartment_kind))
+    }
+    if init_flags < 0 {
+        panic("pe_com_initialize FAIL [record_init] expected=init_flags>=0 got=" + to_string(init_flags))
+    }
+    if thread_id <= 0 {
+        panic("pe_com_initialize FAIL [record_init] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    let row = to_string(init_id) + "\t" + to_string(apartment_kind)
+        + "\t" + to_string(init_flags) + "\t" + to_string(thread_id) + "\n"
+    pci_append_row(pci_inits_path(), row)
+}
+
+// ─── init_count: total init 수 ───
+fn init_count() -> int {
+    let t = pci_read_table(pci_inits_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_apartment: 특정 apartment_kind 의 init 수 ───
+fn count_by_apartment(apartment_kind: int) -> int {
+    let t = pci_read_table(pci_inits_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == apartment_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_flag_bit: (init_flags AND bit_mask) != 0 인 init 수 ───
+fn count_by_flag_bit(bit_mask: int) -> int {
+    let t = pci_read_table(pci_inits_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let flags = to_int(parts[2])
+                // bitwise AND via decomposition — Hexa 환경 호환을 위해 bit 단위 loop
+                let mut bit = 1
+                let mut hit = 0
+                while bit <= flags {
+                    if bit <= bit_mask {
+                        let bit_in_flags = (flags / bit) - ((flags / (bit * 2)) * 2)
+                        let bit_in_mask = (bit_mask / bit) - ((bit_mask / (bit * 2)) * 2)
+                        if bit_in_flags == 1 {
+                            if bit_in_mask == 1 {
+                                hit = 1
+                            }
+                        }
+                    }
+                    bit = bit * 2
+                }
+                if hit == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 고유 thread_id 수 ───
+fn distinct_threads() -> int {
+    let t = pci_read_table(pci_inits_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[3])
+                let mut j = 0
+                let mut found = 0
+                while j < len(seen) {
+                    if seen[j] == tid {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── init_apartment: 특정 init_id 의 apartment_kind (없으면 0) ───
+fn init_apartment(init_id: int) -> int {
+    let t = pci_read_table(pci_inits_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == init_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pci_stats: [init_count, count_apt(sta), count_apt(mta), distinct_threads] ───
+fn pci_stats() -> array {
+    let mut out = []
+    out.push(init_count())
+    out.push(count_by_apartment(1))
+    out.push(count_by_apartment(2))
+    out.push(distinct_threads())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pci-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pci()
+
+    // 2. record 5 inits across ≥2 apartments and ≥2 threads
+    //    flags: 0x1=APARTMENTTHREADED, 0x2=MULTITHREADED, 0x4=DISABLE_OLE1DDE, 0x8=SPEED_OVER_MEMORY
+    record_init(220001, 1, 5, 7001)   // sta + (APT|DISABLE_OLE1DDE = 1|4 = 5)
+    r0_emit("pe_com_initialize_record",
+        "\"init_id\":220001,\"apartment_kind\":1,\"init_flags\":5,\"thread_id\":7001,\"target\":\"sta\"")
+
+    record_init(220002, 2, 2, 7002)   // mta + MULTITHREADED
+    r0_emit("pe_com_initialize_record",
+        "\"init_id\":220002,\"apartment_kind\":2,\"init_flags\":2,\"thread_id\":7002,\"target\":\"mta\"")
+
+    record_init(220003, 1, 1, 7001)   // sta + APARTMENTTHREADED, same thread as 220001
+    r0_emit("pe_com_initialize_record",
+        "\"init_id\":220003,\"apartment_kind\":1,\"init_flags\":1,\"thread_id\":7001,\"target\":\"sta\"")
+
+    record_init(220004, 2, 10, 7003)  // mta + (MULTI|SPEED = 2|8 = 10)
+    r0_emit("pe_com_initialize_record",
+        "\"init_id\":220004,\"apartment_kind\":2,\"init_flags\":10,\"thread_id\":7003,\"target\":\"mta\"")
+
+    record_init(220005, 3, 0, 7004)   // na + no flags
+    r0_emit("pe_com_initialize_record",
+        "\"init_id\":220005,\"apartment_kind\":3,\"init_flags\":0,\"thread_id\":7004,\"target\":\"na\"")
+
+    // 3. init_count = 5
+    let c = init_count()
+    if c != 5 {
+        panic("pe_com_initialize FAIL [init_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_apartment sanity
+    let a1 = count_by_apartment(1)
+    if a1 != 2 {
+        panic("pe_com_initialize FAIL [count_by_apartment(1)] expected=2 got=" + to_string(a1))
+    }
+    let a2 = count_by_apartment(2)
+    if a2 != 2 {
+        panic("pe_com_initialize FAIL [count_by_apartment(2)] expected=2 got=" + to_string(a2))
+    }
+    let a3 = count_by_apartment(3)
+    if a3 != 1 {
+        panic("pe_com_initialize FAIL [count_by_apartment(3)] expected=1 got=" + to_string(a3))
+    }
+    let a99 = count_by_apartment(99)
+    if a99 != 0 {
+        panic("pe_com_initialize FAIL [count_by_apartment(99)] expected=0 got=" + to_string(a99))
+    }
+
+    // 5. count_by_flag_bit sanity
+    //    flags 분포: 5(=0b0101), 2(=0b0010), 1(=0b0001), 10(=0b1010), 0
+    //    bit 0x1 (APARTMENTTHREADED): 5,1 → 2
+    //    bit 0x2 (MULTITHREADED): 2,10 → 2
+    //    bit 0x4 (DISABLE_OLE1DDE): 5 → 1
+    //    bit 0x8 (SPEED_OVER_MEMORY): 10 → 1
+    let f1 = count_by_flag_bit(1)
+    if f1 != 2 {
+        panic("pe_com_initialize FAIL [count_by_flag_bit(1)] expected=2 got=" + to_string(f1))
+    }
+    let f2 = count_by_flag_bit(2)
+    if f2 != 2 {
+        panic("pe_com_initialize FAIL [count_by_flag_bit(2)] expected=2 got=" + to_string(f2))
+    }
+    let f4 = count_by_flag_bit(4)
+    if f4 != 1 {
+        panic("pe_com_initialize FAIL [count_by_flag_bit(4)] expected=1 got=" + to_string(f4))
+    }
+    let f8 = count_by_flag_bit(8)
+    if f8 != 1 {
+        panic("pe_com_initialize FAIL [count_by_flag_bit(8)] expected=1 got=" + to_string(f8))
+    }
+
+    // 6. distinct_threads = 4 (7001 중복 제거 → 7001,7002,7003,7004)
+    let dt = distinct_threads()
+    if dt != 4 {
+        panic("pe_com_initialize FAIL [distinct_threads] expected=4 got=" + to_string(dt))
+    }
+
+    // 7. init_apartment sanity
+    let ap1 = init_apartment(220001)
+    if ap1 != 1 {
+        panic("pe_com_initialize FAIL [init_apartment(220001)] expected=1 got=" + to_string(ap1))
+    }
+    let ap4 = init_apartment(220004)
+    if ap4 != 2 {
+        panic("pe_com_initialize FAIL [init_apartment(220004)] expected=2 got=" + to_string(ap4))
+    }
+    let ap_miss = init_apartment(9999)
+    if ap_miss != 0 {
+        panic("pe_com_initialize FAIL [init_apartment(9999)] expected=0 got=" + to_string(ap_miss))
+    }
+
+    // 8. pci_stats() = [5, 2, 2, 4]
+    let s = pci_stats()
+    if len(s) != 4 {
+        panic("pe_com_initialize FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_com_initialize FAIL [stats init_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_com_initialize FAIL [stats count_apt(sta)] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_com_initialize FAIL [stats count_apt(mta)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_com_initialize FAIL [stats distinct_threads] expected=4 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_com_initialize_stats",
+        "\"init_count\":" + to_string(s[0])
+        + ",\"sta\":" + to_string(s[1])
+        + ",\"mta\":" + to_string(s[2])
+        + ",\"distinct_threads\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_com_initialize FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pci()
+    let s2 = pci_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_com_initialize FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_com_initialize self_test PASS (inits=" + to_string(s[0])
+        + ", sta=" + to_string(s[1]) + ", mta=" + to_string(s[2])
+        + ", threads=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pci_stats()
+            println("init_count\t" + to_string(s[0]))
+            println("count_apt_sta\t" + to_string(s[1]))
+            println("count_apt_mta\t" + to_string(s[2]))
+            println("distinct_threads\t" + to_string(s[3]))
+            return
+        }
+        if sub == "apt" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("init_apartment\t" + to_string(init_apartment(iid)))
+                return
+            }
+            println("usage: hexa run pe_com_initialize.hexa apt <init_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_apartment\t" + to_string(count_by_apartment(kind)))
+                return
+            }
+            println("usage: hexa run pe_com_initialize.hexa count <apartment_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pci()
+            println("cleaned: " + pci_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pci_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_com_initialize.hexa { self-test | stats | apt <init_id> | count <apartment_kind> | cleanup | dir }")
+}

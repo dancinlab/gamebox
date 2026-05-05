@@ -1,0 +1,465 @@
+// lib/loader/dx_d3d12.hexa — Phase 5b — D3D12 → D3DMetal mapping skeleton (D4 필수)
+//
+// own 1 enforcement: Wine / CrossOver / dxvk / vkd3d / community 코드 0 줄.
+//   참조 only — Microsoft 공식 D3D12 / DXGI / DXR API spec:
+//     - Device:       https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12device
+//     - CommandList:  https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12graphicscommandlist
+//     - Resource:     https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createcommittedresource
+//     - DXR:          https://learn.microsoft.com/en-us/windows/win32/direct3d12/direct3d-12-raytracing
+//     - DXGI:         https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nn-dxgi1_4-idxgiswapchain3
+//   Apple Metal / MetalFX / CAMetalLayer / Metal raytracing equivalent 은
+//   developer.apple.com 만 참조. Apple Metal Raytracing API (macOS 14+) 매핑.
+//   vkd3d / dxvk source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 1 (실제 ≥ 3: d3d12_lookup + d3d12_stats + dxr_check)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만 — GPU device alloc 없음, mapping table only)
+//   - panic("dx_d3d12 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 5b — skeleton):
+//   ~32 핵심 D3D12 / DXR / DXGI 함수의 *mapping table*.
+//   각 entry = (D3D12 함수명, 대응되는 Metal/D3DMetal 호출, 카테고리, status).
+//   실제 MTLDevice alloc / MTLAccelerationStructure build / CAMetalLayer
+//   binding 은 Phase 5b 후속 (실 GPU path).
+//
+// status 값:
+//   "skeleton" — mapping 만 (Phase 5b 현재 모든 entry)
+//   "stub"     — default value 만 반환 (호출 시 NULL 또는 0)
+//   "impl"     — 실제 Metal / D3DMetal 호출 수행
+//
+// 32 함수 카테고리 (실제 분포):
+//   Device       8  (D3D12CreateDevice, CreateCommandQueue, CreateCommandList,
+//                    CreateGraphicsPipelineState, CreateComputePipelineState,
+//                    CreateRootSignature, CreateDescriptorHeap, CreateConstantBufferView)
+//   Resource     6  (CreateCommittedResource, CreatePlacedResource,
+//                    CreateShaderResourceView, CreateUnorderedAccessView,
+//                    CreateRenderTargetView, CreateDepthStencilView)
+//   CommandList 10  (DrawInstanced, DrawIndexedInstanced, Dispatch,
+//                    IASetVertexBuffers, IASetIndexBuffer, SetPipelineState,
+//                    SetGraphicsRootSignature, ResourceBarrier,
+//                    ClearRenderTargetView, OMSetRenderTargets)
+//   DXR          5  (D3D12_RAYTRACING_ACCELERATION_STRUCTURE,
+//                    BuildRaytracingAccelerationStructure, DispatchRays,
+//                    CreateStateObject, ID3D12StateObject)
+//   SwapChain    3  (Present, GetCurrentBackBufferIndex, ResizeBuffers)
+//   ─────────────
+//   total       32  / 5 categories
+//
+// D4 specific — DXR (raytracing):
+//   macOS 14+ Apple Silicon → Metal raytracing API native 지원.
+//   macOS 13 / Intel → DXR 매핑 unavailable (dxr_supported() = false).
+//   참조: https://developer.apple.com/documentation/metal/ray_tracing
+//   참조: https://developer.apple.com/documentation/metal/mtlaccelerationstructure
+
+use "../perf/r0_common"
+
+// ─── 32 함수 mapping table (TSV — name\tmetal_equiv\tcategory\tstatus) ───
+//
+// 한 줄 = "<D3D12 name>\t<Metal/D3DMetal equivalent>\t<category>\t<status>"
+// 줄 구분자 = "\n". 첫 줄도 의미 entry (header 없음 — 데이터 32 줄).
+fn d3d12_table() -> str {
+    let t = ""
+    // Device (8)
+    t = t + "D3D12CreateDevice\tCreateMTLDevice_d3d12\tDevice\tskeleton\n"
+    t = t + "CreateCommandQueue\tMTLCommandQueue_new\tDevice\tskeleton\n"
+    t = t + "CreateCommandList\tMTLRenderCommandEncoder_new\tDevice\tskeleton\n"
+    t = t + "CreateGraphicsPipelineState\tMTLRenderPipelineState_new\tDevice\tskeleton\n"
+    t = t + "CreateComputePipelineState\tMTLComputePipelineState_new\tDevice\tskeleton\n"
+    t = t + "CreateRootSignature\tMTLArgumentEncoder_new\tDevice\tskeleton\n"
+    t = t + "CreateDescriptorHeap\tMTLArgumentBuffer_new\tDevice\tskeleton\n"
+    t = t + "CreateConstantBufferView\tMTLBuffer_view\tDevice\tskeleton\n"
+    // Resource (6)
+    t = t + "CreateCommittedResource\tMTLBuffer_or_Texture_new\tResource\tskeleton\n"
+    t = t + "CreatePlacedResource\tMTLBuffer_placed\tResource\tskeleton\n"
+    t = t + "CreateShaderResourceView\tMTLTextureView_new\tResource\tskeleton\n"
+    t = t + "CreateUnorderedAccessView\tMTLTexture_RW\tResource\tskeleton\n"
+    t = t + "CreateRenderTargetView\tMTLRenderTarget_new\tResource\tskeleton\n"
+    t = t + "CreateDepthStencilView\tMTLDepthStencil_new\tResource\tskeleton\n"
+    // CommandList (10)
+    t = t + "DrawInstanced\tMTLRenderCommandEncoder_drawPrimitives_instanced\tCommandList\tskeleton\n"
+    t = t + "DrawIndexedInstanced\tMTLRenderCommandEncoder_drawIndexedPrimitives_instanced\tCommandList\tskeleton\n"
+    t = t + "Dispatch\tMTLComputeCommandEncoder_dispatchThreadgroups\tCommandList\tskeleton\n"
+    t = t + "IASetVertexBuffers\tMTLRenderCommandEncoder_setVertexBuffer\tCommandList\tskeleton\n"
+    t = t + "IASetIndexBuffer\tMTLRenderCommandEncoder_setIndexBuffer\tCommandList\tskeleton\n"
+    t = t + "SetPipelineState\tMTLRenderCommandEncoder_setRenderPipelineState\tCommandList\tskeleton\n"
+    t = t + "SetGraphicsRootSignature\tMTLArgumentEncoder_set\tCommandList\tskeleton\n"
+    t = t + "ResourceBarrier\tMTLResource_barrier\tCommandList\tskeleton\n"
+    t = t + "ClearRenderTargetView\tMTLRenderCommandEncoder_clear\tCommandList\tskeleton\n"
+    t = t + "OMSetRenderTargets\tMTLRenderPassDescriptor_set\tCommandList\tskeleton\n"
+    // DXR (5)
+    t = t + "D3D12_RAYTRACING_ACCELERATION_STRUCTURE\tMTLAccelerationStructure\tDXR\tskeleton\n"
+    t = t + "BuildRaytracingAccelerationStructure\tMTLAccelerationStructureCommandEncoder_build\tDXR\tskeleton\n"
+    t = t + "DispatchRays\tMTLAccelerationStructure_dispatch\tDXR\tskeleton\n"
+    t = t + "CreateStateObject\tMTLPipelineState_raytracing\tDXR\tskeleton\n"
+    t = t + "ID3D12StateObject\tMTLState_object\tDXR\tskeleton\n"
+    // SwapChain (3)
+    t = t + "Present\tCAMetalLayer_drawable_present\tSwapChain\tskeleton\n"
+    t = t + "GetCurrentBackBufferIndex\tCAMetalLayer_currentDrawable\tSwapChain\tskeleton\n"
+    t = t + "ResizeBuffers\tCAMetalLayer_resize\tSwapChain\tskeleton\n"
+    return t
+}
+
+// ─── table line count (entry 수 = 32) ───
+fn d3d12_table_size() -> int {
+    let t = d3d12_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let count = 0
+    while i < n {
+        if lines[i] != "" {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── lookup: D3D12 함수명 → "<metal>\t<category>\t<status>" 또는 "" ───
+fn lookup_mapping(name: str) -> str {
+    let t = d3d12_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == name {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── status only ───
+fn function_status(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[2]
+    }
+    return ""
+}
+
+// ─── category only ───
+fn function_category(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[1]
+    }
+    return ""
+}
+
+// ─── Metal / D3DMetal equivalent only ───
+fn function_metal_equiv(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[0]
+    }
+    return ""
+}
+
+// ─── category 통계 ───
+//
+//   반환: array of [category_name, total_count, impl_count]
+//   (hexa stage1 dict 부재 → array of array).
+//   impl_count = status == "impl" 인 entry 수 (Phase 5b 현재 모두 0).
+fn d3d12_stats() -> array {
+    let mut cats = []
+    cats.push(["Device", 0, 0])
+    cats.push(["Resource", 0, 0])
+    cats.push(["CommandList", 0, 0])
+    cats.push(["DXR", 0, 0])
+    cats.push(["SwapChain", 0, 0])
+
+    let t = d3d12_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let cat = parts[2]
+                let st = parts[3]
+                let j = 0
+                while j < len(cats) {
+                    if cats[j][0] == cat {
+                        cats[j][1] = cats[j][1] + 1
+                        if st == "impl" {
+                            cats[j][2] = cats[j][2] + 1
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cats
+}
+
+// ─── 전체 impl_count 합 (스카라) ───
+fn d3d12_impl_count() -> int {
+    let stats = d3d12_stats()
+    let n = len(stats)
+    let i = 0
+    let total = 0
+    while i < n {
+        total = total + stats[i][2]
+        i = i + 1
+    }
+    return total
+}
+
+// ─── DXR 지원 여부 검증 ───
+//
+// D4 mandate: DXR (raytracing) 매핑은 macOS 14+ Apple Silicon 에서만
+// native Metal raytracing API 로 dispatch 가능.
+//   - Apple Silicon (arm64) + macOS 14+ → true
+//   - Intel / macOS 13 이하 → false
+// 참조: https://developer.apple.com/documentation/metal/ray_tracing
+//         https://developer.apple.com/documentation/metal/mtldevice/3553988-supportsraytracing
+fn dxr_supported() -> bool {
+    let arch = exec("uname -m").trim()
+    if arch != "arm64" {
+        return false
+    }
+    let major = exec("sw_vers -productVersion 2>/dev/null | cut -d. -f1").trim()
+    if major == "" {
+        return false
+    }
+    let mj = to_int(major)
+    if mj < 14 {
+        return false
+    }
+    return true
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "d3d12test-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. table_size ≥ 28 (실제 정확히 32)
+    let sz = d3d12_table_size()
+    if sz < 28 {
+        panic("dx_d3d12 FAIL [table_size] expected=>=28 got=" + to_string(sz))
+    }
+    if sz != 32 {
+        panic("dx_d3d12 FAIL [table_size_exact] expected=32 got=" + to_string(sz))
+    }
+
+    // 2. lookup_mapping("D3D12CreateDevice") = "CreateMTLDevice_d3d12\tDevice\tskeleton"
+    let m_dev = lookup_mapping("D3D12CreateDevice")
+    let exp_dev = "CreateMTLDevice_d3d12\tDevice\tskeleton"
+    if m_dev != exp_dev {
+        panic("dx_d3d12 FAIL [lookup D3D12CreateDevice] expected=" + exp_dev + " got=" + m_dev)
+    }
+
+    // 3. lookup_mapping("DispatchRays") = "MTLAccelerationStructure_dispatch\tDXR\tskeleton"
+    let m_dxr = lookup_mapping("DispatchRays")
+    let exp_dxr = "MTLAccelerationStructure_dispatch\tDXR\tskeleton"
+    if m_dxr != exp_dxr {
+        panic("dx_d3d12 FAIL [lookup DispatchRays] expected=" + exp_dxr + " got=" + m_dxr)
+    }
+
+    // 3b. lookup_mapping("Dispatch") = "MTLComputeCommandEncoder_dispatchThreadgroups\tCommandList\tskeleton"
+    let m_disp = lookup_mapping("Dispatch")
+    let exp_disp = "MTLComputeCommandEncoder_dispatchThreadgroups\tCommandList\tskeleton"
+    if m_disp != exp_disp {
+        panic("dx_d3d12 FAIL [lookup Dispatch] expected=" + exp_disp + " got=" + m_disp)
+    }
+
+    // 3c. lookup_mapping("Present") = "CAMetalLayer_drawable_present\tSwapChain\tskeleton"
+    let m_pres = lookup_mapping("Present")
+    let exp_pres = "CAMetalLayer_drawable_present\tSwapChain\tskeleton"
+    if m_pres != exp_pres {
+        panic("dx_d3d12 FAIL [lookup Present] expected=" + exp_pres + " got=" + m_pres)
+    }
+
+    // 3d. function_status("D3D12CreateDevice") = "skeleton"
+    let st = function_status("D3D12CreateDevice")
+    if st != "skeleton" {
+        panic("dx_d3d12 FAIL [function_status D3D12CreateDevice] expected=skeleton got=" + st)
+    }
+
+    // 3e. unknown name → empty
+    let m_unknown = lookup_mapping("NoSuchFunction")
+    if m_unknown != "" {
+        panic("dx_d3d12 FAIL [lookup unknown] expected=empty got=" + m_unknown)
+    }
+
+    // 6a. r0_emit "d3d12_lookup" {name, metal}
+    let metal_dev = function_metal_equiv("D3D12CreateDevice")
+    r0_emit("d3d12_lookup",
+        "\"name\":\"D3D12CreateDevice\",\"metal\":\"" + metal_dev + "\"")
+
+    // 4. d3d12_stats() ≥ 5 categories (DXR 포함)
+    let stats = d3d12_stats()
+    let cat_n = len(stats)
+    if cat_n < 5 {
+        panic("dx_d3d12 FAIL [stats categories] expected=>=5 got=" + to_string(cat_n))
+    }
+    // 카테고리별 정확한 count + DXR present 검증
+    let i = 0
+    let sum_total = 0
+    let sum_impl = 0
+    let dxr_seen = false
+    while i < cat_n {
+        let cn = stats[i][0]
+        let ct = stats[i][1]
+        let ci = stats[i][2]
+        sum_total = sum_total + ct
+        sum_impl = sum_impl + ci
+        if cn == "Device" {
+            if ct != 8 {
+                panic("dx_d3d12 FAIL [stats Device count] expected=8 got=" + to_string(ct))
+            }
+        }
+        if cn == "Resource" {
+            if ct != 6 {
+                panic("dx_d3d12 FAIL [stats Resource count] expected=6 got=" + to_string(ct))
+            }
+        }
+        if cn == "CommandList" {
+            if ct != 10 {
+                panic("dx_d3d12 FAIL [stats CommandList count] expected=10 got=" + to_string(ct))
+            }
+        }
+        if cn == "DXR" {
+            dxr_seen = true
+            if ct != 5 {
+                panic("dx_d3d12 FAIL [stats DXR count] expected=5 got=" + to_string(ct))
+            }
+        }
+        if cn == "SwapChain" {
+            if ct != 3 {
+                panic("dx_d3d12 FAIL [stats SwapChain count] expected=3 got=" + to_string(ct))
+            }
+        }
+        i = i + 1
+    }
+    if !dxr_seen {
+        panic("dx_d3d12 FAIL [stats DXR present] expected=true got=false")
+    }
+    if sum_total != 32 {
+        panic("dx_d3d12 FAIL [stats total sum] expected=32 got=" + to_string(sum_total))
+    }
+    if sum_impl != 0 {
+        panic("dx_d3d12 FAIL [stats impl sum] expected=0 got=" + to_string(sum_impl))
+    }
+
+    // 6b. r0_emit "d3d12_stats" {table_size, categories}
+    r0_emit("d3d12_stats",
+        "\"table_size\":" + to_string(sz)
+        + ",\"categories\":" + to_string(cat_n)
+        + ",\"impl_count\":" + to_string(sum_impl))
+
+    // 5. dxr_supported() → bool (현재 macOS / arch 검사)
+    let dxr_ok = dxr_supported()
+    let dxr_str = "false"
+    if dxr_ok { dxr_str = "true" }
+    let arch = exec("uname -m").trim()
+    let macos_ver = exec("sw_vers -productVersion 2>/dev/null").trim()
+
+    // 6c. r0_emit "dxr_check" {arch, macos, supported}
+    r0_emit("dxr_check",
+        "\"arch\":\"" + arch + "\""
+        + ",\"macos\":\"" + macos_ver + "\""
+        + ",\"supported\":" + dxr_str)
+
+    // R0 emit count 검증 — 정확히 3 events (d3d12_lookup + d3d12_stats + dxr_check)
+    let emit_n = r0_session_count(sid)
+    if emit_n != 3 {
+        panic("dx_d3d12 FAIL [r0 emit count] expected=3 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ dx_d3d12 self_test PASS (" + to_string(sz) + " functions, "
+        + to_string(cat_n) + " categories, DXR support reported=" + dxr_str
+        + ", arch=" + arch + ", macOS=" + macos_ver
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "table" {
+            print(d3d12_table())
+            return
+        }
+        if sub == "lookup" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let m = lookup_mapping(name)
+                if m == "" {
+                    println("(not found)")
+                } else {
+                    println(m)
+                }
+                return
+            }
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let s = function_status(name)
+                if s == "" {
+                    println("(not found)")
+                } else {
+                    println(s)
+                }
+                return
+            }
+        }
+        if sub == "stats" {
+            let stats = d3d12_stats()
+            let n = len(stats)
+            let i = 0
+            while i < n {
+                println(stats[i][0]
+                    + "\t" + to_string(stats[i][1])
+                    + "\t" + to_string(stats[i][2]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "size" {
+            println(to_string(d3d12_table_size()))
+            return
+        }
+        if sub == "dxr-supported" {
+            let ok = dxr_supported()
+            if ok {
+                println("true")
+            } else {
+                println("false")
+            }
+            return
+        }
+    }
+    println("usage: hexa run dx_d3d12.hexa { self-test | table | lookup <name> | status <name> | stats | size | dxr-supported }")
+}

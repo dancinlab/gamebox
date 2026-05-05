@@ -1,0 +1,379 @@
+// lib/loader/pe_native_mmap_wrapper.hexa — stage4 macOS mmap wrapper skeleton
+//
+// PE 의 ImageBase + SizeOfImage 만큼 mmap 으로 region 확보. MAP_ANON +
+// PROT_READ|PROT_WRITE 로 reserve, section copy 후 mprotect 으로 R+X.
+// Apple Silicon W^X — write/exec 동시 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Apple mmap(2) / mprotect(2) man page + Apple Silicon W^X policy 만 참조.
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// prot_flags:
+//   1 = R         (.rdata — read-only)
+//   2 = R+W       (initial reserve / .data / stack)
+//   4 = R+X       (.text — after section copy + mprotect)
+//   6 = R+W+X     (forbidden — W^X 위반 — record_mmap 거부)
+//
+// persist schema (TSV — pnmw_history.tsv):
+//   call_id<int> \t region_size<int> \t prot_flags<int> \t success<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnmw_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_mmap_wrapper"
+}
+
+fn pnmw_history_path() -> str {
+    return pnmw_dir() + "/pnmw_history.tsv"
+}
+
+fn pnmw_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnmw_dir() + "'")
+}
+
+fn cleanup_pnmw() -> void {
+    pnmw_ensure_dir()
+    let _ = exec("rm -f '" + pnmw_history_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnmw_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnmw_append_row(path: str, row: str) -> void {
+    pnmw_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_mmap: mmap call 기록 ───
+fn record_mmap(call_id: int, region_size: int, prot_flags: int, success: int) -> void {
+    if call_id <= 0 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if region_size <= 0 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] expected=region_size>0 got=" + to_string(region_size))
+    }
+    if prot_flags <= 0 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] expected=prot_flags>0 got=" + to_string(prot_flags))
+    }
+    if prot_flags == 6 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] forbidden=R+W+X (W^X violation) call_id=" + to_string(call_id))
+    }
+    if prot_flags > 4 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] expected=prot_flags<=4 got=" + to_string(prot_flags))
+    }
+    if success < 0 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_native_mmap_wrapper FAIL [record_mmap] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(call_id) + "\t" + to_string(region_size)
+        + "\t" + to_string(prot_flags) + "\t" + to_string(success) + "\n"
+    pnmw_append_row(pnmw_history_path(), row)
+}
+
+// ─── mmap_count: 전체 mmap call row 수 ───
+fn mmap_count() -> int {
+    let mut cnt = 0
+    let t = pnmw_read_table(pnmw_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    cnt = cnt + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── total_size: region_size sum ───
+fn total_size() -> int {
+    let mut sum = 0
+    let t = pnmw_read_table(pnmw_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum = sum + to_int(parts[1])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum
+}
+
+// ─── success_count: success == 1 row 수 ───
+fn success_count() -> int {
+    let mut cnt = 0
+    let t = pnmw_read_table(pnmw_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[3]) == 1 {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── count_by_prot: 특정 prot_flags row 수 ───
+fn count_by_prot(flag: int) -> int {
+    let mut cnt = 0
+    let t = pnmw_read_table(pnmw_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[2]) == flag {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── region_size: 특정 call_id 의 region_size (없으면 0) ───
+fn region_size(call_id: int) -> int {
+    let mut out = 0
+    let t = pnmw_read_table(pnmw_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[0]) == call_id {
+                        out = to_int(parts[1])
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ─── pnmw_stats: [mmap_count, total_size, success_count, count_by_prot(2)] ───
+fn pnmw_stats() -> array {
+    let mut out = []
+    out.push(mmap_count())
+    out.push(total_size())
+    out.push(success_count())
+    out.push(count_by_prot(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnmw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnmw()
+
+    // 2. record 4 synthetic mmap calls
+    record_mmap(99001, 5279744, 2, 1)
+    r0_emit("pe_native_mmap_wrapper_record",
+        "\"call_id\":99001,\"region_size\":5279744,\"prot_flags\":2,\"success\":1,\"label\":\"bnet_setup_reserve\"")
+
+    record_mmap(99002, 5279744, 4, 1)
+    r0_emit("pe_native_mmap_wrapper_record",
+        "\"call_id\":99002,\"region_size\":5279744,\"prot_flags\":4,\"success\":1,\"label\":\"bnet_setup_rx\"")
+
+    record_mmap(99003, 1048576, 2, 1)
+    r0_emit("pe_native_mmap_wrapper_record",
+        "\"call_id\":99003,\"region_size\":1048576,\"prot_flags\":2,\"success\":1,\"label\":\"stack_rw\"")
+
+    record_mmap(99004, 4096, 1, 1)
+    r0_emit("pe_native_mmap_wrapper_record",
+        "\"call_id\":99004,\"region_size\":4096,\"prot_flags\":1,\"success\":1,\"label\":\"rdata_ro\"")
+
+    // 3. mmap_count = 4
+    let mc = mmap_count()
+    if mc != 4 {
+        panic("pe_native_mmap_wrapper FAIL [mmap_count] expected=4 got=" + to_string(mc))
+    }
+
+    // 4. total_size = 5279744+5279744+1048576+4096 = 11612160
+    let ts = total_size()
+    if ts != 11612160 {
+        panic("pe_native_mmap_wrapper FAIL [total_size] expected=11612160 got=" + to_string(ts))
+    }
+
+    // 5. success_count = 4
+    let sc = success_count()
+    if sc != 4 {
+        panic("pe_native_mmap_wrapper FAIL [success_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 6. count_by_prot
+    let c1 = count_by_prot(1)
+    if c1 != 1 {
+        panic("pe_native_mmap_wrapper FAIL [count_by_prot(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_prot(2)
+    if c2 != 2 {
+        panic("pe_native_mmap_wrapper FAIL [count_by_prot(2)] expected=2 got=" + to_string(c2))
+    }
+    let c4 = count_by_prot(4)
+    if c4 != 1 {
+        panic("pe_native_mmap_wrapper FAIL [count_by_prot(4)] expected=1 got=" + to_string(c4))
+    }
+    let c99 = count_by_prot(99)
+    if c99 != 0 {
+        panic("pe_native_mmap_wrapper FAIL [count_by_prot(99)] expected=0 got=" + to_string(c99))
+    }
+
+    // 7. region_size lookup
+    let r1 = region_size(99001)
+    if r1 != 5279744 {
+        panic("pe_native_mmap_wrapper FAIL [region_size(99001)] expected=5279744 got=" + to_string(r1))
+    }
+    let r4 = region_size(99004)
+    if r4 != 4096 {
+        panic("pe_native_mmap_wrapper FAIL [region_size(99004)] expected=4096 got=" + to_string(r4))
+    }
+    let rx = region_size(9999)
+    if rx != 0 {
+        panic("pe_native_mmap_wrapper FAIL [region_size(9999)] expected=0 got=" + to_string(rx))
+    }
+
+    // 8. pnmw_stats() = [4, 11612160, 4, 2]
+    let s = pnmw_stats()
+    if len(s) != 4 {
+        panic("pe_native_mmap_wrapper FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_native_mmap_wrapper FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 11612160 {
+        panic("pe_native_mmap_wrapper FAIL [stats[1]] expected=11612160 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_native_mmap_wrapper FAIL [stats[2]] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_native_mmap_wrapper FAIL [stats[3]] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_native_mmap_wrapper_stats",
+        "\"mmap_count\":" + to_string(s[0])
+        + ",\"total_size\":" + to_string(s[1])
+        + ",\"success_count\":" + to_string(s[2])
+        + ",\"rw_count\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_native_mmap_wrapper FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pnmw()
+    let s2 = pnmw_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_native_mmap_wrapper FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_mmap_wrapper self_test PASS (mmaps=" + to_string(s[0])
+        + ", total_size=" + to_string(s[1]) + ", success=" + to_string(s[2])
+        + ", rw=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnmw_stats()
+            println("mmap_count\t" + to_string(s[0]))
+            println("total_size\t" + to_string(s[1]))
+            println("success_count\t" + to_string(s[2]))
+            println("rw_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("region_size\t" + to_string(region_size(cid)))
+                return
+            }
+            println("usage: hexa run pe_native_mmap_wrapper.hexa size <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let f = to_int(a[3])
+                println("count_by_prot\t" + to_string(count_by_prot(f)))
+                return
+            }
+            println("usage: hexa run pe_native_mmap_wrapper.hexa count <prot_flag>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnmw()
+            println("cleaned: " + pnmw_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnmw_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_mmap_wrapper.hexa { self-test | stats | size <call_id> | count <prot_flag> | cleanup | dir }")
+}

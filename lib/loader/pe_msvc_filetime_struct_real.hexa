@@ -1,0 +1,522 @@
+// lib/loader/pe_msvc_filetime_struct_real.hexa — Windows FILETIME / SYSTEM_INFO / OSVERSIONINFO struct fill tracker
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / community wrapper 0 줄.
+//        Microsoft Win32 public ABI (FILETIME / SYSTEM_INFO / OSVERSIONINFO)
+//        observation only — 본 module 은 struct fill telemetry 만 기록.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   MSVC CRT / KERNEL32 가 i386 PE 실행 중 user struct buffer 에 쓰는
+//   FILETIME (8 byte: dwLowDateTime / dwHighDateTime),
+//   SYSTEM_INFO (36 byte: dwPageSize / dwNumberOfProcessors / wProcessorArchitecture …),
+//   OSVERSIONINFO (148 byte: dwMajorVersion / dwMinorVersion / dwBuildNumber …)
+//   세 종류의 struct fill 시점과, 그 외 보조 struct (MEMORYSTATUS / STARTUPINFO /
+//   CONTEXT / PROCESSORINFO) 를 별도 misc 테이블에 기록.
+//   각 struct 의 caller_use 행은 후속 deref offset 을 추적해서
+//   wrong-offset 으로 인한 invalid 사용을 표면화한다.
+//
+// fill 시점 source_kind:
+//   0=gettimeofday   — host gettimeofday → FILETIME 변환
+//   1=mach_absolute_time — host mach_abs → 100ns FILETIME
+//   2=hardcoded      — 고정 epoch (test fixture)
+//   3=clock_gettime  — host clock_gettime(CLOCK_REALTIME) → FILETIME
+//
+// processor_arch_kind (Win32 PROCESSOR_ARCHITECTURE_*):
+//   0=x86 9=amd64 5=arm 12=arm64
+//
+// persist schema (TSV — 5 separate tables):
+//   filetime.tsv:
+//     ft_id<int> \t target_va_hex<str> \t low_dword_hex<str> \t high_dword_hex<str> \t source_kind<int>
+//   system_info.tsv:
+//     si_id<int> \t target_va_hex<str> \t page_size<int> \t num_proc<int> \t processor_arch_kind<int>
+//   os_version.tsv:
+//     ov_id<int> \t target_va_hex<str> \t major_version<int> \t minor_version<int> \t build_number<int>
+//   misc.tsv:
+//     misc_id<int> \t struct_kind<str> \t target_va_hex<str> \t size_bytes<int>
+//   caller_use.tsv:
+//     use_id<int> \t struct_id<int> \t struct_kind<str> \t deref_offset_hex<str> \t valid<int>
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: ft_id / si_id / ov_id / misc_id / use_id /
+// target_va_hex / low_dword_hex / high_dword_hex / source_kind /
+// page_size / num_proc / processor_arch_kind /
+// major_version / minor_version / build_number /
+// struct_kind / size_bytes / struct_id / deref_offset_hex / valid.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmfsr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_filetime_struct_real"
+}
+
+fn pmfsr_filetime_path() -> str {
+    return pmfsr_dir() + "/filetime.tsv"
+}
+
+fn pmfsr_system_info_path() -> str {
+    return pmfsr_dir() + "/system_info.tsv"
+}
+
+fn pmfsr_os_version_path() -> str {
+    return pmfsr_dir() + "/os_version.tsv"
+}
+
+fn pmfsr_misc_path() -> str {
+    return pmfsr_dir() + "/misc.tsv"
+}
+
+fn pmfsr_caller_use_path() -> str {
+    return pmfsr_dir() + "/caller_use.tsv"
+}
+
+fn pmfsr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmfsr_dir() + "'")
+}
+
+fn cleanup_pmfsr() -> void {
+    pmfsr_ensure_dir()
+    let _ = exec("rm -f '" + pmfsr_filetime_path() + "' '" + pmfsr_system_info_path()
+        + "' '" + pmfsr_os_version_path() + "' '" + pmfsr_misc_path()
+        + "' '" + pmfsr_caller_use_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmfsr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmfsr_append_row(path: str, row: str) -> void {
+    pmfsr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmfsr_count_rows(path: str, min_cols: int) -> int {
+    let t = pmfsr_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: source_kind / arch name lookup ───
+fn source_kind_name(k: int) -> str {
+    if k == 0 {
+        return "gettimeofday"
+    }
+    if k == 1 {
+        return "mach_absolute_time"
+    }
+    if k == 2 {
+        return "hardcoded"
+    }
+    if k == 3 {
+        return "clock_gettime"
+    }
+    return "unknown"
+}
+
+fn arch_name(k: int) -> str {
+    if k == 0 {
+        return "x86"
+    }
+    if k == 9 {
+        return "amd64"
+    }
+    if k == 5 {
+        return "arm"
+    }
+    if k == 12 {
+        return "arm64"
+    }
+    return "unknown"
+}
+
+// ─── record_filetime_fill: FILETIME (low_dword / high_dword) struct fill milestone ───
+fn record_filetime_fill(ft_id: int, target_va_hex: str, low_dword_hex: str, high_dword_hex: str, source_kind: int) -> void {
+    if ft_id <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_filetime_fill] expected=ft_id>0 got=" + to_string(ft_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_filetime_fill] expected=target_va_hex!=empty got=empty")
+    }
+    if low_dword_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_filetime_fill] expected=low_dword_hex!=empty got=empty")
+    }
+    if high_dword_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_filetime_fill] expected=high_dword_hex!=empty got=empty")
+    }
+    if source_kind < 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_filetime_fill] expected=source_kind>=0 got=" + to_string(source_kind))
+    }
+    if source_kind > 3 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_filetime_fill] expected=source_kind<=3 got=" + to_string(source_kind))
+    }
+    let row = to_string(ft_id) + "\t" + target_va_hex + "\t"
+        + low_dword_hex + "\t" + high_dword_hex + "\t" + to_string(source_kind) + "\n"
+    pmfsr_append_row(pmfsr_filetime_path(), row)
+}
+
+// ─── record_system_info_fill: SYSTEM_INFO (page_size / num_proc / arch) struct fill milestone ───
+fn record_system_info_fill(si_id: int, target_va_hex: str, page_size: int, num_proc: int, processor_arch_kind: int) -> void {
+    if si_id <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_system_info_fill] expected=si_id>0 got=" + to_string(si_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_system_info_fill] expected=target_va_hex!=empty got=empty")
+    }
+    if page_size <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_system_info_fill] expected=page_size>0 got=" + to_string(page_size))
+    }
+    if num_proc <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_system_info_fill] expected=num_proc>0 got=" + to_string(num_proc))
+    }
+    if processor_arch_kind < 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_system_info_fill] expected=processor_arch_kind>=0 got=" + to_string(processor_arch_kind))
+    }
+    let row = to_string(si_id) + "\t" + target_va_hex + "\t"
+        + to_string(page_size) + "\t" + to_string(num_proc) + "\t"
+        + to_string(processor_arch_kind) + "\n"
+    pmfsr_append_row(pmfsr_system_info_path(), row)
+}
+
+// ─── record_os_version_fill: OSVERSIONINFO (major / minor / build) struct fill milestone ───
+fn record_os_version_fill(ov_id: int, target_va_hex: str, major_version: int, minor_version: int, build_number: int) -> void {
+    if ov_id <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_os_version_fill] expected=ov_id>0 got=" + to_string(ov_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_os_version_fill] expected=target_va_hex!=empty got=empty")
+    }
+    if major_version < 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_os_version_fill] expected=major_version>=0 got=" + to_string(major_version))
+    }
+    if minor_version < 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_os_version_fill] expected=minor_version>=0 got=" + to_string(minor_version))
+    }
+    if build_number < 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_os_version_fill] expected=build_number>=0 got=" + to_string(build_number))
+    }
+    let row = to_string(ov_id) + "\t" + target_va_hex + "\t"
+        + to_string(major_version) + "\t" + to_string(minor_version) + "\t"
+        + to_string(build_number) + "\n"
+    pmfsr_append_row(pmfsr_os_version_path(), row)
+}
+
+// ─── record_struct_misc: 보조 struct (MEMORYSTATUS / STARTUPINFO / CONTEXT / PROCESSORINFO) milestone ───
+fn record_struct_misc(misc_id: int, struct_kind: str, target_va_hex: str, size_bytes: int) -> void {
+    if misc_id <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_struct_misc] expected=misc_id>0 got=" + to_string(misc_id))
+    }
+    if struct_kind == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_struct_misc] expected=struct_kind!=empty got=empty")
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_struct_misc] expected=target_va_hex!=empty got=empty")
+    }
+    if size_bytes <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_struct_misc] expected=size_bytes>0 got=" + to_string(size_bytes))
+    }
+    let row = to_string(misc_id) + "\t" + struct_kind + "\t" + target_va_hex + "\t"
+        + to_string(size_bytes) + "\n"
+    pmfsr_append_row(pmfsr_misc_path(), row)
+}
+
+// ─── record_caller_use: caller 가 struct 내부 field 를 deref 한 milestone ───
+fn record_caller_use(use_id: int, struct_id: int, struct_kind: str, deref_offset_hex: str, valid: int) -> void {
+    if use_id <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_caller_use] expected=use_id>0 got=" + to_string(use_id))
+    }
+    if struct_id <= 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_caller_use] expected=struct_id>0 got=" + to_string(struct_id))
+    }
+    if struct_kind == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_caller_use] expected=struct_kind!=empty got=empty")
+    }
+    if deref_offset_hex == "" {
+        panic("pe_msvc_filetime_struct_real FAIL [record_caller_use] expected=deref_offset_hex!=empty got=empty")
+    }
+    if valid < 0 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_caller_use] expected=valid>=0 got=" + to_string(valid))
+    }
+    if valid > 1 {
+        panic("pe_msvc_filetime_struct_real FAIL [record_caller_use] expected=valid<=1 got=" + to_string(valid))
+    }
+    let row = to_string(use_id) + "\t" + to_string(struct_id) + "\t" + struct_kind + "\t"
+        + deref_offset_hex + "\t" + to_string(valid) + "\n"
+    pmfsr_append_row(pmfsr_caller_use_path(), row)
+}
+
+// ─── statistics ───
+fn filetime_count() -> int {
+    return pmfsr_count_rows(pmfsr_filetime_path(), 5)
+}
+
+fn system_info_count() -> int {
+    return pmfsr_count_rows(pmfsr_system_info_path(), 5)
+}
+
+fn os_version_count() -> int {
+    return pmfsr_count_rows(pmfsr_os_version_path(), 5)
+}
+
+fn misc_count() -> int {
+    return pmfsr_count_rows(pmfsr_misc_path(), 4)
+}
+
+fn caller_use_count() -> int {
+    return pmfsr_count_rows(pmfsr_caller_use_path(), 5)
+}
+
+fn pmfsr_stats() -> array {
+    let mut out = []
+    out.push(filetime_count())
+    out.push(system_info_count())
+    out.push(os_version_count())
+    out.push(misc_count())
+    out.push(caller_use_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pmfsr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmfsr()
+
+    // ─── 1. filetime_fill × 2 (now=gettimeofday + epoch 2026-05-02=hardcoded) ───
+    // 2026-05-02 00:00:00 UTC → Windows FILETIME 100ns ticks since 1601-01-01:
+    //   high=0x01DCBD18 low=0xCB7B4000 (대표값; test fixture)
+    record_filetime_fill(1, "0x10001000", "0x12345678", "0x01DCBD17", 0)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"filetime_fill\",\"ft_id\":1,\"target_va_hex\":\"0x10001000\",\"low_dword_hex\":\"0x12345678\",\"high_dword_hex\":\"0x01DCBD17\",\"source_kind\":0,\"source\":\"gettimeofday\"")
+
+    record_filetime_fill(2, "0x10001008", "0xCB7B4000", "0x01DCBD18", 2)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"filetime_fill\",\"ft_id\":2,\"target_va_hex\":\"0x10001008\",\"low_dword_hex\":\"0xCB7B4000\",\"high_dword_hex\":\"0x01DCBD18\",\"source_kind\":2,\"source\":\"hardcoded\",\"epoch\":\"2026-05-02T00:00:00Z\"")
+
+    // ─── 2. system_info_fill × 2 (page=4096 num_proc=1 arch=x86 / arch=amd64) ───
+    record_system_info_fill(1, "0x10002000", 4096, 1, 0)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"system_info_fill\",\"si_id\":1,\"target_va_hex\":\"0x10002000\",\"page_size\":4096,\"num_proc\":1,\"processor_arch_kind\":0,\"arch\":\"x86\"")
+
+    record_system_info_fill(2, "0x10002028", 4096, 1, 9)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"system_info_fill\",\"si_id\":2,\"target_va_hex\":\"0x10002028\",\"page_size\":4096,\"num_proc\":1,\"processor_arch_kind\":9,\"arch\":\"amd64\"")
+
+    // ─── 3. os_version_fill × 1 (Windows 10/11 fake: 10.0.22000) ───
+    record_os_version_fill(1, "0x10003000", 10, 0, 22000)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"os_version_fill\",\"ov_id\":1,\"target_va_hex\":\"0x10003000\",\"major_version\":10,\"minor_version\":0,\"build_number\":22000,\"label\":\"Windows 10/11 fake\"")
+
+    // ─── 4. struct_misc × 4 (PROCESSORINFO / MEMORYSTATUS / STARTUPINFO / CONTEXT) ───
+    record_struct_misc(1, "PROCESSORINFO", "0x10004000", 36)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"struct_misc\",\"misc_id\":1,\"struct_kind\":\"PROCESSORINFO\",\"target_va_hex\":\"0x10004000\",\"size_bytes\":36")
+
+    record_struct_misc(2, "MEMORYSTATUS", "0x10004100", 32)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"struct_misc\",\"misc_id\":2,\"struct_kind\":\"MEMORYSTATUS\",\"target_va_hex\":\"0x10004100\",\"size_bytes\":32")
+
+    record_struct_misc(3, "STARTUPINFO", "0x10004200", 68)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"struct_misc\",\"misc_id\":3,\"struct_kind\":\"STARTUPINFO\",\"target_va_hex\":\"0x10004200\",\"size_bytes\":68")
+
+    record_struct_misc(4, "CONTEXT", "0x10004300", 716)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"struct_misc\",\"misc_id\":4,\"struct_kind\":\"CONTEXT\",\"target_va_hex\":\"0x10004300\",\"size_bytes\":716")
+
+    // ─── 5. caller_use × 4
+    //    FILETIME(id=1) → .dwLowDateTime  (offset 0x00, valid=1)
+    //    SYSTEM_INFO(id=1) → .dwPageSize  (offset 0x04, valid=1)
+    //    OSVERSIONINFO(id=1) → .dwMajorVersion (offset 0x04, valid=1)
+    //    STARTUPINFO(misc id=3) → .cb (offset 0x00, valid=1)
+    record_caller_use(1, 1, "FILETIME", "0x00", 1)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"caller_use\",\"use_id\":1,\"struct_id\":1,\"struct_kind\":\"FILETIME\",\"deref_offset_hex\":\"0x00\",\"valid\":1,\"field\":\".dwLowDateTime\"")
+
+    record_caller_use(2, 1, "SYSTEM_INFO", "0x04", 1)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"caller_use\",\"use_id\":2,\"struct_id\":1,\"struct_kind\":\"SYSTEM_INFO\",\"deref_offset_hex\":\"0x04\",\"valid\":1,\"field\":\".dwPageSize\"")
+
+    record_caller_use(3, 1, "OSVERSIONINFO", "0x04", 1)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"caller_use\",\"use_id\":3,\"struct_id\":1,\"struct_kind\":\"OSVERSIONINFO\",\"deref_offset_hex\":\"0x04\",\"valid\":1,\"field\":\".dwMajorVersion\"")
+
+    record_caller_use(4, 3, "STARTUPINFO", "0x00", 1)
+    r0_emit("pe_msvc_filetime_struct_real_record",
+        "\"kind\":\"caller_use\",\"use_id\":4,\"struct_id\":3,\"struct_kind\":\"STARTUPINFO\",\"deref_offset_hex\":\"0x00\",\"valid\":1,\"field\":\".cb\"")
+
+    // ─── assertions: count ───
+    let ftc = filetime_count()
+    if ftc != 2 {
+        panic("pe_msvc_filetime_struct_real FAIL [filetime_count] expected=2 got=" + to_string(ftc))
+    }
+    let sic = system_info_count()
+    if sic != 2 {
+        panic("pe_msvc_filetime_struct_real FAIL [system_info_count] expected=2 got=" + to_string(sic))
+    }
+    let ovc = os_version_count()
+    if ovc != 1 {
+        panic("pe_msvc_filetime_struct_real FAIL [os_version_count] expected=1 got=" + to_string(ovc))
+    }
+    let mc = misc_count()
+    if mc != 4 {
+        panic("pe_msvc_filetime_struct_real FAIL [misc_count] expected=4 got=" + to_string(mc))
+    }
+    let cuc = caller_use_count()
+    if cuc != 4 {
+        panic("pe_msvc_filetime_struct_real FAIL [caller_use_count] expected=4 got=" + to_string(cuc))
+    }
+
+    // ─── helper sanity ───
+    if source_kind_name(0) != "gettimeofday" {
+        panic("pe_msvc_filetime_struct_real FAIL [source_kind_name(0)] expected=gettimeofday got=" + source_kind_name(0))
+    }
+    if source_kind_name(1) != "mach_absolute_time" {
+        panic("pe_msvc_filetime_struct_real FAIL [source_kind_name(1)] expected=mach_absolute_time got=" + source_kind_name(1))
+    }
+    if source_kind_name(2) != "hardcoded" {
+        panic("pe_msvc_filetime_struct_real FAIL [source_kind_name(2)] expected=hardcoded got=" + source_kind_name(2))
+    }
+    if source_kind_name(3) != "clock_gettime" {
+        panic("pe_msvc_filetime_struct_real FAIL [source_kind_name(3)] expected=clock_gettime got=" + source_kind_name(3))
+    }
+    if arch_name(0) != "x86" {
+        panic("pe_msvc_filetime_struct_real FAIL [arch_name(0)] expected=x86 got=" + arch_name(0))
+    }
+    if arch_name(9) != "amd64" {
+        panic("pe_msvc_filetime_struct_real FAIL [arch_name(9)] expected=amd64 got=" + arch_name(9))
+    }
+    if arch_name(5) != "arm" {
+        panic("pe_msvc_filetime_struct_real FAIL [arch_name(5)] expected=arm got=" + arch_name(5))
+    }
+    if arch_name(12) != "arm64" {
+        panic("pe_msvc_filetime_struct_real FAIL [arch_name(12)] expected=arm64 got=" + arch_name(12))
+    }
+
+    // ─── stats sanity ───
+    let s = pmfsr_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_filetime_struct_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_msvc_filetime_struct_real FAIL [stats filetime_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvc_filetime_struct_real FAIL [stats system_info_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_msvc_filetime_struct_real FAIL [stats os_version_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_filetime_struct_real FAIL [stats misc_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvc_filetime_struct_real FAIL [stats caller_use_count] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (13 record emits + stats/summary/kpi = 16 ≥ 14) ───
+    r0_emit("pe_msvc_filetime_struct_real_stats",
+        "\"filetime_count\":" + to_string(s[0])
+        + ",\"system_info_count\":" + to_string(s[1])
+        + ",\"os_version_count\":" + to_string(s[2])
+        + ",\"misc_count\":" + to_string(s[3])
+        + ",\"caller_use_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_filetime_struct_real_summary",
+        "\"struct_kinds\":[\"FILETIME\",\"SYSTEM_INFO\",\"OSVERSIONINFO\",\"PROCESSORINFO\",\"MEMORYSTATUS\",\"STARTUPINFO\",\"CONTEXT\"],\"total_records\":13")
+
+    r0_emit("pe_msvc_filetime_struct_real_kpi",
+        "\"os_label\":\"Windows 10/11 fake\",\"os_major\":10,\"os_minor\":0,\"os_build\":22000,\"page_size\":4096,\"num_proc\":1,\"primary_arch\":\"x86\",\"epoch_test\":\"2026-05-02T00:00:00Z\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_filetime_struct_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmfsr()
+    let s2 = pmfsr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_filetime_struct_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_filetime_struct_real self_test PASS (filetime="
+        + to_string(s[0]) + ", system_info=" + to_string(s[1])
+        + ", os_version=" + to_string(s[2]) + ", misc=" + to_string(s[3])
+        + ", caller_use=" + to_string(s[4]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmfsr_stats()
+            println("filetime_count\t" + to_string(s[0]))
+            println("system_info_count\t" + to_string(s[1]))
+            println("os_version_count\t" + to_string(s[2]))
+            println("misc_count\t" + to_string(s[3]))
+            println("caller_use_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "source-kind-name" {
+            if len(a) >= 4 {
+                println(source_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_filetime_struct_real.hexa source-kind-name <int>")
+            return
+        }
+        if sub == "arch-name" {
+            if len(a) >= 4 {
+                println(arch_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_filetime_struct_real.hexa arch-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmfsr()
+            println("cleaned: " + pmfsr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmfsr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_filetime_struct_real.hexa { self-test | stats | source-kind-name <k> | arch-name <k> | cleanup | dir }")
+}

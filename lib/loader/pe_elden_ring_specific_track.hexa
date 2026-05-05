@@ -1,0 +1,484 @@
+// lib/loader/pe_elden_ring_specific_track.hexa — Elden Ring 전용 entry/loader 추적.
+//
+// Elden Ring + Shadow of Erdtree (FromSoftware) launch (own2 자체 추적):
+//   process_attach          — eldenring.exe entry
+//   fromsoft_engine_init    — Dantelion 2 engine + DX12
+//   eac_init                — Easy Anti-Cheat kernel driver (Apple 차단)
+//                             → offline-only launch 시 EAC 우회 (--offline cmdline)
+//   savegame_load           — ER0000.sl2 + sl2.bak
+//   character_create        — char select / new game
+//   world_load              — Land Between map streaming
+//   first_frame             — DX12 swapchain present
+//   sote_dlc_check          — Shadow of Erdtree DLC owner check
+//   multiplayer_lobby       — co-op / invasion (online_required = 1)
+//   결론: single-player + DLC 가능, multiplayer 차단 (사용자 directive 거부)
+// own1: 공개 정보 + binary observation. Wine Elden Ring wrapper / Seamless Co-op mod 인용 X
+//
+// own 1 enforcement: 타사 Wine layer / community 코드 0 줄.
+//   본 module 은 Elden Ring-specific phase tracker — 실 eldenring.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 10 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = process_attach       (eldenring.exe entry)
+//   2 = fromsoft_engine_init (Dantelion 2 + DX12 device create)
+//   3 = eac_init             (EAC kernel driver — online 필수)
+//   4 = savegame_load        (ER0000.sl2 mmap + sl2.bak)
+//   5 = character_create     (char select / new game)
+//   6 = world_load           (Land Between map streaming)
+//   7 = first_frame          (DX12 swapchain Present first call)
+//   8 = sote_dlc_check       (Shadow of Erdtree DLC owner check)
+//   9 = multiplayer_lobby    (co-op / invasion)
+//
+// online_required:
+//   0 = offline launch 가능
+//   1 = online 강제 (EAC, DLC owner check, multiplayer)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t dll_loaded<int> \t online_required<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn perst_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_elden_ring_specific_track"
+}
+
+fn perst_steps_path() -> str {
+    return perst_dir() + "/steps.tsv"
+}
+
+fn perst_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + perst_dir() + "'")
+}
+
+fn cleanup_perst() -> void {
+    perst_ensure_dir()
+    let _ = exec("rm -f '" + perst_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn perst_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn perst_append_row(path: str, row: str) -> void {
+    perst_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: Elden Ring launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, dll_loaded: int, online_required: int) -> void {
+    if step_id <= 0 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 9 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=phase_kind<=9 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if online_required < 0 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=online_required>=0 got=" + to_string(online_required))
+    }
+    if online_required > 1 {
+        panic("pe_elden_ring_specific_track FAIL [record_step] expected=online_required<=1 got=" + to_string(online_required))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(online_required) + "\n"
+    perst_append_row(perst_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = perst_read_table(perst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = perst_read_table(perst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = perst_read_table(perst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── online_required_count: online_required=1 인 step 수 ───
+fn online_required_count() -> int {
+    let t = perst_read_table(perst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── offline_count: step_count - online_required_count ───
+fn offline_count() -> int {
+    return step_count() - online_required_count()
+}
+
+// ─── step_dll_loaded: 특정 step_id 의 dll_loaded (없으면 0) ───
+fn step_dll_loaded(step_id: int) -> int {
+    let t = perst_read_table(perst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── perst_stats: [step_count, loaded_count, online_required_count, offline_count, count_by_phase_kind(3)] ───
+fn perst_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(online_required_count())
+    out.push(offline_count())
+    out.push(count_by_phase_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "perst-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_perst()
+
+    // 2. record 9 steps — Elden Ring + SOTE launch chain 전체
+    //    각 phase_kind 1..9 1건. ≥4 offline + ≥3 online.
+    //   id 190001: phase 1 process_attach        dll=0 online=0 (eldenring.exe entry)
+    //   id 190002: phase 2 fromsoft_engine_init  dll=1 online=0 (Dantelion 2 + DX12)
+    //   id 190003: phase 3 eac_init              dll=1 online=1 (EAC kernel — online 필수)
+    //   id 190004: phase 4 savegame_load         dll=0 online=0 (ER0000.sl2 mmap)
+    //   id 190005: phase 5 character_create      dll=0 online=0 (char select)
+    //   id 190006: phase 6 world_load            dll=1 online=0 (Land Between stream)
+    //   id 190007: phase 7 first_frame           dll=0 online=0 (DX12 Present first)
+    //   id 190008: phase 8 sote_dlc_check        dll=1 online=1 (DLC owner check)
+    //   id 190009: phase 9 multiplayer_lobby     dll=0 online=1 (co-op / invasion)
+    //   sums: steps=9, loaded=4, online_required=3, offline=6, count_kind(3)=1
+    record_step(190001, 1, 0, 0)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190001,\"phase_kind\":1,\"dll_loaded\":0,\"online_required\":0,\"target\":\"process_attach\"")
+
+    record_step(190002, 2, 1, 0)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190002,\"phase_kind\":2,\"dll_loaded\":1,\"online_required\":0,\"target\":\"fromsoft_engine_init\"")
+
+    record_step(190003, 3, 1, 1)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190003,\"phase_kind\":3,\"dll_loaded\":1,\"online_required\":1,\"target\":\"eac_init\"")
+
+    record_step(190004, 4, 0, 0)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190004,\"phase_kind\":4,\"dll_loaded\":0,\"online_required\":0,\"target\":\"savegame_load\"")
+
+    record_step(190005, 5, 0, 0)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190005,\"phase_kind\":5,\"dll_loaded\":0,\"online_required\":0,\"target\":\"character_create\"")
+
+    record_step(190006, 6, 1, 0)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190006,\"phase_kind\":6,\"dll_loaded\":1,\"online_required\":0,\"target\":\"world_load\"")
+
+    record_step(190007, 7, 0, 0)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190007,\"phase_kind\":7,\"dll_loaded\":0,\"online_required\":0,\"target\":\"first_frame\"")
+
+    record_step(190008, 8, 1, 1)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190008,\"phase_kind\":8,\"dll_loaded\":1,\"online_required\":1,\"target\":\"sote_dlc_check\"")
+
+    record_step(190009, 9, 0, 1)
+    r0_emit("pe_elden_ring_specific_track_record",
+        "\"step_id\":190009,\"phase_kind\":9,\"dll_loaded\":0,\"online_required\":1,\"target\":\"multiplayer_lobby\"")
+
+    // 3. step_count = 9
+    let c = step_count()
+    if c != 9 {
+        panic("pe_elden_ring_specific_track FAIL [step_count] expected=9 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..9 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p8 = count_by_phase_kind(8)
+    if p8 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(p8))
+    }
+    let p9 = count_by_phase_kind(9)
+    if p9 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(9)] expected=1 got=" + to_string(p9))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_elden_ring_specific_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (190002, 190003, 190006, 190008)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_elden_ring_specific_track FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. online_required_count = 3 (190003 EAC, 190008 DLC, 190009 MP)
+    let oc = online_required_count()
+    if oc != 3 {
+        panic("pe_elden_ring_specific_track FAIL [online_required_count] expected=3 got=" + to_string(oc))
+    }
+
+    // 7. offline_count = 6 (= 9 - 3)
+    let fc = offline_count()
+    if fc != 6 {
+        panic("pe_elden_ring_specific_track FAIL [offline_count] expected=6 got=" + to_string(fc))
+    }
+
+    // 8. ≥4 offline + ≥3 online enforcement
+    if fc < 4 {
+        panic("pe_elden_ring_specific_track FAIL [offline_count guard] expected=>=4 got=" + to_string(fc))
+    }
+    if oc < 3 {
+        panic("pe_elden_ring_specific_track FAIL [online_required_count guard] expected=>=3 got=" + to_string(oc))
+    }
+
+    // 9. step_dll_loaded sanity
+    let d2 = step_dll_loaded(190002)
+    if d2 != 1 {
+        panic("pe_elden_ring_specific_track FAIL [step_dll_loaded(190002)] expected=1 got=" + to_string(d2))
+    }
+    let d4 = step_dll_loaded(190004)
+    if d4 != 0 {
+        panic("pe_elden_ring_specific_track FAIL [step_dll_loaded(190004)] expected=0 got=" + to_string(d4))
+    }
+    let d_miss = step_dll_loaded(9999)
+    if d_miss != 0 {
+        panic("pe_elden_ring_specific_track FAIL [step_dll_loaded(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 10. perst_stats() = [9, 4, 3, 6, 1]
+    let s = perst_stats()
+    if len(s) != 5 {
+        panic("pe_elden_ring_specific_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 9 {
+        panic("pe_elden_ring_specific_track FAIL [stats step_count] expected=9 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_elden_ring_specific_track FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_elden_ring_specific_track FAIL [stats online_required_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 6 {
+        panic("pe_elden_ring_specific_track FAIL [stats offline_count] expected=6 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_elden_ring_specific_track FAIL [stats count_eac] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 11. emit stats
+    r0_emit("pe_elden_ring_specific_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"online_required_count\":" + to_string(s[2])
+        + ",\"offline_count\":" + to_string(s[3])
+        + ",\"count_eac_init\":" + to_string(s[4]))
+
+    // 12. emit count >= 10 (9 records + 1 stats = 10)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 10 {
+        panic("pe_elden_ring_specific_track FAIL [r0 emit count] expected=>=10 got=" + to_string(emit_n))
+    }
+
+    // 13. cleanup → stats 모두 0
+    cleanup_perst()
+    let s2 = perst_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_elden_ring_specific_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_elden_ring_specific_track self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", online=" + to_string(s[2])
+        + ", offline=" + to_string(s[3]) + ", eac_init=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = perst_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("online_required_count\t" + to_string(s[2]))
+            println("offline_count\t" + to_string(s[3]))
+            println("count_eac_init\t" + to_string(s[4]))
+            return
+        }
+        if sub == "loaded" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_dll_loaded\t" + to_string(step_dll_loaded(sid)))
+                return
+            }
+            println("usage: hexa run pe_elden_ring_specific_track.hexa loaded <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_elden_ring_specific_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_perst()
+            println("cleaned: " + perst_dir())
+            return
+        }
+        if sub == "dir" {
+            println(perst_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_elden_ring_specific_track.hexa { self-test | stats | loaded <step_id> | count <phase_kind> | cleanup | dir }")
+}

@@ -1,0 +1,494 @@
+// lib/loader/pe_i386_memory_model.hexa — i386 linear 4GB address space + segment override + paging unit
+//
+// 본 module 은 i386 PE32 binary 가 사용하는 linear (32-bit, 4GB) memory model 의
+// instrumentation tracker. interpreter 가 실제 메모리 액세스를 수행할 때 거치는
+// layer 를 record 하여 region/segment override/page fault/TLB/protection violation
+// coverage 를 보존한다.
+//
+// i386 메모리 모델 (Intel SDM Volume 3 — Memory Management 참조):
+//   - Real mode: 16-bit segment * 16 + 16-bit offset = 20-bit linear addr (shim 범위 외).
+//   - Protected mode: segment selector → GDT/LDT descriptor → segment base + offset = linear addr.
+//     Win32 PE 는 flat memory model — CS/DS/SS/ES base = 0, limit = 0xFFFFFFFF.
+//     FS:[0] = TEB pointer (Win32 NT 만의 convention). GS unused on i386 PE.
+//   - Paging: linear → physical via 2-level page table (PD + PT, 4KB page).
+//     32-bit linear / 4KB = 1,048,576 페이지. PE32 windows 컨텍스트는 4KB page 표준.
+//
+// region kind (prot_kind):
+//   0 = FREE  (unmapped)
+//   1 = RO    (.rdata read-only)
+//   2 = RW    (.data/.bss/.reloc/STACK/TEB/PEB)
+//   3 = RWX   (drop-in JIT region — 일반 PE32 에는 거의 없음)
+//   4 = RX    (.text — DEP/NX 적용)
+//
+// own 1 enforcement: Wine kernel mm / CrossOver / community PE memory mapper 코드 0 줄.
+//   Intel SDM Volume 3 (Memory Management) + PE/COFF spec 만 참조.
+// own 2 mandate: r0_emit ≥ 10 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV):
+//   regions.tsv     : region_id<int> \t va_hex<str>     \t length<int> \t prot_kind<int>
+//   segments.tsv    : seg_idx<int>    \t base<int>      \t limit<int>
+//   faults.tsv      : va_hex<str>     \t fault_kind<int>
+//   tlb.tsv         : va_hex<str>     \t event_kind<int>
+//   violations.tsv  : va_hex<str>     \t attempted_prot<int> \t region_prot<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pimm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_memory_model"
+}
+
+fn pimm_regions_path() -> str {
+    return pimm_dir() + "/regions.tsv"
+}
+
+fn pimm_segments_path() -> str {
+    return pimm_dir() + "/segments.tsv"
+}
+
+fn pimm_faults_path() -> str {
+    return pimm_dir() + "/faults.tsv"
+}
+
+fn pimm_tlb_path() -> str {
+    return pimm_dir() + "/tlb.tsv"
+}
+
+fn pimm_violations_path() -> str {
+    return pimm_dir() + "/violations.tsv"
+}
+
+fn pimm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pimm_dir() + "'")
+}
+
+fn cleanup_pimm() -> void {
+    pimm_ensure_dir()
+    let _ = exec("rm -f '" + pimm_regions_path() + "' '" + pimm_segments_path()
+        + "' '" + pimm_faults_path() + "' '" + pimm_tlb_path()
+        + "' '" + pimm_violations_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pimm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pimm_append_row(path: str, row: str) -> void {
+    pimm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── prot_name: prot_kind → 사람이 읽을 수 있는 이름 ───
+fn prot_name(kind: int) -> str {
+    if kind == 0 { return "FREE" }
+    if kind == 1 { return "RO" }
+    if kind == 2 { return "RW" }
+    if kind == 3 { return "RWX" }
+    if kind == 4 { return "RX" }
+    return "UNKNOWN"
+}
+
+// ─── record_region: region 1 건 기록 ───
+fn record_region(region_id: int, va_hex: str, length: int, prot_kind: int) -> void {
+    if region_id <= 0 {
+        panic("pe_i386_memory_model FAIL [record_region] expected=region_id>0 got=" + to_string(region_id))
+    }
+    if va_hex == "" {
+        panic("pe_i386_memory_model FAIL [record_region] expected=va_hex!=empty got=empty")
+    }
+    if length <= 0 {
+        panic("pe_i386_memory_model FAIL [record_region] expected=length>0 got=" + to_string(length))
+    }
+    if prot_kind < 0 {
+        panic("pe_i386_memory_model FAIL [record_region] expected=prot_kind>=0 got=" + to_string(prot_kind))
+    }
+    if prot_kind > 4 {
+        panic("pe_i386_memory_model FAIL [record_region] expected=prot_kind<=4 got=" + to_string(prot_kind))
+    }
+    let row = to_string(region_id) + "\t" + va_hex
+        + "\t" + to_string(length) + "\t" + to_string(prot_kind) + "\n"
+    pimm_append_row(pimm_regions_path(), row)
+}
+
+// ─── record_segment_override: segment override 1 건 기록 ───
+fn record_segment_override(seg_idx: int, base: int, limit: int) -> void {
+    if seg_idx < 0 {
+        panic("pe_i386_memory_model FAIL [record_segment_override] expected=seg_idx>=0 got=" + to_string(seg_idx))
+    }
+    if seg_idx > 5 {
+        panic("pe_i386_memory_model FAIL [record_segment_override] expected=seg_idx<=5 got=" + to_string(seg_idx))
+    }
+    if base < 0 {
+        panic("pe_i386_memory_model FAIL [record_segment_override] expected=base>=0 got=" + to_string(base))
+    }
+    if limit < 0 {
+        panic("pe_i386_memory_model FAIL [record_segment_override] expected=limit>=0 got=" + to_string(limit))
+    }
+    let row = to_string(seg_idx) + "\t" + to_string(base)
+        + "\t" + to_string(limit) + "\n"
+    pimm_append_row(pimm_segments_path(), row)
+}
+
+// ─── record_page_fault: page fault 1 건 기록 ───
+fn record_page_fault(va_hex: str, fault_kind: int) -> void {
+    if va_hex == "" {
+        panic("pe_i386_memory_model FAIL [record_page_fault] expected=va_hex!=empty got=empty")
+    }
+    if fault_kind < 0 {
+        panic("pe_i386_memory_model FAIL [record_page_fault] expected=fault_kind>=0 got=" + to_string(fault_kind))
+    }
+    if fault_kind > 2 {
+        panic("pe_i386_memory_model FAIL [record_page_fault] expected=fault_kind<=2 got=" + to_string(fault_kind))
+    }
+    let row = va_hex + "\t" + to_string(fault_kind) + "\n"
+    pimm_append_row(pimm_faults_path(), row)
+}
+
+// ─── record_tlb_event: TLB event 1 건 기록 (모델만, 실 TLB 없음) ───
+fn record_tlb_event(va_hex: str, event_kind: int) -> void {
+    if va_hex == "" {
+        panic("pe_i386_memory_model FAIL [record_tlb_event] expected=va_hex!=empty got=empty")
+    }
+    if event_kind < 0 {
+        panic("pe_i386_memory_model FAIL [record_tlb_event] expected=event_kind>=0 got=" + to_string(event_kind))
+    }
+    if event_kind > 2 {
+        panic("pe_i386_memory_model FAIL [record_tlb_event] expected=event_kind<=2 got=" + to_string(event_kind))
+    }
+    let row = va_hex + "\t" + to_string(event_kind) + "\n"
+    pimm_append_row(pimm_tlb_path(), row)
+}
+
+// ─── record_protection_violation: protection violation 1 건 기록 ───
+fn record_protection_violation(va_hex: str, attempted_prot: int, region_prot: int) -> void {
+    if va_hex == "" {
+        panic("pe_i386_memory_model FAIL [record_protection_violation] expected=va_hex!=empty got=empty")
+    }
+    if attempted_prot < 0 {
+        panic("pe_i386_memory_model FAIL [record_protection_violation] expected=attempted_prot>=0 got=" + to_string(attempted_prot))
+    }
+    if attempted_prot > 4 {
+        panic("pe_i386_memory_model FAIL [record_protection_violation] expected=attempted_prot<=4 got=" + to_string(attempted_prot))
+    }
+    if region_prot < 0 {
+        panic("pe_i386_memory_model FAIL [record_protection_violation] expected=region_prot>=0 got=" + to_string(region_prot))
+    }
+    if region_prot > 4 {
+        panic("pe_i386_memory_model FAIL [record_protection_violation] expected=region_prot<=4 got=" + to_string(region_prot))
+    }
+    let row = va_hex + "\t" + to_string(attempted_prot)
+        + "\t" + to_string(region_prot) + "\n"
+    pimm_append_row(pimm_violations_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pimm_count_rows(path: str, min_fields: int) -> int {
+    let t = pimm_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn region_count() -> int {
+    return pimm_count_rows(pimm_regions_path(), 4)
+}
+
+fn segment_override_count() -> int {
+    return pimm_count_rows(pimm_segments_path(), 3)
+}
+
+fn fault_count() -> int {
+    return pimm_count_rows(pimm_faults_path(), 2)
+}
+
+fn tlb_event_count() -> int {
+    return pimm_count_rows(pimm_tlb_path(), 2)
+}
+
+fn violation_count() -> int {
+    return pimm_count_rows(pimm_violations_path(), 3)
+}
+
+// ─── region_for: va_hex 와 일치하는 region 의 region_id 반환 (없으면 0) ───
+fn region_for(va_hex: str) -> int {
+    let t = pimm_read_table(pimm_regions_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[1] == va_hex {
+                    return to_int(parts[0])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pimm_stats: [region_count, segment_override_count, fault_count, tlb_event_count, violation_count] ───
+fn pimm_stats() -> array {
+    let mut out = []
+    out.push(region_count())
+    out.push(segment_override_count())
+    out.push(fault_count())
+    out.push(tlb_event_count())
+    out.push(violation_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pimm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pimm()
+
+    // 2. record 6 typical PE32 region (Battle.net / D2R 류 32-bit binary):
+    //   region 1: .text   RX  (0x00401000, 256KB)
+    //   region 2: .rdata  RO  (0x00441000, 64KB)
+    //   region 3: .data   RW  (0x00451000, 32KB)
+    //   region 4: .rsrc   RO  (0x00459000, 16KB)
+    //   region 5: .reloc  RW  (0x0045D000, 8KB)
+    //   region 6: STACK   RW  (0x0012F000, 1MB) — 표준 32-bit stack TOS 근처
+    record_region(1, "0x00401000", 262144, 4)
+    r0_emit("pe_i386_memory_model_region",
+        "\"region_id\":1,\"section\":\".text\",\"va\":\"0x00401000\",\"length\":262144,\"prot\":\"RX\"")
+
+    record_region(2, "0x00441000", 65536, 1)
+    r0_emit("pe_i386_memory_model_region",
+        "\"region_id\":2,\"section\":\".rdata\",\"va\":\"0x00441000\",\"length\":65536,\"prot\":\"RO\"")
+
+    record_region(3, "0x00451000", 32768, 2)
+    r0_emit("pe_i386_memory_model_region",
+        "\"region_id\":3,\"section\":\".data\",\"va\":\"0x00451000\",\"length\":32768,\"prot\":\"RW\"")
+
+    record_region(4, "0x00459000", 16384, 1)
+    r0_emit("pe_i386_memory_model_region",
+        "\"region_id\":4,\"section\":\".rsrc\",\"va\":\"0x00459000\",\"length\":16384,\"prot\":\"RO\"")
+
+    record_region(5, "0x0045D000", 8192, 2)
+    r0_emit("pe_i386_memory_model_region",
+        "\"region_id\":5,\"section\":\".reloc\",\"va\":\"0x0045D000\",\"length\":8192,\"prot\":\"RW\"")
+
+    record_region(6, "0x0012F000", 1048576, 2)
+    r0_emit("pe_i386_memory_model_region",
+        "\"region_id\":6,\"section\":\"STACK\",\"va\":\"0x0012F000\",\"length\":1048576,\"prot\":\"RW\"")
+
+    // 3. segment override 6 (CS=0, DS=1, SS=2, ES=3, FS=4, GS=5):
+    //   CS/DS/SS/ES: flat — base=0, limit=0xFFFFFFFF
+    //   FS: TEB base (예: 0x7EFDD000 — Win32 typical TEB) — limit 4KB
+    //   GS: unused on i386 PE — base=0 limit=0
+    record_segment_override(0, 0, 4294967295)
+    r0_emit("pe_i386_memory_model_segment",
+        "\"seg_idx\":0,\"seg\":\"CS\",\"base\":0,\"limit\":4294967295,\"flat\":1")
+
+    record_segment_override(1, 0, 4294967295)
+    r0_emit("pe_i386_memory_model_segment",
+        "\"seg_idx\":1,\"seg\":\"DS\",\"base\":0,\"limit\":4294967295,\"flat\":1")
+
+    record_segment_override(2, 0, 4294967295)
+    r0_emit("pe_i386_memory_model_segment",
+        "\"seg_idx\":2,\"seg\":\"SS\",\"base\":0,\"limit\":4294967295,\"flat\":1")
+
+    record_segment_override(3, 0, 4294967295)
+    r0_emit("pe_i386_memory_model_segment",
+        "\"seg_idx\":3,\"seg\":\"ES\",\"base\":0,\"limit\":4294967295,\"flat\":1")
+
+    record_segment_override(4, 2130567168, 4096)
+    r0_emit("pe_i386_memory_model_segment",
+        "\"seg_idx\":4,\"seg\":\"FS\",\"base\":2130567168,\"base_hex\":\"0x7EFDD000\",\"limit\":4096,\"role\":\"TEB\"")
+
+    record_segment_override(5, 0, 0)
+    r0_emit("pe_i386_memory_model_segment",
+        "\"seg_idx\":5,\"seg\":\"GS\",\"base\":0,\"limit\":0,\"role\":\"unused\"")
+
+    // 4. page fault 2 (read miss + write protection violation):
+    //   fault_kind 0 = read, 1 = write, 2 = exec
+    record_page_fault("0x00500000", 0)
+    r0_emit("pe_i386_memory_model_fault",
+        "\"va\":\"0x00500000\",\"fault_kind\":0,\"kind\":\"read_miss\"")
+
+    record_page_fault("0x00441000", 1)
+    record_protection_violation("0x00441000", 2, 1)
+    r0_emit("pe_i386_memory_model_fault",
+        "\"va\":\"0x00441000\",\"fault_kind\":1,\"kind\":\"write_protection_violation\",\"attempted\":\"RW\",\"region\":\"RO\"")
+
+    // 5. assertions
+    let rc = region_count()
+    if rc != 6 {
+        panic("pe_i386_memory_model FAIL [region_count] expected=6 got=" + to_string(rc))
+    }
+
+    let soc = segment_override_count()
+    if soc != 6 {
+        panic("pe_i386_memory_model FAIL [segment_override_count] expected=6 got=" + to_string(soc))
+    }
+
+    let fc = fault_count()
+    if fc != 2 {
+        panic("pe_i386_memory_model FAIL [fault_count] expected=2 got=" + to_string(fc))
+    }
+
+    let vc = violation_count()
+    if vc != 1 {
+        panic("pe_i386_memory_model FAIL [violation_count] expected=1 got=" + to_string(vc))
+    }
+
+    // 6. region_for sanity
+    let rid_text = region_for("0x00401000")
+    if rid_text != 1 {
+        panic("pe_i386_memory_model FAIL [region_for(.text)] expected=1 got=" + to_string(rid_text))
+    }
+    let rid_rdata = region_for("0x00441000")
+    if rid_rdata != 2 {
+        panic("pe_i386_memory_model FAIL [region_for(.rdata)] expected=2 got=" + to_string(rid_rdata))
+    }
+    let rid_stack = region_for("0x0012F000")
+    if rid_stack != 6 {
+        panic("pe_i386_memory_model FAIL [region_for(STACK)] expected=6 got=" + to_string(rid_stack))
+    }
+    let rid_miss = region_for("0xDEADBEEF")
+    if rid_miss != 0 {
+        panic("pe_i386_memory_model FAIL [region_for(miss)] expected=0 got=" + to_string(rid_miss))
+    }
+
+    // 7. prot_name sanity
+    if prot_name(0) != "FREE" {
+        panic("pe_i386_memory_model FAIL [prot_name(0)] expected=FREE got=" + prot_name(0))
+    }
+    if prot_name(1) != "RO" {
+        panic("pe_i386_memory_model FAIL [prot_name(1)] expected=RO got=" + prot_name(1))
+    }
+    if prot_name(2) != "RW" {
+        panic("pe_i386_memory_model FAIL [prot_name(2)] expected=RW got=" + prot_name(2))
+    }
+    if prot_name(3) != "RWX" {
+        panic("pe_i386_memory_model FAIL [prot_name(3)] expected=RWX got=" + prot_name(3))
+    }
+    if prot_name(4) != "RX" {
+        panic("pe_i386_memory_model FAIL [prot_name(4)] expected=RX got=" + prot_name(4))
+    }
+
+    // 8. tlb event sanity (모델만 — 실 TLB 없음)
+    record_tlb_event("0x00401000", 1)
+    r0_emit("pe_i386_memory_model_tlb",
+        "\"va\":\"0x00401000\",\"event_kind\":1,\"kind\":\"miss\"")
+    let tec = tlb_event_count()
+    if tec != 1 {
+        panic("pe_i386_memory_model FAIL [tlb_event_count] expected=1 got=" + to_string(tec))
+    }
+
+    // 9. pimm_stats() = [6, 6, 2, 1, 1]
+    let s = pimm_stats()
+    if len(s) != 5 {
+        panic("pe_i386_memory_model FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_i386_memory_model FAIL [stats region_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 6 {
+        panic("pe_i386_memory_model FAIL [stats segment_override_count] expected=6 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_i386_memory_model FAIL [stats fault_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_memory_model FAIL [stats tlb_event_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_i386_memory_model FAIL [stats violation_count] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats — total emit ≥ 10:
+    //   6 region + 6 segment + 2 fault + 1 tlb + 1 stats = 16 ≥ 10
+    r0_emit("pe_i386_memory_model_stats",
+        "\"region_count\":" + to_string(s[0])
+        + ",\"segment_override_count\":" + to_string(s[1])
+        + ",\"fault_count\":" + to_string(s[2])
+        + ",\"tlb_event_count\":" + to_string(s[3])
+        + ",\"violation_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 10
+    let emit_n = r0_session_count(sid)
+    if emit_n < 10 {
+        panic("pe_i386_memory_model FAIL [r0 emit count] expected=>=10 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pimm()
+    let s2 = pimm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_memory_model FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_memory_model self_test PASS (regions=" + to_string(s[0])
+        + ", segments=" + to_string(s[1]) + ", faults=" + to_string(s[2])
+        + ", tlb=" + to_string(s[3]) + ", violations=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pimm_stats()
+            println("region_count\t" + to_string(s[0]))
+            println("segment_override_count\t" + to_string(s[1]))
+            println("fault_count\t" + to_string(s[2]))
+            println("tlb_event_count\t" + to_string(s[3]))
+            println("violation_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pimm()
+            println("cleaned: " + pimm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pimm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_memory_model.hexa { self-test | stats | cleanup | dir }")
+}

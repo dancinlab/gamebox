@@ -1,0 +1,463 @@
+// lib/loader/pe_i386_msvc_runtime_real.hexa — i386 MSVC runtime → Apple libc bridge tracker
+//
+// i386 MSVC runtime → Apple libc:
+//   memcpy/memset/strlen/strcmp 직접 매핑 (Apple libc 1:1)
+//   malloc/free               → libc malloc/free
+//   __CxxFrameHandler3        → SEH integration (cycle 84 cross-ref)
+//   _initterm                 → CRT init (global ctors invocation table walk)
+//   __getmainargs             → argv setup (Apple posix argv → MSVC CRT)
+// own1: MSDN msvcrt + Apple libc reference only. Wine msvcrt/* 인용 X
+//
+// own 1 enforcement: Wine / Reactos / CrossOver / community 코드 0 줄.
+//   본 module 은 i386 MSVC runtime 1-line 함수 호출 tracker — 실 native dispatch X.
+//   Apple libc bridge 는 docstring 만 (실 helper.mm bridge stage6/7).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// func_kind code (MSVC runtime export):
+//   1 = memcpy
+//   2 = memset
+//   3 = strlen
+//   4 = strcmp
+//   5 = printf
+//   6 = malloc
+//   7 = free
+//   8 = __CxxFrameHandler (SEH cross-ref cycle 84)
+//   9 = _initterm
+//  10 = __getmainargs
+//
+// runtime_kind code (DLL origin):
+//   1 = msvcrt       (legacy / vc6 / generic msvcrt.dll)
+//   2 = msvcr100     (VS2010)
+//   3 = msvcr120     (VS2013)
+//   4 = msvcr140     (VS2015+ ucrtbase compatibility shim)
+//   5 = vcruntime140 (VS2015+ vcruntime split — __CxxFrameHandler etc.)
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t func_kind<int> \t runtime_kind<int> \t ret_value<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pimr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_msvc_runtime_real"
+}
+
+fn pimr_calls_path() -> str {
+    return pimr_dir() + "/calls.tsv"
+}
+
+fn pimr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pimr_dir() + "'")
+}
+
+fn cleanup_pimr() -> void {
+    pimr_ensure_dir()
+    let _ = exec("rm -f '" + pimr_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pimr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pimr_append_row(path: str, row: str) -> void {
+    pimr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: i386 MSVC runtime 호출 1 건 기록 ───
+fn record_call(call_id: int, func_kind: int, runtime_kind: int, ret_value: int) -> void {
+    if call_id <= 0 {
+        panic("pe_i386_msvc_runtime_real FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if func_kind < 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [record_call] expected=func_kind>=1 got=" + to_string(func_kind))
+    }
+    if func_kind > 10 {
+        panic("pe_i386_msvc_runtime_real FAIL [record_call] expected=func_kind<=10 got=" + to_string(func_kind))
+    }
+    if runtime_kind < 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [record_call] expected=runtime_kind>=1 got=" + to_string(runtime_kind))
+    }
+    if runtime_kind > 5 {
+        panic("pe_i386_msvc_runtime_real FAIL [record_call] expected=runtime_kind<=5 got=" + to_string(runtime_kind))
+    }
+    if ret_value < 0 {
+        panic("pe_i386_msvc_runtime_real FAIL [record_call] expected=ret_value>=0 got=" + to_string(ret_value))
+    }
+    let row = to_string(call_id) + "\t" + to_string(func_kind)
+        + "\t" + to_string(runtime_kind) + "\t" + to_string(ret_value) + "\n"
+    pimr_append_row(pimr_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = pimr_read_table(pimr_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_func_kind: 특정 func_kind 의 호출 수 ───
+fn count_by_func_kind(func_kind: int) -> int {
+    let t = pimr_read_table(pimr_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == func_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_runtime_kind: 특정 runtime_kind 의 호출 수 ───
+fn count_by_runtime_kind(runtime_kind: int) -> int {
+    let t = pimr_read_table(pimr_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == runtime_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_return_value: 모든 호출 ret_value 합 ───
+fn total_return_value() -> int {
+    let t = pimr_read_table(pimr_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── cxx_handler_count: __CxxFrameHandler (func_kind=8) 호출 수 (cycle 84 SEH cross-ref) ───
+fn cxx_handler_count() -> int {
+    return count_by_func_kind(8)
+}
+
+// ─── call_return_value: 특정 call_id 의 ret_value (없으면 0) ───
+fn call_return_value(call_id: int) -> int {
+    let t = pimr_read_table(pimr_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pimr_stats: [call_count, cxx_handler_count, total_return_value, runtime_kind=5 (vcruntime140) count] ───
+fn pimr_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(cxx_handler_count())
+    out.push(total_return_value())
+    out.push(count_by_runtime_kind(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pimr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pimr()
+
+    // 2. record 6 calls (≥4 func_kinds, ≥3 runtime_kinds)
+    //    func_kinds covered: 1 (memcpy), 3 (strlen), 6 (malloc), 7 (free),
+    //                        8 (__CxxFrameHandler), 9 (_initterm)
+    //    runtime_kinds covered: 1 (msvcrt), 2 (msvcr100), 4 (msvcr140), 5 (vcruntime140)
+
+    // call 1: memcpy on msvcrt → libc memcpy → ret = dst ptr synthetic 1024
+    record_call(840001, 1, 1, 1024)
+    r0_emit("pe_i386_msvc_runtime_real_record",
+        "\"call_id\":840001,\"func_kind\":1,\"runtime_kind\":1,\"ret_value\":1024,\"target\":\"memcpy\",\"dll\":\"msvcrt.dll\",\"native\":\"libc_memcpy\"")
+
+    // call 2: strlen on msvcr100 → libc strlen → 14
+    record_call(840002, 3, 2, 14)
+    r0_emit("pe_i386_msvc_runtime_real_record",
+        "\"call_id\":840002,\"func_kind\":3,\"runtime_kind\":2,\"ret_value\":14,\"target\":\"strlen\",\"dll\":\"msvcr100.dll\",\"native\":\"libc_strlen\"")
+
+    // call 3: malloc on msvcr140 → libc malloc → ret = ptr synthetic 4096
+    record_call(840003, 6, 4, 4096)
+    r0_emit("pe_i386_msvc_runtime_real_record",
+        "\"call_id\":840003,\"func_kind\":6,\"runtime_kind\":4,\"ret_value\":4096,\"target\":\"malloc\",\"dll\":\"msvcr140.dll\",\"native\":\"libc_malloc\"")
+
+    // call 4: free on msvcr140 → libc free → 0 (void)
+    record_call(840004, 7, 4, 0)
+    r0_emit("pe_i386_msvc_runtime_real_record",
+        "\"call_id\":840004,\"func_kind\":7,\"runtime_kind\":4,\"ret_value\":0,\"target\":\"free\",\"dll\":\"msvcr140.dll\",\"native\":\"libc_free\"")
+
+    // call 5: __CxxFrameHandler3 on vcruntime140 → SEH integration (cycle 84) → 0 (continue search)
+    record_call(840005, 8, 5, 0)
+    r0_emit("pe_i386_msvc_runtime_real_record",
+        "\"call_id\":840005,\"func_kind\":8,\"runtime_kind\":5,\"ret_value\":0,\"target\":\"__CxxFrameHandler3\",\"dll\":\"vcruntime140.dll\",\"native\":\"seh_cycle84\"")
+
+    // call 6: _initterm on msvcrt → CRT init (global ctors) → 0
+    record_call(840006, 9, 1, 0)
+    r0_emit("pe_i386_msvc_runtime_real_record",
+        "\"call_id\":840006,\"func_kind\":9,\"runtime_kind\":1,\"ret_value\":0,\"target\":\"_initterm\",\"dll\":\"msvcrt.dll\",\"native\":\"crt_init_walk\"")
+
+    // 3. call_count = 6
+    let c = call_count()
+    if c != 6 {
+        panic("pe_i386_msvc_runtime_real FAIL [call_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_func_kind sanity (≥4 distinct func_kinds)
+    let fk1 = count_by_func_kind(1)
+    if fk1 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(1)] expected=1 got=" + to_string(fk1))
+    }
+    let fk3 = count_by_func_kind(3)
+    if fk3 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(3)] expected=1 got=" + to_string(fk3))
+    }
+    let fk6 = count_by_func_kind(6)
+    if fk6 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(6)] expected=1 got=" + to_string(fk6))
+    }
+    let fk7 = count_by_func_kind(7)
+    if fk7 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(7)] expected=1 got=" + to_string(fk7))
+    }
+    let fk8 = count_by_func_kind(8)
+    if fk8 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(8)] expected=1 got=" + to_string(fk8))
+    }
+    let fk9 = count_by_func_kind(9)
+    if fk9 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(9)] expected=1 got=" + to_string(fk9))
+    }
+    let fk2 = count_by_func_kind(2)
+    if fk2 != 0 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_func_kind(2)] expected=0 got=" + to_string(fk2))
+    }
+
+    // 5. count_by_runtime_kind — ≥3 distinct (1 msvcrt, 2 msvcr100, 4 msvcr140, 5 vcruntime140)
+    let rk1 = count_by_runtime_kind(1)
+    if rk1 != 2 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_runtime_kind(1)] expected=2 got=" + to_string(rk1))
+    }
+    let rk2 = count_by_runtime_kind(2)
+    if rk2 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_runtime_kind(2)] expected=1 got=" + to_string(rk2))
+    }
+    let rk3 = count_by_runtime_kind(3)
+    if rk3 != 0 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_runtime_kind(3)] expected=0 got=" + to_string(rk3))
+    }
+    let rk4 = count_by_runtime_kind(4)
+    if rk4 != 2 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_runtime_kind(4)] expected=2 got=" + to_string(rk4))
+    }
+    let rk5 = count_by_runtime_kind(5)
+    if rk5 != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [count_by_runtime_kind(5)] expected=1 got=" + to_string(rk5))
+    }
+
+    // 6. cxx_handler_count = 1 (cycle 84 cross-ref)
+    let cxh = cxx_handler_count()
+    if cxh != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [cxx_handler_count] expected=1 got=" + to_string(cxh))
+    }
+
+    // 7. total_return_value = 1024 + 14 + 4096 + 0 + 0 + 0 = 5134
+    let trv = total_return_value()
+    if trv != 5134 {
+        panic("pe_i386_msvc_runtime_real FAIL [total_return_value] expected=5134 got=" + to_string(trv))
+    }
+
+    // 8. call_return_value sanity
+    let rv1 = call_return_value(840001)
+    if rv1 != 1024 {
+        panic("pe_i386_msvc_runtime_real FAIL [call_return_value(840001)] expected=1024 got=" + to_string(rv1))
+    }
+    let rv3 = call_return_value(840003)
+    if rv3 != 4096 {
+        panic("pe_i386_msvc_runtime_real FAIL [call_return_value(840003)] expected=4096 got=" + to_string(rv3))
+    }
+    let rv_miss = call_return_value(9999)
+    if rv_miss != 0 {
+        panic("pe_i386_msvc_runtime_real FAIL [call_return_value(9999)] expected=0 got=" + to_string(rv_miss))
+    }
+
+    // 9. pimr_stats() = [6, 1, 5134, 1]
+    let s = pimr_stats()
+    if len(s) != 4 {
+        panic("pe_i386_msvc_runtime_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_i386_msvc_runtime_real FAIL [stats call_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [stats cxx_handler_count] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 5134 {
+        panic("pe_i386_msvc_runtime_real FAIL [stats total_return_value] expected=5134 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_msvc_runtime_real FAIL [stats vcruntime140_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_i386_msvc_runtime_real_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"cxx_handler_count\":" + to_string(s[1])
+        + ",\"total_return_value\":" + to_string(s[2])
+        + ",\"vcruntime140_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_i386_msvc_runtime_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pimr()
+    let s2 = pimr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_msvc_runtime_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_msvc_runtime_real self_test PASS (calls=" + to_string(s[0])
+        + ", cxx_handler=" + to_string(s[1]) + ", total_rv=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pimr_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("cxx_handler_count\t" + to_string(s[1]))
+            println("total_return_value\t" + to_string(s[2]))
+            println("vcruntime140_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "return" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_return_value\t" + to_string(call_return_value(cid)))
+                return
+            }
+            println("usage: hexa run pe_i386_msvc_runtime_real.hexa return <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let mode = a[3]
+                let val = to_int(a[4])
+                if mode == "func" {
+                    println("count_by_func_kind\t" + to_string(count_by_func_kind(val)))
+                    return
+                }
+                if mode == "runtime" {
+                    println("count_by_runtime_kind\t" + to_string(count_by_runtime_kind(val)))
+                    return
+                }
+                println("usage: hexa run pe_i386_msvc_runtime_real.hexa count { func <func_kind> | runtime <runtime_kind> }")
+                return
+            }
+            println("usage: hexa run pe_i386_msvc_runtime_real.hexa count { func <func_kind> | runtime <runtime_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pimr()
+            println("cleaned: " + pimr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pimr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_msvc_runtime_real.hexa { self-test | stats | return <call_id> | count func <func_kind> | count runtime <runtime_kind> | cleanup | dir }")
+}

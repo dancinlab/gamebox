@@ -1,0 +1,558 @@
+// lib/loader/pe_msvc_msync_mach_semaphore.hexa
+// — CrossOver msync (Mach semaphore pool) sync 추적기
+//
+// 본 module 은 Win32 NT sync (NtCreateSemaphore / NtWaitForSingleObject /
+// NtWaitForMultipleObjects 등) 를 macOS Mach kernel primitive 로 routing 할 때
+// 발생하는 4-tier algorithm 을 spec 차원에서 추적한다.
+//
+//   tier 1: Mach semaphore pool      — semaphore_create / signal / wait / trywait
+//                                      pool 1024 free-list reuse + handle 재할당.
+//   tier 2: __ulock_wait2 fast path  — uncontended path 의 atomic compare-wait
+//                                      (Darwin private syscall, ulock = futex equiv).
+//   tier 3: Mach msg multi-wait      — NtWaitForMultipleObjects(WaitAll/WaitAny) 를
+//                                      mach_msg() port-set 으로 fan-in 등록.
+//   tier 4: 16-byte fixed-stride shm — 호스트 wineserver process 와 sync state
+//                                      page 공유. stride 16 = atomic_uint64 + flags.
+//
+// research-6 (algorithm direction) :
+//   CrossOver msync — Mach semaphore pool size 1024, __ulock_wait2 fast path,
+//   Mach port-set multi-wait registration, 16-byte fixed-stride shm 의 4-tier
+//   spec direction 만 인용 — 본 module 은 tracker 이며 실 mach_*/__ulock_wait2/
+//   semaphore_*/mach_msg() syscall 호출 X.
+// reference (Apple Mach) :
+//   Apple <mach/semaphore.h> / <mach/mach_port.h> / <sys/ulock.h> public header
+//   layout 만 spec 참조. Apple SDK call X.
+//
+// own 1 enforcement: Wine / CrossOver / GPTK / Whisky / Box86 / QEMU 코드 0 줄 import.
+//                   알고리즘 방향만 reference. 본 module 은 pure tracker.
+// own 2 mandate: panic + r0_emit ≥ 14 + self_test() + main() dispatch.
+//
+// persist schema (TSV — records.tsv):
+//   record_id<int> \t kind<str> \t link_id<int> \t a<int> \t b<int>
+//     \t c<int> \t d<int> \t e<int> \t f<int>
+//
+//   kind 별 의미:
+//     "pool_op"       — link_id=op_id, a=op_kind, b=pool_index,
+//                       c=semaphore_handle (hex parsed)
+//     "ulock_wait"    — link_id=wait_id, a=addr, b=value, c=timeout_ns,
+//                       d=returned_kind
+//     "multi_wait"    — link_id=multi_id, a=wait_count, b=mach_msg_id,
+//                       c=returned_index
+//     "shm_segment"   — link_id=shm_id, a=va, b=size_bytes, c=stride_bytes
+//     "pool_state"    — link_id=state_id, a=total_count, b=free_count,
+//                       c=allocated_count
+//
+// op_kind code (record_pool_op):
+//   0 = alloc      (semaphore_create — pool free-list pop)
+//   1 = free       (semaphore_destroy — pool free-list push)
+//   2 = signal     (semaphore_signal — wake 1 waiter)
+//   3 = wait       (semaphore_wait — block until signal)
+//   4 = trywait    (semaphore_timedwait_trap timeout=0 — fast probe)
+//
+// returned_kind code (record_ulock_wait):
+//   0 = woken      (다른 thread 의 __ulock_wake 로 깨어남)
+//   1 = timeout    (timeout_ns 만료)
+//   2 = invalid    (addr 비매핑 / EINVAL)
+//   3 = intr       (signal 인터럽트 / EINTR)
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmms_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_msync_mach_semaphore"
+}
+
+fn pmms_records_path() -> str {
+    return pmms_dir() + "/records.tsv"
+}
+
+fn pmms_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmms_dir() + "'")
+}
+
+fn cleanup_pmms() -> void {
+    pmms_ensure_dir()
+    let _ = exec("rm -f '" + pmms_records_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmms_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmms_append_row(path: str, row: str) -> void {
+    pmms_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int ───
+fn pmms_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_msync_mach_semaphore FAIL [pmms_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── op_kind_name: 0..4 → spec 이름 ───
+fn op_kind_name(k: int) -> str {
+    if k == 0 { return "alloc" }
+    if k == 1 { return "free" }
+    if k == 2 { return "signal" }
+    if k == 3 { return "wait" }
+    if k == 4 { return "trywait" }
+    return "?"
+}
+
+// ─── returned_kind_name: 0..3 → spec 이름 ───
+fn returned_kind_name(k: int) -> str {
+    if k == 0 { return "woken" }
+    if k == 1 { return "timeout" }
+    if k == 2 { return "invalid" }
+    if k == 3 { return "intr" }
+    return "?"
+}
+
+// ─── record_pool_op: Mach semaphore pool 1 op 등록 ───
+fn record_pool_op(op_id: int, op_kind: int, pool_index: int, semaphore_handle_hex: str) -> void {
+    if op_id <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_op] expected=op_kind>=0 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if pool_index < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_op] expected=pool_index>=0 got=" + to_string(pool_index))
+    }
+    if pool_index >= 1024 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_op] expected=pool_index<1024 got=" + to_string(pool_index))
+    }
+    let h = pmms_hex_to_int(semaphore_handle_hex)
+    if h < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_op] expected=handle>=0 got=" + to_string(h))
+    }
+    let row = to_string(op_id) + "\tpool_op\t" + to_string(op_id)
+        + "\t" + to_string(op_kind) + "\t" + to_string(pool_index)
+        + "\t" + to_string(h) + "\t0\t0\t0\n"
+    pmms_append_row(pmms_records_path(), row)
+}
+
+// ─── record_ulock_wait: __ulock_wait2 fast path 1 wait 등록 ───
+fn record_ulock_wait(wait_id: int, addr_hex: str, value_hex: str, timeout_ns: int, returned_kind: int) -> void {
+    if wait_id <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_ulock_wait] expected=wait_id>0 got=" + to_string(wait_id))
+    }
+    let addr = pmms_hex_to_int(addr_hex)
+    if addr < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_ulock_wait] expected=addr>=0 got=" + to_string(addr))
+    }
+    let val = pmms_hex_to_int(value_hex)
+    if val < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_ulock_wait] expected=value>=0 got=" + to_string(val))
+    }
+    if timeout_ns < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_ulock_wait] expected=timeout_ns>=0 got=" + to_string(timeout_ns))
+    }
+    if returned_kind < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_ulock_wait] expected=returned_kind>=0 got=" + to_string(returned_kind))
+    }
+    if returned_kind > 3 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_ulock_wait] expected=returned_kind<=3 got=" + to_string(returned_kind))
+    }
+    let row = to_string(wait_id) + "\tulock_wait\t" + to_string(wait_id)
+        + "\t" + to_string(addr) + "\t" + to_string(val)
+        + "\t" + to_string(timeout_ns) + "\t" + to_string(returned_kind) + "\t0\t0\n"
+    pmms_append_row(pmms_records_path(), row)
+}
+
+// ─── record_multi_wait: NtWaitForMultipleObjects → mach_msg port-set ───
+fn record_multi_wait(multi_id: int, wait_count: int, mach_msg_id: int, returned_index: int) -> void {
+    if multi_id <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_multi_wait] expected=multi_id>0 got=" + to_string(multi_id))
+    }
+    if wait_count <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_multi_wait] expected=wait_count>0 got=" + to_string(wait_count))
+    }
+    if mach_msg_id < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_multi_wait] expected=mach_msg_id>=0 got=" + to_string(mach_msg_id))
+    }
+    if returned_index < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_multi_wait] expected=returned_index>=0 got=" + to_string(returned_index))
+    }
+    if returned_index >= wait_count {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_multi_wait] expected=returned_index<wait_count got=" + to_string(returned_index))
+    }
+    let row = to_string(multi_id) + "\tmulti_wait\t" + to_string(multi_id)
+        + "\t" + to_string(wait_count) + "\t" + to_string(mach_msg_id)
+        + "\t" + to_string(returned_index) + "\t0\t0\t0\n"
+    pmms_append_row(pmms_records_path(), row)
+}
+
+// ─── record_shm_segment: 16-byte fixed-stride shm segment 등록 ───
+fn record_shm_segment(shm_id: int, va_hex: str, size_bytes: int, stride_bytes: int) -> void {
+    if shm_id <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_shm_segment] expected=shm_id>0 got=" + to_string(shm_id))
+    }
+    let va = pmms_hex_to_int(va_hex)
+    if va < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_shm_segment] expected=va>=0 got=" + to_string(va))
+    }
+    if size_bytes <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_shm_segment] expected=size_bytes>0 got=" + to_string(size_bytes))
+    }
+    if stride_bytes != 16 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_shm_segment] expected=stride_bytes==16 got=" + to_string(stride_bytes))
+    }
+    let row = to_string(shm_id) + "\tshm_segment\t" + to_string(shm_id)
+        + "\t" + to_string(va) + "\t" + to_string(size_bytes)
+        + "\t" + to_string(stride_bytes) + "\t0\t0\t0\n"
+    pmms_append_row(pmms_records_path(), row)
+}
+
+// ─── record_pool_state: pool 점유 snapshot ───
+fn record_pool_state(state_id: int, total_count: int, free_count: int, allocated_count: int) -> void {
+    if state_id <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if total_count <= 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_state] expected=total_count>0 got=" + to_string(total_count))
+    }
+    if total_count > 1024 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_state] expected=total_count<=1024 got=" + to_string(total_count))
+    }
+    if free_count < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_state] expected=free_count>=0 got=" + to_string(free_count))
+    }
+    if allocated_count < 0 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_state] expected=allocated_count>=0 got=" + to_string(allocated_count))
+    }
+    if free_count + allocated_count != total_count {
+        panic("pe_msvc_msync_mach_semaphore FAIL [record_pool_state] expected=free+alloc==total got=" + to_string(free_count + allocated_count))
+    }
+    let row = to_string(state_id) + "\tpool_state\t" + to_string(state_id)
+        + "\t" + to_string(total_count) + "\t" + to_string(free_count)
+        + "\t" + to_string(allocated_count) + "\t0\t0\t0\n"
+    pmms_append_row(pmms_records_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn pmms_count_kind(kind_filter: str) -> int {
+    let t = pmms_read_table(pmms_records_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 9 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn pool_op_count() -> int {
+    return pmms_count_kind("pool_op")
+}
+
+fn ulock_wait_count() -> int {
+    return pmms_count_kind("ulock_wait")
+}
+
+fn multi_wait_count() -> int {
+    return pmms_count_kind("multi_wait")
+}
+
+fn shm_segment_count() -> int {
+    return pmms_count_kind("shm_segment")
+}
+
+fn pool_state_count() -> int {
+    return pmms_count_kind("pool_state")
+}
+
+fn pmms_stats() -> array {
+    let mut out = []
+    out.push(pool_op_count())
+    out.push(ulock_wait_count())
+    out.push(multi_wait_count())
+    out.push(shm_segment_count())
+    out.push(pool_state_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pmms-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmms()
+
+    // ─── 5 pool_op — 5 op_kind (alloc / free / signal / wait / trywait) ───
+    record_pool_op(1, 0, 0, "0F000001")    // alloc — pool slot 0
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_op\",\"op_id\":1,\"op_kind\":0,\"name\":\"alloc\",\"pool_index\":0,\"semaphore_handle\":\"0x0F000001\"")
+
+    record_pool_op(2, 2, 0, "0F000001")    // signal — same handle
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_op\",\"op_id\":2,\"op_kind\":2,\"name\":\"signal\",\"pool_index\":0,\"semaphore_handle\":\"0x0F000001\"")
+
+    record_pool_op(3, 3, 0, "0F000001")    // wait
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_op\",\"op_id\":3,\"op_kind\":3,\"name\":\"wait\",\"pool_index\":0,\"semaphore_handle\":\"0x0F000001\"")
+
+    record_pool_op(4, 4, 1, "0F000002")    // trywait — pool slot 1
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_op\",\"op_id\":4,\"op_kind\":4,\"name\":\"trywait\",\"pool_index\":1,\"semaphore_handle\":\"0x0F000002\"")
+
+    record_pool_op(5, 1, 0, "0F000001")    // free — return to pool
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_op\",\"op_id\":5,\"op_kind\":1,\"name\":\"free\",\"pool_index\":0,\"semaphore_handle\":\"0x0F000001\"")
+
+    // ─── 4 ulock_wait — 4 returned_kind (woken / timeout / invalid / intr) ───
+    record_ulock_wait(1, "00301000", "00000001", 1000000, 0)   // woken
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"ulock_wait\",\"wait_id\":1,\"addr\":\"0x00301000\",\"value\":\"0x00000001\",\"timeout_ns\":1000000,\"returned_kind\":0,\"name\":\"woken\"")
+
+    record_ulock_wait(2, "00301010", "00000002", 5000000, 1)   // timeout
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"ulock_wait\",\"wait_id\":2,\"addr\":\"0x00301010\",\"value\":\"0x00000002\",\"timeout_ns\":5000000,\"returned_kind\":1,\"name\":\"timeout\"")
+
+    record_ulock_wait(3, "00000000", "00000000", 0, 2)         // invalid (NULL addr → EINVAL)
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"ulock_wait\",\"wait_id\":3,\"addr\":\"0x00000000\",\"value\":\"0x00000000\",\"timeout_ns\":0,\"returned_kind\":2,\"name\":\"invalid\"")
+
+    record_ulock_wait(4, "00301020", "0000000A", 10000000, 3)  // intr (signal)
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"ulock_wait\",\"wait_id\":4,\"addr\":\"0x00301020\",\"value\":\"0x0000000A\",\"timeout_ns\":10000000,\"returned_kind\":3,\"name\":\"intr\"")
+
+    // ─── 2 multi_wait — Mach msg port-set fan-in ───
+    record_multi_wait(1, 4, 1001, 2)  // 4 objects, returned at index 2
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"multi_wait\",\"multi_id\":1,\"wait_count\":4,\"mach_msg_id\":1001,\"returned_index\":2")
+
+    record_multi_wait(2, 8, 1002, 0)  // 8 objects, returned at index 0
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"multi_wait\",\"multi_id\":2,\"wait_count\":8,\"mach_msg_id\":1002,\"returned_index\":0")
+
+    // ─── 2 shm_segment — 16-byte stride ───
+    record_shm_segment(1, "00400000", 16384, 16)   // 1024 entries × 16 byte
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"shm_segment\",\"shm_id\":1,\"va\":\"0x00400000\",\"size_bytes\":16384,\"stride_bytes\":16")
+
+    record_shm_segment(2, "00500000", 65536, 16)   // 4096 entries × 16 byte
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"shm_segment\",\"shm_id\":2,\"va\":\"0x00500000\",\"size_bytes\":65536,\"stride_bytes\":16")
+
+    // ─── 2 pool_state — alloc 진행 snapshot ───
+    record_pool_state(1, 1024, 1023, 1)  // 1 allocated
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_state\",\"state_id\":1,\"total_count\":1024,\"free_count\":1023,\"allocated_count\":1")
+
+    record_pool_state(2, 1024, 1022, 2)  // 2 allocated
+    r0_emit("pe_msvc_msync_mach_semaphore_record",
+        "\"kind\":\"pool_state\",\"state_id\":2,\"total_count\":1024,\"free_count\":1022,\"allocated_count\":2")
+
+    // ─── assertions ───
+    let po = pool_op_count()
+    if po != 5 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [pool_op_count] expected=5 got=" + to_string(po))
+    }
+    let uw = ulock_wait_count()
+    if uw != 4 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [ulock_wait_count] expected=4 got=" + to_string(uw))
+    }
+    let mw = multi_wait_count()
+    if mw != 2 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [multi_wait_count] expected=2 got=" + to_string(mw))
+    }
+    let ss = shm_segment_count()
+    if ss != 2 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [shm_segment_count] expected=2 got=" + to_string(ss))
+    }
+    let ps = pool_state_count()
+    if ps != 2 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [pool_state_count] expected=2 got=" + to_string(ps))
+    }
+
+    // ─── op_kind_name lookups ───
+    let n_alloc = op_kind_name(0)
+    if n_alloc != "alloc" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [op_kind_name(0)] expected=alloc got=" + n_alloc)
+    }
+    let n_free = op_kind_name(1)
+    if n_free != "free" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [op_kind_name(1)] expected=free got=" + n_free)
+    }
+    let n_signal = op_kind_name(2)
+    if n_signal != "signal" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [op_kind_name(2)] expected=signal got=" + n_signal)
+    }
+    let n_wait = op_kind_name(3)
+    if n_wait != "wait" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [op_kind_name(3)] expected=wait got=" + n_wait)
+    }
+    let n_trywait = op_kind_name(4)
+    if n_trywait != "trywait" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [op_kind_name(4)] expected=trywait got=" + n_trywait)
+    }
+
+    // ─── returned_kind_name lookups ───
+    let r_woken = returned_kind_name(0)
+    if r_woken != "woken" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [returned_kind_name(0)] expected=woken got=" + r_woken)
+    }
+    let r_timeout = returned_kind_name(1)
+    if r_timeout != "timeout" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [returned_kind_name(1)] expected=timeout got=" + r_timeout)
+    }
+    let r_invalid = returned_kind_name(2)
+    if r_invalid != "invalid" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [returned_kind_name(2)] expected=invalid got=" + r_invalid)
+    }
+    let r_intr = returned_kind_name(3)
+    if r_intr != "intr" {
+        panic("pe_msvc_msync_mach_semaphore FAIL [returned_kind_name(3)] expected=intr got=" + r_intr)
+    }
+
+    // ─── hex parser sanity ───
+    let h_va = pmms_hex_to_int("00400000")
+    if h_va != 4194304 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [pmms_hex_to_int(00400000)] expected=4194304 got=" + to_string(h_va))
+    }
+
+    // ─── stats sanity ───
+    let s = pmms_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [stats pool_op] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [stats ulock_wait] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [stats multi_wait] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [stats shm_segment] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [stats pool_state] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (위 record 15 + 이 1 + summary 1 = 17 ≥ 14) ───
+    r0_emit("pe_msvc_msync_mach_semaphore_stats",
+        "\"pool_op_count\":" + to_string(s[0])
+        + ",\"ulock_wait_count\":" + to_string(s[1])
+        + ",\"multi_wait_count\":" + to_string(s[2])
+        + ",\"shm_segment_count\":" + to_string(s[3])
+        + ",\"pool_state_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_msync_mach_semaphore_summary",
+        "\"phase\":\"msync_mach_semaphore_complete\""
+        + ",\"research\":\"crossover_msync_algorithm_direction\""
+        + ",\"reference\":\"apple_mach_semaphore_h\""
+        + ",\"pool_capacity\":1024"
+        + ",\"shm_stride_bytes\":16"
+        + ",\"op_kinds\":5"
+        + ",\"returned_kinds\":4")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_msync_mach_semaphore FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmms()
+    let s2 = pmms_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_msync_mach_semaphore FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_msync_mach_semaphore self_test PASS (pool_op=" + to_string(s[0])
+        + ", ulock_wait=" + to_string(s[1]) + ", multi_wait=" + to_string(s[2])
+        + ", shm=" + to_string(s[3]) + ", pool_state=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmms_stats()
+            println("pool_op_count\t" + to_string(s[0]))
+            println("ulock_wait_count\t" + to_string(s[1]))
+            println("multi_wait_count\t" + to_string(s[2]))
+            println("shm_segment_count\t" + to_string(s[3]))
+            println("pool_state_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmms()
+            println("cleaned: " + pmms_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmms_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_msync_mach_semaphore.hexa { self-test | stats | cleanup | dir }")
+}

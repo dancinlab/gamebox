@@ -1,0 +1,198 @@
+// lib/perf/c_purple_plaync_oauth_proxy.hexa — CN-150 skeleton manjeom 15/15
+//
+// PLAYNC (login.plaync.com) OAuth 2.0 Authorization Code + Token flow 추적 —
+// PURPLE 부팅 시 PLAYNC OAuth 가 진행된다: (1) auth_code 획득 (browser
+// redirect), (2) token_exchange (code → access_token + refresh_token),
+// (3) token_refresh (access_token 만료 시 refresh_token 으로 재발급). 본
+// 모듈은 각 stage 의 elapsed_us 와 success 여부를 columnar log 로 모아
+// session × stage 별 latency profile 을 생성한다.
+//
+// 무기: session × stage × elapsed × success 4-key columnar log.
+// 효과: PLAYNC OAuth latency profile 정량화 → Battle.net OAuth / Steam OAuth /
+// Tencent ID 모듈과 generic 흡수 후보 (provider-agnostic OAuth proxy).
+
+use "./r0_common"
+
+let PPOP_DIR = GAMEBOX_HOME + "/persist/purple_plaync_oauth_proxy"
+let OAUTH_LOG = PPOP_DIR + "/oauth.tsv"
+
+fn ppop_dir() -> str { return PPOP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + PPOP_DIR + "'")
+}
+
+// ─── OAuth stage 기록 ───
+//   session_id (PURPLE login session id),
+//   stage (1=auth_code, 2=token_exchange, 3=token_refresh),
+//   elapsed_us (해당 stage 소요 microsecond),
+//   success (0=fail, 1=ok — 사용자 거절 / network error / token 만료 등 fail).
+fn record_oauth(session_id: int, stage: int, elapsed_us: int, success: int) -> void {
+    ensure_dir()
+    let line = to_string(session_id) + "\t" + to_string(stage) + "\t" + to_string(elapsed_us) + "\t" + to_string(success)
+    let tmp = OAUTH_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + OAUTH_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("plaync_oauth_record", "\"session\":" + to_string(session_id) + ",\"stage\":" + to_string(stage) + ",\"elapsed_us\":" + to_string(elapsed_us) + ",\"success\":" + to_string(success))
+}
+
+// ─── oauth_count — 등록된 OAuth 행 수 ───
+fn oauth_count() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + OAUTH_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── success_count — success=1 행 수 ───
+fn success_count() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '$4==1{c++} END{print c+0}' '" + OAUTH_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── fail_count — success=0 행 수 ───
+fn fail_count() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '$4==0{c++} END{print c+0}' '" + OAUTH_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_elapsed_us — 전체 elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + OAUTH_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── count_by_stage — 해당 stage 의 session 행 수 ───
+fn count_by_stage(stage: int) -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v st=" + to_string(stage) + " '$2==st{c++} END{print c+0}' '" + OAUTH_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── session_elapsed — 그 session 의 마지막 stage elapsed_us ───
+//   동일 session_id 행이 여러 개일 때 마지막(파일 순서상 가장 뒤) 항목의 elapsed
+//   을 반환한다 (가장 최근 stage 의 latency). 미등록 session 은 0.
+fn session_elapsed(session_id: int) -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v s=" + to_string(session_id) + " '$1==s{e=$3} END{print e+0}' '" + OAUTH_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── ppop_stats — [oauth_count, success_count, total_elapsed_us, count_by_stage(2)] ───
+fn ppop_stats() -> array {
+    return [oauth_count(), success_count(), total_elapsed_us(), count_by_stage(2)]
+}
+
+fn cleanup_ppop() -> void {
+    let _ = exec("rm -rf '" + PPOP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "ppop-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_ppop()
+
+    // 합성 OAuth 시나리오 (4 sessions):
+    //   session=4001 stage=1 (auth_code)       elapsed=180000 success=1
+    //   session=4001 stage=2 (token_exchange)  elapsed=240000 success=1
+    //   session=4002 stage=1 (auth_code)       elapsed=200000 success=0  ← 사용자 거절
+    //   session=4003 stage=3 (token_refresh)   elapsed=120000 success=1
+    record_oauth(4001, 1, 180000, 1)
+    record_oauth(4001, 2, 240000, 1)
+    record_oauth(4002, 1, 200000, 0)
+    record_oauth(4003, 3, 120000, 1)
+
+    // oauth_count = 4
+    let oc = oauth_count()
+    if oc != 4 { panic("c_purple_plaync_oauth_proxy FAIL [oauth_count] expected=4 got=" + to_string(oc)) }
+
+    // success_count = 3, fail_count = 1
+    let sc = success_count()
+    if sc != 3 { panic("c_purple_plaync_oauth_proxy FAIL [success_count] expected=3 got=" + to_string(sc)) }
+    let fc = fail_count()
+    if fc != 1 { panic("c_purple_plaync_oauth_proxy FAIL [fail_count] expected=1 got=" + to_string(fc)) }
+
+    // total_elapsed_us = 180000+240000+200000+120000 = 740000
+    let te = total_elapsed_us()
+    if te != 740000 { panic("c_purple_plaync_oauth_proxy FAIL [total_elapsed_us] expected=740000 got=" + to_string(te)) }
+
+    // count_by_stage: 1→2, 2→1, 3→1, 99→0
+    let c1 = count_by_stage(1)
+    if c1 != 2 { panic("c_purple_plaync_oauth_proxy FAIL [count_by_stage 1] expected=2 got=" + to_string(c1)) }
+    let c2 = count_by_stage(2)
+    if c2 != 1 { panic("c_purple_plaync_oauth_proxy FAIL [count_by_stage 2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_stage(3)
+    if c3 != 1 { panic("c_purple_plaync_oauth_proxy FAIL [count_by_stage 3] expected=1 got=" + to_string(c3)) }
+    let c99 = count_by_stage(99)
+    if c99 != 0 { panic("c_purple_plaync_oauth_proxy FAIL [count_by_stage 99] expected=0 got=" + to_string(c99)) }
+
+    // session_elapsed(4001) = 240000 (마지막 stage=2 의 elapsed)
+    let se1 = session_elapsed(4001)
+    if se1 != 240000 { panic("c_purple_plaync_oauth_proxy FAIL [session_elapsed 4001] expected=240000 got=" + to_string(se1)) }
+    // session_elapsed(9999) = 0 (미등록)
+    let se9 = session_elapsed(9999)
+    if se9 != 0 { panic("c_purple_plaync_oauth_proxy FAIL [session_elapsed 9999] expected=0 got=" + to_string(se9)) }
+
+    // ppop_stats = [4, 3, 740000, 1]
+    let stats = ppop_stats()
+    if stats[0] != 4 { panic("c_purple_plaync_oauth_proxy FAIL [stats oauth_count] expected=4 got=" + to_string(stats[0])) }
+    if stats[1] != 3 { panic("c_purple_plaync_oauth_proxy FAIL [stats success_count] expected=3 got=" + to_string(stats[1])) }
+    if stats[2] != 740000 { panic("c_purple_plaync_oauth_proxy FAIL [stats total_elapsed_us] expected=740000 got=" + to_string(stats[2])) }
+    if stats[3] != 1 { panic("c_purple_plaync_oauth_proxy FAIL [stats count_by_stage(2)] expected=1 got=" + to_string(stats[3])) }
+
+    r0_emit("plaync_oauth_summary", "\"oauth_count\":" + to_string(stats[0]) + ",\"success\":" + to_string(stats[1]) + ",\"fail\":" + to_string(fc) + ",\"total_elapsed_us\":" + to_string(stats[2]) + ",\"token_exchange\":" + to_string(stats[3]))
+
+    // record × 4 + summary × 1 = ≥ 5 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_purple_plaync_oauth_proxy FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    cleanup_ppop()
+
+    println("  ✅ c_purple_plaync_oauth_proxy self_test PASS (4 oauth, success=3, fail=1, total_us=740000, token_exchange=1, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = ppop_stats()
+            println("oauth_count=" + to_string(s[0]) + " success=" + to_string(s[1]) + " total_elapsed_us=" + to_string(s[2]) + " token_exchange=" + to_string(s[3]))
+            return
+        }
+        if sub == "elapsed" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                let e = session_elapsed(sid)
+                println(to_string(e))
+                return
+            }
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let st = to_int(a[3])
+                let c = count_by_stage(st)
+                println(to_string(c))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_ppop(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_purple_plaync_oauth_proxy.hexa { self-test | stats | elapsed <session_id> | count <stage> | cleanup }")
+}

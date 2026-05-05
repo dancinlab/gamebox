@@ -1,0 +1,411 @@
+// lib/loader/pe_d3d12_descriptor_heap_real.hexa — cycle 83 D3D12 descriptor heap tracker
+//
+// D3D12 descriptor heap → Metal:
+//   D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV → MTLArgumentEncoder + argument buffer
+//   D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER     → MTLSamplerState array
+//   D3D12_DESCRIPTOR_HEAP_TYPE_RTV         → MTLRenderPassDescriptor.colorAttachments[N]
+//   D3D12_DESCRIPTOR_HEAP_TYPE_DSV         → MTLRenderPassDescriptor.depthAttachment
+//   shader_visible heap (CBV_SRV_UAV/Sampler) — Metal argument buffer tier 2 (M1+)
+//   non-shader-visible (RTV/DSV) — CPU side staging
+//   D4 의 1M+ descriptor allocation 일반적
+// own1: D3DMetal + MSDN ID3D12DescriptorHeap only
+//
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// heap_kind code:
+//   1 = CBV_SRV_UAV (shader_visible 가능)
+//   2 = Sampler    (shader_visible 가능)
+//   3 = RTV        (shader_visible 불가)
+//   4 = DSV        (shader_visible 불가)
+//
+// persist schema (TSV — heaps.tsv):
+//   heap_id<int> \t heap_kind<int> \t descriptor_count<int> \t shader_visible<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pddh_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_descriptor_heap_real"
+}
+
+fn pddh_heaps_path() -> str {
+    return pddh_dir() + "/heaps.tsv"
+}
+
+fn pddh_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pddh_dir() + "'")
+}
+
+fn cleanup_pddh() -> void {
+    pddh_ensure_dir()
+    let _ = exec("rm -f '" + pddh_heaps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pddh_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pddh_append_row(path: str, row: str) -> void {
+    pddh_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_heap: descriptor heap 1 건 기록 ───
+fn record_heap(heap_id: int, heap_kind: int, descriptor_count: int, shader_visible: int) -> void {
+    if heap_id <= 0 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] expected=heap_id>0 got=" + to_string(heap_id))
+    }
+    if heap_kind < 1 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] expected=heap_kind>=1 got=" + to_string(heap_kind))
+    }
+    if heap_kind > 4 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] expected=heap_kind<=4 got=" + to_string(heap_kind))
+    }
+    if descriptor_count < 0 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] expected=descriptor_count>=0 got=" + to_string(descriptor_count))
+    }
+    if shader_visible < 0 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] expected=shader_visible>=0 got=" + to_string(shader_visible))
+    }
+    if shader_visible > 1 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] expected=shader_visible<=1 got=" + to_string(shader_visible))
+    }
+    // RTV/DSV 는 shader_visible 불가
+    if shader_visible == 1 {
+        if heap_kind == 3 {
+            panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] RTV cannot be shader_visible heap_id=" + to_string(heap_id))
+        }
+        if heap_kind == 4 {
+            panic("pe_d3d12_descriptor_heap_real FAIL [record_heap] DSV cannot be shader_visible heap_id=" + to_string(heap_id))
+        }
+    }
+    let row = to_string(heap_id) + "\t" + to_string(heap_kind)
+        + "\t" + to_string(descriptor_count) + "\t" + to_string(shader_visible) + "\n"
+    pddh_append_row(pddh_heaps_path(), row)
+}
+
+// ─── heap_count: total heap 수 ───
+fn heap_count() -> int {
+    let t = pddh_read_table(pddh_heaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_descriptor_count: 모든 heap 의 descriptor_count 합 ───
+fn total_descriptor_count() -> int {
+    let t = pddh_read_table(pddh_heaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_heap_kind: 특정 heap_kind 의 heap 수 ───
+fn count_by_heap_kind(kind: int) -> int {
+    let t = pddh_read_table(pddh_heaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── shader_visible_count: shader_visible=1 heap 수 ───
+fn shader_visible_count() -> int {
+    let t = pddh_read_table(pddh_heaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── cbv_srv_uav_count: CBV_SRV_UAV heap 수 (heap_kind == 1) ───
+fn cbv_srv_uav_count() -> int {
+    return count_by_heap_kind(1)
+}
+
+// ─── heap_descriptor_count: 특정 heap_id 의 descriptor_count (없으면 0) ───
+fn heap_descriptor_count(heap_id: int) -> int {
+    let t = pddh_read_table(pddh_heaps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == heap_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pddh_stats: [heap_count, total_descriptor_count, shader_visible_count, cbv_srv_uav_count] ───
+fn pddh_stats() -> array {
+    let mut out = []
+    out.push(heap_count())
+    out.push(total_descriptor_count())
+    out.push(shader_visible_count())
+    out.push(cbv_srv_uav_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pddh-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pddh()
+
+    // 2. record 5 heaps across all 4 heap_kinds with ≥2 shader_visible
+    record_heap(830001, 1, 1000000, 1)
+    r0_emit("pe_d3d12_descriptor_heap_real_record",
+        "\"heap_id\":830001,\"heap_kind\":1,\"descriptor_count\":1000000,\"shader_visible\":1,\"target\":\"CBV_SRV_UAV\"")
+
+    record_heap(830002, 1, 4096, 0)
+    r0_emit("pe_d3d12_descriptor_heap_real_record",
+        "\"heap_id\":830002,\"heap_kind\":1,\"descriptor_count\":4096,\"shader_visible\":0,\"target\":\"CBV_SRV_UAV\"")
+
+    record_heap(830003, 2, 2048, 1)
+    r0_emit("pe_d3d12_descriptor_heap_real_record",
+        "\"heap_id\":830003,\"heap_kind\":2,\"descriptor_count\":2048,\"shader_visible\":1,\"target\":\"Sampler\"")
+
+    record_heap(830004, 3, 8, 0)
+    r0_emit("pe_d3d12_descriptor_heap_real_record",
+        "\"heap_id\":830004,\"heap_kind\":3,\"descriptor_count\":8,\"shader_visible\":0,\"target\":\"RTV\"")
+
+    record_heap(830005, 4, 1, 0)
+    r0_emit("pe_d3d12_descriptor_heap_real_record",
+        "\"heap_id\":830005,\"heap_kind\":4,\"descriptor_count\":1,\"shader_visible\":0,\"target\":\"DSV\"")
+
+    // 3. heap_count = 5
+    let c = heap_count()
+    if c != 5 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [heap_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_descriptor_count = 1006153
+    let td = total_descriptor_count()
+    if td != 1006153 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [total_descriptor_count] expected=1006153 got=" + to_string(td))
+    }
+
+    // 5. count_by_heap_kind sanity
+    let k1 = count_by_heap_kind(1)
+    if k1 != 2 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [count_by_heap_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_heap_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [count_by_heap_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_heap_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [count_by_heap_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_heap_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [count_by_heap_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_heap_kind(99)
+    if k99 != 0 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [count_by_heap_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. shader_visible_count = 2
+    let sv = shader_visible_count()
+    if sv != 2 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [shader_visible_count] expected=2 got=" + to_string(sv))
+    }
+
+    // 7. cbv_srv_uav_count = 2
+    let cs = cbv_srv_uav_count()
+    if cs != 2 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [cbv_srv_uav_count] expected=2 got=" + to_string(cs))
+    }
+
+    // 8. heap_descriptor_count sanity
+    let d1 = heap_descriptor_count(830001)
+    if d1 != 1000000 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [heap_descriptor_count(830001)] expected=1000000 got=" + to_string(d1))
+    }
+    let d3 = heap_descriptor_count(830003)
+    if d3 != 2048 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [heap_descriptor_count(830003)] expected=2048 got=" + to_string(d3))
+    }
+    let d_miss = heap_descriptor_count(9999)
+    if d_miss != 0 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [heap_descriptor_count(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 9. pddh_stats() = [5, 1006153, 2, 2]
+    let s = pddh_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [stats heap_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 1006153 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [stats total_descriptor_count] expected=1006153 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [stats shader_visible_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [stats cbv_srv_uav_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d12_descriptor_heap_real_stats",
+        "\"heap_count\":" + to_string(s[0])
+        + ",\"total_descriptor_count\":" + to_string(s[1])
+        + ",\"shader_visible_count\":" + to_string(s[2])
+        + ",\"cbv_srv_uav_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d12_descriptor_heap_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pddh()
+    let s2 = pddh_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d12_descriptor_heap_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_descriptor_heap_real self_test PASS (heaps=" + to_string(s[0])
+        + ", descriptors=" + to_string(s[1]) + ", shader_visible=" + to_string(s[2])
+        + ", cbv_srv_uav=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pddh_stats()
+            println("heap_count\t" + to_string(s[0]))
+            println("total_descriptor_count\t" + to_string(s[1]))
+            println("shader_visible_count\t" + to_string(s[2]))
+            println("cbv_srv_uav_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "descriptors" {
+            if len(a) >= 4 {
+                let hid = to_int(a[3])
+                println("heap_descriptor_count\t" + to_string(heap_descriptor_count(hid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_descriptor_heap_real.hexa descriptors <heap_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_heap_kind\t" + to_string(count_by_heap_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_descriptor_heap_real.hexa count <heap_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pddh()
+            println("cleaned: " + pddh_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pddh_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_descriptor_heap_real.hexa { self-test | stats | descriptors <heap_id> | count <heap_kind> | cleanup | dir }")
+}

@@ -1,0 +1,478 @@
+// lib/loader/pe_signal_trap_handler_real.hexa — Apple sigaction + ucontext_t trap handler
+//
+// phase 12 entry call 시 미매핑 IAT slot 액세스 → SIGSEGV. ucontext_t 분석
+// (RIP/EIP 위치) → IAT entry 식별 → helper IPC kind=5 dlsym 또는 own2 stub
+// 주소 patch → setcontext 로 retry. arm64 host 의 경우 ucontext.uc_mcontext
+// 의 __ss.__pc 를 분석, x86_64 host 일 때 __ss.__rip 를 분석하여 fault
+// instruction 이 IAT thunk (jmp [rip+disp32]) 인지 식별. 미매핑 slot 이면
+// IAT entry 의 함수명 hash 를 helper 로 전송하여 dlsym/own2 stub 으로 patch
+// 후 동일 IP 로 setcontext, retry counter 를 증가.
+//
+// own 1 enforcement: Apple sigaction(2) + ucontext.h 만 사용. Wine /
+// CrossOver / GPTK / Whisky / community signal handler 0 줄. 본 module 은
+// signal trap handler tracker — 실제 sigaction 등록 / ucontext_t 분석 /
+// IAT patch 는 stage6 native helper. 본 hexa 는 trap 발생 정합성 (signal_kind
+// × fault_kind × recovered) 만 record / count / stats.
+//   own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// signal_kind (Apple sigaction):
+//    4 = SIGILL
+//    5 = SIGTRAP
+//    8 = SIGFPE
+//   10 = SIGBUS  (Mach EXC_BAD_ACCESS — alignment / unmapped page)
+//   11 = SIGSEGV (Mach EXC_BAD_ACCESS — IAT unresolved 의 주 진입점)
+//
+// fault_kind (ucontext_t 분석 결과):
+//   1 = iat_unresolved   (jmp [rip+disp32] target == 0 / unmapped)
+//   2 = stack_overflow   (rsp < guard page)
+//   3 = write_to_text    (write to .text section / read-only page)
+//   4 = cfg_violation    (CFG indirect call to non-marked target)
+//   5 = integer_div_zero (SIGFPE — idiv with rcx=0)
+//
+// recovered:
+//   0 = unrecovered (panic / abort)
+//   1 = recovered   (IAT patch + setcontext retry 성공)
+//
+// persist schema (TSV — traps.tsv):
+//   trap_id<int> \t signal_kind<int> \t fault_kind<int> \t recovered<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psthr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_signal_trap_handler_real"
+}
+
+fn psthr_traps_path() -> str {
+    return psthr_dir() + "/traps.tsv"
+}
+
+fn psthr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psthr_dir() + "'")
+}
+
+fn cleanup_psthr() -> void {
+    psthr_ensure_dir()
+    let _ = exec("rm -f '" + psthr_traps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psthr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psthr_append_row(path: str, row: str) -> void {
+    psthr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_trap: sigaction + ucontext_t 기반 trap 1 건 기록 ───
+fn record_trap(trap_id: int, signal_kind: int, fault_kind: int, recovered: int) -> void {
+    if trap_id <= 0 {
+        panic("pe_signal_trap_handler_real FAIL [record_trap] expected=trap_id>0 got=" + to_string(trap_id))
+    }
+    if signal_kind < 1 {
+        panic("pe_signal_trap_handler_real FAIL [record_trap] expected=signal_kind>=1 got=" + to_string(signal_kind))
+    }
+    if signal_kind > 64 {
+        panic("pe_signal_trap_handler_real FAIL [record_trap] expected=signal_kind<=64 got=" + to_string(signal_kind))
+    }
+    if fault_kind < 1 {
+        panic("pe_signal_trap_handler_real FAIL [record_trap] expected=fault_kind>=1 got=" + to_string(fault_kind))
+    }
+    if fault_kind > 5 {
+        panic("pe_signal_trap_handler_real FAIL [record_trap] expected=fault_kind<=5 got=" + to_string(fault_kind))
+    }
+    if recovered != 0 {
+        if recovered != 1 {
+            panic("pe_signal_trap_handler_real FAIL [record_trap] expected=recovered in {0,1} got=" + to_string(recovered))
+        }
+    }
+    let row = to_string(trap_id) + "\t" + to_string(signal_kind)
+        + "\t" + to_string(fault_kind) + "\t" + to_string(recovered) + "\n"
+    psthr_append_row(psthr_traps_path(), row)
+}
+
+// ─── trap_count: total trap 수 ───
+fn trap_count() -> int {
+    let t = psthr_read_table(psthr_traps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_signal_kind: 특정 signal_kind 의 trap 수 ───
+fn count_by_signal_kind(signal_kind: int) -> int {
+    let t = psthr_read_table(psthr_traps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == signal_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_fault_kind: 특정 fault_kind 의 trap 수 ───
+fn count_by_fault_kind(fault_kind: int) -> int {
+    let t = psthr_read_table(psthr_traps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == fault_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── recovered_count: recovered=1 trap 수 ───
+fn recovered_count() -> int {
+    let t = psthr_read_table(psthr_traps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── iat_recover_count: fault_kind=1 (iat_unresolved) AND recovered=1 trap 수 ───
+fn iat_recover_count() -> int {
+    let t = psthr_read_table(psthr_traps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    if to_int(parts[3]) == 1 {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── trap_recovered: 특정 trap_id 의 recovered (없으면 0) ───
+fn trap_recovered(trap_id: int) -> int {
+    let t = psthr_read_table(psthr_traps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == trap_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psthr_stats: [trap_count, count_by_signal_kind(11), recovered_count, iat_recover_count] ───
+fn psthr_stats() -> array {
+    let mut out = []
+    out.push(trap_count())
+    out.push(count_by_signal_kind(11))
+    out.push(recovered_count())
+    out.push(iat_recover_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psthr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psthr()
+
+    // 2. record 6 traps covering ≥3 signal_kinds (11/8/4/5/10) + ≥3 fault_kinds (1/2/3/4/5) + ≥3 recovered
+    //    SIGSEGV → iat_unresolved → IAT patch + setcontext retry 성공
+    record_trap(910001, 11, 1, 1)
+    r0_emit("pe_signal_trap_handler_real_record",
+        "\"trap_id\":910001,\"signal_kind\":11,\"fault_kind\":1,\"recovered\":1,\"target\":\"SIGSEGV_iat_unresolved_recovered\"")
+
+    //    SIGSEGV → stack_overflow → guard page 미회복
+    record_trap(910002, 11, 2, 0)
+    r0_emit("pe_signal_trap_handler_real_record",
+        "\"trap_id\":910002,\"signal_kind\":11,\"fault_kind\":2,\"recovered\":0,\"target\":\"SIGSEGV_stack_overflow_unrecovered\"")
+
+    //    SIGFPE → integer_div_zero → idiv 회복 안됨
+    record_trap(910003, 8, 5, 0)
+    r0_emit("pe_signal_trap_handler_real_record",
+        "\"trap_id\":910003,\"signal_kind\":8,\"fault_kind\":5,\"recovered\":0,\"target\":\"SIGFPE_div0_unrecovered\"")
+
+    //    SIGSEGV → iat_unresolved → 두 번째 IAT slot patch 성공
+    record_trap(910004, 11, 1, 1)
+    r0_emit("pe_signal_trap_handler_real_record",
+        "\"trap_id\":910004,\"signal_kind\":11,\"fault_kind\":1,\"recovered\":1,\"target\":\"SIGSEGV_iat_unresolved_recovered2\"")
+
+    //    SIGILL → cfg_violation → CFG bitmap 갱신 후 재시도 성공
+    record_trap(910005, 4, 4, 1)
+    r0_emit("pe_signal_trap_handler_real_record",
+        "\"trap_id\":910005,\"signal_kind\":4,\"fault_kind\":4,\"recovered\":1,\"target\":\"SIGILL_cfg_violation_recovered\"")
+
+    //    SIGBUS → write_to_text → mprotect RW patch 후 미회복
+    record_trap(910006, 10, 3, 0)
+    r0_emit("pe_signal_trap_handler_real_record",
+        "\"trap_id\":910006,\"signal_kind\":10,\"fault_kind\":3,\"recovered\":0,\"target\":\"SIGBUS_write_to_text_unrecovered\"")
+
+    // 3. trap_count = 6
+    let c = trap_count()
+    if c != 6 {
+        panic("pe_signal_trap_handler_real FAIL [trap_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_signal_kind sanity (≥3 distinct kinds)
+    let s11 = count_by_signal_kind(11)
+    if s11 != 3 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_signal_kind(11)] expected=3 got=" + to_string(s11))
+    }
+    let s8 = count_by_signal_kind(8)
+    if s8 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_signal_kind(8)] expected=1 got=" + to_string(s8))
+    }
+    let s4 = count_by_signal_kind(4)
+    if s4 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_signal_kind(4)] expected=1 got=" + to_string(s4))
+    }
+    let s10 = count_by_signal_kind(10)
+    if s10 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_signal_kind(10)] expected=1 got=" + to_string(s10))
+    }
+    let s_miss = count_by_signal_kind(5)
+    if s_miss != 0 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_signal_kind(5)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 5. count_by_fault_kind sanity (≥3 distinct kinds)
+    let f1 = count_by_fault_kind(1)
+    if f1 != 2 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_fault_kind(1)] expected=2 got=" + to_string(f1))
+    }
+    let f2 = count_by_fault_kind(2)
+    if f2 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_fault_kind(2)] expected=1 got=" + to_string(f2))
+    }
+    let f3 = count_by_fault_kind(3)
+    if f3 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_fault_kind(3)] expected=1 got=" + to_string(f3))
+    }
+    let f4 = count_by_fault_kind(4)
+    if f4 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_fault_kind(4)] expected=1 got=" + to_string(f4))
+    }
+    let f5 = count_by_fault_kind(5)
+    if f5 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [count_by_fault_kind(5)] expected=1 got=" + to_string(f5))
+    }
+
+    // 6. recovered_count = 3
+    let rec = recovered_count()
+    if rec != 3 {
+        panic("pe_signal_trap_handler_real FAIL [recovered_count] expected=3 got=" + to_string(rec))
+    }
+
+    // 7. iat_recover_count = 2 (910001, 910004 — fault_kind=1 AND recovered=1)
+    let iat = iat_recover_count()
+    if iat != 2 {
+        panic("pe_signal_trap_handler_real FAIL [iat_recover_count] expected=2 got=" + to_string(iat))
+    }
+
+    // 8. trap_recovered sanity
+    let r1 = trap_recovered(910001)
+    if r1 != 1 {
+        panic("pe_signal_trap_handler_real FAIL [trap_recovered(910001)] expected=1 got=" + to_string(r1))
+    }
+    let r3 = trap_recovered(910003)
+    if r3 != 0 {
+        panic("pe_signal_trap_handler_real FAIL [trap_recovered(910003)] expected=0 got=" + to_string(r3))
+    }
+    let r_miss = trap_recovered(9999)
+    if r_miss != 0 {
+        panic("pe_signal_trap_handler_real FAIL [trap_recovered(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 9. psthr_stats() = [6, 3, 3, 2]
+    let s = psthr_stats()
+    if len(s) != 4 {
+        panic("pe_signal_trap_handler_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_signal_trap_handler_real FAIL [stats trap_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_signal_trap_handler_real FAIL [stats segv] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_signal_trap_handler_real FAIL [stats recovered] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_signal_trap_handler_real FAIL [stats iat_recover] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_signal_trap_handler_real_stats",
+        "\"trap_count\":" + to_string(s[0])
+        + ",\"segv_count\":" + to_string(s[1])
+        + ",\"recovered\":" + to_string(s[2])
+        + ",\"iat_recover\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_signal_trap_handler_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_psthr()
+    let s2 = psthr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_signal_trap_handler_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_signal_trap_handler_real self_test PASS (traps=" + to_string(s[0])
+        + ", segv=" + to_string(s[1]) + ", recovered=" + to_string(s[2])
+        + ", iat_recover=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psthr_stats()
+            println("trap_count\t" + to_string(s[0]))
+            println("segv_count\t" + to_string(s[1]))
+            println("recovered\t" + to_string(s[2]))
+            println("iat_recover\t" + to_string(s[3]))
+            return
+        }
+        if sub == "recovered" {
+            if len(a) >= 4 {
+                let tid = to_int(a[3])
+                println("trap_recovered\t" + to_string(trap_recovered(tid)))
+                return
+            }
+            println("usage: hexa run pe_signal_trap_handler_real.hexa recovered <trap_id>")
+            return
+        }
+        if sub == "count-signal" {
+            if len(a) >= 4 {
+                let sk = to_int(a[3])
+                println("count_by_signal_kind\t" + to_string(count_by_signal_kind(sk)))
+                return
+            }
+            println("usage: hexa run pe_signal_trap_handler_real.hexa count-signal <signal_kind>")
+            return
+        }
+        if sub == "count-fault" {
+            if len(a) >= 4 {
+                let fk = to_int(a[3])
+                println("count_by_fault_kind\t" + to_string(count_by_fault_kind(fk)))
+                return
+            }
+            println("usage: hexa run pe_signal_trap_handler_real.hexa count-fault <fault_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psthr()
+            println("cleaned: " + psthr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psthr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_signal_trap_handler_real.hexa { self-test | stats | recovered <trap_id> | count-signal <signal_kind> | count-fault <fault_kind> | cleanup | dir }")
+}

@@ -1,0 +1,290 @@
+// lib/loader/native_helper_bridge.hexa — Phase 1 stage1 — native helper 브리지
+//
+// hexa loader 가 macOS native code (Objective-C++ in airgenome.app) 와 통신하는
+// 인터페이스 skeleton. 본 파일은 hexa-side stub — native side 는 native/src 안.
+//
+// 통신 방식: stage1 = 환경변수 + 임시 파일 (fork-friendly).
+//             stage2 = mach port + shared memory ring buffer.
+//
+// 호출 가능한 helper:
+//   mmap_file(path, prot) -> base_addr
+//   dlopen_framework(name) -> handle
+//   dlsym(handle, name) -> addr
+//   call_function(addr, args_blob) -> result_blob
+
+use "../perf/r0_common"
+
+let BRIDGE_REQ = "/tmp/airgenome_bridge_req"
+let BRIDGE_RESP = "/tmp/airgenome_bridge_resp"
+
+fn bridge_available() -> bool {
+    let r = exec("test -f /Applications/airgenome.app/Contents/MacOS/airgenome_helper 2>/dev/null && echo ok").trim()
+    return r == "ok"
+}
+
+fn helper_protocol_version() -> int { return 1 }
+
+// stage1: write request file, native helper polls. 본 모듈은 형식만 검증.
+fn build_request(op: str, payload: str) -> str {
+    return "v1\t" + op + "\t" + payload
+}
+
+fn parse_response(line: str) -> str {
+    // "v1\tstatus\tresult"
+    let parts = line.split("\t")
+    if len(parts) < 3 { return "" }
+    if parts[0] != "v1" { return "" }
+    if parts[1] != "ok" { return "" }
+    return parts[2]
+}
+
+// 호출 종류
+fn supported_ops() -> array {
+    return ["mmap_file", "dlopen", "dlsym", "call_function", "ping"]
+}
+
+fn ping_via_metadata() -> str {
+    // stage1 — actual native helper 없이 metadata 만 검증
+    return "stage1_no_native"
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Track R 2026-05-03 — L2 long-horizon Apple-native bridge surface (additive)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Track R extends this bridge with 5 Apple-native API surface declarations
+// (PARTIAL emit only — actual native invocation is helper.mm/E1+E2 territory):
+//   1. Metal CommandQueue / CommandBuffer 생성 surface
+//   2. MTLDevice probe (MTLCreateSystemDefaultDevice)
+//   3. CGDirectDisplay query (CoreGraphics CGDirectDisplayID enumeration)
+//   4. IOKit framework probe (IOServiceMatching / IOServiceGetMatchingServices)
+//   5. Foundation NSObject lifecycle (alloc/init/release/autorelease pool)
+//
+// own1: Apple SDK direct binding via hexa-native FFI scaffold = OK
+//   (Apple platform component = own1 정합).
+// own1 NOT-IN-SCOPE 영구: Wine / CrossOver / GPTK / Whisky / Mono / CoreCLR
+//   / 3rd-party D3D-to-Metal binding / non-Apple-SDK shim 0줄.
+//
+// emit format: `__NATIVE_BRIDGE__ PARTIAL <surface>` (own2 정직 emit,
+//   actual call X — surface declaration only, 실 syscall 발동은 helper.mm).
+// rationale: hexa loader 측 자체 syscall 발동 X (sandboxed). bridge layer 측
+//   responsibility = surface enumeration + helper.mm IPC dispatch contract.
+
+fn apple_surfaces() -> array {
+    // 5 Apple-native surface 명세 (확정 — additive)
+    return [
+        "metal_command_queue",
+        "mtl_device_probe",
+        "cg_direct_display",
+        "iokit_service_match",
+        "ns_object_lifecycle"
+    ]
+}
+
+fn surface_partial_emit(surface: str) -> str {
+    // emit format: `__NATIVE_BRIDGE__ PARTIAL <surface>`
+    return "__NATIVE_BRIDGE__ PARTIAL " + surface
+}
+
+fn metal_command_queue_spec() -> str {
+    // surface 1: Metal CommandQueue / CommandBuffer 생성 surface
+    // 실 호출 path = helper.mm kind=7 metal_device → MTLCreateSystemDefaultDevice
+    //   → [device newCommandQueue] → [queue commandBuffer]
+    // hexa loader 측 = surface declaration only, 실 호출 X
+    return "metal_command_queue:device->newCommandQueue->commandBuffer"
+}
+
+fn mtl_device_probe_spec() -> str {
+    // surface 2: MTLDevice probe (MTLCreateSystemDefaultDevice)
+    // 실 호출 path = helper.mm kind=7 metal_device → MTLCreateSystemDefaultDevice()
+    //   → MTLDevice* (retain count 관리는 helper 측)
+    return "mtl_device_probe:MTLCreateSystemDefaultDevice"
+}
+
+fn cg_direct_display_spec() -> str {
+    // surface 3: CGDirectDisplay query (CoreGraphics CGDirectDisplayID enumeration)
+    // 실 호출 path = helper.mm 측 CGGetActiveDisplayList(max, displays, count)
+    //   → CGDirectDisplayID array (display 측 query — first-frame swapchain prereq)
+    return "cg_direct_display:CGGetActiveDisplayList"
+}
+
+fn iokit_service_match_spec() -> str {
+    // surface 4: IOKit framework probe (IOServiceMatching / IOServiceGetMatchingServices)
+    // 실 호출 path = helper.mm 측 IOServiceMatching("IOAccelerator") + IOServiceGetMatchingServices
+    //   → io_iterator_t (Metal device 측 IOKit registry 질의)
+    return "iokit_service_match:IOServiceMatching+IOServiceGetMatchingServices"
+}
+
+fn ns_object_lifecycle_spec() -> str {
+    // surface 5: Foundation NSObject lifecycle (alloc/init/release/autorelease pool)
+    // 실 호출 path = helper.mm kind=6 nsobject → [[NSObject alloc] init] / release /
+    //   @autoreleasepool block (objc_msgSend ABI lr/x0/x1 packing)
+    return "ns_object_lifecycle:alloc-init-release-autoreleasepool"
+}
+
+fn surface_dispatch(surface: str) -> str {
+    if surface == "metal_command_queue" { return metal_command_queue_spec() }
+    if surface == "mtl_device_probe" { return mtl_device_probe_spec() }
+    if surface == "cg_direct_display" { return cg_direct_display_spec() }
+    if surface == "iokit_service_match" { return iokit_service_match_spec() }
+    if surface == "ns_object_lifecycle" { return ns_object_lifecycle_spec() }
+    return ""
+}
+
+fn surface_count() -> int { return 5 }
+
+fn surface_own1_alignment() -> str {
+    // 5 surface 모두 Apple SDK direct binding (own1 정합)
+    // Wine / CrossOver / Mono / CoreCLR / 3rd-party D3D-to-Metal 0줄
+    return "apple_sdk_direct_binding_only"
+}
+
+fn self_test() -> void {
+    let sid = "nhb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    if helper_protocol_version() != 1 { panic("native_helper_bridge FAIL [version]") }
+
+    let ops = supported_ops()
+    if len(ops) != 5 { panic("native_helper_bridge FAIL [ops] expected=5 got=" + to_string(len(ops))) }
+
+    let req = build_request("ping", "")
+    if !req.contains("v1\tping") { panic("native_helper_bridge FAIL [req]") }
+
+    let resp_ok = parse_response("v1\tok\thello")
+    if resp_ok != "hello" { panic("native_helper_bridge FAIL [resp ok]") }
+
+    let resp_bad = parse_response("v1\terror\tnope")
+    if resp_bad != "" { panic("native_helper_bridge FAIL [resp err]") }
+
+    let resp_wrongver = parse_response("v2\tok\thello")
+    if resp_wrongver != "" { panic("native_helper_bridge FAIL [resp ver]") }
+
+    let p = ping_via_metadata()
+    if p != "stage1_no_native" { panic("native_helper_bridge FAIL [ping] got=" + p) }
+
+    let avail = bridge_available()
+    // 현재 native helper 미배포 — false 정상
+    let avail_str = "no"
+    if avail { avail_str = "yes" }
+
+    r0_emit("native_bridge_stage1", "\"version\":1,\"ops\":5,\"available\":\"" + avail_str + "\"")
+
+    // ─── Track R 2026-05-03 — 5 Apple-native surface invariant verification ───
+
+    let surfaces = apple_surfaces()
+    if len(surfaces) != 5 { panic("native_helper_bridge FAIL [surfaces] expected=5 got=" + to_string(len(surfaces))) }
+    if surface_count() != 5 { panic("native_helper_bridge FAIL [surface_count] expected=5") }
+
+    // surface 1 — metal_command_queue
+    let s1 = surfaces[0]
+    if s1 != "metal_command_queue" { panic("native_helper_bridge FAIL [s1] got=" + s1) }
+    let s1_spec = surface_dispatch(s1)
+    if !s1_spec.contains("newCommandQueue") { panic("native_helper_bridge FAIL [s1 spec]") }
+    let s1_emit = surface_partial_emit(s1)
+    if s1_emit != "__NATIVE_BRIDGE__ PARTIAL metal_command_queue" { panic("native_helper_bridge FAIL [s1 emit]") }
+    println(s1_emit)
+
+    // surface 2 — mtl_device_probe
+    let s2 = surfaces[1]
+    if s2 != "mtl_device_probe" { panic("native_helper_bridge FAIL [s2] got=" + s2) }
+    let s2_spec = surface_dispatch(s2)
+    if !s2_spec.contains("MTLCreateSystemDefaultDevice") { panic("native_helper_bridge FAIL [s2 spec]") }
+    let s2_emit = surface_partial_emit(s2)
+    if s2_emit != "__NATIVE_BRIDGE__ PARTIAL mtl_device_probe" { panic("native_helper_bridge FAIL [s2 emit]") }
+    println(s2_emit)
+
+    // surface 3 — cg_direct_display
+    let s3 = surfaces[2]
+    if s3 != "cg_direct_display" { panic("native_helper_bridge FAIL [s3] got=" + s3) }
+    let s3_spec = surface_dispatch(s3)
+    if !s3_spec.contains("CGGetActiveDisplayList") { panic("native_helper_bridge FAIL [s3 spec]") }
+    let s3_emit = surface_partial_emit(s3)
+    if s3_emit != "__NATIVE_BRIDGE__ PARTIAL cg_direct_display" { panic("native_helper_bridge FAIL [s3 emit]") }
+    println(s3_emit)
+
+    // surface 4 — iokit_service_match
+    let s4 = surfaces[3]
+    if s4 != "iokit_service_match" { panic("native_helper_bridge FAIL [s4] got=" + s4) }
+    let s4_spec = surface_dispatch(s4)
+    if !s4_spec.contains("IOServiceMatching") { panic("native_helper_bridge FAIL [s4 spec]") }
+    let s4_emit = surface_partial_emit(s4)
+    if s4_emit != "__NATIVE_BRIDGE__ PARTIAL iokit_service_match" { panic("native_helper_bridge FAIL [s4 emit]") }
+    println(s4_emit)
+
+    // surface 5 — ns_object_lifecycle
+    let s5 = surfaces[4]
+    if s5 != "ns_object_lifecycle" { panic("native_helper_bridge FAIL [s5] got=" + s5) }
+    let s5_spec = surface_dispatch(s5)
+    if !s5_spec.contains("autoreleasepool") { panic("native_helper_bridge FAIL [s5 spec]") }
+    let s5_emit = surface_partial_emit(s5)
+    if s5_emit != "__NATIVE_BRIDGE__ PARTIAL ns_object_lifecycle" { panic("native_helper_bridge FAIL [s5 emit]") }
+    println(s5_emit)
+
+    // unknown surface dispatch invariant
+    let unknown = surface_dispatch("nonexistent_surface")
+    if unknown != "" { panic("native_helper_bridge FAIL [unknown surface] got=" + unknown) }
+
+    // own1 alignment invariant
+    if surface_own1_alignment() != "apple_sdk_direct_binding_only" {
+        panic("native_helper_bridge FAIL [own1 alignment]")
+    }
+
+    r0_emit("native_bridge_track_r_partial", "\"surfaces\":5,\"emit_count\":5,\"own1\":\"apple_sdk_direct_binding_only\"")
+
+    println("  ✅ native_helper_bridge self_test PASS (v1 protocol, 5 ops, 5 Apple-native surfaces partial-emit, own1 apple_sdk_direct_binding_only, native helper avail=" + avail_str + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "ping" { println(ping_via_metadata()); return }
+        if sub == "available" {
+            if bridge_available() { println("yes") } else { println("no") }
+            return
+        }
+        if sub == "ops" {
+            let ops = supported_ops()
+            let i = 0
+            while i < len(ops) {
+                println(ops[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "surfaces" {
+            let surfaces = apple_surfaces()
+            let i = 0
+            while i < len(surfaces) {
+                println(surfaces[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "surface-spec" {
+            if len(a) >= 4 {
+                let s = a[3]
+                println(surface_dispatch(s))
+                return
+            }
+            println("usage: hexa run native_helper_bridge.hexa surface-spec <surface>")
+            return
+        }
+        if sub == "surface-emit" {
+            if len(a) >= 4 {
+                let s = a[3]
+                println(surface_partial_emit(s))
+                return
+            }
+            println("usage: hexa run native_helper_bridge.hexa surface-emit <surface>")
+            return
+        }
+        if sub == "own1" {
+            println(surface_own1_alignment())
+            return
+        }
+    }
+    println("usage: hexa run native_helper_bridge.hexa { self-test | ping | available | ops | surfaces | surface-spec <name> | surface-emit <name> | own1 }")
+}

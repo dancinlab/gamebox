@@ -1,0 +1,410 @@
+// lib/loader/pe_d3d12_fence_real.hexa — cycle 81 R5 phase 2
+// D3D12 ID3D12Fence (Signal/Wait/SetEventOnCompletion) → MTLEvent/MTLSharedEvent 매핑.
+//
+// D3D12 Fence → Metal Event:
+//   ID3D12Fence::Signal                  → MTLEvent newEvent + setSignaledValue:
+//   ID3D12Fence::Wait                    → encodeWaitForEvent:value:
+//   ID3D12Fence::SetEventOnCompletion    → notifyListener:atValue:block:
+//   ID3D12Device::CreateFence            → MTLDevice newSharedEvent (cross-queue/cross-process)
+//   ID3D12Fence::GetCompletedValue       → MTLSharedEvent signaledValue property
+// own1: D3DMetal 위임 우선 + Apple Metal + MSDN ID3D12Fence spec only
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 fence op tracker — 실 ID3D12Fence 호출 X (D3DMetal 위임 stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = signal
+//   2 = wait
+//   3 = set_event_on_completion
+//   4 = create
+//   5 = get_completed_value
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t fence_value<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdfr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_fence_real"
+}
+
+fn pdfr_ops_path() -> str {
+    return pdfr_dir() + "/ops.tsv"
+}
+
+fn pdfr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdfr_dir() + "'")
+}
+
+fn cleanup_pdfr() -> void {
+    pdfr_ensure_dir()
+    let _ = exec("rm -f '" + pdfr_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdfr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdfr_append_row(path: str, row: str) -> void {
+    pdfr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: fence op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, fence_value: int, elevated: int) -> void {
+    if op_id <= 0 {
+        panic("pe_d3d12_fence_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_d3d12_fence_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 5 {
+        panic("pe_d3d12_fence_real FAIL [record_op] expected=op_kind<=5 got=" + to_string(op_kind))
+    }
+    if fence_value < 0 {
+        panic("pe_d3d12_fence_real FAIL [record_op] expected=fence_value>=0 got=" + to_string(fence_value))
+    }
+    if elevated < 0 {
+        panic("pe_d3d12_fence_real FAIL [record_op] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_d3d12_fence_real FAIL [record_op] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(fence_value) + "\t" + to_string(elevated) + "\n"
+    pdfr_append_row(pdfr_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pdfr_read_table(pdfr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(op_kind: int) -> int {
+    let t = pdfr_read_table(pdfr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == op_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_fence_value: 모든 op fence_value 합 ───
+fn total_fence_value() -> int {
+    let t = pdfr_read_table(pdfr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── elevated_count: elevated=1 op 수 ───
+fn elevated_count() -> int {
+    let t = pdfr_read_table(pdfr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── signal_wait_balance: count_by_op_kind(1) - count_by_op_kind(2) ───
+fn signal_wait_balance() -> int {
+    return count_by_op_kind(1) - count_by_op_kind(2)
+}
+
+// ─── op_fence_value: 특정 op_id 의 fence_value (없으면 0) ───
+fn op_fence_value(op_id: int) -> int {
+    let t = pdfr_read_table(pdfr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdfr_stats: [op_count, total_fence_value, elevated_count, signal_wait_balance] ───
+fn pdfr_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_fence_value())
+    out.push(elevated_count())
+    out.push(signal_wait_balance())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdfr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdfr()
+
+    // 2. record 5 ops covering ≥4 op_kinds with ≥2 elevated
+    //    op_kind: 1=signal, 2=wait, 3=set_event_on_completion, 4=create, 5=get_completed_value
+    record_op(330001, 4, 0, 1)
+    r0_emit("pe_d3d12_fence_real_record",
+        "\"op_id\":330001,\"op_kind\":4,\"fence_value\":0,\"elevated\":1,\"target\":\"newSharedEvent\"")
+
+    record_op(330002, 1, 100, 0)
+    r0_emit("pe_d3d12_fence_real_record",
+        "\"op_id\":330002,\"op_kind\":1,\"fence_value\":100,\"elevated\":0,\"target\":\"setSignaledValue\"")
+
+    record_op(330003, 2, 100, 0)
+    r0_emit("pe_d3d12_fence_real_record",
+        "\"op_id\":330003,\"op_kind\":2,\"fence_value\":100,\"elevated\":0,\"target\":\"encodeWaitForEvent\"")
+
+    record_op(330004, 3, 200, 1)
+    r0_emit("pe_d3d12_fence_real_record",
+        "\"op_id\":330004,\"op_kind\":3,\"fence_value\":200,\"elevated\":1,\"target\":\"notifyListenerAtValueBlock\"")
+
+    record_op(330005, 1, 300, 0)
+    r0_emit("pe_d3d12_fence_real_record",
+        "\"op_id\":330005,\"op_kind\":1,\"fence_value\":300,\"elevated\":0,\"target\":\"setSignaledValue\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_d3d12_fence_real FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_fence_value = 0+100+100+200+300 = 700
+    let tv = total_fence_value()
+    if tv != 700 {
+        panic("pe_d3d12_fence_real FAIL [total_fence_value] expected=700 got=" + to_string(tv))
+    }
+
+    // 5. elevated_count = 2 (330001, 330004)
+    let ec = elevated_count()
+    if ec != 2 {
+        panic("pe_d3d12_fence_real FAIL [elevated_count] expected=2 got=" + to_string(ec))
+    }
+
+    // 6. count_by_op_kind sanity (≥4 op_kinds covered: 1,2,3,4)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_d3d12_fence_real FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d12_fence_real FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d12_fence_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d12_fence_real FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 0 {
+        panic("pe_d3d12_fence_real FAIL [count_by_op_kind(5)] expected=0 got=" + to_string(k5))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_d3d12_fence_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. signal_wait_balance = 2 - 1 = 1
+    let swb = signal_wait_balance()
+    if swb != 1 {
+        panic("pe_d3d12_fence_real FAIL [signal_wait_balance] expected=1 got=" + to_string(swb))
+    }
+
+    // 8. op_fence_value sanity
+    let fv2 = op_fence_value(330002)
+    if fv2 != 100 {
+        panic("pe_d3d12_fence_real FAIL [op_fence_value(330002)] expected=100 got=" + to_string(fv2))
+    }
+    let fv5 = op_fence_value(330005)
+    if fv5 != 300 {
+        panic("pe_d3d12_fence_real FAIL [op_fence_value(330005)] expected=300 got=" + to_string(fv5))
+    }
+    let fv_miss = op_fence_value(9999)
+    if fv_miss != 0 {
+        panic("pe_d3d12_fence_real FAIL [op_fence_value(9999)] expected=0 got=" + to_string(fv_miss))
+    }
+
+    // 9. pdfr_stats() = [5, 700, 2, 1]
+    let s = pdfr_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_fence_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d12_fence_real FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 700 {
+        panic("pe_d3d12_fence_real FAIL [stats total_fence_value] expected=700 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_d3d12_fence_real FAIL [stats elevated_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_d3d12_fence_real FAIL [stats signal_wait_balance] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d12_fence_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_fence_value\":" + to_string(s[1])
+        + ",\"elevated_count\":" + to_string(s[2])
+        + ",\"signal_wait_balance\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d12_fence_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdfr()
+    let s2 = pdfr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d12_fence_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_fence_real self_test PASS (ops=" + to_string(s[0])
+        + ", fence_value=" + to_string(s[1]) + ", elevated=" + to_string(s[2])
+        + ", signal_wait_balance=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdfr_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_fence_value\t" + to_string(s[1]))
+            println("elevated_count\t" + to_string(s[2]))
+            println("signal_wait_balance\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fence-value" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_fence_value\t" + to_string(op_fence_value(oid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_fence_real.hexa fence-value <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_fence_real.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdfr()
+            println("cleaned: " + pdfr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdfr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_fence_real.hexa { self-test | stats | fence-value <op_id> | count <op_kind> | cleanup | dir }")
+}

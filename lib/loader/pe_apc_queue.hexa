@@ -1,0 +1,374 @@
+// lib/loader/pe_apc_queue.hexa — cycle70 Async Procedure Call queue telemetry
+//
+// Windows APC: QueueUserAPC posts an APC routine to a target thread; when the
+// thread next enters an alertable wait (SleepEx/WaitForSingleObjectEx 등),
+// KiUserApcDispatcher fires queued APCs in order. Three flavors:
+//   user APC, kernel special APC (signal-bypass), kernel normal APC.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 APC queue tracker — 실 QueueUserAPC / NtQueueApcThread 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// apc_kind code:
+//   1 = user APC          (QueueUserAPC)
+//   2 = kernel special    (signal-bypass)
+//   3 = kernel normal
+//
+// delivered:
+//   0 = pending (still queued, thread not yet alertable)
+//   1 = delivered (KiUserApcDispatcher fired)
+//
+// persist schema (TSV — apcs.tsv):
+//   apc_id<int> \t thread_id<int> \t apc_kind<int> \t delivered<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn paq_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_apc_queue"
+}
+
+fn paq_apcs_path() -> str {
+    return paq_dir() + "/apcs.tsv"
+}
+
+fn paq_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + paq_dir() + "'")
+}
+
+fn cleanup_paq() -> void {
+    paq_ensure_dir()
+    let _ = exec("rm -f '" + paq_apcs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn paq_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn paq_append_row(path: str, row: str) -> void {
+    paq_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_apc: APC 1 건 기록 ───
+fn record_apc(apc_id: int, thread_id: int, apc_kind: int, delivered: int) -> void {
+    if apc_id <= 0 {
+        panic("pe_apc_queue FAIL [record_apc] expected=apc_id>0 got=" + to_string(apc_id))
+    }
+    if thread_id <= 0 {
+        panic("pe_apc_queue FAIL [record_apc] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    if apc_kind < 1 {
+        panic("pe_apc_queue FAIL [record_apc] expected=apc_kind>=1 got=" + to_string(apc_kind))
+    }
+    if apc_kind > 3 {
+        panic("pe_apc_queue FAIL [record_apc] expected=apc_kind<=3 got=" + to_string(apc_kind))
+    }
+    if delivered < 0 {
+        panic("pe_apc_queue FAIL [record_apc] expected=delivered>=0 got=" + to_string(delivered))
+    }
+    if delivered > 1 {
+        panic("pe_apc_queue FAIL [record_apc] expected=delivered<=1 got=" + to_string(delivered))
+    }
+    let row = to_string(apc_id) + "\t" + to_string(thread_id)
+        + "\t" + to_string(apc_kind) + "\t" + to_string(delivered) + "\n"
+    paq_append_row(paq_apcs_path(), row)
+}
+
+// ─── apc_count: total APC 수 ───
+fn apc_count() -> int {
+    let t = paq_read_table(paq_apcs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── delivered_count: delivered=1 인 APC 수 ───
+fn delivered_count() -> int {
+    let t = paq_read_table(paq_apcs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pending_count: apc_count - delivered_count ───
+fn pending_count() -> int {
+    return apc_count() - delivered_count()
+}
+
+// ─── count_by_apc_kind: 특정 apc_kind 의 APC 수 ───
+fn count_by_apc_kind(kind: int) -> int {
+    let t = paq_read_table(paq_apcs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── apc_thread: 특정 apc_id 의 thread_id (없으면 0) ───
+fn apc_thread(apc_id: int) -> int {
+    let t = paq_read_table(paq_apcs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == apc_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── paq_stats: [apc_count, delivered_count, pending_count, count_by_apc_kind(1)] ───
+fn paq_stats() -> array {
+    let mut out = []
+    out.push(apc_count())
+    out.push(delivered_count())
+    out.push(pending_count())
+    out.push(count_by_apc_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "paq-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_paq()
+
+    // 2. record 5 APCs across 2 threads (thread 7001, 7002), 3 delivered
+    record_apc(120001, 7001, 1, 1)
+    r0_emit("pe_apc_queue_record",
+        "\"apc_id\":120001,\"thread_id\":7001,\"apc_kind\":1,\"delivered\":1,\"target\":\"user\"")
+
+    record_apc(120002, 7001, 2, 1)
+    r0_emit("pe_apc_queue_record",
+        "\"apc_id\":120002,\"thread_id\":7001,\"apc_kind\":2,\"delivered\":1,\"target\":\"kernel_special\"")
+
+    record_apc(120003, 7002, 1, 0)
+    r0_emit("pe_apc_queue_record",
+        "\"apc_id\":120003,\"thread_id\":7002,\"apc_kind\":1,\"delivered\":0,\"target\":\"user\"")
+
+    record_apc(120004, 7002, 3, 1)
+    r0_emit("pe_apc_queue_record",
+        "\"apc_id\":120004,\"thread_id\":7002,\"apc_kind\":3,\"delivered\":1,\"target\":\"kernel_normal\"")
+
+    record_apc(120005, 7001, 1, 0)
+    r0_emit("pe_apc_queue_record",
+        "\"apc_id\":120005,\"thread_id\":7001,\"apc_kind\":1,\"delivered\":0,\"target\":\"user\"")
+
+    // 3. apc_count = 5
+    let c = apc_count()
+    if c != 5 {
+        panic("pe_apc_queue FAIL [apc_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. delivered_count = 3
+    let dc = delivered_count()
+    if dc != 3 {
+        panic("pe_apc_queue FAIL [delivered_count] expected=3 got=" + to_string(dc))
+    }
+
+    // 5. pending_count = 2
+    let pc = pending_count()
+    if pc != 2 {
+        panic("pe_apc_queue FAIL [pending_count] expected=2 got=" + to_string(pc))
+    }
+
+    // 6. count_by_apc_kind sanity
+    let k1 = count_by_apc_kind(1)
+    if k1 != 3 {
+        panic("pe_apc_queue FAIL [count_by_apc_kind(1)] expected=3 got=" + to_string(k1))
+    }
+    let k2 = count_by_apc_kind(2)
+    if k2 != 1 {
+        panic("pe_apc_queue FAIL [count_by_apc_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_apc_kind(3)
+    if k3 != 1 {
+        panic("pe_apc_queue FAIL [count_by_apc_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k99 = count_by_apc_kind(99)
+    if k99 != 0 {
+        panic("pe_apc_queue FAIL [count_by_apc_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. apc_thread sanity
+    let th2 = apc_thread(120002)
+    if th2 != 7001 {
+        panic("pe_apc_queue FAIL [apc_thread(120002)] expected=7001 got=" + to_string(th2))
+    }
+    let th3 = apc_thread(120003)
+    if th3 != 7002 {
+        panic("pe_apc_queue FAIL [apc_thread(120003)] expected=7002 got=" + to_string(th3))
+    }
+    let th_miss = apc_thread(9999)
+    if th_miss != 0 {
+        panic("pe_apc_queue FAIL [apc_thread(9999)] expected=0 got=" + to_string(th_miss))
+    }
+
+    // 8. paq_stats() = [5, 3, 2, 3]
+    let s = paq_stats()
+    if len(s) != 4 {
+        panic("pe_apc_queue FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_apc_queue FAIL [stats apc_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_apc_queue FAIL [stats delivered_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_apc_queue FAIL [stats pending_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_apc_queue FAIL [stats count_kind(1)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_apc_queue_stats",
+        "\"apc_count\":" + to_string(s[0])
+        + ",\"delivered_count\":" + to_string(s[1])
+        + ",\"pending_count\":" + to_string(s[2])
+        + ",\"kind_user\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_apc_queue FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_paq()
+    let s2 = paq_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_apc_queue FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_apc_queue self_test PASS (apcs=" + to_string(s[0])
+        + ", delivered=" + to_string(s[1]) + ", pending=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = paq_stats()
+            println("apc_count\t" + to_string(s[0]))
+            println("delivered_count\t" + to_string(s[1]))
+            println("pending_count\t" + to_string(s[2]))
+            println("count_kind_user\t" + to_string(s[3]))
+            return
+        }
+        if sub == "thread" {
+            if len(a) >= 4 {
+                let aid = to_int(a[3])
+                println("apc_thread\t" + to_string(apc_thread(aid)))
+                return
+            }
+            println("usage: hexa run pe_apc_queue.hexa thread <apc_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let arg3 = a[3]
+                if arg3 == "delivered" {
+                    println("delivered_count\t" + to_string(delivered_count()))
+                    return
+                }
+                let kind = to_int(arg3)
+                println("count_by_apc_kind\t" + to_string(count_by_apc_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_apc_queue.hexa count { delivered | <apc_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_paq()
+            println("cleaned: " + paq_dir())
+            return
+        }
+        if sub == "dir" {
+            println(paq_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_apc_queue.hexa { self-test | stats | thread <apc_id> | count delivered | count <apc_kind> | cleanup | dir }")
+}

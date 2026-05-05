@@ -1,0 +1,185 @@
+// lib/perf/c_mtl_function_const_variant.hexa — CN-148 skeleton manjeom 15/15
+//
+// Metal function constants pipeline variant 추적 — 단일 MSL → 다수 specialized
+// PSO link-time 생성. D4 lighting shader 가 spec_const(shadow=on/off, gi=on/off,
+// dof=on/off 등) 8 개로 256 가지 variant 가능. function_constants 사용 시 single
+// MSL source → 256 specialization PSO 가 link-time 분기 → MSL 텍스트 8 ×
+// replication 회피, compile cache 공유.
+//
+// 무기: variant × spec_const_count × pso_count_save × compile_ms_save 4-key 로그.
+// 효과: D4 PSO blend variant 폭발 (변종 cache, recompile 비용) 정량화 → MSL
+// 소스 single, link-time variant only.
+
+use "./r0_common"
+
+let MFCV_DIR = GAMEBOX_HOME + "/persist/mtl_function_const_variant"
+let VARIANT_LOG = MFCV_DIR + "/variants.tsv"
+
+fn mfcv_dir() -> str { return MFCV_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + MFCV_DIR + "'")
+}
+
+// ─── variant 등록 ───
+//   variant_id (D4 lighting / deferred / post-process 등 logical name 의 hash),
+//   spec_const_count (function_constants 분기 차원 수),
+//   pso_count_save (link-time 분기로 회피한 specialized PSO 수),
+//   compile_ms_save (single MSL source 공유로 절약한 compile 시간 ms).
+fn record_variant(variant_id: int, spec_const_count: int, pso_count_save: int, compile_ms_save: int) -> void {
+    ensure_dir()
+    let line = to_string(variant_id) + "\t" + to_string(spec_const_count) + "\t" + to_string(pso_count_save) + "\t" + to_string(compile_ms_save)
+    let tmp = VARIANT_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + VARIANT_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("mtl_fn_const_variant_record", "\"variant\":" + to_string(variant_id) + ",\"spec_consts\":" + to_string(spec_const_count) + ",\"pso_save\":" + to_string(pso_count_save) + ",\"compile_ms_save\":" + to_string(compile_ms_save))
+}
+
+// ─── variant_count — 등록된 variant 행 수 ───
+fn variant_count() -> int {
+    let exists = exec("test -f '" + VARIANT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + VARIANT_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_spec_consts — 모든 variant spec_const_count 합 ───
+fn total_spec_consts() -> int {
+    let exists = exec("test -f '" + VARIANT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + VARIANT_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_pso_save — 모든 variant pso_count_save 합 ───
+fn total_pso_save() -> int {
+    let exists = exec("test -f '" + VARIANT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + VARIANT_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_compile_ms_save — 모든 variant compile_ms_save 합 ───
+fn total_compile_ms_save() -> int {
+    let exists = exec("test -f '" + VARIANT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + VARIANT_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_compile_save_per_pso — total compile_ms_save / total pso_count_save ───
+//   pso 0 이면 0 반환 (divide-by-zero guard). int 절삭.
+fn avg_compile_save_per_pso() -> int {
+    let tp = total_pso_save()
+    if tp == 0 { return 0 }
+    let tc = total_compile_ms_save()
+    return tc / tp
+}
+
+// ─── variant_save_ms — 그 variant 의 compile_ms_save ───
+//   variant_id 미등록이면 0.
+fn variant_save_ms(variant_id: int) -> int {
+    let exists = exec("test -f '" + VARIANT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v v=" + to_string(variant_id) + " '$1==v {s+=$4} END{print s+0}' '" + VARIANT_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── mfcv_stats — [variant_count, total_spec_consts, total_pso_save, total_compile_ms_save] ───
+fn mfcv_stats() -> array {
+    return [variant_count(), total_spec_consts(), total_pso_save(), total_compile_ms_save()]
+}
+
+fn cleanup_mfcv() -> void {
+    let _ = exec("rm -rf '" + MFCV_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "mfcv-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_mfcv()
+
+    // 합성 variant 3 종:
+    //   D4 lighting variants         (id=5001) — spec_consts=8, pso_save=256, compile=12800 ms
+    //   D4 deferred shading variants (id=5002) — spec_consts=4, pso_save=16,  compile=800 ms
+    //   D4 post-process variants     (id=5003) — spec_consts=6, pso_save=64,  compile=3200 ms
+    record_variant(5001, 8, 256, 12800)
+    record_variant(5002, 4, 16, 800)
+    record_variant(5003, 6, 64, 3200)
+
+    // variant_count = 3
+    let vc = variant_count()
+    if vc != 3 { panic("c_mtl_function_const_variant FAIL [variant_count] expected=3 got=" + to_string(vc)) }
+
+    // total_spec_consts = 8+4+6 = 18
+    let ts = total_spec_consts()
+    if ts != 18 { panic("c_mtl_function_const_variant FAIL [total_spec_consts] expected=18 got=" + to_string(ts)) }
+
+    // total_pso_save = 256+16+64 = 336
+    let tp = total_pso_save()
+    if tp != 336 { panic("c_mtl_function_const_variant FAIL [total_pso_save] expected=336 got=" + to_string(tp)) }
+
+    // total_compile_ms_save = 12800+800+3200 = 16800
+    let tc = total_compile_ms_save()
+    if tc != 16800 { panic("c_mtl_function_const_variant FAIL [total_compile_ms_save] expected=16800 got=" + to_string(tc)) }
+
+    // avg_compile_save_per_pso = 16800 / 336 = 50 (int trunc)
+    let avg = avg_compile_save_per_pso()
+    if avg != 50 { panic("c_mtl_function_const_variant FAIL [avg_compile_save_per_pso] expected=50 got=" + to_string(avg)) }
+
+    // variant_save_ms:
+    //   5001 → 12800, 5002 → 800, 5003 → 3200, 9999 → 0
+    let v1 = variant_save_ms(5001)
+    if v1 != 12800 { panic("c_mtl_function_const_variant FAIL [save 5001] expected=12800 got=" + to_string(v1)) }
+    let v2 = variant_save_ms(5002)
+    if v2 != 800 { panic("c_mtl_function_const_variant FAIL [save 5002] expected=800 got=" + to_string(v2)) }
+    let v3 = variant_save_ms(5003)
+    if v3 != 3200 { panic("c_mtl_function_const_variant FAIL [save 5003] expected=3200 got=" + to_string(v3)) }
+    let v4 = variant_save_ms(9999)
+    if v4 != 0 { panic("c_mtl_function_const_variant FAIL [save unknown] expected=0 got=" + to_string(v4)) }
+
+    let stats = mfcv_stats()
+    if stats[0] != 3 { panic("c_mtl_function_const_variant FAIL [stats variants] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 18 { panic("c_mtl_function_const_variant FAIL [stats spec_consts] expected=18 got=" + to_string(stats[1])) }
+    if stats[2] != 336 { panic("c_mtl_function_const_variant FAIL [stats pso_save] expected=336 got=" + to_string(stats[2])) }
+    if stats[3] != 16800 { panic("c_mtl_function_const_variant FAIL [stats compile_ms_save] expected=16800 got=" + to_string(stats[3])) }
+
+    r0_emit("mtl_fn_const_variant_summary", "\"variants\":" + to_string(stats[0]) + ",\"spec_consts\":" + to_string(stats[1]) + ",\"pso_save\":" + to_string(stats[2]) + ",\"compile_ms_save\":" + to_string(stats[3]) + ",\"avg_per_pso\":" + to_string(avg))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_mtl_function_const_variant FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    cleanup_mfcv()
+
+    println("  ✅ c_mtl_function_const_variant self_test PASS (3 variants, 18 spec_consts, 336 pso_save, 16800 ms compile_save, avg=50 ms/pso, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = mfcv_stats()
+            println("variants=" + to_string(s[0]) + " spec_consts=" + to_string(s[1]) + " pso_save=" + to_string(s[2]) + " compile_ms_save=" + to_string(s[3]))
+            return
+        }
+        if sub == "save" {
+            if len(a) >= 4 {
+                let vid = to_int(a[3])
+                let ms = variant_save_ms(vid)
+                println(to_string(ms))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_mfcv(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_mtl_function_const_variant.hexa { self-test | stats | save <variant_id> | cleanup }")
+}

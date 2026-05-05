@@ -1,0 +1,417 @@
+// lib/loader/pe_swapchain_present_track.hexa — Metal/CAMetalLayer swapchain
+// present 추적 skeleton.
+//
+// Metal CAMetalLayer present 호출의 target/actual timestamp + vsync 상태를
+// 누적 기록 — frame pacing 분석용. 실제 CVDisplayLink / CAMetalDrawable present
+// hook 은 native 단계 (stage6+). 본 module 은 시간/vsync 데이터 tracker.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 present timing tracker — 실 Metal API 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// vsync code:
+//   0 = vsync off (present immediately)
+//   1 = vsync on (present at vblank)
+//
+// persist schema (TSV — presents.tsv):
+//   present_id<int> \t target_us<int> \t actual_us<int> \t vsync<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pspt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_swapchain_present_track"
+}
+
+fn pspt_presents_path() -> str {
+    return pspt_dir() + "/presents.tsv"
+}
+
+fn pspt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pspt_dir() + "'")
+}
+
+fn cleanup_pspt() -> void {
+    pspt_ensure_dir()
+    let _ = exec("rm -f '" + pspt_presents_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pspt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pspt_append_row(path: str, row: str) -> void {
+    pspt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_present: present 1 건 기록 ───
+fn record_present(present_id: int, target_us: int, actual_us: int, vsync: int) -> void {
+    if present_id <= 0 {
+        panic("pe_swapchain_present_track FAIL [record_present] expected=present_id>0 got=" + to_string(present_id))
+    }
+    if target_us < 0 {
+        panic("pe_swapchain_present_track FAIL [record_present] expected=target_us>=0 got=" + to_string(target_us))
+    }
+    if actual_us < 0 {
+        panic("pe_swapchain_present_track FAIL [record_present] expected=actual_us>=0 got=" + to_string(actual_us))
+    }
+    if vsync < 0 {
+        panic("pe_swapchain_present_track FAIL [record_present] expected=vsync>=0 got=" + to_string(vsync))
+    }
+    if vsync > 1 {
+        panic("pe_swapchain_present_track FAIL [record_present] expected=vsync<=1 got=" + to_string(vsync))
+    }
+    let row = to_string(present_id) + "\t" + to_string(target_us)
+        + "\t" + to_string(actual_us) + "\t" + to_string(vsync) + "\n"
+    pspt_append_row(pspt_presents_path(), row)
+}
+
+// ─── present_count: total present 수 ───
+fn present_count() -> int {
+    let t = pspt_read_table(pspt_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_target_us: 모든 present target_us 합 ───
+fn total_target_us() -> int {
+    let t = pspt_read_table(pspt_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_actual_us: 모든 present actual_us 합 ───
+fn total_actual_us() -> int {
+    let t = pspt_read_table(pspt_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── vsync_count: vsync=1 인 present 수 ───
+fn vsync_count() -> int {
+    let t = pspt_read_table(pspt_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── over_target_count: actual_us > target_us 인 present 수 ───
+fn over_target_count() -> int {
+    let t = pspt_read_table(pspt_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) > to_int(parts[1]) {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── present_actual_us: 특정 present_id 의 actual_us (없으면 0) ───
+fn present_actual_us(present_id: int) -> int {
+    let t = pspt_read_table(pspt_presents_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == present_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pspt_stats: [present_count, total_target_us, total_actual_us, vsync_count, over_target_count] ───
+fn pspt_stats() -> array {
+    let mut out = []
+    out.push(present_count())
+    out.push(total_target_us())
+    out.push(total_actual_us())
+    out.push(vsync_count())
+    out.push(over_target_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pspt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pspt()
+
+    // 2. record 5 presents — mix on-target / over-target + vsync states
+    //   id 120001: target 16667, actual 16500, vsync 1 (on target, vsync)
+    //   id 120002: target 16667, actual 16700, vsync 1 (over target, vsync)
+    //   id 120003: target  8333, actual  8000, vsync 0 (on target, no vsync)
+    //   id 120004: target  8333, actual  9000, vsync 0 (over target, no vsync)
+    //   id 120005: target 16667, actual 16667, vsync 1 (exact, vsync)
+    //   sums: target=66667, actual=66867, vsync=3, over=2
+    record_present(120001, 16667, 16500, 1)
+    r0_emit("pe_swapchain_present_track_record",
+        "\"present_id\":120001,\"target_us\":16667,\"actual_us\":16500,\"vsync\":1")
+
+    record_present(120002, 16667, 16700, 1)
+    r0_emit("pe_swapchain_present_track_record",
+        "\"present_id\":120002,\"target_us\":16667,\"actual_us\":16700,\"vsync\":1")
+
+    record_present(120003, 8333, 8000, 0)
+    r0_emit("pe_swapchain_present_track_record",
+        "\"present_id\":120003,\"target_us\":8333,\"actual_us\":8000,\"vsync\":0")
+
+    record_present(120004, 8333, 9000, 0)
+    r0_emit("pe_swapchain_present_track_record",
+        "\"present_id\":120004,\"target_us\":8333,\"actual_us\":9000,\"vsync\":0")
+
+    record_present(120005, 16667, 16667, 1)
+    r0_emit("pe_swapchain_present_track_record",
+        "\"present_id\":120005,\"target_us\":16667,\"actual_us\":16667,\"vsync\":1")
+
+    // 3. present_count = 5
+    let c = present_count()
+    if c != 5 {
+        panic("pe_swapchain_present_track FAIL [present_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_target_us = 66667
+    let tt = total_target_us()
+    if tt != 66667 {
+        panic("pe_swapchain_present_track FAIL [total_target_us] expected=66667 got=" + to_string(tt))
+    }
+
+    // 5. total_actual_us = 66867
+    let ta = total_actual_us()
+    if ta != 66867 {
+        panic("pe_swapchain_present_track FAIL [total_actual_us] expected=66867 got=" + to_string(ta))
+    }
+
+    // 6. vsync_count = 3
+    let vc = vsync_count()
+    if vc != 3 {
+        panic("pe_swapchain_present_track FAIL [vsync_count] expected=3 got=" + to_string(vc))
+    }
+
+    // 7. over_target_count = 2  (120002, 120004)
+    let oc = over_target_count()
+    if oc != 2 {
+        panic("pe_swapchain_present_track FAIL [over_target_count] expected=2 got=" + to_string(oc))
+    }
+
+    // 8. present_actual_us sanity
+    let a2 = present_actual_us(120002)
+    if a2 != 16700 {
+        panic("pe_swapchain_present_track FAIL [present_actual_us(120002)] expected=16700 got=" + to_string(a2))
+    }
+    let a4 = present_actual_us(120004)
+    if a4 != 9000 {
+        panic("pe_swapchain_present_track FAIL [present_actual_us(120004)] expected=9000 got=" + to_string(a4))
+    }
+    let a_miss = present_actual_us(9999)
+    if a_miss != 0 {
+        panic("pe_swapchain_present_track FAIL [present_actual_us(9999)] expected=0 got=" + to_string(a_miss))
+    }
+
+    // 9. pspt_stats() = [5, 66667, 66867, 3, 2]
+    let s = pspt_stats()
+    if len(s) != 5 {
+        panic("pe_swapchain_present_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_swapchain_present_track FAIL [stats present_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 66667 {
+        panic("pe_swapchain_present_track FAIL [stats total_target_us] expected=66667 got=" + to_string(s[1]))
+    }
+    if s[2] != 66867 {
+        panic("pe_swapchain_present_track FAIL [stats total_actual_us] expected=66867 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_swapchain_present_track FAIL [stats vsync_count] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_swapchain_present_track FAIL [stats over_target_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_swapchain_present_track_stats",
+        "\"present_count\":" + to_string(s[0])
+        + ",\"total_target_us\":" + to_string(s[1])
+        + ",\"total_actual_us\":" + to_string(s[2])
+        + ",\"vsync_count\":" + to_string(s[3])
+        + ",\"over_target_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_swapchain_present_track FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pspt()
+    let s2 = pspt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_swapchain_present_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_swapchain_present_track self_test PASS (presents=" + to_string(s[0])
+        + ", target_us=" + to_string(s[1]) + ", actual_us=" + to_string(s[2])
+        + ", vsync=" + to_string(s[3]) + ", over=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pspt_stats()
+            println("present_count\t" + to_string(s[0]))
+            println("total_target_us\t" + to_string(s[1]))
+            println("total_actual_us\t" + to_string(s[2]))
+            println("vsync_count\t" + to_string(s[3]))
+            println("over_target_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "actual" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("present_actual_us\t" + to_string(present_actual_us(pid)))
+                return
+            }
+            println("usage: hexa run pe_swapchain_present_track.hexa actual <present_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = a[3]
+                if kind == "vsync" {
+                    println("vsync_count\t" + to_string(vsync_count()))
+                    return
+                }
+                if kind == "over" {
+                    println("over_target_count\t" + to_string(over_target_count()))
+                    return
+                }
+                println("usage: hexa run pe_swapchain_present_track.hexa count { vsync | over }")
+                return
+            }
+            println("usage: hexa run pe_swapchain_present_track.hexa count { vsync | over }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pspt()
+            println("cleaned: " + pspt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pspt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_swapchain_present_track.hexa { self-test | stats | actual <present_id> | count vsync|over | cleanup | dir }")
+}

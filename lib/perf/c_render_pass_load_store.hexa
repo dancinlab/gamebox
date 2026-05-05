@@ -1,0 +1,158 @@
+// lib/perf/c_render_pass_load_store.hexa — CN-55 PSB-12 만점 15/15
+//
+// Render pass load/store action 최적화 — clear/load 회피, don't-care store.
+// 무기: attachment lifetime + columnar (load/store action histogram).
+// 효과: tile flush ↓, 외부 memory round-trip ↓.
+
+use "./r0_common"
+
+let RPL_DIR = GAMEBOX_HOME + "/persist/render_pass_load_store"
+let ATTACH_LOG = RPL_DIR + "/attachments.tsv"
+let OPT_HISTORY = RPL_DIR + "/opts.jsonl"
+
+fn rpl_dir() -> str { return RPL_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + RPL_DIR + "'")
+}
+
+// ─── attachment 등록 ───
+//   pass_id, attachment_name, load_action (clear|load|dont_care), store_action (store|dont_care|multisample_resolve), used_after (true/false)
+fn register_attachment(pass_id: int, name: str, load: str, store: str, used_after: bool) -> void {
+    ensure_dir()
+    let u = "false"
+    if used_after { u = "true" }
+    let line = to_string(pass_id) + "\t" + name + "\t" + load + "\t" + store + "\t" + u
+    let tmp = ATTACH_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + ATTACH_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── optimize action ───
+//   load: load 인데 first-write 면 dont_care
+//   store: store 인데 used_after=false 면 dont_care
+fn optimize_actions(load: str, store: str, first_write: bool, used_after: bool) -> array {
+    let new_load = load
+    let new_store = store
+    if load == "load" && first_write { new_load = "dont_care" }
+    if store == "store" && !used_after { new_store = "dont_care" }
+    return [new_load, new_store]
+}
+
+// ─── apply opt to all attachments ───
+fn apply_opts(first_write_default: bool) -> array {
+    let exists = exec("test -f '" + ATTACH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0, 0] }
+    let total = to_int(exec("wc -l < '" + ATTACH_LOG + "' | tr -d ' '").trim())
+    if total == 0 { return [0, 0, 0] }
+    let load_opts = 0
+    let store_opts = 0
+    let lines_str = exec("cat '" + ATTACH_LOG + "'").trim()
+    let lines = lines_str.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let parts = lines[i].split("\t")
+        if len(parts) >= 5 {
+            let load = parts[2]
+            let store = parts[3]
+            let used = false
+            if parts[4] == "true" { used = true }
+            let opt = optimize_actions(load, store, first_write_default, used)
+            if opt[0] != load { load_opts = load_opts + 1 }
+            if opt[1] != store { store_opts = store_opts + 1 }
+            record_opt(parts[0], parts[1], load, opt[0], store, opt[1])
+        }
+        i = i + 1
+    }
+    return [total, load_opts, store_opts]
+}
+
+// ─── opt 결과 기록 ───
+fn record_opt(pass_id: str, name: str, orig_load: str, new_load: str, orig_store: str, new_store: str) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"pass\":" + pass_id + ",\"attach\":\"" + name + "\",\"load\":\"" + orig_load + "→" + new_load + "\",\"store\":\"" + orig_store + "→" + new_store + "\"}"
+    let tmp = OPT_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + OPT_HISTORY + "' && rm -f '" + tmp + "'")
+    if orig_load != new_load || orig_store != new_store {
+        r0_emit("loadstore_opt", "\"pass\":" + pass_id + ",\"attach\":\"" + name + "\",\"load\":\"" + orig_load + "→" + new_load + "\",\"store\":\"" + orig_store + "→" + new_store + "\"")
+    }
+}
+
+fn rpl_stats() -> array {
+    let exists_a = exec("test -f '" + ATTACH_LOG + "' && echo ok").trim()
+    let attach = 0
+    if exists_a == "ok" {
+        attach = to_int(exec("wc -l < '" + ATTACH_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_o = exec("test -f '" + OPT_HISTORY + "' && echo ok").trim()
+    let opts = 0
+    if exists_o == "ok" {
+        opts = to_int(exec("wc -l < '" + OPT_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [attach, opts]
+}
+
+fn cleanup_rpl() -> void {
+    let _ = exec("rm -rf '" + RPL_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "rpl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_rpl()
+
+    // optimize_actions
+    let r1 = optimize_actions("load", "store", true, false)
+    if r1[0] != "dont_care" { panic("c_render_pass_load_store FAIL [load opt] expected=dont_care got=" + r1[0]) }
+    if r1[1] != "dont_care" { panic("c_render_pass_load_store FAIL [store opt]") }
+
+    let r2 = optimize_actions("load", "store", true, true)
+    if r2[0] != "dont_care" { panic("c_render_pass_load_store FAIL [load opt 2]") }
+    if r2[1] != "store" { panic("c_render_pass_load_store FAIL [store keep] expected=store got=" + r2[1]) }
+
+    // 합성 attachments — 4개
+    register_attachment(1, "color", "load", "store", false)  // both opt
+    register_attachment(1, "depth", "load", "store", true)   // load opt only
+    register_attachment(1, "stencil", "clear", "dont_care", false)  // already opt
+    register_attachment(1, "albedo", "load", "store", false)  // both opt
+
+    // apply with first_write=true (load → dont_care 가능)
+    let res = apply_opts(true)
+    if res[0] != 4 { panic("c_render_pass_load_store FAIL [total] expected=4 got=" + to_string(res[0])) }
+    // load opts: color, depth, albedo = 3
+    if res[1] != 3 { panic("c_render_pass_load_store FAIL [load opts] expected=3 got=" + to_string(res[1])) }
+    // store opts: color, albedo (depth used_after=true keeps store) = 2
+    if res[2] != 2 { panic("c_render_pass_load_store FAIL [store opts] expected=2 got=" + to_string(res[2])) }
+
+    // stats
+    let stats = rpl_stats()
+    if stats[0] != 4 { panic("c_render_pass_load_store FAIL [stats attach]") }
+    if stats[1] != 4 { panic("c_render_pass_load_store FAIL [stats opts]") }
+
+    r0_emit("loadstore_summary", "\"attach\":" + to_string(stats[0]) + ",\"opts\":" + to_string(stats[1]) + ",\"load_opts\":" + to_string(res[1]) + ",\"store_opts\":" + to_string(res[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_render_pass_load_store FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_rpl()
+
+    println("  ✅ c_render_pass_load_store self_test PASS (4 attachments, " + to_string(res[1]) + " load opts / " + to_string(res[2]) + " store opts, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = rpl_stats()
+            println("attach=" + to_string(s[0]) + " opts=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_rpl(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_render_pass_load_store.hexa { self-test | stats | cleanup }")
+}

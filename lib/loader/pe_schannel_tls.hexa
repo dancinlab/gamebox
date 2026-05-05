@@ -1,0 +1,438 @@
+// lib/loader/pe_schannel_tls.hexa — SCHANNEL.dll TLS surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine / CrossOver / Whisky / GPTK / community wrapper 의존 0. OpenSSL /
+//       BoringSSL / mbedtls / WolfSSL / s2n / GnuTLS / SChannel source 코드 인용 0. SSPI
+//       (Security Support Provider Interface) reference shape 만 (CtxtHandle / CredHandle /
+//       SecBuffer / SecBufferDesc). 실 TLS handshake / 실 cert verify / 실 record encrypt = 미수행.
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+//       PARTIAL emit 명시 — production TLS smoke pending separate cycle, full coverage X.
+// online_expansion_lockin: L1 (EULA/ToS) + L2 (Warden long-horizon) + L3 (multi-year) +
+//                          L4 (D2R online single target) + L5 (Track J/K/L parallel) ALL OK
+//                          (사용자 lock-in 2026-05-03).
+//
+// Track K3 — SCHANNEL (schannel.dll) TLS 1.2 + 1.3 + Blizzard cert chain surface coverage 8 fn.
+// Battle.net Agent + WININET 측 https 호출 측 TLS layer (handshake + record encrypt/decrypt +
+// cert chain validation). 본 모듈은 SSPI fn name + synthetic ClientHello / ServerHello /
+// cert chain / Finished round-trip row 만 emit.
+//
+// 대상 fn (8 fn):
+//   AcquireCredentialsHandle / FreeCredentialsHandle  (TLS credential lifecycle)
+//   InitializeSecurityContext                         (client-side handshake)
+//   AcceptSecurityContext                             (server-side handshake — D2R 측 미사용 but coverage)
+//   EncryptMessage / DecryptMessage                   (record-layer crypto)
+//   QueryContextAttributes                            (cert chain / cipher suite extraction)
+//   CertVerifyChainPolicy                             (cert chain validation — Blizzard root CA pinning)
+//
+// synthetic ClientHello (RFC 8446 §4.1.2 layout, 200 byte): record_type 0x16 + record_version
+// 0x0303 + handshake_type 0x01 + client_version 0x0303 + random 32 byte 0xAA..AA + session_id 32B
+// + cipher_suites [0x1302,0x1303,0x1301] (TLS_AES_256_GCM_SHA384 + AES_128 + CHACHA20) + compression
+// 0x00 + ext supported_versions=0x0304 + key_share secp256r1 + sni us.api.battle.net.
+// synthetic ServerHello: handshake_type 0x02 + server_random 32B + selected_cipher 0x1302.
+// synthetic cert chain 3-tier (leaf + intermediate + root, DER stub 1024 byte each): leaf
+// CN=us.api.battle.net issuer Blizzard Issuing CA-1 / inter CN=Blizzard Issuing CA-1 issuer
+// Blizzard Root CA / root self-signed Blizzard Entertainment Root CA (pinning anchor).
+//
+// fn_kind code:
+//   0 = AcquireCredentialsHandle      4 = EncryptMessage
+//   1 = FreeCredentialsHandle         5 = DecryptMessage
+//   2 = InitializeSecurityContext     6 = QueryContextAttributes
+//   3 = AcceptSecurityContext         7 = CertVerifyChainPolicy
+//
+// persist schema (TSV — 4 separate tables):
+//   sspi_invoke.tsv:
+//     invoke_id<int> \t fn_kind<int> \t fn_name<str> \t status<str>
+//   handshake_step.tsv:
+//     step_id<int> \t direction<str> \t msg_kind<str> \t bytes_synth<int>
+//   record_layer.tsv:
+//     rec_id<int> \t fn_kind<int> \t direction<str> \t plaintext_bytes<int> \t ciphertext_bytes<int>
+//   cert_chain.tsv:
+//     cert_id<int> \t tier<str> \t cn<str> \t issuer<str> \t verify_status<str>
+//
+// 식별자 주의: type / mod / handle / class / interface / module / import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pschan_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_schannel_tls"
+}
+
+fn pschan_invoke_path() -> str {
+    return pschan_dir() + "/sspi_invoke.tsv"
+}
+
+fn pschan_handshake_step_path() -> str {
+    return pschan_dir() + "/handshake_step.tsv"
+}
+
+fn pschan_record_layer_path() -> str {
+    return pschan_dir() + "/record_layer.tsv"
+}
+
+fn pschan_cert_chain_path() -> str {
+    return pschan_dir() + "/cert_chain.tsv"
+}
+
+fn pschan_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pschan_dir() + "'")
+}
+
+fn cleanup_pschan() -> void {
+    pschan_ensure_dir()
+    let _ = exec("rm -f '" + pschan_invoke_path() + "' '" + pschan_handshake_step_path()
+        + "' '" + pschan_record_layer_path() + "' '" + pschan_cert_chain_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pschan_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pschan_append_row(path: str, row: str) -> void {
+    pschan_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pschan_count_rows(path: str, min_cols: int) -> int {
+    let t = pschan_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (8 fn coverage) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "AcquireCredentialsHandle" }
+    if k == 1 { return "FreeCredentialsHandle" }
+    if k == 2 { return "InitializeSecurityContext" }
+    if k == 3 { return "AcceptSecurityContext" }
+    if k == 4 { return "EncryptMessage" }
+    if k == 5 { return "DecryptMessage" }
+    if k == 6 { return "QueryContextAttributes" }
+    if k == 7 { return "CertVerifyChainPolicy" }
+    return "unknown"
+}
+
+// ─── record_sspi_invoke: SCHANNEL/SSPI fn invoke milestone (skeleton row) ───
+fn record_sspi_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_schannel_tls FAIL [record_sspi_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_schannel_tls FAIL [record_sspi_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 7 {
+        panic("pe_schannel_tls FAIL [record_sspi_invoke] expected=fn_kind<=7 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_schannel_tls FAIL [record_sspi_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_schannel_tls FAIL [record_sspi_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pschan_append_row(pschan_invoke_path(), row)
+}
+
+// ─── record_handshake_step: TLS handshake step row (ClientHello / ServerHello / cert / Finished) ───
+fn record_handshake_step(step_id: int, direction: str, msg_kind: str, bytes_synth: int) -> void {
+    if step_id <= 0 {
+        panic("pe_schannel_tls FAIL [record_handshake_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if direction == "" {
+        panic("pe_schannel_tls FAIL [record_handshake_step] expected=direction!=empty got=empty")
+    }
+    if msg_kind == "" {
+        panic("pe_schannel_tls FAIL [record_handshake_step] expected=msg_kind!=empty got=empty")
+    }
+    if bytes_synth < 0 {
+        panic("pe_schannel_tls FAIL [record_handshake_step] expected=bytes_synth>=0 got=" + to_string(bytes_synth))
+    }
+    let row = to_string(step_id) + "\t" + direction + "\t" + msg_kind + "\t"
+        + to_string(bytes_synth) + "\n"
+    pschan_append_row(pschan_handshake_step_path(), row)
+}
+
+// ─── record_record_layer: EncryptMessage / DecryptMessage row (synthetic plaintext/ciphertext) ───
+fn record_record_layer(rec_id: int, fn_kind: int, direction: str, plaintext_bytes: int, ciphertext_bytes: int) -> void {
+    if rec_id <= 0 {
+        panic("pe_schannel_tls FAIL [record_record_layer] expected=rec_id>0 got=" + to_string(rec_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_schannel_tls FAIL [record_record_layer] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 7 {
+        panic("pe_schannel_tls FAIL [record_record_layer] expected=fn_kind<=7 got=" + to_string(fn_kind))
+    }
+    if direction == "" {
+        panic("pe_schannel_tls FAIL [record_record_layer] expected=direction!=empty got=empty")
+    }
+    if plaintext_bytes < 0 {
+        panic("pe_schannel_tls FAIL [record_record_layer] expected=plaintext_bytes>=0 got=" + to_string(plaintext_bytes))
+    }
+    if ciphertext_bytes < 0 {
+        panic("pe_schannel_tls FAIL [record_record_layer] expected=ciphertext_bytes>=0 got=" + to_string(ciphertext_bytes))
+    }
+    let row = to_string(rec_id) + "\t" + to_string(fn_kind) + "\t" + direction + "\t"
+        + to_string(plaintext_bytes) + "\t" + to_string(ciphertext_bytes) + "\n"
+    pschan_append_row(pschan_record_layer_path(), row)
+}
+
+// ─── record_cert_chain: cert chain entry row (leaf / intermediate / root, Blizzard CA pinning) ───
+fn record_cert_chain(cert_id: int, tier: str, cn: str, issuer: str, verify_status: str) -> void {
+    if cert_id <= 0 {
+        panic("pe_schannel_tls FAIL [record_cert_chain] expected=cert_id>0 got=" + to_string(cert_id))
+    }
+    if tier == "" {
+        panic("pe_schannel_tls FAIL [record_cert_chain] expected=tier!=empty got=empty")
+    }
+    if cn == "" {
+        panic("pe_schannel_tls FAIL [record_cert_chain] expected=cn!=empty got=empty")
+    }
+    if issuer == "" {
+        panic("pe_schannel_tls FAIL [record_cert_chain] expected=issuer!=empty got=empty")
+    }
+    if verify_status == "" {
+        panic("pe_schannel_tls FAIL [record_cert_chain] expected=verify_status!=empty got=empty")
+    }
+    let row = to_string(cert_id) + "\t" + tier + "\t" + cn + "\t"
+        + issuer + "\t" + verify_status + "\n"
+    pschan_append_row(pschan_cert_chain_path(), row)
+}
+
+// ─── statistics ───
+fn sspi_invoke_count() -> int {
+    return pschan_count_rows(pschan_invoke_path(), 4)
+}
+
+fn handshake_step_count() -> int {
+    return pschan_count_rows(pschan_handshake_step_path(), 4)
+}
+
+fn record_layer_count() -> int {
+    return pschan_count_rows(pschan_record_layer_path(), 5)
+}
+
+fn cert_chain_count() -> int {
+    return pschan_count_rows(pschan_cert_chain_path(), 5)
+}
+
+fn pschan_stats() -> array {
+    let mut out = []
+    out.push(sspi_invoke_count())
+    out.push(handshake_step_count())
+    out.push(record_layer_count())
+    out.push(cert_chain_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pschan-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pschan()
+
+    // ─── 1. sspi_invoke × 7 (7 representative SSPI fn) ───
+    record_sspi_invoke(1, 0, "AcquireCredentialsHandle", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL AcquireCredentialsHandle")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"AcquireCredentialsHandle\",\"status\":\"PARTIAL\",\"package\":\"Microsoft Unified Security Protocol Provider\",\"cred_use\":\"SECPKG_CRED_OUTBOUND\"")
+    record_sspi_invoke(2, 2, "InitializeSecurityContext", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL InitializeSecurityContext")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":2,\"fn_kind\":2,\"fn_name\":\"InitializeSecurityContext\",\"status\":\"PARTIAL\",\"target\":\"us.api.battle.net\",\"context_req\":\"ISC_REQ_CONFIDENTIALITY|ISC_REQ_REPLAY_DETECT\"")
+    record_sspi_invoke(3, 3, "AcceptSecurityContext", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL AcceptSecurityContext")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":3,\"fn_kind\":3,\"fn_name\":\"AcceptSecurityContext\",\"status\":\"PARTIAL\",\"server_side\":true,\"coverage_only\":true")
+    record_sspi_invoke(4, 4, "EncryptMessage", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL EncryptMessage")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":4,\"fn_kind\":4,\"fn_name\":\"EncryptMessage\",\"status\":\"PARTIAL\",\"cipher\":\"TLS_AES_256_GCM_SHA384\",\"qop\":0")
+    record_sspi_invoke(5, 5, "DecryptMessage", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL DecryptMessage")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":5,\"fn_kind\":5,\"fn_name\":\"DecryptMessage\",\"status\":\"PARTIAL\",\"cipher\":\"TLS_AES_256_GCM_SHA384\",\"sequence_no\":1")
+    record_sspi_invoke(6, 6, "QueryContextAttributes", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL QueryContextAttributes")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":6,\"fn_kind\":6,\"fn_name\":\"QueryContextAttributes\",\"status\":\"PARTIAL\",\"attribute\":\"SECPKG_ATTR_REMOTE_CERT_CONTEXT\",\"cipher_suite_hex\":\"0x1302\"")
+    record_sspi_invoke(7, 7, "CertVerifyChainPolicy", "PARTIAL")
+    println("__SCHANNEL__ PARTIAL CertVerifyChainPolicy")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"sspi_invoke\",\"invoke_id\":7,\"fn_kind\":7,\"fn_name\":\"CertVerifyChainPolicy\",\"status\":\"PARTIAL\",\"policy\":\"CERT_CHAIN_POLICY_SSL\",\"pinning_target\":\"Blizzard Entertainment Root CA\"")
+
+    // ─── 2. handshake_step × 4 (ClientHello → ServerHello → Cert → Finished) ───
+    record_handshake_step(1, "tx", "ClientHello", 200)
+    println("__SCHANNEL__ PARTIAL ClientHello")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"handshake_step\",\"step_id\":1,\"direction\":\"tx\",\"msg_kind\":\"ClientHello\",\"bytes_synth\":200,\"record_type\":\"0x16\",\"version\":\"0x0303\",\"random_pattern\":\"0xAA..AA\",\"cipher_suites\":[\"0x1302\",\"0x1303\",\"0x1301\"],\"sni\":\"us.api.battle.net\"")
+    record_handshake_step(2, "rx", "ServerHello", 122)
+    println("__SCHANNEL__ PARTIAL ServerHello")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"handshake_step\",\"step_id\":2,\"direction\":\"rx\",\"msg_kind\":\"ServerHello\",\"bytes_synth\":122,\"selected_cipher\":\"0x1302\",\"selected_cipher_name\":\"TLS_AES_256_GCM_SHA384\",\"selected_version\":\"0x0304\"")
+    record_handshake_step(3, "rx", "Certificate", 3072)
+    println("__SCHANNEL__ PARTIAL Certificate")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"handshake_step\",\"step_id\":3,\"direction\":\"rx\",\"msg_kind\":\"Certificate\",\"bytes_synth\":3072,\"cert_chain_tiers\":3,\"chain\":[\"leaf\",\"intermediate\",\"root\"]")
+    record_handshake_step(4, "tx", "Finished", 64)
+    println("__SCHANNEL__ PARTIAL Finished")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"handshake_step\",\"step_id\":4,\"direction\":\"tx\",\"msg_kind\":\"Finished\",\"bytes_synth\":64,\"verify_data_hex\":\"AABBCCDDEEFF00112233445566778899\",\"hkdf_label\":\"client finished\"")
+
+    // ─── 3. record_layer × 2 (encrypt + decrypt synthetic round-trip) ───
+    record_record_layer(1, 4, "tx", 256, 272)
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"record_layer\",\"rec_id\":1,\"fn_kind\":4,\"fn_name\":\"EncryptMessage\",\"direction\":\"tx\",\"plaintext_bytes\":256,\"ciphertext_bytes\":272,\"aead\":\"AES-256-GCM\",\"tag_bytes\":16")
+    record_record_layer(2, 5, "rx", 1024, 1040)
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"record_layer\",\"rec_id\":2,\"fn_kind\":5,\"fn_name\":\"DecryptMessage\",\"direction\":\"rx\",\"plaintext_bytes\":1024,\"ciphertext_bytes\":1040,\"aead\":\"AES-256-GCM\",\"tag_bytes\":16")
+
+    // ─── 4. cert_chain × 3 (leaf + intermediate + root, Blizzard pinning target) ───
+    record_cert_chain(1, "leaf", "us.api.battle.net", "Blizzard Entertainment Issuing CA-1", "PARTIAL")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"cert_chain\",\"cert_id\":1,\"tier\":\"leaf\",\"cn\":\"us.api.battle.net\",\"issuer\":\"Blizzard Entertainment Issuing CA-1\",\"verify_status\":\"PARTIAL\",\"der_bytes_synth\":1024,\"sig_alg\":\"sha256WithRSAEncryption\"")
+    record_cert_chain(2, "intermediate", "Blizzard Issuing CA-1", "Blizzard Entertainment Root CA", "PARTIAL")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"cert_chain\",\"cert_id\":2,\"tier\":\"intermediate\",\"cn\":\"Blizzard Issuing CA-1\",\"issuer\":\"Blizzard Entertainment Root CA\",\"verify_status\":\"PARTIAL\",\"der_bytes_synth\":1024,\"sig_alg\":\"sha256WithRSAEncryption\"")
+    record_cert_chain(3, "root", "Blizzard Entertainment Root CA", "Blizzard Entertainment Root CA", "PARTIAL")
+    r0_emit("pe_schannel_tls_record", "\"kind\":\"cert_chain\",\"cert_id\":3,\"tier\":\"root\",\"cn\":\"Blizzard Entertainment Root CA\",\"issuer\":\"Blizzard Entertainment Root CA\",\"verify_status\":\"PARTIAL\",\"der_bytes_synth\":1024,\"self_signed\":true,\"pinning_anchor\":true")
+
+    // ─── assertions: count ───
+    let si = sspi_invoke_count()
+    if si != 7 {
+        panic("pe_schannel_tls FAIL [sspi_invoke_count] expected=7 got=" + to_string(si))
+    }
+    let hs = handshake_step_count()
+    if hs != 4 {
+        panic("pe_schannel_tls FAIL [handshake_step_count] expected=4 got=" + to_string(hs))
+    }
+    let rl = record_layer_count()
+    if rl != 2 {
+        panic("pe_schannel_tls FAIL [record_layer_count] expected=2 got=" + to_string(rl))
+    }
+    let cc = cert_chain_count()
+    if cc != 3 {
+        panic("pe_schannel_tls FAIL [cert_chain_count] expected=3 got=" + to_string(cc))
+    }
+
+    // ─── helper name sanity ───
+    if fn_kind_name(0) != "AcquireCredentialsHandle" {
+        panic("pe_schannel_tls FAIL [fn_kind_name(0)]")
+    }
+    if fn_kind_name(2) != "InitializeSecurityContext" {
+        panic("pe_schannel_tls FAIL [fn_kind_name(2)]")
+    }
+    if fn_kind_name(4) != "EncryptMessage" {
+        panic("pe_schannel_tls FAIL [fn_kind_name(4)]")
+    }
+    if fn_kind_name(7) != "CertVerifyChainPolicy" {
+        panic("pe_schannel_tls FAIL [fn_kind_name(7)]")
+    }
+    if fn_kind_name(99) != "unknown" {
+        panic("pe_schannel_tls FAIL [fn_kind_name(99)]")
+    }
+
+    // ─── stats sanity ───
+    let s = pschan_stats()
+    if len(s) != 4 {
+        panic("pe_schannel_tls FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 7 {
+        panic("pe_schannel_tls FAIL [stats sspi_invoke_count] expected=7 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_schannel_tls FAIL [stats handshake_step_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_schannel_tls FAIL [stats record_layer_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_schannel_tls FAIL [stats cert_chain_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_schannel_tls_stats",
+        "\"sspi_invoke_count\":" + to_string(s[0])
+        + ",\"handshake_step_count\":" + to_string(s[1])
+        + ",\"record_layer_count\":" + to_string(s[2])
+        + ",\"cert_chain_count\":" + to_string(s[3]))
+
+    r0_emit("pe_schannel_tls_summary",
+        "\"target\":\"SCHANNEL.dll\",\"fn_total\":8,\"fn_emit_partial\":7,\"tls_versions\":[\"1.2\",\"1.3\"],\"cipher_suite_default\":\"TLS_AES_256_GCM_SHA384\",\"cert_chain_tiers\":3,\"pinning_anchor\":\"Blizzard Entertainment Root CA\",\"shim_kind\":\"skeleton\",\"network\":\"none\",\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_schannel_tls_kpi",
+        "\"handshake_steps_covered\":4,\"record_directions_covered\":2,\"cert_tiers_covered\":3,\"sspi_fns_covered\":7,\"network_real\":false,\"warden_compat_long_horizon\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_schannel_tls_round_trip_matrix",
+        "\"surface\":\"SCHANNEL_full_8_fn\",\"fn_partial\":7,\"fn_skeleton_only\":1,\"shim_kind\":\"skeleton\",\"network\":\"none\",\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real ClientHello + cert verify + AEAD encrypt pending separate cycle\",\"blizzard_cert_pinning_real\":\"never_executed\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_schannel_tls FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pschan()
+    let s2 = pschan_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_schannel_tls FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_schannel_tls self_test PASS (sspi_invoke="
+        + to_string(s[0]) + ", handshake_step=" + to_string(s[1])
+        + ", record_layer=" + to_string(s[2]) + ", cert_chain=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pschan_stats()
+            println("sspi_invoke_count\t" + to_string(s[0]))
+            println("handshake_step_count\t" + to_string(s[1]))
+            println("record_layer_count\t" + to_string(s[2]))
+            println("cert_chain_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_schannel_tls.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pschan()
+            println("cleaned: " + pschan_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pschan_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_schannel_tls.hexa { self-test | stats | fn-kind-name <int> | cleanup | dir }")
+}

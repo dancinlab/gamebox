@@ -1,0 +1,498 @@
+// lib/loader/pe_i386_register_state.hexa — i386 32-bit register state machine tracker
+//
+// Phase 후속 interpreter 가 사용할 i386 register state 의 hexa 측 추적 skeleton.
+// 본 module 은 Apple SDK 호출 / Wine / Box86 / QEMU / Bochs / community 코드 를
+// 단 한 줄도 포함하지 않는 pure tracker. Intel SDM (Vol.1 §3.4 General-Purpose
+// Registers, §3.4.2 Segment Registers, §3.4.3 EFLAGS Register) 만 참조한다.
+//
+// i386 register topology:
+//   - GP 32-bit × 8 : EAX(0) ECX(1) EDX(2) EBX(3) ESP(4) EBP(5) ESI(6) EDI(7)
+//   - segment    × 6: CS(0) DS(1) SS(2) ES(3) FS(4) GS(5) — 16-bit selector
+//                     + 32-bit base (cached descriptor base address)
+//   - EFLAGS bits   : CF(0) PF(2) AF(4) ZF(6) SF(7) TF(8) IF(9) DF(10) OF(11)
+//                     본 tracker 는 임의 bit_idx 0..31 모두 허용 (확장 bit 대비)
+//   - EIP 32-bit    : instruction pointer
+//
+// state snapshot: interpreter 한 step 단위로 (snapshot_id, gp_count, eflag_count,
+// eip_value) 를 남기면 회귀 분석 시 register 변화율을 통계 가능.
+//
+// own 1: Wine winecrt0 / CrossOver / community 0 줄. SDM spec 자체 구현.
+// own 2: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — 5 separate tables):
+//   gp.tsv       : reg_idx<int> \t value<int>     \t snapshot_id<int>
+//   segment.tsv  : seg_idx<int> \t selector<int>  \t base<int>
+//   eflag.tsv    : bit_idx<int> \t value<int>     \t snapshot_id<int>
+//   eip.tsv      : value<int>   \t snapshot_id<int>
+//   snapshot.tsv : snapshot_id<int> \t gp_count<int> \t eflag_count<int> \t eip_value<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pirs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_register_state"
+}
+
+fn pirs_state_path() -> str {
+    return pirs_dir() + "/state.tsv"
+}
+
+fn pirs_gp_path() -> str {
+    return pirs_dir() + "/gp.tsv"
+}
+
+fn pirs_segment_path() -> str {
+    return pirs_dir() + "/segment.tsv"
+}
+
+fn pirs_eflag_path() -> str {
+    return pirs_dir() + "/eflag.tsv"
+}
+
+fn pirs_eip_path() -> str {
+    return pirs_dir() + "/eip.tsv"
+}
+
+fn pirs_snapshot_path() -> str {
+    return pirs_dir() + "/snapshot.tsv"
+}
+
+fn pirs_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pirs_dir() + "'")
+}
+
+fn cleanup_pirs() -> void {
+    pirs_ensure_dir()
+    let _ = exec("rm -f '" + pirs_gp_path() + "' '" + pirs_segment_path()
+        + "' '" + pirs_eflag_path() + "' '" + pirs_eip_path()
+        + "' '" + pirs_snapshot_path() + "' '" + pirs_state_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pirs_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pirs_append_row(path: str, row: str) -> void {
+    pirs_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pirs_count_rows(path: str, min_cols: int) -> int {
+    let t = pirs_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+fn reg_name(idx: int) -> str {
+    if idx == 0 { return "eax" }
+    if idx == 1 { return "ecx" }
+    if idx == 2 { return "edx" }
+    if idx == 3 { return "ebx" }
+    if idx == 4 { return "esp" }
+    if idx == 5 { return "ebp" }
+    if idx == 6 { return "esi" }
+    if idx == 7 { return "edi" }
+    return "?"
+}
+
+fn seg_name(idx: int) -> str {
+    if idx == 0 { return "cs" }
+    if idx == 1 { return "ds" }
+    if idx == 2 { return "ss" }
+    if idx == 3 { return "es" }
+    if idx == 4 { return "fs" }
+    if idx == 5 { return "gs" }
+    return "?"
+}
+
+fn eflag_name(bit: int) -> str {
+    if bit == 0  { return "CF" }
+    if bit == 2  { return "PF" }
+    if bit == 4  { return "AF" }
+    if bit == 6  { return "ZF" }
+    if bit == 7  { return "SF" }
+    if bit == 8  { return "TF" }
+    if bit == 9  { return "IF" }
+    if bit == 10 { return "DF" }
+    if bit == 11 { return "OF" }
+    return "?"
+}
+
+// ─── record_gp: GP register 32-bit value 기록 (reg_idx 0..7) ───
+fn record_gp(reg_idx: int, value: int, snapshot_id: int) -> void {
+    if reg_idx < 0 {
+        panic("pe_i386_register_state FAIL [record_gp] expected=reg_idx>=0 got=" + to_string(reg_idx))
+    }
+    if reg_idx > 7 {
+        panic("pe_i386_register_state FAIL [record_gp] expected=reg_idx<=7 got=" + to_string(reg_idx))
+    }
+    if snapshot_id <= 0 {
+        panic("pe_i386_register_state FAIL [record_gp] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    let row = to_string(reg_idx) + "\t" + to_string(value) + "\t" + to_string(snapshot_id) + "\n"
+    pirs_append_row(pirs_gp_path(), row)
+}
+
+// ─── record_segment: segment selector + cached base 기록 (seg_idx 0..5) ───
+fn record_segment(seg_idx: int, selector: int, base: int) -> void {
+    if seg_idx < 0 {
+        panic("pe_i386_register_state FAIL [record_segment] expected=seg_idx>=0 got=" + to_string(seg_idx))
+    }
+    if seg_idx > 5 {
+        panic("pe_i386_register_state FAIL [record_segment] expected=seg_idx<=5 got=" + to_string(seg_idx))
+    }
+    if selector < 0 {
+        panic("pe_i386_register_state FAIL [record_segment] expected=selector>=0 got=" + to_string(selector))
+    }
+    if base < 0 {
+        panic("pe_i386_register_state FAIL [record_segment] expected=base>=0 got=" + to_string(base))
+    }
+    // 16-bit selector boundary check
+    if selector > 65535 {
+        panic("pe_i386_register_state FAIL [record_segment] expected=selector<=65535 got=" + to_string(selector))
+    }
+    let row = to_string(seg_idx) + "\t" + to_string(selector) + "\t" + to_string(base) + "\n"
+    pirs_append_row(pirs_segment_path(), row)
+}
+
+// ─── record_eflag_bit: EFLAGS bit 1 개 기록 (bit_idx 0..31, value 0/1) ───
+fn record_eflag_bit(bit_idx: int, value: int, snapshot_id: int) -> void {
+    if bit_idx < 0 {
+        panic("pe_i386_register_state FAIL [record_eflag_bit] expected=bit_idx>=0 got=" + to_string(bit_idx))
+    }
+    if bit_idx > 31 {
+        panic("pe_i386_register_state FAIL [record_eflag_bit] expected=bit_idx<=31 got=" + to_string(bit_idx))
+    }
+    if value < 0 {
+        panic("pe_i386_register_state FAIL [record_eflag_bit] expected=value>=0 got=" + to_string(value))
+    }
+    if value > 1 {
+        panic("pe_i386_register_state FAIL [record_eflag_bit] expected=value<=1 got=" + to_string(value))
+    }
+    if snapshot_id <= 0 {
+        panic("pe_i386_register_state FAIL [record_eflag_bit] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    let row = to_string(bit_idx) + "\t" + to_string(value) + "\t" + to_string(snapshot_id) + "\n"
+    pirs_append_row(pirs_eflag_path(), row)
+}
+
+// ─── record_eip: EIP (instruction pointer) 기록 ───
+fn record_eip(value: int, snapshot_id: int) -> void {
+    if value < 0 {
+        panic("pe_i386_register_state FAIL [record_eip] expected=value>=0 got=" + to_string(value))
+    }
+    if snapshot_id <= 0 {
+        panic("pe_i386_register_state FAIL [record_eip] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    let row = to_string(value) + "\t" + to_string(snapshot_id) + "\n"
+    pirs_append_row(pirs_eip_path(), row)
+}
+
+// ─── record_state_snapshot: per-step aggregate snapshot ───
+fn record_state_snapshot(snapshot_id: int, gp_cnt: int, eflag_cnt: int, eip_value: int) -> void {
+    if snapshot_id <= 0 {
+        panic("pe_i386_register_state FAIL [record_state_snapshot] expected=snapshot_id>0 got=" + to_string(snapshot_id))
+    }
+    if gp_cnt < 0 {
+        panic("pe_i386_register_state FAIL [record_state_snapshot] expected=gp_cnt>=0 got=" + to_string(gp_cnt))
+    }
+    if gp_cnt > 8 {
+        panic("pe_i386_register_state FAIL [record_state_snapshot] expected=gp_cnt<=8 got=" + to_string(gp_cnt))
+    }
+    if eflag_cnt < 0 {
+        panic("pe_i386_register_state FAIL [record_state_snapshot] expected=eflag_cnt>=0 got=" + to_string(eflag_cnt))
+    }
+    if eip_value < 0 {
+        panic("pe_i386_register_state FAIL [record_state_snapshot] expected=eip_value>=0 got=" + to_string(eip_value))
+    }
+    let row = to_string(snapshot_id) + "\t" + to_string(gp_cnt)
+        + "\t" + to_string(eflag_cnt) + "\t" + to_string(eip_value) + "\n"
+    pirs_append_row(pirs_snapshot_path(), row)
+}
+
+// ─── statistics ───
+fn gp_count() -> int {
+    return pirs_count_rows(pirs_gp_path(), 3)
+}
+
+fn segment_count() -> int {
+    return pirs_count_rows(pirs_segment_path(), 3)
+}
+
+fn eflag_count() -> int {
+    return pirs_count_rows(pirs_eflag_path(), 3)
+}
+
+fn eip_count() -> int {
+    return pirs_count_rows(pirs_eip_path(), 2)
+}
+
+fn snapshot_count() -> int {
+    return pirs_count_rows(pirs_snapshot_path(), 4)
+}
+
+fn pirs_stats() -> array {
+    let mut out = []
+    out.push(gp_count())
+    out.push(segment_count())
+    out.push(eflag_count())
+    out.push(eip_count())
+    out.push(snapshot_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pirs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pirs()
+
+    let snap = 920501
+
+    // 1. GP 8 record (idx 0..7) — EAX..EDI 32-bit value
+    record_gp(0, 1145258561, snap)            // EAX = 0x44434241
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":0,\"reg\":\"eax\",\"value\":1145258561,\"snapshot_id\":920501")
+
+    record_gp(1, 305419896, snap)             // ECX = 0x12345678
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":1,\"reg\":\"ecx\",\"value\":305419896,\"snapshot_id\":920501")
+
+    record_gp(2, 2882400000, snap)            // EDX = 0xABC...
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":2,\"reg\":\"edx\",\"value\":2882400000,\"snapshot_id\":920501")
+
+    record_gp(3, 0, snap)                     // EBX = 0
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":3,\"reg\":\"ebx\",\"value\":0,\"snapshot_id\":920501")
+
+    record_gp(4, 2147479552, snap)            // ESP = 0x7FFFE000
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":4,\"reg\":\"esp\",\"value\":2147479552,\"snapshot_id\":920501")
+
+    record_gp(5, 2147479000, snap)            // EBP
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":5,\"reg\":\"ebp\",\"value\":2147479000,\"snapshot_id\":920501")
+
+    record_gp(6, 4194304, snap)               // ESI = 0x400000
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":6,\"reg\":\"esi\",\"value\":4194304,\"snapshot_id\":920501")
+
+    record_gp(7, 4198400, snap)               // EDI
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"gp\",\"reg_idx\":7,\"reg\":\"edi\",\"value\":4198400,\"snapshot_id\":920501")
+
+    // 2. segment 6 record (idx 0..5) — CS/DS/SS/ES/FS/GS
+    record_segment(0, 27, 0)                  // CS = 0x1B (user code, base=0)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"segment\",\"seg_idx\":0,\"seg\":\"cs\",\"selector\":27,\"base\":0")
+
+    record_segment(1, 35, 0)                  // DS = 0x23 (user data, base=0)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"segment\",\"seg_idx\":1,\"seg\":\"ds\",\"selector\":35,\"base\":0")
+
+    record_segment(2, 35, 0)                  // SS = 0x23
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"segment\",\"seg_idx\":2,\"seg\":\"ss\",\"selector\":35,\"base\":0")
+
+    record_segment(3, 35, 0)                  // ES = 0x23
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"segment\",\"seg_idx\":3,\"seg\":\"es\",\"selector\":35,\"base\":0")
+
+    record_segment(4, 59, 2147475456)         // FS = 0x3B (TEB base 0x7FFDE000)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"segment\",\"seg_idx\":4,\"seg\":\"fs\",\"selector\":59,\"base\":2147475456")
+
+    record_segment(5, 0, 0)                   // GS = 0
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"segment\",\"seg_idx\":5,\"seg\":\"gs\",\"selector\":0,\"base\":0")
+
+    // 3. EFLAGS bit 5 record — CF / ZF / SF / IF / DF
+    record_eflag_bit(0, 0, snap)              // CF = 0
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"eflag\",\"bit_idx\":0,\"flag\":\"CF\",\"value\":0,\"snapshot_id\":920501")
+
+    record_eflag_bit(6, 1, snap)              // ZF = 1
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"eflag\",\"bit_idx\":6,\"flag\":\"ZF\",\"value\":1,\"snapshot_id\":920501")
+
+    record_eflag_bit(7, 0, snap)              // SF = 0
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"eflag\",\"bit_idx\":7,\"flag\":\"SF\",\"value\":0,\"snapshot_id\":920501")
+
+    record_eflag_bit(9, 1, snap)              // IF = 1 (interrupts enabled)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"eflag\",\"bit_idx\":9,\"flag\":\"IF\",\"value\":1,\"snapshot_id\":920501")
+
+    record_eflag_bit(10, 0, snap)             // DF = 0 (string ops forward)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"eflag\",\"bit_idx\":10,\"flag\":\"DF\",\"value\":0,\"snapshot_id\":920501")
+
+    // 4. EIP 1 record
+    record_eip(4198400, snap)                 // EIP = 0x401000 (typical PE entry)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"eip\",\"value\":4198400,\"snapshot_id\":920501")
+
+    // 5. snapshot 1 record
+    record_state_snapshot(snap, 8, 5, 4198400)
+    r0_emit("pe_i386_register_state_record",
+        "\"kind\":\"snapshot\",\"snapshot_id\":920501,\"gp_count\":8,\"eflag_count\":5,\"eip_value\":4198400")
+
+    // ─── assertions ───
+    let g = gp_count()
+    if g != 8 {
+        panic("pe_i386_register_state FAIL [gp_count] expected=8 got=" + to_string(g))
+    }
+    let sg = segment_count()
+    if sg != 6 {
+        panic("pe_i386_register_state FAIL [segment_count] expected=6 got=" + to_string(sg))
+    }
+    let ef = eflag_count()
+    if ef != 5 {
+        panic("pe_i386_register_state FAIL [eflag_count] expected=5 got=" + to_string(ef))
+    }
+    let ep = eip_count()
+    if ep != 1 {
+        panic("pe_i386_register_state FAIL [eip_count] expected=1 got=" + to_string(ep))
+    }
+    let sn = snapshot_count()
+    if sn != 1 {
+        panic("pe_i386_register_state FAIL [snapshot_count] expected=1 got=" + to_string(sn))
+    }
+
+    // ─── name lookup assertions ───
+    let n_eax = reg_name(0)
+    if n_eax != "eax" {
+        panic("pe_i386_register_state FAIL [reg_name(0)] expected=eax got=" + n_eax)
+    }
+    let n_edi = reg_name(7)
+    if n_edi != "edi" {
+        panic("pe_i386_register_state FAIL [reg_name(7)] expected=edi got=" + n_edi)
+    }
+    let n_fs = seg_name(4)
+    if n_fs != "fs" {
+        panic("pe_i386_register_state FAIL [seg_name(4)] expected=fs got=" + n_fs)
+    }
+    let n_cs = seg_name(0)
+    if n_cs != "cs" {
+        panic("pe_i386_register_state FAIL [seg_name(0)] expected=cs got=" + n_cs)
+    }
+    let n_zf = eflag_name(6)
+    if n_zf != "ZF" {
+        panic("pe_i386_register_state FAIL [eflag_name(6)] expected=ZF got=" + n_zf)
+    }
+    let n_cf = eflag_name(0)
+    if n_cf != "CF" {
+        panic("pe_i386_register_state FAIL [eflag_name(0)] expected=CF got=" + n_cf)
+    }
+    let n_of = eflag_name(11)
+    if n_of != "OF" {
+        panic("pe_i386_register_state FAIL [eflag_name(11)] expected=OF got=" + n_of)
+    }
+
+    // ─── stats sanity ───
+    let s = pirs_stats()
+    if len(s) != 5 {
+        panic("pe_i386_register_state FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_i386_register_state FAIL [stats gp] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 6 {
+        panic("pe_i386_register_state FAIL [stats seg] expected=6 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_i386_register_state FAIL [stats eflag] expected=5 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_register_state FAIL [stats eip] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_i386_register_state FAIL [stats snap] expected=1 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (전체 emit ≥ 12 보장: 위 record 21 + 이 1 = 22) ───
+    r0_emit("pe_i386_register_state_stats",
+        "\"gp_count\":" + to_string(s[0])
+        + ",\"segment_count\":" + to_string(s[1])
+        + ",\"eflag_count\":" + to_string(s[2])
+        + ",\"eip_count\":" + to_string(s[3])
+        + ",\"snapshot_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_i386_register_state FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pirs()
+    let s2 = pirs_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_register_state FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_register_state self_test PASS (gp=" + to_string(s[0])
+        + ", seg=" + to_string(s[1]) + ", eflag=" + to_string(s[2])
+        + ", eip=" + to_string(s[3]) + ", snap=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pirs_stats()
+            println("gp_count\t" + to_string(s[0]))
+            println("segment_count\t" + to_string(s[1]))
+            println("eflag_count\t" + to_string(s[2]))
+            println("eip_count\t" + to_string(s[3]))
+            println("snapshot_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pirs()
+            println("cleaned: " + pirs_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pirs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_register_state.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,160 @@
+// lib/loader/pe_native_nsobject_lifetime.hexa — stage4 NSObject retain/release tracking skeleton
+//
+// macOS Foundation NSObject 의 lifetime — alloc/init/retain/release/dealloc.
+// Win32 IUnknown 의 AddRef/Release 와 동등. PE 가 ObjC 객체 보유 시 ref
+// count 추적 필수 (memory leak / use-after-free 방지).
+
+use "../perf/r0_common"
+
+let PNNL_DIR = GAMEBOX_HOME + "/persist/pe_native_nsobject_lifetime"
+let PNNL_TABLE = PNNL_DIR + "/lifetime.tsv"
+
+fn pnnl_dir() -> str { return PNNL_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + PNNL_DIR + "'")
+}
+
+fn append_row(row: str) -> void {
+    ensure_dir()
+    let tmp = PNNL_TABLE + ".tmp"
+    write_file(tmp, row + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PNNL_TABLE + "' && rm -f '" + tmp + "'")
+}
+
+fn op_name(kind: int) -> str {
+    if kind == 1 { return "alloc" }
+    if kind == 2 { return "init" }
+    if kind == 3 { return "retain" }
+    if kind == 4 { return "release" }
+    if kind == 5 { return "dealloc" }
+    return "unknown"
+}
+
+// Schema (TSV): obj_id<int> | op_kind<int> | ref_count_delta<int> | elapsed_us<int>
+fn record_lifetime(obj_id: int, op_kind: int, ref_count_delta: int, elapsed_us: int) -> void {
+    append_row(to_string(obj_id) + "\t" + to_string(op_kind) + "\t" + to_string(ref_count_delta) + "\t" + to_string(elapsed_us))
+    r0_emit("pnnl_lifetime", "\"obj_id\":" + to_string(obj_id) + ",\"op\":\"" + op_name(op_kind) + "\",\"delta\":" + to_string(ref_count_delta) + ",\"elapsed_us\":" + to_string(elapsed_us))
+}
+
+fn table_exists() -> bool {
+    let r = exec("test -f '" + PNNL_TABLE + "' && echo ok").trim()
+    return r == "ok"
+}
+
+fn lifetime_count() -> int {
+    if !table_exists() { return 0 }
+    return to_int(exec("wc -l < '" + PNNL_TABLE + "' | tr -d ' '").trim())
+}
+
+fn count_by_op_kind(kind: int) -> int {
+    if !table_exists() { return 0 }
+    let s = exec("awk -F'\\t' -v k=" + to_string(kind) + " '$2==k {c++} END {print c+0}' '" + PNNL_TABLE + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn total_ref_delta() -> int {
+    if !table_exists() { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END {print s+0}' '" + PNNL_TABLE + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn obj_lifetime_count(obj_id: int) -> int {
+    if !table_exists() { return 0 }
+    let s = exec("awk -F'\\t' -v oid=" + to_string(obj_id) + " '$1==oid {c++} END {print c+0}' '" + PNNL_TABLE + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn pnnl_stats() -> array {
+    return [lifetime_count(), count_by_op_kind(3), count_by_op_kind(4), total_ref_delta()]
+}
+
+fn cleanup_pnnl() -> void {
+    let _ = exec("rm -rf '" + PNNL_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "pnnl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pnnl()
+
+    // 6 ops on 1 NSString object (obj_id=103001)
+    record_lifetime(103001, 1, 1, 80)    // alloc, +1 (refcount 1)
+    record_lifetime(103001, 2, 0, 60)    // init, +0 (refcount 1)
+    record_lifetime(103001, 3, 1, 40)    // retain, +1 (refcount 2)
+    record_lifetime(103001, 3, 1, 40)    // retain, +1 (refcount 3)
+    record_lifetime(103001, 4, -1, 50)   // release, -1 (refcount 2)
+    record_lifetime(103001, 4, -1, 50)   // release, -1 (refcount 1)
+
+    // lifetime_count
+    let lc = lifetime_count()
+    if lc != 6 { panic("pe_native_nsobject_lifetime FAIL [lifetime_count] expected=6 got=" + to_string(lc)) }
+
+    // count_by_op_kind
+    let c1 = count_by_op_kind(1)
+    if c1 != 1 { panic("pe_native_nsobject_lifetime FAIL [count_by_op_kind 1] expected=1 got=" + to_string(c1)) }
+    let c2 = count_by_op_kind(2)
+    if c2 != 1 { panic("pe_native_nsobject_lifetime FAIL [count_by_op_kind 2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_op_kind(3)
+    if c3 != 2 { panic("pe_native_nsobject_lifetime FAIL [count_by_op_kind 3] expected=2 got=" + to_string(c3)) }
+    let c4 = count_by_op_kind(4)
+    if c4 != 2 { panic("pe_native_nsobject_lifetime FAIL [count_by_op_kind 4] expected=2 got=" + to_string(c4)) }
+    let c5 = count_by_op_kind(5)
+    if c5 != 0 { panic("pe_native_nsobject_lifetime FAIL [count_by_op_kind 5] expected=0 got=" + to_string(c5)) }
+    let c99 = count_by_op_kind(99)
+    if c99 != 0 { panic("pe_native_nsobject_lifetime FAIL [count_by_op_kind 99] expected=0 got=" + to_string(c99)) }
+
+    // total_ref_delta = 1+0+1+1-1-1 = 1
+    let trd = total_ref_delta()
+    if trd != 1 { panic("pe_native_nsobject_lifetime FAIL [total_ref_delta] expected=1 got=" + to_string(trd)) }
+
+    // obj_lifetime_count
+    let olc = obj_lifetime_count(103001)
+    if olc != 6 { panic("pe_native_nsobject_lifetime FAIL [obj_lifetime_count 103001] expected=6 got=" + to_string(olc)) }
+    let olm = obj_lifetime_count(9999)
+    if olm != 0 { panic("pe_native_nsobject_lifetime FAIL [obj_lifetime_count 9999] expected=0 got=" + to_string(olm)) }
+
+    // pnnl_stats = [6, 2, 2, 1]
+    let st = pnnl_stats()
+    if len(st) != 4 { panic("pe_native_nsobject_lifetime FAIL [pnnl_stats len] expected=4 got=" + to_string(len(st))) }
+    if st[0] != 6 { panic("pe_native_nsobject_lifetime FAIL [pnnl_stats[0]] expected=6 got=" + to_string(st[0])) }
+    if st[1] != 2 { panic("pe_native_nsobject_lifetime FAIL [pnnl_stats[1]] expected=2 got=" + to_string(st[1])) }
+    if st[2] != 2 { panic("pe_native_nsobject_lifetime FAIL [pnnl_stats[2]] expected=2 got=" + to_string(st[2])) }
+    if st[3] != 1 { panic("pe_native_nsobject_lifetime FAIL [pnnl_stats[3]] expected=1 got=" + to_string(st[3])) }
+
+    // emit count >= 7 (6 lifetime + 1 summary)
+    r0_emit("pnnl_self_test", "\"lifetime_count\":6,\"retain\":2,\"release\":2,\"final_refcount\":1")
+    let cnt = r0_session_count(sid)
+    if cnt < 7 { panic("pe_native_nsobject_lifetime FAIL [emit count] expected>=7 got=" + to_string(cnt)) }
+
+    cleanup_pnnl()
+
+    println("  ✅ pe_native_nsobject_lifetime self_test PASS (lifetime=6, alloc=1, init=1, retain=2, release=2, final_refcount=1, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let st = pnnl_stats()
+            println("lifetime_count=" + to_string(st[0]) + " retain=" + to_string(st[1]) + " release=" + to_string(st[2]) + " total_ref_delta=" + to_string(st[3]))
+            return
+        }
+        if sub == "count" && len(a) >= 4 {
+            println(to_string(count_by_op_kind(to_int(a[3]))))
+            return
+        }
+        if sub == "obj" && len(a) >= 4 {
+            println(to_string(obj_lifetime_count(to_int(a[3]))))
+            return
+        }
+        if sub == "cleanup" { cleanup_pnnl(); println("cleaned"); return }
+    }
+    println("usage: hexa run pe_native_nsobject_lifetime.hexa { self-test | stats | count <op_kind> | obj <obj_id> | cleanup }")
+}

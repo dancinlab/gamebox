@@ -1,0 +1,162 @@
+// lib/loader/iat_runtime_bind.hexa — Phase 1 stage1 — IAT 런타임 바인드 빌더
+//
+// pe_imports 가 추출한 (DLL × symbol) 리스트를 우리 DLL adapter 매핑 테이블에서
+// 검색해 runtime address 결정. 미발견은 unresolved.
+//
+// stage1: address 는 fake (0x70000000 + hash). stage2 에서 native dlsym/dlopen
+//          으로 실제 macOS framework address.
+//
+// 우리 adapter: win32_kernel32 + win32_kernel32_extras + win32_user32 + win32_shell32
+//              win32_ntdll + win32_msvcrt + win32_advapi32 + win32_gdi32
+//              win32_winsock + win32_wininet + win32_crypt32 + win32_rpcrt4
+//              win32_ole32 + win32_oleaut32 + win32_wintrust + win32_version
+//              win32_msimg32 + win32_uiautomationcore
+// = 18 DLL adapters.
+
+use "./pe_imports"
+use "../perf/r0_common"
+
+// 우리 adapter coverage 테이블 (DLL → 알려진 symbol prefix list)
+fn known_dll_count() -> int { return 18 }
+
+fn dll_resolved_prefix_list(dll: str) -> str {
+    let d = dll.to_lower()
+    if d == "kernel32.dll" { return "GetModuleHandle GetProcAddress CreateFile ReadFile WriteFile CloseHandle GetLastError SetLastError VirtualAlloc VirtualFree HeapAlloc HeapFree LoadLibrary FreeLibrary GetCommandLine GetEnvironment GetSystemTime GetTickCount Sleep ExitProcess GetModuleFileName GetCurrentProcess GetCurrentThread CreateThread WaitForSingleObject SetEvent ResetEvent CreateMutex CreateEvent GetStdHandle SetStdHandle GetCurrentDirectory SetCurrentDirectory GetTempPath GetTempFileName DeleteFile MoveFile CopyFile FindFirstFile FindNextFile FindClose CreateDirectory RemoveDirectory" }
+    if d == "user32.dll" { return "MessageBox GetSystemMetrics LoadCursor LoadIcon RegisterClass CreateWindow ShowWindow UpdateWindow GetMessage TranslateMessage DispatchMessage DefWindowProc PostQuitMessage SetWindowText GetWindowText SetForegroundWindow" }
+    if d == "shell32.dll" { return "SHGetFolderPath ShellExecute SHGetSpecialFolder SHCreateDirectory SHGetKnownFolderPath ShellExecuteEx" }
+    if d == "ntdll.dll" { return "RtlAllocateHeap RtlFreeHeap NtCreateFile NtReadFile NtWriteFile NtClose RtlGetVersion" }
+    if d == "msvcrt.dll" { return "malloc free memcpy memset strcpy strlen strcmp printf fprintf fopen fclose fread fwrite" }
+    if d == "advapi32.dll" { return "RegOpenKey RegCloseKey RegQueryValue RegSetValue OpenProcessToken GetUserName" }
+    if d == "gdi32.dll" { return "CreateDC DeleteDC GetDeviceCaps CreateFont SelectObject DeleteObject" }
+    if d == "ws2_32.dll" { return "WSAStartup WSACleanup socket connect bind listen accept send recv closesocket" }
+    if d == "winsock.dll" { return "WSAStartup WSACleanup socket connect bind listen" }
+    if d == "wininet.dll" { return "InternetOpen InternetConnect HttpOpenRequest HttpSendRequest InternetReadFile InternetCloseHandle" }
+    if d == "crypt32.dll" { return "CertOpenSystemStore CertCloseStore CertFindCertificate CryptHashData CryptHashCertificate" }
+    if d == "rpcrt4.dll" { return "UuidCreate RpcStringFree NdrClientCall" }
+    if d == "ole32.dll" { return "CoInitialize CoUninitialize CoCreateInstance" }
+    if d == "oleaut32.dll" { return "SysAllocString SysFreeString VariantInit VariantClear" }
+    if d == "wintrust.dll" { return "WinVerifyTrust" }
+    if d == "version.dll" { return "GetFileVersionInfo VerQueryValue GetFileVersionInfoSize" }
+    if d == "msimg32.dll" { return "AlphaBlend" }
+    if d == "uiautomationcore.dll" { return "UiaProviderForNonClient UiaReturnRawElementProvider UiaHostProviderFromHwnd UiaRaiseAutomationEvent UiaDisconnectAllProviders" }
+    return ""
+}
+
+fn dll_adapter_known(dll: str) -> bool {
+    return dll_resolved_prefix_list(dll) != ""
+}
+
+fn symbol_in_adapter(dll: str, symbol: str) -> bool {
+    if !dll_adapter_known(dll) { return false }
+    let prefixes = dll_resolved_prefix_list(dll)
+    let i = 0
+    while i < len(symbol) {
+        let prefix = symbol
+        if i > 0 { prefix = symbol.substring(0, len(symbol) - i) }
+        if prefixes.contains(prefix) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn fake_address(dll: str, symbol: str) -> int {
+    // synthetic — 실제 dlsym 대체. base 0x70000000 + 16-byte slot per (dll+sym) hash.
+    let mut h = 0
+    let i = 0
+    let s = dll + ":" + symbol
+    while i < len(s) {
+        h = (h * 31 + i) % 16777216
+        i = i + 1
+    }
+    return 0x70000000 + h * 16
+}
+
+fn build_iat(pe_path: str) -> array {
+    // pe_imports 의 list_dependencies 활용 — return [{dll, symbol, status, addr}]
+    let deps = list_dependencies(pe_path)
+    let result = []
+    let i = 0
+    while i < len(deps) {
+        let dll = deps[i]
+        if dll_adapter_known(dll) {
+            // 우리 adapter 기준 — coverage 일부만 simulate
+            let symbols = dll_resolved_prefix_list(dll)
+            // 첫 토큰만 take (skeleton — 실제 IAT 는 pe_imports stage 2 에서 enumerate)
+            let first_sym = exec("echo '" + symbols + "' | awk '{print $1}'").trim()
+            if first_sym != "" {
+                let addr = fake_address(dll, first_sym)
+                result = append(result, dll + "\t" + first_sym + "\tresolved\t" + to_string(addr))
+            }
+        } else {
+            result = append(result, dll + "\tunknown\tunresolved\t0")
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn coverage_pct(pe_path: str) -> int {
+    let iat = build_iat(pe_path)
+    if len(iat) == 0 { return 0 }
+    let mut resolved = 0
+    let i = 0
+    while i < len(iat) {
+        if iat[i].contains("\tresolved\t") { resolved = resolved + 1 }
+        i = i + 1
+    }
+    return resolved * 100 / len(iat)
+}
+
+fn self_test() -> void {
+    let sid = "irb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    if known_dll_count() != 18 { panic("iat_runtime_bind FAIL [adapter count] expected=18") }
+
+    // 알려진 DLL
+    if !dll_adapter_known("kernel32.dll") { panic("iat_runtime_bind FAIL [known kernel32]") }
+    if !dll_adapter_known("WININET.DLL") { panic("iat_runtime_bind FAIL [known wininet uppercase]") }
+    if dll_adapter_known("foo.dll") { panic("iat_runtime_bind FAIL [unknown foo]") }
+
+    // fake address 안정성
+    let a1 = fake_address("kernel32.dll", "CreateFileA")
+    let a2 = fake_address("kernel32.dll", "CreateFileA")
+    if a1 != a2 { panic("iat_runtime_bind FAIL [addr determinism]") }
+    let a3 = fake_address("kernel32.dll", "ReadFile")
+    if a1 == a3 { panic("iat_runtime_bind FAIL [addr collision]") }
+
+    // 실 PE 파일 있으면 build_iat
+    let bnet = exec("ls /Users/ghost/core/airgenome-gamebox/tool/bench/Battle.net-Setup.exe 2>/dev/null").trim()
+    if bnet != "" {
+        let pct = coverage_pct(bnet)
+        // 16 DLL 모두 adapter 보유 — coverage 100% expected
+        if pct < 80 { panic("iat_runtime_bind FAIL [coverage] expected>=80 got=" + to_string(pct)) }
+        r0_emit("iat_bind_built", "\"coverage_pct\":" + to_string(pct))
+        println("  ✅ iat_runtime_bind self_test PASS (18 adapters, Battle.net-Setup coverage=" + to_string(pct) + "%)")
+    } else {
+        r0_emit("iat_bind_skip", "\"reason\":\"no_pe_sample\"")
+        println("  ✅ iat_runtime_bind self_test PASS (18 adapters, fake addr stable — no PE sample)")
+    }
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "build" && len(a) >= 4 {
+            let iat = build_iat(a[3])
+            let i = 0
+            while i < len(iat) {
+                println(iat[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "coverage" && len(a) >= 4 {
+            println(to_string(coverage_pct(a[3])) + "%")
+            return
+        }
+    }
+    println("usage: hexa run iat_runtime_bind.hexa { self-test | build <pe_path> | coverage <pe_path> }")
+}

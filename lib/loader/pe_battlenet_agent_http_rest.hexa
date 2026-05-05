@@ -1,0 +1,222 @@
+// pe_battlenet_agent_http_rest.hexa — Battle.net Agent.exe HTTP REST 우회 path
+//
+// research-E 핵심 finding: Agent.exe = HTTP REST server (port 1120, NOT websocket).
+// User-Agent "phoenix-agent/1.0". launcher (CEF) 우회 → Agent.exe 직접 talk
+// 가능. 본 hexa 는 Agent.exe HTTP endpoint round-trip + game launch + install
+// state 추적 (Apple Network framework 자체 구현 시 사용 instrumentation sink).
+//
+// own1: hexa pure, Wine wininet 0줄. research-E reference (architecture only).
+// own2: r0_emit ≥ 14, panic, self-test.
+
+use "../perf/r0_common"
+
+fn pbah_dir() -> str { return GAMEBOX_HOME + "/persist/pe_battlenet_agent_http_rest" }
+fn pbah_request_path() -> str { return pbah_dir() + "/request.tsv" }
+fn pbah_oauth_path() -> str { return pbah_dir() + "/oauth.tsv" }
+fn pbah_launch_path() -> str { return pbah_dir() + "/launch.tsv" }
+fn pbah_install_path() -> str { return pbah_dir() + "/install.tsv" }
+fn pbah_response_path() -> str { return pbah_dir() + "/response.tsv" }
+
+fn pbah_ensure() -> void { let _ = exec("mkdir -p '" + pbah_dir() + "'") }
+fn cleanup_pbah() -> void {
+    pbah_ensure()
+    let _ = exec("rm -f '" + pbah_request_path() + "' '" + pbah_oauth_path()
+        + "' '" + pbah_launch_path() + "' '" + pbah_install_path()
+        + "' '" + pbah_response_path() + "'")
+}
+
+fn pbah_read(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbah_append(path: str, row: str) -> void {
+    pbah_ensure()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn record_agent_request(request_id: int, method: str, endpoint: str, status_code: int, bearer_token_hash: str) -> void {
+    if request_id <= 0 { panic("pe_battlenet_agent_http_rest FAIL [request] id>0") }
+    if method == "" || endpoint == "" { panic("pe_battlenet_agent_http_rest FAIL [request] method/endpoint non-empty") }
+    if status_code < 0 || status_code > 599 { panic("pe_battlenet_agent_http_rest FAIL [request] status 0-599") }
+    let row = to_string(request_id) + "\t" + method + "\t" + endpoint + "\t" + to_string(status_code) + "\t" + bearer_token_hash + "\n"
+    pbah_append(pbah_request_path(), row)
+}
+
+// step_kind: 0=challenge / 1=token_get / 2=refresh / 3=revoke
+fn record_oauth_step(oauth_id: int, step_kind: int, success: int) -> void {
+    if oauth_id <= 0 { panic("pe_battlenet_agent_http_rest FAIL [oauth] id>0") }
+    if step_kind < 0 || step_kind > 3 { panic("pe_battlenet_agent_http_rest FAIL [oauth] step 0-3") }
+    if success < 0 || success > 1 { panic("pe_battlenet_agent_http_rest FAIL [oauth] success 0/1") }
+    let row = to_string(oauth_id) + "\t" + to_string(step_kind) + "\t" + to_string(success) + "\n"
+    pbah_append(pbah_oauth_path(), row)
+}
+
+fn record_game_launch(launch_id: int, game_uid: str, exe_path: str, launch_status_code: int) -> void {
+    if launch_id <= 0 { panic("pe_battlenet_agent_http_rest FAIL [launch] id>0") }
+    if game_uid == "" || exe_path == "" { panic("pe_battlenet_agent_http_rest FAIL [launch] uid/exe non-empty") }
+    if launch_status_code < 0 || launch_status_code > 599 { panic("pe_battlenet_agent_http_rest FAIL [launch] status 0-599") }
+    let row = to_string(launch_id) + "\t" + game_uid + "\t" + exe_path + "\t" + to_string(launch_status_code) + "\n"
+    pbah_append(pbah_launch_path(), row)
+}
+
+// state_kind: 0=not_installed / 1=downloading / 2=installing / 3=installed / 4=updating / 5=error
+fn record_install_state(state_id: int, game_uid: str, state_kind: int, progress_pct: int) -> void {
+    if state_id <= 0 { panic("pe_battlenet_agent_http_rest FAIL [install] id>0") }
+    if game_uid == "" { panic("pe_battlenet_agent_http_rest FAIL [install] uid non-empty") }
+    if state_kind < 0 || state_kind > 5 { panic("pe_battlenet_agent_http_rest FAIL [install] state 0-5") }
+    if progress_pct < 0 || progress_pct > 100 { panic("pe_battlenet_agent_http_rest FAIL [install] pct 0-100") }
+    let row = to_string(state_id) + "\t" + game_uid + "\t" + to_string(state_kind) + "\t" + to_string(progress_pct) + "\n"
+    pbah_append(pbah_install_path(), row)
+}
+
+fn record_endpoint_response(response_id: int, endpoint: str, response_size_bytes: int, content_type: str) -> void {
+    if response_id <= 0 { panic("pe_battlenet_agent_http_rest FAIL [response] id>0") }
+    if endpoint == "" || content_type == "" { panic("pe_battlenet_agent_http_rest FAIL [response] non-empty") }
+    if response_size_bytes < 0 { panic("pe_battlenet_agent_http_rest FAIL [response] size>=0") }
+    let row = to_string(response_id) + "\t" + endpoint + "\t" + to_string(response_size_bytes) + "\t" + content_type + "\n"
+    pbah_append(pbah_response_path(), row)
+}
+
+fn count_rows(path: str, min_cols: int) -> int {
+    let t = pbah_read(path)
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= min_cols { cnt = cnt + 1 }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn agent_request_count() -> int { return count_rows(pbah_request_path(), 5) }
+fn oauth_step_count() -> int { return count_rows(pbah_oauth_path(), 3) }
+fn game_launch_count() -> int { return count_rows(pbah_launch_path(), 4) }
+fn install_state_count() -> int { return count_rows(pbah_install_path(), 4) }
+fn endpoint_response_count() -> int { return count_rows(pbah_response_path(), 4) }
+
+fn method_name(m: str) -> str {
+    if m == "GET" { return "GET" }
+    if m == "POST" { return "POST" }
+    if m == "HEAD" { return "HEAD" }
+    if m == "PUT" { return "PUT" }
+    if m == "DELETE" { return "DELETE" }
+    return ""
+}
+fn state_kind_name(k: int) -> str {
+    if k == 0 { return "not_installed" }
+    if k == 1 { return "downloading" }
+    if k == 2 { return "installing" }
+    if k == 3 { return "installed" }
+    if k == 4 { return "updating" }
+    if k == 5 { return "error" }
+    return ""
+}
+fn oauth_step_name(k: int) -> str {
+    if k == 0 { return "challenge" }
+    if k == 1 { return "token_get" }
+    if k == 2 { return "refresh" }
+    if k == 3 { return "revoke" }
+    return ""
+}
+
+fn pbah_stats() -> array {
+    let mut out = []
+    out.push(agent_request_count())
+    out.push(oauth_step_count())
+    out.push(game_launch_count())
+    out.push(install_state_count())
+    out.push(endpoint_response_count())
+    return out
+}
+
+fn self_test() -> void {
+    let sid = "pbah-" + exec("date +%s").trim()
+    r0_session_set(sid)
+    cleanup_pbah()
+
+    record_agent_request(1, "GET",  "/agent",         200, "abc123"); r0_emit("pbah_req", "\"id\":1")
+    record_agent_request(2, "POST", "/agent/uid/d2r", 202, "abc123"); r0_emit("pbah_req", "\"id\":2")
+    record_agent_request(3, "GET",  "/agent/install", 200, "abc123"); r0_emit("pbah_req", "\"id\":3")
+    record_agent_request(4, "POST", "/agent/uninstall", 204, "abc123"); r0_emit("pbah_req", "\"id\":4")
+    record_agent_request(5, "GET",  "/agent/version",  200, "abc123"); r0_emit("pbah_req", "\"id\":5")
+
+    record_oauth_step(1, 0, 1); r0_emit("pbah_oauth", "\"id\":1,\"step\":0")
+    record_oauth_step(2, 1, 1); r0_emit("pbah_oauth", "\"id\":2,\"step\":1")
+    record_oauth_step(3, 2, 1); r0_emit("pbah_oauth", "\"id\":3,\"step\":2")
+    record_oauth_step(4, 3, 1); r0_emit("pbah_oauth", "\"id\":4,\"step\":3")
+
+    record_game_launch(1, "d2r", "C:\\Diablo II Resurrected\\D2R.exe", 200); r0_emit("pbah_launch", "\"id\":1")
+    record_game_launch(2, "wow", "C:\\World of Warcraft\\Wow.exe", 200); r0_emit("pbah_launch", "\"id\":2")
+    record_game_launch(3, "ow2", "C:\\Overwatch\\Overwatch.exe", 200); r0_emit("pbah_launch", "\"id\":3")
+
+    record_install_state(1, "d2r", 0, 0); r0_emit("pbah_install", "\"id\":1")
+    record_install_state(2, "d2r", 1, 50); r0_emit("pbah_install", "\"id\":2")
+    record_install_state(3, "d2r", 2, 90); r0_emit("pbah_install", "\"id\":3")
+    record_install_state(4, "d2r", 3, 100); r0_emit("pbah_install", "\"id\":4")
+
+    record_endpoint_response(1, "/agent",         512, "application/json"); r0_emit("pbah_resp", "\"id\":1")
+    record_endpoint_response(2, "/agent/uid/d2r", 256, "application/json"); r0_emit("pbah_resp", "\"id\":2")
+    record_endpoint_response(3, "/agent/install", 1024, "application/json"); r0_emit("pbah_resp", "\"id\":3")
+    record_endpoint_response(4, "/agent/version", 128, "application/json"); r0_emit("pbah_resp", "\"id\":4")
+
+    if agent_request_count() != 5 { panic("pe_battlenet_agent_http_rest FAIL [count req] expected=5") }
+    if oauth_step_count() != 4 { panic("pe_battlenet_agent_http_rest FAIL [count oauth] expected=4") }
+    if game_launch_count() != 3 { panic("pe_battlenet_agent_http_rest FAIL [count launch] expected=3") }
+    if install_state_count() != 4 { panic("pe_battlenet_agent_http_rest FAIL [count install] expected=4") }
+    if endpoint_response_count() != 4 { panic("pe_battlenet_agent_http_rest FAIL [count response] expected=4") }
+
+    if method_name("POST") != "POST" { panic("pe_battlenet_agent_http_rest FAIL [name POST]") }
+    if state_kind_name(3) != "installed" { panic("pe_battlenet_agent_http_rest FAIL [name installed]") }
+    if oauth_step_name(1) != "token_get" { panic("pe_battlenet_agent_http_rest FAIL [name token_get]") }
+
+    let s = pbah_stats()
+    r0_emit("pbah_stats", "\"req\":" + to_string(s[0]) + ",\"oauth\":" + to_string(s[1])
+        + ",\"launch\":" + to_string(s[2]) + ",\"install\":" + to_string(s[3])
+        + ",\"resp\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 { panic("pe_battlenet_agent_http_rest FAIL [emit] expected>=14 got=" + to_string(emit_n)) }
+
+    cleanup_pbah()
+    let s2 = pbah_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 { panic("pe_battlenet_agent_http_rest FAIL [cleanup]") }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battlenet_agent_http_rest self_test PASS (req=" + to_string(s[0])
+        + ", oauth=" + to_string(s[1]) + ", launch=" + to_string(s[2])
+        + ", install=" + to_string(s[3]) + ", resp=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pbah_stats()
+            println("req\t" + to_string(s[0]))
+            println("oauth\t" + to_string(s[1]))
+            println("launch\t" + to_string(s[2]))
+            println("install\t" + to_string(s[3]))
+            println("resp\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" { cleanup_pbah(); println("cleaned: " + pbah_dir()); return }
+        if sub == "dir" { println(pbah_dir()); return }
+    }
+    println("usage: hexa run pe_battlenet_agent_http_rest.hexa { self-test | stats | cleanup | dir }")
+}

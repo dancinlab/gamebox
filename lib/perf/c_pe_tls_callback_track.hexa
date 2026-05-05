@@ -1,0 +1,182 @@
+// lib/perf/c_pe_tls_callback_track.hexa — CN-138 skeleton manjeom 15/15
+//
+// Phase 1 PE TLS Directory callback 추적 — entry point 전 실행되는 hidden 진입점.
+// anti-debug 가 즐겨 쓰는 TLS callback 위치 + suspicion level 기록.
+//
+// 무기: per-PE callback table + columnar (idx, va, suspicion 0..3).
+// 효과: anti-debug / packer 가 심은 hidden init 즉시 분류 — Phase 1 closure path 강화.
+//
+// hexa-lang stage1 제약: per-PE 통계는 awk filter (pe_name 컬럼 매치)로 산출.
+
+use "./r0_common"
+
+let CPTC_DIR = GAMEBOX_HOME + "/persist/pe_tls_callback_track"
+let TLS_LOG = CPTC_DIR + "/callbacks.tsv"
+
+fn cptc_dir() -> str { return CPTC_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CPTC_DIR + "'")
+}
+
+fn suspicion_tag(level: int) -> str {
+    if level <= 0 { return "none" }
+    if level == 1 { return "low" }
+    if level == 2 { return "medium" }
+    return "high"
+}
+
+fn record_tls_callback(pe_name: str, callback_idx: int, callback_va: int, suspicion_level: int) -> void {
+    ensure_dir()
+    let tag = suspicion_tag(suspicion_level)
+    let line = pe_name + "\t" + to_string(callback_idx) + "\t" + to_string(callback_va) + "\t" + to_string(suspicion_level) + "\t" + tag
+    let tmp = TLS_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + TLS_LOG + "' && rm -f '" + tmp + "'")
+    if suspicion_level >= 2 {
+        r0_emit("pe_tls_suspect", "\"pe\":\"" + pe_name + "\",\"idx\":" + to_string(callback_idx) + ",\"va\":" + to_string(callback_va) + ",\"level\":" + to_string(suspicion_level))
+    } else {
+        r0_emit("pe_tls_ok", "\"pe\":\"" + pe_name + "\",\"idx\":" + to_string(callback_idx) + ",\"tag\":\"" + tag + "\"")
+    }
+}
+
+fn callback_count(pe_name: str) -> int {
+    let exists = exec("test -f '" + TLS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v p='" + pe_name + "' '$1==p' '" + TLS_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn max_suspicion(pe_name: str) -> int {
+    let exists = exec("test -f '" + TLS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v p='" + pe_name + "' '$1==p { if ($4+0 > m) m=$4+0 } END { print m+0 }' '" + TLS_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn needs_audit(pe_name: str) -> bool {
+    if max_suspicion(pe_name) >= 2 { return true }
+    return false
+}
+
+fn cleanup_cptc() -> void {
+    let _ = exec("rm -rf '" + CPTC_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cptc-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cptc()
+
+    // suspicion_tag 경계 검증
+    if suspicion_tag(0) != "none" { panic("c_pe_tls_callback_track FAIL [tag none]") }
+    if suspicion_tag(1) != "low" { panic("c_pe_tls_callback_track FAIL [tag low]") }
+    if suspicion_tag(2) != "medium" { panic("c_pe_tls_callback_track FAIL [tag medium]") }
+    if suspicion_tag(3) != "high" { panic("c_pe_tls_callback_track FAIL [tag high]") }
+
+    // PE 1: Battle.net launcher — 0 callback (정상)
+    //   record 자체 안 함 → callback_count 0, max_suspicion 0, needs_audit false.
+
+    // PE 2: D2R.exe — 1 callback, low suspicion (단순 init)
+    record_tls_callback("D2R.exe", 0, 0x140012340, 1)
+
+    // PE 3: 의심 PE (packer.exe) — 2 callback, 둘 다 high
+    record_tls_callback("packer.exe", 0, 0x401050, 3)
+    record_tls_callback("packer.exe", 1, 0x4012a0, 2)
+
+    // Battle.net: 등록 안 했으니 0
+    let bnet_n = callback_count("Battle.net.exe")
+    if bnet_n != 0 { panic("c_pe_tls_callback_track FAIL [bnet count] expected=0 got=" + to_string(bnet_n)) }
+    let bnet_m = max_suspicion("Battle.net.exe")
+    if bnet_m != 0 { panic("c_pe_tls_callback_track FAIL [bnet max] expected=0 got=" + to_string(bnet_m)) }
+    if needs_audit("Battle.net.exe") != false { panic("c_pe_tls_callback_track FAIL [bnet audit]") }
+
+    // D2R: 1 callback, max=1, needs_audit=false (low only)
+    let d2r_n = callback_count("D2R.exe")
+    if d2r_n != 1 { panic("c_pe_tls_callback_track FAIL [d2r count] expected=1 got=" + to_string(d2r_n)) }
+    let d2r_m = max_suspicion("D2R.exe")
+    if d2r_m != 1 { panic("c_pe_tls_callback_track FAIL [d2r max] expected=1 got=" + to_string(d2r_m)) }
+    if needs_audit("D2R.exe") != false { panic("c_pe_tls_callback_track FAIL [d2r audit no]") }
+
+    // packer: 2 callback, max=3, needs_audit=true
+    let pk_n = callback_count("packer.exe")
+    if pk_n != 2 { panic("c_pe_tls_callback_track FAIL [pk count] expected=2 got=" + to_string(pk_n)) }
+    let pk_m = max_suspicion("packer.exe")
+    if pk_m != 3 { panic("c_pe_tls_callback_track FAIL [pk max] expected=3 got=" + to_string(pk_m)) }
+    if needs_audit("packer.exe") != true { panic("c_pe_tls_callback_track FAIL [pk audit yes]") }
+
+    r0_emit("pe_tls_summary", "\"pes\":3,\"d2r_callbacks\":" + to_string(d2r_n) + ",\"packer_max\":" + to_string(pk_m) + ",\"audit_required\":1")
+
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_pe_tls_callback_track FAIL [emit] got=" + to_string(cnt)) }
+
+    // ─── synthetic PE TLS callback state machine round-trip (cond.1 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track AQ mission: D2R cond.1 (PE parse + IAT real-resolve + mainCRTStartup
+    // reach) 측 evidence augment. PE TLS Directory callback walk 측 entry
+    // point 전 hidden init 추적 path 측 D2R cond.1 + D4 cond.1 cross-link.
+    // anti-debug / packer 식별 surface — DRM / DRMmask 영역 cross-link.
+    //
+    // (a) synthetic TLS Directory walk 4-phase state machine cycle —
+    //     parse_tls_dir → walk_callback_array → classify_suspicion → tally_audit:
+    //     phase_count               4                   (4 TLS walk phases)
+    //     tls_dir_off               0x140118000         (synthetic TLS dir RVA)
+    //     callback_array_off        0x14011A000         (synthetic callback array)
+    //     walk_kind                 "synthetic_inline"  (실 IMAGE_DIRECTORY_ENTRY_TLS X)
+    //
+    // (b) synthetic 3-PE suspicion matrix scaffold —
+    //     Battle.net.exe / D2R.exe / packer.exe 분류:
+    //     pe_total                  3                   (3 synthetic PE)
+    //     bnet_callback_count       0                   (정상 launcher)
+    //     d2r_callback_count        1                   (D2R 단순 init)
+    //     packer_callback_count     2                   (의심 packer)
+    //     audit_required_count      1                   (packer.exe only)
+    //     suspicion_max_high        3                   (packer.exe entry 0)
+    //     dist_kind                 "synthetic_inline"  (실 awk per-PE tally X)
+    //
+    // round-trip = synthesize_tls_walk(scaffold) → tally_suspicion_distribution(scaffold).
+    //              hexa-native loop only — 실 TLS callback execution 0,
+    //              real anti-debug detection 0.
+    //
+    // synthetic TLS walk phase emit
+    r0_emit("c_pe_tls_callback_track_synthetic_phase",
+        "\"stage\":\"tls_walk_phase\",\"phase_count\":4,\"tls_dir_off\":\"0x140118000\",\"callback_array_off\":\"0x14011A000\",\"walk_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+    println("__PE_TLS__ PARTIAL tls_walk_phase")
+
+    // synthetic suspicion distribution emit
+    r0_emit("c_pe_tls_callback_track_synthetic_distribution",
+        "\"stage\":\"suspicion_distribution\",\"pe_total\":3,\"bnet_callback_count\":0,\"d2r_callback_count\":1,\"packer_callback_count\":2,\"audit_required_count\":1,\"suspicion_max_high\":3,\"dist_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+    println("__PE_TLS__ PARTIAL suspicion_distribution")
+
+    cleanup_cptc()
+
+    println("  ✅ c_pe_tls_callback_track self_test PASS (3 PE: bnet 0 / d2r 1 low / packer 2 high, 1 audit_required, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "record" && len(a) >= 7 {
+            record_tls_callback(a[3], to_int(a[4]), to_int(a[5]), to_int(a[6]))
+            println("recorded")
+            return
+        }
+        if sub == "stats" && len(a) >= 4 {
+            let pe = a[3]
+            println("pe=" + pe + " callbacks=" + to_string(callback_count(pe)) + " max_suspicion=" + to_string(max_suspicion(pe)))
+            return
+        }
+        if sub == "audit" && len(a) >= 4 {
+            let pe = a[3]
+            if needs_audit(pe) { println("audit_required") } else { println("audit_clear") }
+            return
+        }
+        if sub == "cleanup" { cleanup_cptc(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_pe_tls_callback_track.hexa { self-test | record <pe> <idx> <va> <level> | stats <pe> | audit <pe> | cleanup }")
+}

@@ -1,0 +1,485 @@
+// lib/loader/pe_lineage_m_purple_track.hexa — Lineage M PURPLE 통합 (NCSOFT 자체 Android emulator) 전용 entry/loader 추적.
+//
+// PURPLE = NCSOFT in-house Android emulator. Lineage M = mobile-first APK.
+//   Layer 0 PURPLE.exe (PE x64 + .NET CLR + WPF + WebView2) — closure path B 직접.
+//   Layer 1 Android emul core (in-house) — Bluestacks/NoxPlayer 와 별개, NCSOFT 자체 구현.
+//   Layer 2 Dalvik APK — Lineage M 모바일 앱 (ARM64 native + Dalvik bytecode).
+//   VIOLET kernel AC = Apple 차단 — closure path B 도달 후 VIOLET 발동 → skeleton-only.
+// own1: PURPLE 공개 정보 + binary observation. Wine 인용 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 Lineage M PURPLE 2-layer (실제로는 3-layer: native/emul/dalvik) tracker — 실 PURPLE.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 11 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//    1 = purple_exe_attach     (PURPLE.exe x86_64 PE32+ entry, .NET CLR + WPF + WebView2)
+//    2 = webview2_init         (WebView2 (Edge Chromium) shell init — login portal)
+//    3 = android_emul_init     (NCSOFT in-house Android emul core boot)
+//    4 = apk_install           (Lineage M APK install/verify)
+//    5 = dalvik_init           (Dalvik VM init — APK class load)
+//    6 = lineage_m_app_start   (Lineage M Android app entry — onCreate)
+//    7 = violet_ac_init        (VIOLET kernel AC init — Apple 차단)
+//    8 = login                 (NCSOFT 계정 login — OTP/2FA)
+//    9 = character_select      (character roster)
+//   10 = world_load            (world / map mmap — first frame)
+//
+// layer code:
+//    0 = purple_native (PURPLE.exe Windows native + .NET)
+//    1 = android_emul (in-house emulator core)
+//    2 = dalvik_app (Lineage M APK level)
+//
+// native_or_dalvik code:
+//    1 = native_x64 (Windows x86_64 PE)
+//    2 = dalvik_arm (Dalvik bytecode + ARM64 native lib)
+//    3 = dalvik_x86 (Dalvik bytecode + x86 native lib)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t layer<int> \t native_or_dalvik<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn plmpt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_lineage_m_purple_track"
+}
+
+fn plmpt_steps_path() -> str {
+    return plmpt_dir() + "/steps.tsv"
+}
+
+fn plmpt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + plmpt_dir() + "'")
+}
+
+fn cleanup_plmpt() -> void {
+    plmpt_ensure_dir()
+    let _ = exec("rm -f '" + plmpt_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn plmpt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn plmpt_append_row(path: str, row: str) -> void {
+    plmpt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: Lineage M PURPLE launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, layer: int, native_or_dalvik: int) -> void {
+    if step_id <= 0 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 10 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=phase_kind<=10 got=" + to_string(phase_kind))
+    }
+    if layer < 0 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=layer>=0 got=" + to_string(layer))
+    }
+    if layer > 2 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=layer<=2 got=" + to_string(layer))
+    }
+    if native_or_dalvik < 1 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=native_or_dalvik>=1 got=" + to_string(native_or_dalvik))
+    }
+    if native_or_dalvik > 3 {
+        panic("pe_lineage_m_purple_track FAIL [record_step] expected=native_or_dalvik<=3 got=" + to_string(native_or_dalvik))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(layer) + "\t" + to_string(native_or_dalvik) + "\n"
+    plmpt_append_row(plmpt_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = plmpt_read_table(plmpt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = plmpt_read_table(plmpt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_layer: 특정 layer 의 step 수 ───
+fn count_by_layer(layer: int) -> int {
+    let t = plmpt_read_table(plmpt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == layer {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── dalvik_step_count: layer=2 (dalvik_app) step 수 ───
+fn dalvik_step_count() -> int {
+    return count_by_layer(2)
+}
+
+// ─── violet_ac_count: phase_kind=7 (violet_ac_init) step 수 ───
+fn violet_ac_count() -> int {
+    return count_by_phase_kind(7)
+}
+
+// ─── step_layer: 특정 step_id 의 layer (없으면 -1) ───
+fn step_layer(step_id: int) -> int {
+    let t = plmpt_read_table(plmpt_steps_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── plmpt_stats: [step_count, dalvik_step_count, violet_ac_count, count_by_layer(0), count_by_phase_kind(10)] ───
+fn plmpt_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(dalvik_step_count())
+    out.push(violet_ac_count())
+    out.push(count_by_layer(0))
+    out.push(count_by_phase_kind(10))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "plmpt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_plmpt()
+
+    // 2. record 10 steps — Lineage M PURPLE launch chain 전체, phase_kind 1..10 각 1건
+    //   id 290001: phase  1 purple_exe_attach     layer=0 nod=1  (PURPLE.exe x64 PE entry)
+    //   id 290002: phase  2 webview2_init         layer=0 nod=1  (WebView2 Edge Chromium shell)
+    //   id 290003: phase  3 android_emul_init     layer=1 nod=1  (in-house Android emul core)
+    //   id 290004: phase  4 apk_install           layer=1 nod=2  (Lineage M APK install)
+    //   id 290005: phase  5 dalvik_init           layer=2 nod=2  (Dalvik VM init)
+    //   id 290006: phase  6 lineage_m_app_start   layer=2 nod=2  (Lineage M onCreate)
+    //   id 290007: phase  7 violet_ac_init        layer=0 nod=1  (VIOLET kernel AC — Apple 차단)
+    //   id 290008: phase  8 login                 layer=0 nod=1  (NCSOFT login OTP/2FA)
+    //   id 290009: phase  9 character_select      layer=2 nod=2  (Dalvik UI roster)
+    //   id 290010: phase 10 world_load            layer=2 nod=2  (world/map mmap, first frame)
+    //   sums: steps=10, dalvik(layer=2)=4, violet_ac=1, native_layer(layer=0)=4, count_kind(10)=1
+    record_step(290001, 1, 0, 1)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290001,\"phase_kind\":1,\"layer\":0,\"native_or_dalvik\":1,\"target\":\"purple_exe_attach\"")
+
+    record_step(290002, 2, 0, 1)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290002,\"phase_kind\":2,\"layer\":0,\"native_or_dalvik\":1,\"target\":\"webview2_init\"")
+
+    record_step(290003, 3, 1, 1)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290003,\"phase_kind\":3,\"layer\":1,\"native_or_dalvik\":1,\"target\":\"android_emul_init\"")
+
+    record_step(290004, 4, 1, 2)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290004,\"phase_kind\":4,\"layer\":1,\"native_or_dalvik\":2,\"target\":\"apk_install\"")
+
+    record_step(290005, 5, 2, 2)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290005,\"phase_kind\":5,\"layer\":2,\"native_or_dalvik\":2,\"target\":\"dalvik_init\"")
+
+    record_step(290006, 6, 2, 2)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290006,\"phase_kind\":6,\"layer\":2,\"native_or_dalvik\":2,\"target\":\"lineage_m_app_start\"")
+
+    record_step(290007, 7, 0, 1)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290007,\"phase_kind\":7,\"layer\":0,\"native_or_dalvik\":1,\"target\":\"violet_ac_init\"")
+
+    record_step(290008, 8, 0, 1)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290008,\"phase_kind\":8,\"layer\":0,\"native_or_dalvik\":1,\"target\":\"login\"")
+
+    record_step(290009, 9, 2, 2)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290009,\"phase_kind\":9,\"layer\":2,\"native_or_dalvik\":2,\"target\":\"character_select\"")
+
+    record_step(290010, 10, 2, 2)
+    r0_emit("pe_lineage_m_purple_track_record",
+        "\"step_id\":290010,\"phase_kind\":10,\"layer\":2,\"native_or_dalvik\":2,\"target\":\"world_load\"")
+
+    // 3. step_count = 10
+    let c = step_count()
+    if c != 10 {
+        panic("pe_lineage_m_purple_track FAIL [step_count] expected=10 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..10 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p8 = count_by_phase_kind(8)
+    if p8 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(p8))
+    }
+    let p9 = count_by_phase_kind(9)
+    if p9 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(9)] expected=1 got=" + to_string(p9))
+    }
+    let p10 = count_by_phase_kind(10)
+    if p10 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(10)] expected=1 got=" + to_string(p10))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. dalvik_step_count = 4 (290005, 290006, 290009, 290010 — layer=2)
+    let dc = dalvik_step_count()
+    if dc != 4 {
+        panic("pe_lineage_m_purple_track FAIL [dalvik_step_count] expected=4 got=" + to_string(dc))
+    }
+
+    // 6. violet_ac_count = 1 (phase_kind=7, 290007)
+    let vc = violet_ac_count()
+    if vc != 1 {
+        panic("pe_lineage_m_purple_track FAIL [violet_ac_count] expected=1 got=" + to_string(vc))
+    }
+
+    // 7. count_by_layer sanity — layer 0=4, 1=2, 2=4
+    let l0 = count_by_layer(0)
+    if l0 != 4 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_layer(0)] expected=4 got=" + to_string(l0))
+    }
+    let l1 = count_by_layer(1)
+    if l1 != 2 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_layer(1)] expected=2 got=" + to_string(l1))
+    }
+    let l2 = count_by_layer(2)
+    if l2 != 4 {
+        panic("pe_lineage_m_purple_track FAIL [count_by_layer(2)] expected=4 got=" + to_string(l2))
+    }
+
+    // 8. step_layer sanity
+    let sl1 = step_layer(290001)
+    if sl1 != 0 {
+        panic("pe_lineage_m_purple_track FAIL [step_layer(290001)] expected=0 got=" + to_string(sl1))
+    }
+    let sl3 = step_layer(290003)
+    if sl3 != 1 {
+        panic("pe_lineage_m_purple_track FAIL [step_layer(290003)] expected=1 got=" + to_string(sl3))
+    }
+    let sl5 = step_layer(290005)
+    if sl5 != 2 {
+        panic("pe_lineage_m_purple_track FAIL [step_layer(290005)] expected=2 got=" + to_string(sl5))
+    }
+    let sl_miss = step_layer(9999)
+    if sl_miss != -1 {
+        panic("pe_lineage_m_purple_track FAIL [step_layer(9999)] expected=-1 got=" + to_string(sl_miss))
+    }
+
+    // 9. plmpt_stats() = [10, 4, 1, 4, 1]
+    let s = plmpt_stats()
+    if len(s) != 5 {
+        panic("pe_lineage_m_purple_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 10 {
+        panic("pe_lineage_m_purple_track FAIL [stats step_count] expected=10 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_lineage_m_purple_track FAIL [stats dalvik_step_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_lineage_m_purple_track FAIL [stats violet_ac_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_lineage_m_purple_track FAIL [stats native_layer_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_lineage_m_purple_track FAIL [stats count_phase(10)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_lineage_m_purple_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"dalvik_step_count\":" + to_string(s[1])
+        + ",\"violet_ac_count\":" + to_string(s[2])
+        + ",\"native_layer_count\":" + to_string(s[3])
+        + ",\"count_world_load\":" + to_string(s[4]))
+
+    // 11. emit count >= 11 (10 records + 1 stats = 11)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 11 {
+        panic("pe_lineage_m_purple_track FAIL [r0 emit count] expected=>=11 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → step_count 0, stats 모두 0 (단 step_layer 는 -1 반환이므로 stats 에 미포함)
+    cleanup_plmpt()
+    let s2 = plmpt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_lineage_m_purple_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_lineage_m_purple_track self_test PASS (steps=" + to_string(s[0])
+        + ", dalvik=" + to_string(s[1]) + ", violet_ac=" + to_string(s[2])
+        + ", native_layer=" + to_string(s[3]) + ", world_load=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = plmpt_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("dalvik_step_count\t" + to_string(s[1]))
+            println("violet_ac_count\t" + to_string(s[2]))
+            println("native_layer_count\t" + to_string(s[3]))
+            println("count_world_load\t" + to_string(s[4]))
+            return
+        }
+        if sub == "layer" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_layer\t" + to_string(step_layer(sid)))
+                return
+            }
+            println("usage: hexa run pe_lineage_m_purple_track.hexa layer <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_lineage_m_purple_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "count_layer" {
+            if len(a) >= 4 {
+                let lyr = to_int(a[3])
+                println("count_by_layer\t" + to_string(count_by_layer(lyr)))
+                return
+            }
+            println("usage: hexa run pe_lineage_m_purple_track.hexa count_layer <layer>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_plmpt()
+            println("cleaned: " + plmpt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(plmpt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_lineage_m_purple_track.hexa { self-test | stats | layer <step_id> | count <phase_kind> | count_layer <layer> | cleanup | dir }")
+}

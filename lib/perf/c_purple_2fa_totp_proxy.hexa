@@ -1,0 +1,168 @@
+// lib/perf/c_purple_2fa_totp_proxy.hexa — CN-151 skeleton manjeom 15/15
+//
+// NC 인증기 TOTP RFC 6238 (HMAC-SHA1 기반 6자리 OTP) 추적 — PLAYNC OAuth
+// 2단계 인증 시 NC 인증기 (mobile app) 가 30초 window TOTP 코드를 생성하고
+// PURPLE 가 user 입력 OTP 를 검증할 때 HMAC 시간 / window index / code 길이를
+// 4-key columnar log 로 모아 기록한다. 본 모듈은 latency profile 정량화만
+// 담당 — 실제 HMAC 계산 / OTP 비교는 host (NC 인증기 / PURPLE OAuth) 책임.
+//
+// 무기: device × hmac_sha1_us × window_idx × code_len 4-key log + sum/avg.
+// 효과: TOTP latency profile 정량화 → generic 2FA 모듈 (Battle.net
+// Authenticator / Steam Mobile / Google Authenticator) 흡수 후보.
+
+use "./r0_common"
+
+let P2TP_DIR = GAMEBOX_HOME + "/persist/purple_2fa_totp_proxy"
+let TOTP_LOG = P2TP_DIR + "/totp.tsv"
+
+fn p2tp_dir() -> str { return P2TP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + P2TP_DIR + "'")
+}
+
+// ─── TOTP 항목 등록 ───
+//   device_id (NC 인증기 logical name 의 hash),
+//   hmac_us (HMAC-SHA1 1회 계산 소요 마이크로초),
+//   window_idx (RFC 6238 30s window 인덱스 = unix_time / 30),
+//   code_len (생성 OTP 자릿수 — RFC 6238 표준은 6).
+fn record_totp(device_id: int, hmac_us: int, window_idx: int, code_len: int) -> void {
+    ensure_dir()
+    let line = to_string(device_id) + "\t" + to_string(hmac_us) + "\t" + to_string(window_idx) + "\t" + to_string(code_len)
+    let tmp = TOTP_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + TOTP_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("p2tp_record", "\"device\":" + to_string(device_id) + ",\"hmac_us\":" + to_string(hmac_us) + ",\"window\":" + to_string(window_idx) + ",\"code_len\":" + to_string(code_len))
+}
+
+// ─── totp_count — 등록된 TOTP 행 수 ───
+fn totp_count() -> int {
+    let exists = exec("test -f '" + TOTP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + TOTP_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_hmac_us — 모든 hmac_us 합 ───
+fn total_hmac_us() -> int {
+    let exists = exec("test -f '" + TOTP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + TOTP_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_hmac_us — total / count (int trunc, 0-guard) ───
+fn avg_hmac_us() -> int {
+    let c = totp_count()
+    if c == 0 { return 0 }
+    return total_hmac_us() / c
+}
+
+// ─── device_hmac_us — 해당 device_id 의 마지막 항목 hmac_us (없으면 0) ───
+fn device_hmac_us(device_id: int) -> int {
+    let exists = exec("test -f '" + TOTP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v d=" + to_string(device_id) + " '$1==d {v=$2} END{print v+0}' '" + TOTP_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── valid_code_len_count — code_len == 6 인 항목 수 (RFC 6238 표준) ───
+fn valid_code_len_count() -> int {
+    let exists = exec("test -f '" + TOTP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '$4==6 {c++} END{print c+0}' '" + TOTP_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── p2tp_stats — [totp_count, total_hmac_us, avg_hmac_us, valid_code_len_count] ───
+fn p2tp_stats() -> array {
+    return [totp_count(), total_hmac_us(), avg_hmac_us(), valid_code_len_count()]
+}
+
+fn cleanup_p2tp() -> void {
+    let _ = exec("rm -rf '" + P2TP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "p2tp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_p2tp()
+
+    // 합성 TOTP 3 종 (3 devices):
+    //   device_id=5001 (NC 인증기 mobile)   — hmac_us=850, window=58000000, code_len=6
+    //   device_id=5002 (TOTP backup tablet) — hmac_us=920, window=58000000, code_len=6
+    //   device_id=5003 (legacy 8자리 cmprt) — hmac_us=780, window=58000001, code_len=8
+    record_totp(5001, 850, 58000000, 6)
+    record_totp(5002, 920, 58000000, 6)
+    record_totp(5003, 780, 58000001, 8)
+
+    // totp_count = 3
+    let tc = totp_count()
+    if tc != 3 { panic("c_purple_2fa_totp_proxy FAIL [totp_count] expected=3 got=" + to_string(tc)) }
+
+    // total_hmac_us = 850+920+780 = 2550
+    let th = total_hmac_us()
+    if th != 2550 { panic("c_purple_2fa_totp_proxy FAIL [total_hmac_us] expected=2550 got=" + to_string(th)) }
+
+    // avg_hmac_us = 2550 / 3 = 850 (int trunc)
+    let av = avg_hmac_us()
+    if av != 850 { panic("c_purple_2fa_totp_proxy FAIL [avg_hmac_us] expected=850 got=" + to_string(av)) }
+
+    // device_hmac_us — 마지막 항목의 hmac_us (없으면 0)
+    let d1 = device_hmac_us(5001)
+    if d1 != 850 { panic("c_purple_2fa_totp_proxy FAIL [device 5001] expected=850 got=" + to_string(d1)) }
+    let d2 = device_hmac_us(5002)
+    if d2 != 920 { panic("c_purple_2fa_totp_proxy FAIL [device 5002] expected=920 got=" + to_string(d2)) }
+    let d3 = device_hmac_us(5003)
+    if d3 != 780 { panic("c_purple_2fa_totp_proxy FAIL [device 5003] expected=780 got=" + to_string(d3)) }
+    let d4 = device_hmac_us(9999)
+    if d4 != 0 { panic("c_purple_2fa_totp_proxy FAIL [device unknown] expected=0 got=" + to_string(d4)) }
+
+    // valid_code_len_count = 2 (5001+5002 = code_len 6, 5003 = 8 비표준)
+    let vc = valid_code_len_count()
+    if vc != 2 { panic("c_purple_2fa_totp_proxy FAIL [valid_code_len] expected=2 got=" + to_string(vc)) }
+
+    let stats = p2tp_stats()
+    if stats[0] != 3 { panic("c_purple_2fa_totp_proxy FAIL [stats count] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 2550 { panic("c_purple_2fa_totp_proxy FAIL [stats total_us] expected=2550 got=" + to_string(stats[1])) }
+    if stats[2] != 850 { panic("c_purple_2fa_totp_proxy FAIL [stats avg_us] expected=850 got=" + to_string(stats[2])) }
+    if stats[3] != 2 { panic("c_purple_2fa_totp_proxy FAIL [stats valid] expected=2 got=" + to_string(stats[3])) }
+
+    r0_emit("p2tp_summary", "\"count\":" + to_string(stats[0]) + ",\"total_us\":" + to_string(stats[1]) + ",\"avg_us\":" + to_string(stats[2]) + ",\"valid6\":" + to_string(stats[3]))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_purple_2fa_totp_proxy FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    cleanup_p2tp()
+
+    println("  ✅ c_purple_2fa_totp_proxy self_test PASS (3 devices, total_us=2550, avg_us=850, valid6=2, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = p2tp_stats()
+            println("count=" + to_string(s[0]) + " total_us=" + to_string(s[1]) + " avg_us=" + to_string(s[2]) + " valid6=" + to_string(s[3]))
+            return
+        }
+        if sub == "hmac" {
+            if len(a) >= 4 {
+                let did = to_int(a[3])
+                let us = device_hmac_us(did)
+                println(to_string(us))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_p2tp(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_purple_2fa_totp_proxy.hexa { self-test | stats | hmac <device_id> | cleanup }")
+}

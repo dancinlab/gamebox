@@ -1,0 +1,464 @@
+// lib/loader/pe_d3d11_input_assembler_real.hexa — D3D11 Input Assembler → MTLVertexDescriptor routing tracker
+//
+// ID3D11DeviceContext::IASetVertexBuffers / IASetIndexBuffer / IASetInputLayout /
+// IASetPrimitiveTopology 호출의 Input Assembler stage 매핑 추적기.
+// 본 module 은 IA op record/aggregate 만 — 실 ID3D11DeviceContext IA 호출 /
+// MTLRenderCommandEncoder setVertexBuffer:offset:atIndex: 호출은 stage2 native
+// helper(D3DMetal binary 위임) 에서 처리.
+//
+// D3D11 IA → Metal: IASetVertexBuffers → setVertexBuffer:offset:atIndex:,
+// primitive topology → MTLPrimitiveType.
+//   IASetVertexBuffers          → MTLRenderCommandEncoder setVertexBuffer:offset:atIndex:
+//   IASetIndexBuffer            → drawIndexedPrimitives indexBuffer:indexBufferOffset:
+//   IASetInputLayout            → MTLVertexDescriptor (layouts/attributes)
+//   IASetPrimitiveTopology      → MTLPrimitiveType
+//   CreateInputLayout           → MTLVertexDescriptor 객체 생성 (pipeline state 시점)
+//   D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST   → MTLPrimitiveTypeTriangle
+//   D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP  → MTLPrimitiveTypeTriangleStrip
+//   D3D_PRIMITIVE_TOPOLOGY_LINELIST       → MTLPrimitiveTypeLine
+//   D3D_PRIMITIVE_TOPOLOGY_LINESTRIP      → MTLPrimitiveTypeLineStrip
+//   D3D_PRIMITIVE_TOPOLOGY_POINTLIST      → MTLPrimitiveTypePoint
+//   D3D_PRIMITIVE_TOPOLOGY_*_PATCHLIST    → tessellation (Metal patch control)
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11DeviceContext.
+// MoltenVK/DXVK 인용 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = set_vertex_buffers      (IASetVertexBuffers)
+//   2 = set_index_buffer        (IASetIndexBuffer)
+//   3 = set_input_layout        (IASetInputLayout)
+//   4 = set_primitive_topology  (IASetPrimitiveTopology)
+//   5 = create_input_layout     (CreateInputLayout)
+//
+// topology code (D3D_PRIMITIVE_TOPOLOGY → MTLPrimitiveType):
+//   1 = triangle_list   (D3D TRIANGLELIST   → MTL Triangle)
+//   2 = triangle_strip  (D3D TRIANGLESTRIP  → MTL TriangleStrip)
+//   3 = line_list       (D3D LINELIST       → MTL Line)
+//   4 = line_strip      (D3D LINESTRIP      → MTL LineStrip)
+//   5 = point_list      (D3D POINTLIST      → MTL Point)
+//   6 = patch           (D3D *_PATCHLIST    → tessellation)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t slot_count<int> \t topology<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdia_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_input_assembler_real"
+}
+
+fn pdia_ops_path() -> str {
+    return pdia_dir() + "/ops.tsv"
+}
+
+fn pdia_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdia_dir() + "'")
+}
+
+fn cleanup_pdia() -> void {
+    pdia_ensure_dir()
+    let _ = exec("rm -f '" + pdia_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdia_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdia_append_row(path: str, row: str) -> void {
+    pdia_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: IA op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, slot_count: int, topology: int) -> void {
+    if op_id <= 0 {
+        panic("pe_d3d11_input_assembler_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 5 {
+        panic("pe_d3d11_input_assembler_real FAIL [record_op] expected=op_kind<=5 got=" + to_string(op_kind))
+    }
+    if slot_count < 0 {
+        panic("pe_d3d11_input_assembler_real FAIL [record_op] expected=slot_count>=0 got=" + to_string(slot_count))
+    }
+    if topology < 0 {
+        panic("pe_d3d11_input_assembler_real FAIL [record_op] expected=topology>=0 got=" + to_string(topology))
+    }
+    if topology > 6 {
+        panic("pe_d3d11_input_assembler_real FAIL [record_op] expected=topology<=6 got=" + to_string(topology))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(slot_count) + "\t" + to_string(topology) + "\n"
+    pdia_append_row(pdia_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pdia_read_table(pdia_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(op_kind: int) -> int {
+    let t = pdia_read_table(pdia_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == op_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_slot_count: 모든 op 의 slot_count 합 ───
+fn total_slot_count() -> int {
+    let t = pdia_read_table(pdia_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_topology: 특정 topology 의 op 수 ───
+fn count_by_topology(topology: int) -> int {
+    let t = pdia_read_table(pdia_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == topology {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── triangle_count: triangle_list + triangle_strip op 수 ───
+fn triangle_count() -> int {
+    return count_by_topology(1) + count_by_topology(2)
+}
+
+// ─── op_slot_count: 특정 op_id 의 slot_count (없으면 0) ───
+fn op_slot_count(op_id: int) -> int {
+    let t = pdia_read_table(pdia_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdia_stats: [op_count, total_slot_count, count_by_op_kind(1), triangle_count] ───
+fn pdia_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_slot_count())
+    out.push(count_by_op_kind(1))
+    out.push(triangle_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdia-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdia()
+
+    // 2. record 6 ops — ≥4 op_kinds, ≥3 topologies
+    //    op1: set_vertex_buffers (kind=1, slots=2, topology=0 n/a)
+    record_op(420001, 1, 2, 0)
+    r0_emit("pe_d3d11_input_assembler_real_record",
+        "\"op_id\":420001,\"op_kind\":1,\"slot_count\":2,\"topology\":0,\"target\":\"setVertexBuffer:offset:atIndex:\"")
+
+    //    op2: set_index_buffer (kind=2, slots=1, topology=0 n/a)
+    record_op(420002, 2, 1, 0)
+    r0_emit("pe_d3d11_input_assembler_real_record",
+        "\"op_id\":420002,\"op_kind\":2,\"slot_count\":1,\"topology\":0,\"target\":\"drawIndexedPrimitives\"")
+
+    //    op3: set_input_layout (kind=3, slots=4, topology=0 n/a)
+    record_op(420003, 3, 4, 0)
+    r0_emit("pe_d3d11_input_assembler_real_record",
+        "\"op_id\":420003,\"op_kind\":3,\"slot_count\":4,\"topology\":0,\"target\":\"MTLVertexDescriptor\"")
+
+    //    op4: set_primitive_topology triangle_list (kind=4, slots=0, topology=1)
+    record_op(420004, 4, 0, 1)
+    r0_emit("pe_d3d11_input_assembler_real_record",
+        "\"op_id\":420004,\"op_kind\":4,\"slot_count\":0,\"topology\":1,\"target\":\"MTLPrimitiveTypeTriangle\"")
+
+    //    op5: set_primitive_topology triangle_strip (kind=4, slots=0, topology=2)
+    record_op(420005, 4, 0, 2)
+    r0_emit("pe_d3d11_input_assembler_real_record",
+        "\"op_id\":420005,\"op_kind\":4,\"slot_count\":0,\"topology\":2,\"target\":\"MTLPrimitiveTypeTriangleStrip\"")
+
+    //    op6: set_primitive_topology line_list (kind=4, slots=0, topology=3)
+    record_op(420006, 4, 0, 3)
+    r0_emit("pe_d3d11_input_assembler_real_record",
+        "\"op_id\":420006,\"op_kind\":4,\"slot_count\":0,\"topology\":3,\"target\":\"MTLPrimitiveTypeLine\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_d3d11_input_assembler_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_slot_count = 2+1+4+0+0+0 = 7
+    let ts = total_slot_count()
+    if ts != 7 {
+        panic("pe_d3d11_input_assembler_real FAIL [total_slot_count] expected=7 got=" + to_string(ts))
+    }
+
+    // 5. count_by_op_kind sanity
+    //    kind=1 set_vertex_buffers → op1 = 1
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    //    kind=2 set_index_buffer → op2 = 1
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    //    kind=3 set_input_layout → op3 = 1
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    //    kind=4 set_primitive_topology → op4, op5, op6 = 3
+    let k4 = count_by_op_kind(4)
+    if k4 != 3 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_op_kind(4)] expected=3 got=" + to_string(k4))
+    }
+    //    kind=5 create_input_layout → none = 0
+    let k5 = count_by_op_kind(5)
+    if k5 != 0 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_op_kind(5)] expected=0 got=" + to_string(k5))
+    }
+
+    // 6. count_by_topology sanity
+    //    topology=1 triangle_list → op4 = 1
+    let t1 = count_by_topology(1)
+    if t1 != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_topology(1)] expected=1 got=" + to_string(t1))
+    }
+    //    topology=2 triangle_strip → op5 = 1
+    let t2 = count_by_topology(2)
+    if t2 != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_topology(2)] expected=1 got=" + to_string(t2))
+    }
+    //    topology=3 line_list → op6 = 1
+    let t3 = count_by_topology(3)
+    if t3 != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_topology(3)] expected=1 got=" + to_string(t3))
+    }
+    //    topology=5 point_list → none = 0
+    let t5 = count_by_topology(5)
+    if t5 != 0 {
+        panic("pe_d3d11_input_assembler_real FAIL [count_by_topology(5)] expected=0 got=" + to_string(t5))
+    }
+
+    // 7. triangle_count = topology(1) + topology(2) = 2
+    let tc = triangle_count()
+    if tc != 2 {
+        panic("pe_d3d11_input_assembler_real FAIL [triangle_count] expected=2 got=" + to_string(tc))
+    }
+
+    // 8. op_slot_count sanity
+    let s1 = op_slot_count(420001)
+    if s1 != 2 {
+        panic("pe_d3d11_input_assembler_real FAIL [op_slot_count(420001)] expected=2 got=" + to_string(s1))
+    }
+    let s3 = op_slot_count(420003)
+    if s3 != 4 {
+        panic("pe_d3d11_input_assembler_real FAIL [op_slot_count(420003)] expected=4 got=" + to_string(s3))
+    }
+    let s_miss = op_slot_count(99999)
+    if s_miss != 0 {
+        panic("pe_d3d11_input_assembler_real FAIL [op_slot_count(99999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 9. pdia_stats() = [6, 7, 1, 2]
+    let s = pdia_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_input_assembler_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d11_input_assembler_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 7 {
+        panic("pe_d3d11_input_assembler_real FAIL [stats total_slot_count] expected=7 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_d3d11_input_assembler_real FAIL [stats set_vertex_buffers] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d11_input_assembler_real FAIL [stats triangle_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d11_input_assembler_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_slot_count\":" + to_string(s[1])
+        + ",\"set_vertex_buffers\":" + to_string(s[2])
+        + ",\"triangle_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d11_input_assembler_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdia()
+    let s2 = pdia_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_input_assembler_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_input_assembler_real self_test PASS (ops=" + to_string(s[0])
+        + ", slots=" + to_string(s[1]) + ", set_vb=" + to_string(s[2])
+        + ", triangles=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdia_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_slot_count\t" + to_string(s[1]))
+            println("set_vertex_buffers\t" + to_string(s[2]))
+            println("triangle_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "slots" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_slot_count\t" + to_string(op_slot_count(oid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_input_assembler_real.hexa slots <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "kind" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+                if kind == "topology" {
+                    println("count_by_topology\t" + to_string(count_by_topology(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_input_assembler_real.hexa count { kind <op_kind> | topology <topology> }")
+                return
+            }
+            println("usage: hexa run pe_d3d11_input_assembler_real.hexa count { kind <op_kind> | topology <topology> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdia()
+            println("cleaned: " + pdia_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdia_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_input_assembler_real.hexa { self-test | stats | slots <op_id> | count kind <op_kind> | count topology <topology> | cleanup | dir }")
+}

@@ -1,0 +1,443 @@
+// lib/loader/pe_wininet_https.hexa — WININET.dll high-level HTTP/HTTPS surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine / CrossOver / Whisky / GPTK / community wrapper 의존 0. libcurl /
+//       OpenSSL / WinHTTP source 코드 인용 0. wininet.h reference shape 만 (HINTERNET handle /
+//       INTERNET_PORT / INTERNET_FLAG_*). 실 InternetOpen / 실 HttpSendRequest / 실 TLS 연결 = 미수행.
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+//       PARTIAL emit 명시 — production HTTPS smoke pending separate cycle, full coverage X.
+// online_expansion_lockin: L1 (EULA/ToS) + L2 (Warden long-horizon) + L3 (multi-year) +
+//                          L4 (D2R online single target) + L5 (Track J/K/L parallel) ALL OK
+//                          (사용자 lock-in 2026-05-03).
+//
+// Track K2 — WININET (wininet.dll) high-level HTTP/HTTPS surface coverage 12 fn (skeleton 만).
+// Battle.net Agent REST API + D2R 측 update channel 측 https endpoint 호출 surface tracker.
+// 본 모듈은 fn name + synthetic 200/401/500 response code round-trip row 만 emit.
+//
+// 대상 fn (12 fn): InternetOpen / InternetCloseHandle, InternetConnect / InternetOpenUrl,
+//                  HttpOpenRequest / HttpSendRequest / HttpQueryInfo,
+//                  InternetReadFile / InternetWriteFile,
+//                  InternetSetOption / InternetQueryOption, HttpAddRequestHeaders.
+//
+// synthetic Battle.net REST endpoint (URL 파싱 reference shape):
+//   scheme   "https"                          (5 byte)
+//   host     "us.api.battle.net"              (17 byte)
+//   port     443                              (synthetic INTERNET_DEFAULT_HTTPS_PORT)
+//   path     "/d2r/profile/v1/account"        (24 byte)
+//   query    "?region=us&locale=en_US"        (23 byte)
+//   total URL ≈ 70 byte
+//
+// synthetic HTTPS request line (skeleton 만):
+//   method   "GET"
+//   path     "/d2r/profile/v1/account?region=us&locale=en_US"
+//   ver      "HTTP/1.1"
+//   headers  ["User-Agent: Battle.net/2.0", "Authorization: Bearer <synthetic_jwt>",
+//             "Accept: application/json"]
+//   body     ""    (GET, no body)
+//
+// synthetic HTTPS response code path (3-state matrix):
+//   200 OK / 401 Unauthorized / 500 Internal Server Error
+//
+// fn_kind code (12 fn):
+//   0 = InternetOpen           4 = HttpOpenRequest      8 = InternetSetOption
+//   1 = InternetCloseHandle    5 = HttpSendRequest      9 = InternetQueryOption
+//   2 = InternetConnect        6 = HttpQueryInfo       10 = HttpAddRequestHeaders
+//   3 = InternetOpenUrl        7 = InternetReadFile    11 = InternetWriteFile
+//
+// persist schema (TSV — 4 separate tables):
+//   wininet_invoke.tsv:
+//     invoke_id<int> \t fn_kind<int> \t fn_name<str> \t status<str>
+//   handle_lifecycle.tsv:
+//     life_id<int> \t op<str> \t handle_hex<str> \t handle_kind<str>
+//   https_round_trip.tsv:
+//     rt_id<int> \t method<str> \t url<str> \t response_code<int> \t status<str>
+//   tls_option.tsv:
+//     opt_id<int> \t fn_kind<int> \t option_name<str> \t value_hex<str>
+//
+// 식별자 주의: type / mod / handle / class / interface / module / import 모두 hexa 예약어 — 사용 X.
+// (handle_hex 는 OK — handle 단독은 예약어이지만 handle_hex / handle_kind 는 식별자 일부이므로 사용 가능.)
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwinet_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wininet_https"
+}
+
+fn pwinet_invoke_path() -> str {
+    return pwinet_dir() + "/wininet_invoke.tsv"
+}
+
+fn pwinet_handle_lifecycle_path() -> str {
+    return pwinet_dir() + "/handle_lifecycle.tsv"
+}
+
+fn pwinet_https_round_trip_path() -> str {
+    return pwinet_dir() + "/https_round_trip.tsv"
+}
+
+fn pwinet_tls_option_path() -> str {
+    return pwinet_dir() + "/tls_option.tsv"
+}
+
+fn pwinet_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwinet_dir() + "'")
+}
+
+fn cleanup_pwinet() -> void {
+    pwinet_ensure_dir()
+    let _ = exec("rm -f '" + pwinet_invoke_path() + "' '" + pwinet_handle_lifecycle_path()
+        + "' '" + pwinet_https_round_trip_path() + "' '" + pwinet_tls_option_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwinet_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwinet_append_row(path: str, row: str) -> void {
+    pwinet_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwinet_count_rows(path: str, min_cols: int) -> int {
+    let t = pwinet_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (12 fn coverage) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "InternetOpen" }
+    if k == 1 { return "InternetCloseHandle" }
+    if k == 2 { return "InternetConnect" }
+    if k == 3 { return "InternetOpenUrl" }
+    if k == 4 { return "HttpOpenRequest" }
+    if k == 5 { return "HttpSendRequest" }
+    if k == 6 { return "HttpQueryInfo" }
+    if k == 7 { return "InternetReadFile" }
+    if k == 8 { return "InternetSetOption" }
+    if k == 9 { return "InternetQueryOption" }
+    if k == 10 { return "HttpAddRequestHeaders" }
+    if k == 11 { return "InternetWriteFile" }
+    return "unknown"
+}
+
+// ─── record_wininet_invoke: WININET fn invoke milestone (skeleton row) ───
+fn record_wininet_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_wininet_https FAIL [record_wininet_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_wininet_https FAIL [record_wininet_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 11 {
+        panic("pe_wininet_https FAIL [record_wininet_invoke] expected=fn_kind<=11 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_wininet_https FAIL [record_wininet_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_wininet_https FAIL [record_wininet_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pwinet_append_row(pwinet_invoke_path(), row)
+}
+
+// ─── record_handle_lifecycle: HINTERNET root/connect/request lifecycle row ───
+fn record_handle_lifecycle(life_id: int, op: str, handle_hex: str, handle_kind: str) -> void {
+    if life_id <= 0 {
+        panic("pe_wininet_https FAIL [record_handle_lifecycle] expected=life_id>0 got=" + to_string(life_id))
+    }
+    if op == "" {
+        panic("pe_wininet_https FAIL [record_handle_lifecycle] expected=op!=empty got=empty")
+    }
+    if handle_hex == "" {
+        panic("pe_wininet_https FAIL [record_handle_lifecycle] expected=handle_hex!=empty got=empty")
+    }
+    if handle_kind == "" {
+        panic("pe_wininet_https FAIL [record_handle_lifecycle] expected=handle_kind!=empty got=empty")
+    }
+    let row = to_string(life_id) + "\t" + op + "\t" + handle_hex + "\t" + handle_kind + "\n"
+    pwinet_append_row(pwinet_handle_lifecycle_path(), row)
+}
+
+// ─── record_https_round_trip: HTTPS request/response synthetic round-trip row ───
+fn record_https_round_trip(rt_id: int, method: str, url: str, response_code: int, status: str) -> void {
+    if rt_id <= 0 {
+        panic("pe_wininet_https FAIL [record_https_round_trip] expected=rt_id>0 got=" + to_string(rt_id))
+    }
+    if method == "" {
+        panic("pe_wininet_https FAIL [record_https_round_trip] expected=method!=empty got=empty")
+    }
+    if url == "" {
+        panic("pe_wininet_https FAIL [record_https_round_trip] expected=url!=empty got=empty")
+    }
+    if response_code < 0 {
+        panic("pe_wininet_https FAIL [record_https_round_trip] expected=response_code>=0 got=" + to_string(response_code))
+    }
+    if status == "" {
+        panic("pe_wininet_https FAIL [record_https_round_trip] expected=status!=empty got=empty")
+    }
+    let row = to_string(rt_id) + "\t" + method + "\t" + url + "\t"
+        + to_string(response_code) + "\t" + status + "\n"
+    pwinet_append_row(pwinet_https_round_trip_path(), row)
+}
+
+// ─── record_tls_option: InternetSetOption / InternetQueryOption synthetic row ───
+fn record_tls_option(opt_id: int, fn_kind: int, option_name: str, value_hex: str) -> void {
+    if opt_id <= 0 {
+        panic("pe_wininet_https FAIL [record_tls_option] expected=opt_id>0 got=" + to_string(opt_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_wininet_https FAIL [record_tls_option] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 11 {
+        panic("pe_wininet_https FAIL [record_tls_option] expected=fn_kind<=11 got=" + to_string(fn_kind))
+    }
+    if option_name == "" {
+        panic("pe_wininet_https FAIL [record_tls_option] expected=option_name!=empty got=empty")
+    }
+    if value_hex == "" {
+        panic("pe_wininet_https FAIL [record_tls_option] expected=value_hex!=empty got=empty")
+    }
+    let row = to_string(opt_id) + "\t" + to_string(fn_kind) + "\t"
+        + option_name + "\t" + value_hex + "\n"
+    pwinet_append_row(pwinet_tls_option_path(), row)
+}
+
+// ─── statistics ───
+fn wininet_invoke_count() -> int {
+    return pwinet_count_rows(pwinet_invoke_path(), 4)
+}
+
+fn handle_lifecycle_count() -> int {
+    return pwinet_count_rows(pwinet_handle_lifecycle_path(), 4)
+}
+
+fn https_round_trip_count() -> int {
+    return pwinet_count_rows(pwinet_https_round_trip_path(), 5)
+}
+
+fn tls_option_count() -> int {
+    return pwinet_count_rows(pwinet_tls_option_path(), 4)
+}
+
+fn pwinet_stats() -> array {
+    let mut out = []
+    out.push(wininet_invoke_count())
+    out.push(handle_lifecycle_count())
+    out.push(https_round_trip_count())
+    out.push(tls_option_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwinet-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwinet()
+
+    // ─── 1. wininet_invoke × 7 (7 representative WININET fn) ───
+    record_wininet_invoke(1, 0, "InternetOpen", "PARTIAL")
+    println("__WININET__ PARTIAL InternetOpen")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"InternetOpen\",\"status\":\"PARTIAL\",\"user_agent\":\"Battle.net/2.0\",\"access_kind\":\"INTERNET_OPEN_TYPE_PRECONFIG\"")
+    record_wininet_invoke(2, 2, "InternetConnect", "PARTIAL")
+    println("__WININET__ PARTIAL InternetConnect")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":2,\"fn_kind\":2,\"fn_name\":\"InternetConnect\",\"status\":\"PARTIAL\",\"host\":\"us.api.battle.net\",\"port\":443,\"service\":\"INTERNET_SERVICE_HTTP\"")
+    record_wininet_invoke(3, 4, "HttpOpenRequest", "PARTIAL")
+    println("__WININET__ PARTIAL HttpOpenRequest")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":3,\"fn_kind\":4,\"fn_name\":\"HttpOpenRequest\",\"status\":\"PARTIAL\",\"verb\":\"GET\",\"path\":\"/d2r/profile/v1/account\",\"flags_hex\":\"0x00800000\"")
+    record_wininet_invoke(4, 5, "HttpSendRequest", "PARTIAL")
+    println("__WININET__ PARTIAL HttpSendRequest")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":4,\"fn_kind\":5,\"fn_name\":\"HttpSendRequest\",\"status\":\"PARTIAL\",\"headers_count\":3,\"body_len\":0")
+    record_wininet_invoke(5, 6, "HttpQueryInfo", "PARTIAL")
+    println("__WININET__ PARTIAL HttpQueryInfo")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":5,\"fn_kind\":6,\"fn_name\":\"HttpQueryInfo\",\"status\":\"PARTIAL\",\"info_level\":\"HTTP_QUERY_STATUS_CODE\",\"buffer_len\":4")
+    record_wininet_invoke(6, 7, "InternetReadFile", "PARTIAL")
+    println("__WININET__ PARTIAL InternetReadFile")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":6,\"fn_kind\":7,\"fn_name\":\"InternetReadFile\",\"status\":\"PARTIAL\",\"bytes_synth\":2048,\"buffer_kind\":\"json_response\"")
+    record_wininet_invoke(7, 1, "InternetCloseHandle", "PARTIAL")
+    println("__WININET__ PARTIAL InternetCloseHandle")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"wininet_invoke\",\"invoke_id\":7,\"fn_kind\":1,\"fn_name\":\"InternetCloseHandle\",\"status\":\"PARTIAL\",\"handle_hex\":\"0x00040000\"")
+
+    // ─── 2. handle_lifecycle × 3 (root / connect / request HINTERNET) ───
+    record_handle_lifecycle(1, "open", "0x00040000", "root")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"handle_lifecycle\",\"life_id\":1,\"op\":\"open\",\"handle_hex\":\"0x00040000\",\"handle_kind\":\"root\",\"fn\":\"InternetOpen\"")
+    record_handle_lifecycle(2, "connect", "0x00040004", "connect")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"handle_lifecycle\",\"life_id\":2,\"op\":\"connect\",\"handle_hex\":\"0x00040004\",\"handle_kind\":\"connect\",\"parent_hex\":\"0x00040000\",\"host\":\"us.api.battle.net\"")
+    record_handle_lifecycle(3, "request", "0x00040008", "request")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"handle_lifecycle\",\"life_id\":3,\"op\":\"request\",\"handle_hex\":\"0x00040008\",\"handle_kind\":\"request\",\"parent_hex\":\"0x00040004\",\"verb\":\"GET\"")
+
+    // ─── 3. https_round_trip × 3 (200 OK / 401 Unauthorized / 500 ISE — synthetic 3-state) ───
+    record_https_round_trip(1, "GET", "https://us.api.battle.net/d2r/profile/v1/account?region=us&locale=en_US", 200, "PARTIAL")
+    println("__WININET__ PARTIAL HttpSendRequest 200")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"https_round_trip\",\"rt_id\":1,\"method\":\"GET\",\"url\":\"https://us.api.battle.net/d2r/profile/v1/account\",\"response_code\":200,\"status\":\"PARTIAL\",\"verdict\":\"OK\",\"body_bytes_synth\":2048")
+    record_https_round_trip(2, "GET", "https://us.api.battle.net/d2r/profile/v1/auth_required", 401, "PARTIAL")
+    println("__WININET__ PARTIAL HttpSendRequest 401")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"https_round_trip\",\"rt_id\":2,\"method\":\"GET\",\"url\":\"https://us.api.battle.net/d2r/profile/v1/auth_required\",\"response_code\":401,\"status\":\"PARTIAL\",\"verdict\":\"unauthorized\",\"www_authenticate\":\"Bearer\"")
+    record_https_round_trip(3, "POST", "https://us.api.battle.net/d2r/save/v1/upload", 500, "PARTIAL")
+    println("__WININET__ PARTIAL HttpSendRequest 500")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"https_round_trip\",\"rt_id\":3,\"method\":\"POST\",\"url\":\"https://us.api.battle.net/d2r/save/v1/upload\",\"response_code\":500,\"status\":\"PARTIAL\",\"verdict\":\"server_error\",\"retry_after\":30")
+
+    // ─── 4. tls_option × 3 (InternetSetOption + InternetQueryOption + HttpAddRequestHeaders) ───
+    record_tls_option(1, 8, "INTERNET_OPTION_SECURITY_FLAGS", "0x40000000")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"tls_option\",\"opt_id\":1,\"fn_kind\":8,\"fn_name\":\"InternetSetOption\",\"option_name\":\"INTERNET_OPTION_SECURITY_FLAGS\",\"value_hex\":\"0x40000000\",\"meaning\":\"SECURITY_FLAG_IGNORE_CERT_CN_INVALID\"")
+    record_tls_option(2, 9, "INTERNET_OPTION_CONNECT_TIMEOUT", "0x0000EA60")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"tls_option\",\"opt_id\":2,\"fn_kind\":9,\"fn_name\":\"InternetQueryOption\",\"option_name\":\"INTERNET_OPTION_CONNECT_TIMEOUT\",\"value_hex\":\"0x0000EA60\",\"meaning\":\"60000_ms\"")
+    record_tls_option(3, 10, "Authorization-Bearer", "0x42455652")
+    r0_emit("pe_wininet_https_record", "\"kind\":\"tls_option\",\"opt_id\":3,\"fn_kind\":10,\"fn_name\":\"HttpAddRequestHeaders\",\"option_name\":\"Authorization-Bearer\",\"value_hex\":\"0x42455652\",\"meaning\":\"synthetic_jwt_first_4_bytes\"")
+
+    // ─── assertions: count ───
+    let wi = wininet_invoke_count()
+    if wi != 7 {
+        panic("pe_wininet_https FAIL [wininet_invoke_count] expected=7 got=" + to_string(wi))
+    }
+    let hl = handle_lifecycle_count()
+    if hl != 3 {
+        panic("pe_wininet_https FAIL [handle_lifecycle_count] expected=3 got=" + to_string(hl))
+    }
+    let hr = https_round_trip_count()
+    if hr != 3 {
+        panic("pe_wininet_https FAIL [https_round_trip_count] expected=3 got=" + to_string(hr))
+    }
+    let to = tls_option_count()
+    if to != 3 {
+        panic("pe_wininet_https FAIL [tls_option_count] expected=3 got=" + to_string(to))
+    }
+
+    // ─── helper name sanity ───
+    if fn_kind_name(0) != "InternetOpen" {
+        panic("pe_wininet_https FAIL [fn_kind_name(0)]")
+    }
+    if fn_kind_name(5) != "HttpSendRequest" {
+        panic("pe_wininet_https FAIL [fn_kind_name(5)]")
+    }
+    if fn_kind_name(8) != "InternetSetOption" {
+        panic("pe_wininet_https FAIL [fn_kind_name(8)]")
+    }
+    if fn_kind_name(11) != "InternetWriteFile" {
+        panic("pe_wininet_https FAIL [fn_kind_name(11)]")
+    }
+    if fn_kind_name(99) != "unknown" {
+        panic("pe_wininet_https FAIL [fn_kind_name(99)]")
+    }
+
+    // ─── stats sanity ───
+    let s = pwinet_stats()
+    if len(s) != 4 {
+        panic("pe_wininet_https FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 7 {
+        panic("pe_wininet_https FAIL [stats wininet_invoke_count] expected=7 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_wininet_https FAIL [stats handle_lifecycle_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_wininet_https FAIL [stats https_round_trip_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_wininet_https FAIL [stats tls_option_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_wininet_https_stats",
+        "\"wininet_invoke_count\":" + to_string(s[0])
+        + ",\"handle_lifecycle_count\":" + to_string(s[1])
+        + ",\"https_round_trip_count\":" + to_string(s[2])
+        + ",\"tls_option_count\":" + to_string(s[3]))
+
+    r0_emit("pe_wininet_https_summary",
+        "\"target\":\"WININET.dll\",\"fn_total\":12,\"fn_emit_partial\":7,\"endpoint_synth\":\"https://us.api.battle.net/d2r/profile/v1/account\",\"port\":443,\"http_ver\":\"HTTP/1.1\",\"shim_kind\":\"skeleton\",\"network\":\"none\",\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_wininet_https_kpi",
+        "\"response_codes_covered\":3,\"response_codes_list\":[200,401,500],\"tls_option_emits\":3,\"handle_lifecycle_emits\":3,\"network_real\":false,\"warden_compat_long_horizon\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_wininet_https_round_trip_matrix",
+        "\"surface\":\"WININET_full_12_fn\",\"fn_partial\":7,\"fn_skeleton_only\":5,\"shim_kind\":\"skeleton\",\"network\":\"none\",\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real HttpSendRequest + TLS handshake + cert validation pending separate cycle\",\"battlenet_rest_endpoint_real\":\"never_called\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_wininet_https FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwinet()
+    let s2 = pwinet_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wininet_https FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wininet_https self_test PASS (wininet_invoke="
+        + to_string(s[0]) + ", handle_lifecycle=" + to_string(s[1])
+        + ", https_round_trip=" + to_string(s[2]) + ", tls_option=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwinet_stats()
+            println("wininet_invoke_count\t" + to_string(s[0]))
+            println("handle_lifecycle_count\t" + to_string(s[1]))
+            println("https_round_trip_count\t" + to_string(s[2]))
+            println("tls_option_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_wininet_https.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwinet()
+            println("cleaned: " + pwinet_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwinet_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wininet_https.hexa { self-test | stats | fn-kind-name <int> | cleanup | dir }")
+}

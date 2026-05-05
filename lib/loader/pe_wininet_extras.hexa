@@ -1,0 +1,492 @@
+// lib/loader/pe_wininet_extras.hexa — WININET.dll advanced surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine wininet source 인용 0.
+//       wininet.dll 직접 binding 0. macOS NSHTTPCookieStorage / NSHTTPCookie /
+//       NSURLCache / NSURLCredentialStorage / CFFTPStream / NSURLConnection 직접 binding 0.
+//       NOTE: WININET extras 측 Battle.net Agent cookie persistence + cache mgmt +
+//       FTP fallback + auth advanced; InternetSetCookieExW/GetUrlCacheEntryInfoW/
+//       FtpOpenFileW/InternetSetOptionExW 측 cookie/cache/ftp/auth round-trip baseline
+//       (long-horizon production smoke pending separate cycle).
+//       DISTINCT from Track K2 pe_wininet_https.hexa basic (HTTP/HTTPS request flow).
+//       This module covers ADVANCED extras (cookie/cache/ftp/auth).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BH3 — WININET cookie/cache/ftp/auth advanced surface 13 fn skeleton-tier.
+// cycle 53 325/435 (~74.71%) → cycle 54 ~338/435 (~77.70%) (+13 fn, BH bundled part 3/4).
+//
+// 대상 fn (13 fn — 4 group, fn_kind 0..12):
+//   COOKIE (4): InternetSetCookieW(0) / InternetGetCookieW(1) /
+//               InternetSetCookieExW(2) / InternetGetCookieExW(3)
+//   CACHE  (3): GetUrlCacheEntryInfoW(4) / DeleteUrlCacheEntryW(5) /
+//               FindFirstUrlCacheEntryW(6)
+//   FTP    (3): FtpOpenFileW(7) / FtpGetFileSize(8) / FtpFindFirstFileW(9)
+//   AUTH   (3): InternetSetOptionExW(10) / InternetSetStatusCallback(11) /
+//               InternetAttemptConnect(12)
+//
+// synthetic struct families:
+//   URL_COMPONENTSW 60B nScheme INTERNET_SCHEME_HTTPS_2 + lpszHostName "us.battle.net" +
+//     nPort 443 + lpszUrlPath "/oauth/token".
+//   INTERNET_COOKIE_HISTORY 4B*4 fAccepted/fLeashed/fDowngraded/fRejected.
+//   INTERNET_CACHE_ENTRY_INFOW 80B+ dwStructSize 80 + lpszSourceUrlName +
+//     lpszLocalFileName + CacheEntryType 0x40_NORMAL_CACHE_ENTRY + dwUseCount + dwHitRate +
+//     dwSizeLow / dwSizeHigh + LastModifiedTime FILETIME 8B + ExpireTime 8B + LastAccessTime 8B +
+//     LastSyncTime 8B + lpHeaderInfo + dwHeaderInfoSize + lpszFileExtension + dwExemptDelta.
+//   WIN32_FIND_DATAW 592B FTP listing dwFileAttributes + ftCreationTime/LastAccessTime/LastWriteTime +
+//     nFileSizeHigh/Low + dwReserved0/1 + cFileName 260*WCHAR + cAlternateFileName 14*WCHAR.
+//   INTERNET_BUFFERSW 56B dwStructSize + Next + lpcszHeader + dwHeadersLength + dwHeadersTotal +
+//     lpvBuffer + dwBufferLength + dwBufferTotal + dwOffsetLow + dwOffsetHigh.
+//
+// persist schema (TSV — 5 table):
+//   syscall_invoke / cookie_event / cache_event / ftp_event / auth_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwx_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wininet_extras"
+}
+
+fn pwx_syscall_invoke_path() -> str {
+    return pwx_dir() + "/syscall_invoke.tsv"
+}
+
+fn pwx_cookie_event_path() -> str {
+    return pwx_dir() + "/cookie_event.tsv"
+}
+
+fn pwx_cache_event_path() -> str {
+    return pwx_dir() + "/cache_event.tsv"
+}
+
+fn pwx_ftp_event_path() -> str {
+    return pwx_dir() + "/ftp_event.tsv"
+}
+
+fn pwx_auth_event_path() -> str {
+    return pwx_dir() + "/auth_event.tsv"
+}
+
+fn pwx_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwx_dir() + "'")
+}
+
+fn cleanup_pwx() -> void {
+    pwx_ensure_dir()
+    let _ = exec("rm -f '" + pwx_syscall_invoke_path() + "' '" + pwx_cookie_event_path()
+        + "' '" + pwx_cache_event_path() + "' '" + pwx_ftp_event_path()
+        + "' '" + pwx_auth_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwx_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwx_append_row(path: str, row: str) -> void {
+    pwx_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwx_count_rows(path: str, min_cols: int) -> int {
+    let t = pwx_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (13 fn coverage, fn_kind 0..12) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "InternetSetCookieW" }
+    if k == 1 { return "InternetGetCookieW" }
+    if k == 2 { return "InternetSetCookieExW" }
+    if k == 3 { return "InternetGetCookieExW" }
+    if k == 4 { return "GetUrlCacheEntryInfoW" }
+    if k == 5 { return "DeleteUrlCacheEntryW" }
+    if k == 6 { return "FindFirstUrlCacheEntryW" }
+    if k == 7 { return "FtpOpenFileW" }
+    if k == 8 { return "FtpGetFileSize" }
+    if k == 9 { return "FtpFindFirstFileW" }
+    if k == 10 { return "InternetSetOptionExW" }
+    if k == 11 { return "InternetSetStatusCallback" }
+    if k == 12 { return "InternetAttemptConnect" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (4 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "cookie"
+        }
+    }
+    if k >= 4 {
+        if k <= 6 {
+            return "cache"
+        }
+    }
+    if k >= 7 {
+        if k <= 9 {
+            return "ftp"
+        }
+    }
+    if k >= 10 {
+        if k <= 12 {
+            return "auth"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: WININET extras fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_wininet_extras FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_wininet_extras FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 12 {
+        panic("pe_wininet_extras FAIL [record_syscall_invoke] expected=fn_kind<=12 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_wininet_extras FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_wininet_extras FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pwx_append_row(pwx_syscall_invoke_path(), row)
+}
+
+// ─── record_cookie_event: SetCookie/GetCookie/SetCookieEx/GetCookieEx row ───
+fn record_cookie_event(evt_id: int, c_kind: str, url: str, cookie_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wininet_extras FAIL [record_cookie_event] evt_id<=0") }
+    if c_kind == "" { panic("pe_wininet_extras FAIL [record_cookie_event] c_kind=empty") }
+    if url == "" { panic("pe_wininet_extras FAIL [record_cookie_event] url=empty") }
+    if cookie_synth == "" { panic("pe_wininet_extras FAIL [record_cookie_event] cookie_synth=empty") }
+    if status == "" { panic("pe_wininet_extras FAIL [record_cookie_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + c_kind + "\t" + url + "\t" + cookie_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_cookie_event_path(), row)
+}
+
+// ─── record_cache_event: GetCacheEntryInfo/DeleteCacheEntry/FindFirstCacheEntry row ───
+fn record_cache_event(evt_id: int, c_kind: str, url: str, entry_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wininet_extras FAIL [record_cache_event] evt_id<=0") }
+    if c_kind == "" { panic("pe_wininet_extras FAIL [record_cache_event] c_kind=empty") }
+    if url == "" { panic("pe_wininet_extras FAIL [record_cache_event] url=empty") }
+    if entry_synth == "" { panic("pe_wininet_extras FAIL [record_cache_event] entry_synth=empty") }
+    if status == "" { panic("pe_wininet_extras FAIL [record_cache_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + c_kind + "\t" + url + "\t" + entry_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_cache_event_path(), row)
+}
+
+// ─── record_ftp_event: FtpOpenFile/FtpGetFileSize/FtpFindFirstFile row ───
+fn record_ftp_event(evt_id: int, f_kind: str, ftp_path: str, ftp_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wininet_extras FAIL [record_ftp_event] evt_id<=0") }
+    if f_kind == "" { panic("pe_wininet_extras FAIL [record_ftp_event] f_kind=empty") }
+    if ftp_path == "" { panic("pe_wininet_extras FAIL [record_ftp_event] ftp_path=empty") }
+    if ftp_synth == "" { panic("pe_wininet_extras FAIL [record_ftp_event] ftp_synth=empty") }
+    if status == "" { panic("pe_wininet_extras FAIL [record_ftp_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + f_kind + "\t" + ftp_path + "\t" + ftp_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_ftp_event_path(), row)
+}
+
+// ─── record_auth_event: SetOptionEx/SetStatusCallback/AttemptConnect row ───
+fn record_auth_event(evt_id: int, a_kind: str, opt_id: str, value_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wininet_extras FAIL [record_auth_event] evt_id<=0") }
+    if a_kind == "" { panic("pe_wininet_extras FAIL [record_auth_event] a_kind=empty") }
+    if opt_id == "" { panic("pe_wininet_extras FAIL [record_auth_event] opt_id=empty") }
+    if value_synth == "" { panic("pe_wininet_extras FAIL [record_auth_event] value_synth=empty") }
+    if status == "" { panic("pe_wininet_extras FAIL [record_auth_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + a_kind + "\t" + opt_id + "\t" + value_synth + "\t" + status + "\n"
+    pwx_append_row(pwx_auth_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pwx_count_rows(pwx_syscall_invoke_path(), 4)
+}
+
+fn cookie_event_count() -> int {
+    return pwx_count_rows(pwx_cookie_event_path(), 5)
+}
+
+fn cache_event_count() -> int {
+    return pwx_count_rows(pwx_cache_event_path(), 5)
+}
+
+fn ftp_event_count() -> int {
+    return pwx_count_rows(pwx_ftp_event_path(), 5)
+}
+
+fn auth_event_count() -> int {
+    return pwx_count_rows(pwx_auth_event_path(), 5)
+}
+
+fn pwx_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(cookie_event_count())
+    out.push(cache_event_count())
+    out.push(ftp_event_count())
+    out.push(auth_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwx-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwx()
+
+    // ─── 1. syscall_invoke × 13 (one per fn, 4 group coverage) ───
+    //   COOKIE group (4)
+    record_syscall_invoke(1, 0, "InternetSetCookieW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetSetCookieW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"InternetSetCookieW\",\"fn_group\":\"cookie\",\"status\":\"PARTIAL\",\"lpszUrl\":\"https://us.battle.net/oauth/token\",\"lpszCookieData\":\"BNES_AUTH_TOKEN_synth_session_24h\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(2, 1, "InternetGetCookieW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetGetCookieW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"InternetGetCookieW\",\"fn_group\":\"cookie\",\"status\":\"PARTIAL\",\"lpszUrl\":\"https://us.battle.net/oauth/token\",\"out_lpszCookieData\":\"BNES_AUTH_TOKEN_synth_session_24h\",\"out_pdwSize\":64,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(3, 2, "InternetSetCookieExW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetSetCookieExW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"InternetSetCookieExW\",\"fn_group\":\"cookie\",\"status\":\"PARTIAL\",\"lpszUrl\":\"https://us.battle.net/oauth/token\",\"lpszCookieName\":\"BNES_AUTH\",\"lpszCookieData\":\"token_synth_24h\",\"dwFlags\":\"INTERNET_COOKIE_HTTPONLY_0x2000_INTERNET_COOKIE_THIRD_PARTY_0x10\",\"return_dword\":\"COOKIE_STATE_ACCEPT_2\"")
+    record_syscall_invoke(4, 3, "InternetGetCookieExW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetGetCookieExW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"InternetGetCookieExW\",\"fn_group\":\"cookie\",\"status\":\"PARTIAL\",\"lpszUrl\":\"https://us.battle.net/oauth/token\",\"lpszCookieName\":\"BNES_AUTH\",\"out_lpszCookieData\":\"token_synth_24h\",\"out_pdwSize\":48,\"dwFlags\":\"INTERNET_COOKIE_HTTPONLY_0x2000\",\"return_bool\":\"TRUE_1\"")
+
+    //   CACHE group (3)
+    record_syscall_invoke(5, 4, "GetUrlCacheEntryInfoW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL GetUrlCacheEntryInfoW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"GetUrlCacheEntryInfoW\",\"fn_group\":\"cache\",\"status\":\"PARTIAL\",\"lpszUrlName\":\"https://us.battle.net/avatar.jpg\",\"out_lpCacheEntryInfo\":\"INTERNET_CACHE_ENTRY_INFOW_80B_NORMAL_CACHE_ENTRY_0x40\",\"out_lpcbCacheEntryInfo\":80,\"struct_bytes\":80,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(6, 5, "DeleteUrlCacheEntryW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL DeleteUrlCacheEntryW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"DeleteUrlCacheEntryW\",\"fn_group\":\"cache\",\"status\":\"PARTIAL\",\"lpszUrlName\":\"https://us.battle.net/avatar.jpg\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(7, 6, "FindFirstUrlCacheEntryW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL FindFirstUrlCacheEntryW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"FindFirstUrlCacheEntryW\",\"fn_group\":\"cache\",\"status\":\"PARTIAL\",\"lpszUrlSearchPattern\":\"https://*.battle.net/*\",\"out_lpFirstCacheEntryInfo\":\"INTERNET_CACHE_ENTRY_INFOW_80B_first\",\"out_lpdwFirstCacheEntryInfoBufferSize\":80,\"return_handle\":\"0xC0010100_HFINDCACHE\"")
+
+    //   FTP group (3)
+    record_syscall_invoke(8, 7, "FtpOpenFileW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL FtpOpenFileW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"FtpOpenFileW\",\"fn_group\":\"ftp\",\"status\":\"PARTIAL\",\"hConnect\":\"0xC0020100_HINTERNET\",\"lpszFileName\":\"/pub/d2r/patch_2.7.bin\",\"dwAccess\":\"GENERIC_READ_0x80000000\",\"dwFlags\":\"FTP_TRANSFER_TYPE_BINARY_0x2\",\"dwContext\":0,\"return_handle\":\"0xC0030100_HINTERNET_file\"")
+    record_syscall_invoke(9, 8, "FtpGetFileSize", "PARTIAL")
+    println("__WININET_EX__ PARTIAL FtpGetFileSize")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"FtpGetFileSize\",\"fn_group\":\"ftp\",\"status\":\"PARTIAL\",\"hFile\":\"0xC0030100_HINTERNET_file\",\"out_lpdwFileSizeHigh\":0,\"return_dword_low\":2147483648,\"file_size_synth\":\"2GB_d2r_patch\"")
+    record_syscall_invoke(10, 9, "FtpFindFirstFileW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL FtpFindFirstFileW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"FtpFindFirstFileW\",\"fn_group\":\"ftp\",\"status\":\"PARTIAL\",\"hConnect\":\"0xC0020100_HINTERNET\",\"lpszSearchFile\":\"/pub/d2r/*.bin\",\"out_lpFindFileData\":\"WIN32_FIND_DATAW_592B_d2r_patch_2_7_bin\",\"struct_bytes\":592,\"return_handle\":\"0xC0040100_HINTERNET_find\"")
+
+    //   AUTH group (3)
+    record_syscall_invoke(11, 10, "InternetSetOptionExW", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetSetOptionExW")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"InternetSetOptionExW\",\"fn_group\":\"auth\",\"status\":\"PARTIAL\",\"hInternet\":\"0xC0020100_HINTERNET\",\"dwOption\":\"INTERNET_OPTION_USERNAME_28\",\"lpBuffer\":\"username_synth_battlenet_user\",\"dwBufferLength\":24,\"dwFlags\":0,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(12, 11, "InternetSetStatusCallback", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetSetStatusCallback")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"InternetSetStatusCallback\",\"fn_group\":\"auth\",\"status\":\"PARTIAL\",\"hInternet\":\"0xC0020100_HINTERNET\",\"lpfnInternetCallback\":\"0xC0050100_INTERNET_STATUS_CALLBACK_synth_fn_pointer\",\"return_callback_prev\":0")
+    record_syscall_invoke(13, 12, "InternetAttemptConnect", "PARTIAL")
+    println("__WININET_EX__ PARTIAL InternetAttemptConnect")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":13,\"fn_kind\":12,\"fn_name\":\"InternetAttemptConnect\",\"fn_group\":\"auth\",\"status\":\"PARTIAL\",\"dwReserved\":0,\"return_dword\":\"ERROR_SUCCESS_0\",\"connectivity_baseline\":true")
+
+    // ─── 2. cookie_event × 4 (set/get/set_ex/get_ex) ───
+    record_cookie_event(1, "set_battlenet_oauth_token", "https://us.battle.net/oauth/token", "BNES_AUTH_TOKEN_synth_session_24h", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cookie_event\",\"evt_id\":1,\"c_kind\":\"set_battlenet_oauth_token\",\"url\":\"https://us.battle.net/oauth/token\",\"cookie_synth\":\"BNES_AUTH_TOKEN_synth_session_24h\",\"battle_net_oauth_baseline\":true,\"status\":\"PARTIAL\"")
+    record_cookie_event(2, "get_battlenet_oauth_token", "https://us.battle.net/oauth/token", "BNES_AUTH_TOKEN_synth_session_24h", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cookie_event\",\"evt_id\":2,\"c_kind\":\"get_battlenet_oauth_token\",\"url\":\"https://us.battle.net/oauth/token\",\"cookie_synth\":\"BNES_AUTH_TOKEN_synth_session_24h\",\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+    record_cookie_event(3, "set_ex_httponly_thirdparty", "https://battle.net", "INTERNET_COOKIE_HTTPONLY_0x2000_THIRD_PARTY_0x10", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cookie_event\",\"evt_id\":3,\"c_kind\":\"set_ex_httponly_thirdparty\",\"url\":\"https://battle.net\",\"cookie_synth\":\"INTERNET_COOKIE_HTTPONLY_0x2000_THIRD_PARTY_0x10\",\"return_dword\":\"COOKIE_STATE_ACCEPT_2\",\"status\":\"PARTIAL\"")
+    record_cookie_event(4, "get_ex_named_cookie", "https://battle.net", "BNES_AUTH_token_synth_24h", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cookie_event\",\"evt_id\":4,\"c_kind\":\"get_ex_named_cookie\",\"url\":\"https://battle.net\",\"cookie_synth\":\"BNES_AUTH_token_synth_24h\",\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+
+    // ─── 3. cache_event × 3 (info/delete/find_first) ───
+    record_cache_event(1, "info_battlenet_avatar_cache", "https://us.battle.net/avatar.jpg", "INTERNET_CACHE_ENTRY_INFOW_80B_NORMAL_CACHE_ENTRY_0x40", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cache_event\",\"evt_id\":1,\"c_kind\":\"info_battlenet_avatar_cache\",\"url\":\"https://us.battle.net/avatar.jpg\",\"entry_synth\":\"INTERNET_CACHE_ENTRY_INFOW_80B_NORMAL_CACHE_ENTRY_0x40\",\"struct_bytes\":80,\"battle_net_cache_baseline\":true,\"status\":\"PARTIAL\"")
+    record_cache_event(2, "delete_stale_avatar", "https://us.battle.net/avatar.jpg", "delete_entry_force_release", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cache_event\",\"evt_id\":2,\"c_kind\":\"delete_stale_avatar\",\"url\":\"https://us.battle.net/avatar.jpg\",\"entry_synth\":\"delete_entry_force_release\",\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+    record_cache_event(3, "find_first_battlenet_pattern", "https://*.battle.net/*", "HFINDCACHE_0xC0010100_INTERNET_CACHE_ENTRY_INFOW_80B_first", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"cache_event\",\"evt_id\":3,\"c_kind\":\"find_first_battlenet_pattern\",\"url\":\"https://*.battle.net/*\",\"entry_synth\":\"HFINDCACHE_0xC0010100_INTERNET_CACHE_ENTRY_INFOW_80B_first\",\"struct_bytes\":80,\"status\":\"PARTIAL\"")
+
+    // ─── 4. ftp_event × 3 (open/get_size/find_first) ───
+    record_ftp_event(1, "open_d2r_patch_binary", "/pub/d2r/patch_2.7.bin", "FTP_TRANSFER_TYPE_BINARY_0x2_GENERIC_READ", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"ftp_event\",\"evt_id\":1,\"f_kind\":\"open_d2r_patch_binary\",\"ftp_path\":\"/pub/d2r/patch_2.7.bin\",\"ftp_synth\":\"FTP_TRANSFER_TYPE_BINARY_0x2_GENERIC_READ\",\"d2r_patch_fallback_baseline\":true,\"status\":\"PARTIAL\"")
+    record_ftp_event(2, "get_size_2gb_patch", "/pub/d2r/patch_2.7.bin", "2147483648_2GB_synth", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"ftp_event\",\"evt_id\":2,\"f_kind\":\"get_size_2gb_patch\",\"ftp_path\":\"/pub/d2r/patch_2.7.bin\",\"ftp_synth\":\"2147483648_2GB_synth\",\"file_size_low\":2147483648,\"file_size_high\":0,\"status\":\"PARTIAL\"")
+    record_ftp_event(3, "find_first_d2r_bin_pattern", "/pub/d2r/*.bin", "WIN32_FIND_DATAW_592B_d2r_patch_2_7_bin", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"ftp_event\",\"evt_id\":3,\"f_kind\":\"find_first_d2r_bin_pattern\",\"ftp_path\":\"/pub/d2r/*.bin\",\"ftp_synth\":\"WIN32_FIND_DATAW_592B_d2r_patch_2_7_bin\",\"struct_bytes\":592,\"status\":\"PARTIAL\"")
+
+    // ─── 5. auth_event × 3 (set_option_ex/set_callback/attempt_connect) ───
+    record_auth_event(1, "set_option_username_ex", "INTERNET_OPTION_USERNAME_28", "username_synth_battlenet_user", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"auth_event\",\"evt_id\":1,\"a_kind\":\"set_option_username_ex\",\"opt_id\":\"INTERNET_OPTION_USERNAME_28\",\"value_synth\":\"username_synth_battlenet_user\",\"battle_net_auth_baseline\":true,\"status\":\"PARTIAL\"")
+    record_auth_event(2, "set_status_callback", "INTERNET_STATUS_CALLBACK_register", "0xC0050100_callback_synth_fn_pointer", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"auth_event\",\"evt_id\":2,\"a_kind\":\"set_status_callback\",\"opt_id\":\"INTERNET_STATUS_CALLBACK_register\",\"value_synth\":\"0xC0050100_callback_synth_fn_pointer\",\"return_callback_prev\":0,\"status\":\"PARTIAL\"")
+    record_auth_event(3, "attempt_connect_internet_modem", "InternetAttemptConnect_dwReserved_0", "ERROR_SUCCESS_0_connected", "PARTIAL")
+    r0_emit("pe_wininet_extras_record", "\"kind\":\"auth_event\",\"evt_id\":3,\"a_kind\":\"attempt_connect_internet_modem\",\"opt_id\":\"InternetAttemptConnect_dwReserved_0\",\"value_synth\":\"ERROR_SUCCESS_0_connected\",\"return_dword\":\"ERROR_SUCCESS_0\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 13 {
+        panic("pe_wininet_extras FAIL [syscall_invoke_count] expected=13 got=" + to_string(si))
+    }
+    let ce = cookie_event_count()
+    if ce != 4 {
+        panic("pe_wininet_extras FAIL [cookie_event_count] expected=4 got=" + to_string(ce))
+    }
+    let ca = cache_event_count()
+    if ca != 3 {
+        panic("pe_wininet_extras FAIL [cache_event_count] expected=3 got=" + to_string(ca))
+    }
+    let fe = ftp_event_count()
+    if fe != 3 {
+        panic("pe_wininet_extras FAIL [ftp_event_count] expected=3 got=" + to_string(fe))
+    }
+    let ae = auth_event_count()
+    if ae != 3 {
+        panic("pe_wininet_extras FAIL [auth_event_count] expected=3 got=" + to_string(ae))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "InternetSetCookieW" { panic("pe_wininet_extras FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "InternetSetCookieExW" { panic("pe_wininet_extras FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "GetUrlCacheEntryInfoW" { panic("pe_wininet_extras FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(7) != "FtpOpenFileW" { panic("pe_wininet_extras FAIL [fn_kind_name(7)]") }
+    if fn_kind_name(10) != "InternetSetOptionExW" { panic("pe_wininet_extras FAIL [fn_kind_name(10)]") }
+    if fn_kind_name(12) != "InternetAttemptConnect" { panic("pe_wininet_extras FAIL [fn_kind_name(12)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_wininet_extras FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "cookie" { panic("pe_wininet_extras FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "cache" { panic("pe_wininet_extras FAIL [fn_group_name(4)]") }
+    if fn_group_name(7) != "ftp" { panic("pe_wininet_extras FAIL [fn_group_name(7)]") }
+    if fn_group_name(10) != "auth" { panic("pe_wininet_extras FAIL [fn_group_name(10)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_wininet_extras FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pwx_stats()
+    if len(s) != 5 { panic("pe_wininet_extras FAIL [stats len] expected=5 got=" + to_string(len(s))) }
+    if s[0] != 13 { panic("pe_wininet_extras FAIL [stats syscall_invoke_count] expected=13 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_wininet_extras FAIL [stats cookie_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 3 { panic("pe_wininet_extras FAIL [stats cache_event_count] expected=3 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_wininet_extras FAIL [stats ftp_event_count] expected=3 got=" + to_string(s[3])) }
+    if s[4] != 3 { panic("pe_wininet_extras FAIL [stats auth_event_count] expected=3 got=" + to_string(s[4])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_wininet_extras_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"cookie_event_count\":" + to_string(s[1])
+        + ",\"cache_event_count\":" + to_string(s[2])
+        + ",\"ftp_event_count\":" + to_string(s[3])
+        + ",\"auth_event_count\":" + to_string(s[4]))
+
+    r0_emit("pe_wininet_extras_summary",
+        "\"target\":\"WININET.dll_advanced_extras\",\"distinct_from\":\"pe_wininet_https.hexa_basic_K2\",\"fn_total\":13,\"fn_emit_partial\":13,\"groups\":[\"cookie\",\"cache\",\"ftp\",\"auth\"],\"url_componentsw_synth_bytes\":60,\"internet_cache_entry_infow_synth_bytes\":80,\"win32_find_dataw_synth_bytes\":592,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_wininet_extras_kpi",
+        "\"cookie_emits\":4,\"cache_emits\":3,\"ftp_emits\":3,\"auth_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"battle_net_oauth_cookie_baseline\":true,\"d2r_d4_avatar_cache_baseline\":true,\"d2r_patch_ftp_fallback_baseline\":true,\"nshttpcookiestorage_nsurlcache_binding\":false,\"cfftpstream_nsurlcredentialstorage_binding\":false")
+
+    // ─── cycle 53 → 54 WININET extras coverage progression evidence emit ───
+    r0_emit("pe_wininet_extras_coverage_progression",
+        "\"surface\":\"WININET_EXTRAS_full_435_fn\",\"cycle_53_count\":325,\"cycle_54_count\":338,\"delta\":13,\"cycle_53_percent\":74.71,\"cycle_54_percent\":77.70,\"cycle_54_module\":\"pe_wininet_extras.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bh3_cycle_increment\":13,\"track_bh_bundled_part_3_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_wininet_extras_round_trip_matrix",
+        "\"surface\":\"WININET_EXTRAS_advanced_13_fn\",\"fn_partial\":13,\"fn_groups\":4,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real InternetSetCookieExW + GetUrlCacheEntryInfoW + FtpOpenFileW + InternetSetOptionExW = NSHTTPCookieStorage + NSURLCache + CFFTPStream + NSURLCredentialStorage + NSURLConnection bridge pending separate cycle (long-horizon WININET advanced pipeline)\",\"distinct_from_K2_basic\":\"pe_wininet_extras = cookie/cache/ftp/auth advanced; pe_wininet_https = HTTP/HTTPS basic request flow\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BH3 expansion emit (cycle 54, WININET extras +13 fn) ───
+    r0_emit("pe_wininet_extras_bh3_expansion",
+        "\"track\":\"BH3\",\"cycle\":54,\"surface\":\"WININET_extras_new\",\"new_fn\":13,\"groups\":[\"cookie\",\"cache\",\"ftp\",\"auth\"],\"cookie_count\":4,\"cache_count\":3,\"ftp_count\":3,\"auth_count\":3,\"emit_format\":\"__WININET_EX__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_3_evidence_augment\":true,\"track_bh_bundled_part_3_of_4\":true,\"distinct_from_K2_basic\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_wininet_extras FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwx()
+    let s2 = pwx_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wininet_extras FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wininet_extras self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", cookie_event=" + to_string(s[1])
+        + ", cache_event=" + to_string(s[2]) + ", ftp_event=" + to_string(s[3])
+        + ", auth_event=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwx_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("cookie_event_count\t" + to_string(s[1]))
+            println("cache_event_count\t" + to_string(s[2]))
+            println("ftp_event_count\t" + to_string(s[3]))
+            println("auth_event_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_wininet_extras.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_wininet_extras.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwx()
+            println("cleaned: " + pwx_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwx_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wininet_extras.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

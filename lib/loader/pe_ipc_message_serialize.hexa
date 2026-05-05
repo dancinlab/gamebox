@@ -1,0 +1,241 @@
+// lib/loader/pe_ipc_message_serialize.hexa — stage5 IPC message serialization skeleton
+//
+// IPC wire format. CBOR (compact binary) / JSON (debug-friendly) / raw
+// (zero-copy). Win32 API call → encoded message → socket send. response
+// decode 동일.
+//
+// own 1 enforcement: Wine / CrossOver / ReactOS IPC marshaller 0 줄.
+//   참조 only — 공식 wire format spec:
+//     - CBOR (RFC 8949):           https://www.rfc-editor.org/rfc/rfc8949.html
+//     - JSON (RFC 8259):           https://www.rfc-editor.org/rfc/rfc8259.html
+//     - protobuf encoding:         https://protobuf.dev/programming-guides/encoding/
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5 (record × 4 + summary)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_ipc_message_serialize FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — docker ↔ host Win32 API call IPC):
+//   stage5 = serialization instrumentation skeleton (msg record + count + raw/encoded bytes).
+//   stage6 = 실 직렬화 — CBOR major-type encoder, JSON escape, protobuf varint.
+//
+// format_kind 정의:
+//   1 = CBOR        (compact binary, RFC 8949)
+//   2 = JSON        (debug-friendly, base64 raw bytes)
+//   3 = raw_bytes   (zero-copy, length-prefixed)
+//   4 = protobuf    (schema-bound, varint)
+//
+// schema (serialize_msgs.tsv): msg_id<int> | format_kind<int> | raw_size<int> | encoded_size<int>
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 ───
+fn pims_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_message_serialize"
+}
+
+fn serialize_msgs_path() -> str {
+    return pims_dir() + "/serialize_msgs.tsv"
+}
+
+fn ensure_pims_dir() -> void {
+    let _ = exec("mkdir -p '" + pims_dir() + "'")
+}
+
+fn cleanup_pims() -> void {
+    let _ = exec("rm -rf '" + pims_dir() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_pims_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_pims_row(path: str, row: str) -> void {
+    ensure_pims_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_serialize ───
+//   format_kind: 1=CBOR, 2=JSON, 3=raw_bytes, 4=protobuf
+fn record_serialize(msg_id: int, format_kind: int, raw_size: int, encoded_size: int) -> void {
+    let row = to_string(msg_id) + "\t" + to_string(format_kind)
+        + "\t" + to_string(raw_size) + "\t" + to_string(encoded_size) + "\n"
+    append_pims_row(serialize_msgs_path(), row)
+    r0_emit("pims_record", "\"msg_id\":" + to_string(msg_id)
+        + ",\"format_kind\":" + to_string(format_kind)
+        + ",\"raw\":" + to_string(raw_size)
+        + ",\"encoded\":" + to_string(encoded_size))
+}
+
+// ─── serialize_count: 전체 row 수 ───
+fn serialize_count() -> int {
+    let t = read_pims_table(serialize_msgs_path())
+    if t == "" {
+        return 0
+    }
+    let r = exec("wc -l < '" + serialize_msgs_path() + "' | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_raw_bytes: raw_size 합계 ───
+fn total_raw_bytes() -> int {
+    let t = read_pims_table(serialize_msgs_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + serialize_msgs_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_encoded_bytes: encoded_size 합계 ───
+fn total_encoded_bytes() -> int {
+    let t = read_pims_table(serialize_msgs_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + serialize_msgs_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── count_by_format_kind: 특정 format kind 카운트 ───
+fn count_by_format_kind(kind: int) -> int {
+    let t = read_pims_table(serialize_msgs_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v k=" + to_string(kind) + " '$2==k' '" + serialize_msgs_path() + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── compression_ratio_pct: (raw - encoded) * 100 / raw, 0-guard ───
+fn compression_ratio_pct() -> int {
+    let raw = total_raw_bytes()
+    if raw <= 0 { return 0 }
+    let enc = total_encoded_bytes()
+    return (raw - enc) * 100 / raw
+}
+
+// ─── msg_encoded_size: msg_id 의 encoded_size lookup ───
+fn msg_encoded_size(msg_id: int) -> int {
+    let t = read_pims_table(serialize_msgs_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v i=" + to_string(msg_id) + " '$1==i {print $4; exit}' '" + serialize_msgs_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── pims_stats: [serialize_count, total_raw_bytes, total_encoded_bytes, compression_ratio_pct] ───
+fn pims_stats() -> array {
+    return [serialize_count(), total_raw_bytes(), total_encoded_bytes(), compression_ratio_pct()]
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pims-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pims()
+
+    // 합성 4 messages — Win32 API call IPC wire format mix
+    record_serialize(111001, 1, 1024, 768)    // CBOR 1KB→768B (25% smaller)
+    record_serialize(111002, 2, 1024, 1280)   // JSON 1KB→1.25KB (overhead, base64)
+    record_serialize(111003, 3, 1024, 1024)   // raw 1KB→1KB
+    record_serialize(111004, 1, 4096, 3200)   // CBOR 4KB→3.2KB
+
+    // serialize_count
+    let sc = serialize_count()
+    if sc != 4 { panic("pe_ipc_message_serialize FAIL [serialize_count] expected=4 got=" + to_string(sc)) }
+
+    // total_raw_bytes
+    let tr = total_raw_bytes()
+    if tr != 7168 { panic("pe_ipc_message_serialize FAIL [total_raw_bytes] expected=7168 got=" + to_string(tr)) }
+
+    // total_encoded_bytes
+    let te = total_encoded_bytes()
+    if te != 6272 { panic("pe_ipc_message_serialize FAIL [total_encoded_bytes] expected=6272 got=" + to_string(te)) }
+
+    // count_by_format_kind
+    let c1 = count_by_format_kind(1)
+    if c1 != 2 { panic("pe_ipc_message_serialize FAIL [count kind=1] expected=2 got=" + to_string(c1)) }
+    let c2 = count_by_format_kind(2)
+    if c2 != 1 { panic("pe_ipc_message_serialize FAIL [count kind=2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_format_kind(3)
+    if c3 != 1 { panic("pe_ipc_message_serialize FAIL [count kind=3] expected=1 got=" + to_string(c3)) }
+    let c4 = count_by_format_kind(4)
+    if c4 != 0 { panic("pe_ipc_message_serialize FAIL [count kind=4] expected=0 got=" + to_string(c4)) }
+    let c99 = count_by_format_kind(99)
+    if c99 != 0 { panic("pe_ipc_message_serialize FAIL [count kind=99] expected=0 got=" + to_string(c99)) }
+
+    // compression_ratio_pct: (7168-6272)*100/7168 = 89600/7168 = 12 (int trunc)
+    let cr = compression_ratio_pct()
+    if cr != 12 { panic("pe_ipc_message_serialize FAIL [compression_ratio_pct] expected=12 got=" + to_string(cr)) }
+
+    // msg_encoded_size lookup
+    let e1 = msg_encoded_size(111001)
+    if e1 != 768 { panic("pe_ipc_message_serialize FAIL [msg_encoded_size 111001] expected=768 got=" + to_string(e1)) }
+    let e3 = msg_encoded_size(111003)
+    if e3 != 1024 { panic("pe_ipc_message_serialize FAIL [msg_encoded_size 111003] expected=1024 got=" + to_string(e3)) }
+    let e_missing = msg_encoded_size(9999)
+    if e_missing != 0 { panic("pe_ipc_message_serialize FAIL [msg_encoded_size 9999] expected=0 got=" + to_string(e_missing)) }
+
+    // pims_stats
+    let s = pims_stats()
+    if len(s) != 4 { panic("pe_ipc_message_serialize FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 4 { panic("pe_ipc_message_serialize FAIL [stats serialize_count] expected=4 got=" + to_string(s[0])) }
+    if s[1] != 7168 { panic("pe_ipc_message_serialize FAIL [stats total_raw] expected=7168 got=" + to_string(s[1])) }
+    if s[2] != 6272 { panic("pe_ipc_message_serialize FAIL [stats total_encoded] expected=6272 got=" + to_string(s[2])) }
+    if s[3] != 12 { panic("pe_ipc_message_serialize FAIL [stats compression_pct] expected=12 got=" + to_string(s[3])) }
+
+    // summary emit
+    r0_emit("pims_summary", "\"msgs\":" + to_string(s[0])
+        + ",\"raw\":" + to_string(s[1])
+        + ",\"encoded\":" + to_string(s[2])
+        + ",\"compression_pct\":" + to_string(s[3]))
+
+    // emit count >= 5 (4 record + 1 summary)
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("pe_ipc_message_serialize FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    cleanup_pims()
+
+    println("  ✅ pe_ipc_message_serialize self_test PASS (4 msgs, raw=7168 encoded=6272 compression=12%, CBOR=2 JSON=1 raw=1 protobuf=0, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pims_stats()
+            println("serialize_count=" + to_string(s[0]) + " total_raw=" + to_string(s[1]) + " total_encoded=" + to_string(s[2]) + " compression_pct=" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println(to_string(msg_encoded_size(mid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_message_serialize.hexa size <msg_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(to_string(count_by_format_kind(k)))
+                return
+            }
+            println("usage: hexa run pe_ipc_message_serialize.hexa count <format_kind>")
+            return
+        }
+        if sub == "cleanup" { cleanup_pims(); println("cleaned"); return }
+    }
+    println("usage: hexa run pe_ipc_message_serialize.hexa { self-test | stats | size <msg_id> | count <format_kind> | cleanup }")
+}

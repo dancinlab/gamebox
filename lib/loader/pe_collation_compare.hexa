@@ -1,0 +1,454 @@
+// lib/loader/pe_collation_compare.hexa — cycle 79 Win32 CompareStringEx /
+// CompareStringW → ICU / CFStringCompare bridge telemetry skeleton.
+//
+// Linguistic compare with locale-aware sort weights. 본 module 은 compare
+// telemetry tracker — 실 ICU ucol_strcoll() / CFStringCompare() 호출 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// flags bit (Win32 CompareStringEx):
+//   NORM_IGNORECASE       = 0x1
+//   NORM_IGNOREKANATYPE   = 0x10
+//   NORM_IGNOREWIDTH      = 0x20
+//   SORT_DIGITSASNUMBERS  = 0x8
+//
+// result code (Win32 CompareStringEx return - 1):
+//   1 = less     (CSTR_LESS_THAN)
+//   2 = equal    (CSTR_EQUAL)
+//   3 = greater  (CSTR_GREATER_THAN)
+//
+// persist schema (TSV — compares.tsv):
+//   compare_id<int> \t lcid<int> \t flags<int> \t result<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcc_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_collation_compare"
+}
+
+fn pcc_compares_path() -> str {
+    return pcc_dir() + "/compares.tsv"
+}
+
+fn pcc_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcc_dir() + "'")
+}
+
+fn cleanup_pcc() -> void {
+    pcc_ensure_dir()
+    let _ = exec("rm -f '" + pcc_compares_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcc_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcc_append_row(path: str, row: str) -> void {
+    pcc_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_compare: compare 1 건 기록 ───
+fn record_compare(compare_id: int, lcid: int, flags: int, result: int) -> void {
+    if compare_id <= 0 {
+        panic("pe_collation_compare FAIL [record_compare] expected=compare_id>0 got=" + to_string(compare_id))
+    }
+    if lcid < 0 {
+        panic("pe_collation_compare FAIL [record_compare] expected=lcid>=0 got=" + to_string(lcid))
+    }
+    if flags < 0 {
+        panic("pe_collation_compare FAIL [record_compare] expected=flags>=0 got=" + to_string(flags))
+    }
+    if result < 1 {
+        panic("pe_collation_compare FAIL [record_compare] expected=result>=1 got=" + to_string(result))
+    }
+    if result > 3 {
+        panic("pe_collation_compare FAIL [record_compare] expected=result<=3 got=" + to_string(result))
+    }
+    let row = to_string(compare_id) + "\t" + to_string(lcid)
+        + "\t" + to_string(flags) + "\t" + to_string(result) + "\n"
+    pcc_append_row(pcc_compares_path(), row)
+}
+
+// ─── compare_count: total compare 수 ───
+fn compare_count() -> int {
+    let t = pcc_read_table(pcc_compares_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_result: 특정 result 의 compare 수 ───
+fn count_by_result(result: int) -> int {
+    let t = pcc_read_table(pcc_compares_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == result {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── _bit_and_nonzero: (a AND b) != 0 ?
+//     bit-AND 연산자 부재 — 각 bit position 을 division/modulo 없이 감산
+//     2 회 (bit, bit*2 단위) 로 추출해 두 값 모두 set 된 bit 가 있으면 1.
+fn _bit_and_nonzero(a: int, b: int) -> int {
+    if a <= 0 {
+        return 0
+    }
+    if b <= 0 {
+        return 0
+    }
+    let mut bit = 1
+    let mut hit = 0
+    while bit <= a {
+        if bit <= b {
+            // a 의 bit position set 여부
+            let mut a_rem = a
+            let two = bit + bit
+            while a_rem >= two {
+                a_rem = a_rem - two
+            }
+            let mut b_rem = b
+            while b_rem >= two {
+                b_rem = b_rem - two
+            }
+            if a_rem >= bit {
+                if b_rem >= bit {
+                    hit = 1
+                }
+            }
+        }
+        bit = bit + bit
+    }
+    return hit
+}
+
+// ─── count_by_flag_bit: (flags AND bit_mask) != 0 인 row 수 ───
+fn count_by_flag_bit(bit_mask: int) -> int {
+    let t = pcc_read_table(pcc_compares_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let f = to_int(parts[2])
+                if _bit_and_nonzero(f, bit_mask) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_lcids: 등장한 lcid 종류 수 ───
+fn distinct_lcids() -> int {
+    let t = pcc_read_table(pcc_compares_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let l = to_int(parts[1])
+                let mut j = 0
+                let mut found = 0
+                while j < len(seen) {
+                    if seen[j] == l {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(l)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── compare_flags: 특정 compare_id 의 flags (없으면 0) ───
+fn compare_flags(compare_id: int) -> int {
+    let t = pcc_read_table(pcc_compares_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == compare_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pcc_stats: [compare_count, count_result_less, count_result_equal,
+//                  count_result_greater, distinct_lcids] ───
+fn pcc_stats() -> array {
+    let mut out = []
+    out.push(compare_count())
+    out.push(count_by_result(1))
+    out.push(count_by_result(2))
+    out.push(count_by_result(3))
+    out.push(distinct_lcids())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcc-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcc()
+
+    // 2. record 5 compares — 3 results × ≥2 lcids, flags 다양화
+    //    LCID: 1033 (en-US), 1041 (ja-JP)
+    //    flags: NORM_IGNORECASE=0x1, NORM_IGNOREKANATYPE=0x10,
+    //           NORM_IGNOREWIDTH=0x20, SORT_DIGITSASNUMBERS=0x8
+    record_compare(120001, 1033, 1, 1)   // en-US, IGNORECASE, less
+    r0_emit("pe_collation_compare_record",
+        "\"compare_id\":120001,\"lcid\":1033,\"flags\":1,\"result\":1,\"target\":\"less\"")
+
+    record_compare(120002, 1033, 9, 2)   // en-US, IGNORECASE|DIGITSASNUMBERS, equal
+    r0_emit("pe_collation_compare_record",
+        "\"compare_id\":120002,\"lcid\":1033,\"flags\":9,\"result\":2,\"target\":\"equal\"")
+
+    record_compare(120003, 1041, 16, 3)  // ja-JP, IGNOREKANATYPE, greater
+    r0_emit("pe_collation_compare_record",
+        "\"compare_id\":120003,\"lcid\":1041,\"flags\":16,\"result\":3,\"target\":\"greater\"")
+
+    record_compare(120004, 1041, 48, 1)  // ja-JP, IGNOREKANATYPE|IGNOREWIDTH, less
+    r0_emit("pe_collation_compare_record",
+        "\"compare_id\":120004,\"lcid\":1041,\"flags\":48,\"result\":1,\"target\":\"less\"")
+
+    record_compare(120005, 1033, 0, 2)   // en-US, no flags, equal
+    r0_emit("pe_collation_compare_record",
+        "\"compare_id\":120005,\"lcid\":1033,\"flags\":0,\"result\":2,\"target\":\"equal\"")
+
+    // 3. compare_count = 5
+    let c = compare_count()
+    if c != 5 {
+        panic("pe_collation_compare FAIL [compare_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_result: less=2, equal=2, greater=1
+    let r1 = count_by_result(1)
+    if r1 != 2 {
+        panic("pe_collation_compare FAIL [count_by_result(1)] expected=2 got=" + to_string(r1))
+    }
+    let r2 = count_by_result(2)
+    if r2 != 2 {
+        panic("pe_collation_compare FAIL [count_by_result(2)] expected=2 got=" + to_string(r2))
+    }
+    let r3 = count_by_result(3)
+    if r3 != 1 {
+        panic("pe_collation_compare FAIL [count_by_result(3)] expected=1 got=" + to_string(r3))
+    }
+
+    // 5. count_by_flag_bit:
+    //    NORM_IGNORECASE (0x1): rows 120001 (1), 120002 (9) → 2
+    //    NORM_IGNOREKANATYPE (0x10): rows 120003 (16), 120004 (48) → 2
+    //    NORM_IGNOREWIDTH (0x20): row 120004 (48) → 1
+    //    SORT_DIGITSASNUMBERS (0x8): row 120002 (9) → 1
+    let fb1 = count_by_flag_bit(1)
+    if fb1 != 2 {
+        panic("pe_collation_compare FAIL [count_by_flag_bit(0x1)] expected=2 got=" + to_string(fb1))
+    }
+    let fb10 = count_by_flag_bit(16)
+    if fb10 != 2 {
+        panic("pe_collation_compare FAIL [count_by_flag_bit(0x10)] expected=2 got=" + to_string(fb10))
+    }
+    let fb20 = count_by_flag_bit(32)
+    if fb20 != 1 {
+        panic("pe_collation_compare FAIL [count_by_flag_bit(0x20)] expected=1 got=" + to_string(fb20))
+    }
+    let fb8 = count_by_flag_bit(8)
+    if fb8 != 1 {
+        panic("pe_collation_compare FAIL [count_by_flag_bit(0x8)] expected=1 got=" + to_string(fb8))
+    }
+
+    // 6. distinct_lcids = 2 (1033, 1041)
+    let dl = distinct_lcids()
+    if dl != 2 {
+        panic("pe_collation_compare FAIL [distinct_lcids] expected=2 got=" + to_string(dl))
+    }
+
+    // 7. compare_flags sanity
+    let f2 = compare_flags(120002)
+    if f2 != 9 {
+        panic("pe_collation_compare FAIL [compare_flags(120002)] expected=9 got=" + to_string(f2))
+    }
+    let f4 = compare_flags(120004)
+    if f4 != 48 {
+        panic("pe_collation_compare FAIL [compare_flags(120004)] expected=48 got=" + to_string(f4))
+    }
+    let f_miss = compare_flags(9999)
+    if f_miss != 0 {
+        panic("pe_collation_compare FAIL [compare_flags(9999)] expected=0 got=" + to_string(f_miss))
+    }
+
+    // 8. pcc_stats() = [5, 2, 2, 1, 2]
+    let s = pcc_stats()
+    if len(s) != 5 {
+        panic("pe_collation_compare FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_collation_compare FAIL [stats compare_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_collation_compare FAIL [stats less] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_collation_compare FAIL [stats equal] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_collation_compare FAIL [stats greater] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_collation_compare FAIL [stats distinct_lcids] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_collation_compare_stats",
+        "\"compare_count\":" + to_string(s[0])
+        + ",\"less\":" + to_string(s[1])
+        + ",\"equal\":" + to_string(s[2])
+        + ",\"greater\":" + to_string(s[3])
+        + ",\"distinct_lcids\":" + to_string(s[4]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_collation_compare FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pcc()
+    let s2 = pcc_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_collation_compare FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_collation_compare self_test PASS (compares=" + to_string(s[0])
+        + ", less=" + to_string(s[1]) + ", equal=" + to_string(s[2])
+        + ", greater=" + to_string(s[3]) + ", lcids=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcc_stats()
+            println("compare_count\t" + to_string(s[0]))
+            println("count_less\t" + to_string(s[1]))
+            println("count_equal\t" + to_string(s[2]))
+            println("count_greater\t" + to_string(s[3]))
+            println("distinct_lcids\t" + to_string(s[4]))
+            return
+        }
+        if sub == "flags" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("compare_flags\t" + to_string(compare_flags(cid)))
+                return
+            }
+            println("usage: hexa run pe_collation_compare.hexa flags <compare_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let result = to_int(a[3])
+                println("count_by_result\t" + to_string(count_by_result(result)))
+                return
+            }
+            println("usage: hexa run pe_collation_compare.hexa count <result>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcc()
+            println("cleaned: " + pcc_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcc_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_collation_compare.hexa { self-test | stats | flags <compare_id> | count <result> | cleanup | dir }")
+}

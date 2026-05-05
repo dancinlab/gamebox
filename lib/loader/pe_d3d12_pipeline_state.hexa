@@ -1,0 +1,400 @@
+// lib/loader/pe_d3d12_pipeline_state.hexa — cycle 81 R5 phase 2
+// D3D12 ID3D12Device::CreateGraphicsPipelineState / CreateComputePipelineState 추적.
+//
+// D3D12 PSO → Metal Pipeline State:
+//   ID3D12Device::CreateGraphicsPipelineState → MTLDevice newRenderPipelineStateWithDescriptor
+//   ID3D12Device::CreateComputePipelineState  → MTLDevice newComputePipelineStateWithFunction
+//   ID3D12PipelineLibrary 의 cache 동등: MTLBinaryArchive (M2+)
+//   D3D12 root signature → Metal argument buffer (cycle 76 cross-ref)
+//   shader_count: VS+PS+GS+HS+DS (graphics) or 1 (compute) or 2 (mesh+amplification) or 3-5 (raytracing)
+// own1: D3DMetal 위임 우선 + Apple Metal + MSDN ID3D12 spec only
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 PSO tracker — 실 ID3D12Device 호출 X (D3DMetal 위임 stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// pso_kind code:
+//   1 = graphics
+//   2 = compute
+//   3 = mesh
+//   4 = raytracing
+//
+// persist schema (TSV — psos.tsv):
+//   pso_id<int> \t pso_kind<int> \t shader_count<int> \t compile_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdps_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_pipeline_state"
+}
+
+fn pdps_psos_path() -> str {
+    return pdps_dir() + "/psos.tsv"
+}
+
+fn pdps_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdps_dir() + "'")
+}
+
+fn cleanup_pdps() -> void {
+    pdps_ensure_dir()
+    let _ = exec("rm -f '" + pdps_psos_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdps_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdps_append_row(path: str, row: str) -> void {
+    pdps_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_pso: PSO 1 건 기록 ───
+fn record_pso(pso_id: int, pso_kind: int, shader_count: int, compile_us: int) -> void {
+    if pso_id <= 0 {
+        panic("pe_d3d12_pipeline_state FAIL [record_pso] expected=pso_id>0 got=" + to_string(pso_id))
+    }
+    if pso_kind < 1 {
+        panic("pe_d3d12_pipeline_state FAIL [record_pso] expected=pso_kind>=1 got=" + to_string(pso_kind))
+    }
+    if pso_kind > 4 {
+        panic("pe_d3d12_pipeline_state FAIL [record_pso] expected=pso_kind<=4 got=" + to_string(pso_kind))
+    }
+    if shader_count < 0 {
+        panic("pe_d3d12_pipeline_state FAIL [record_pso] expected=shader_count>=0 got=" + to_string(shader_count))
+    }
+    if compile_us < 0 {
+        panic("pe_d3d12_pipeline_state FAIL [record_pso] expected=compile_us>=0 got=" + to_string(compile_us))
+    }
+    let row = to_string(pso_id) + "\t" + to_string(pso_kind)
+        + "\t" + to_string(shader_count) + "\t" + to_string(compile_us) + "\n"
+    pdps_append_row(pdps_psos_path(), row)
+}
+
+// ─── pso_count: total PSO 수 ───
+fn pso_count() -> int {
+    let t = pdps_read_table(pdps_psos_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_shader_count: 모든 PSO shader_count 합 ───
+fn total_shader_count() -> int {
+    let t = pdps_read_table(pdps_psos_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_compile_us: 모든 PSO compile_us 합 ───
+fn total_compile_us() -> int {
+    let t = pdps_read_table(pdps_psos_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_pso_kind: 특정 pso_kind 의 PSO 수 ───
+fn count_by_pso_kind(pso_kind: int) -> int {
+    let t = pdps_read_table(pdps_psos_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == pso_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── graphics_count: count_by_pso_kind(1) ───
+fn graphics_count() -> int {
+    return count_by_pso_kind(1)
+}
+
+// ─── pso_compile_us: 특정 pso_id 의 compile_us (없으면 0) ───
+fn pso_compile_us(pso_id: int) -> int {
+    let t = pdps_read_table(pdps_psos_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == pso_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdps_stats: [pso_count, total_shader_count, total_compile_us, graphics_count] ───
+fn pdps_stats() -> array {
+    let mut out = []
+    out.push(pso_count())
+    out.push(total_shader_count())
+    out.push(total_compile_us())
+    out.push(graphics_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdps-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdps()
+
+    // 2. record 5 PSOs across ≥3 pso_kinds
+    //    pso_kind: 1=graphics, 2=compute, 3=mesh, 4=raytracing
+    record_pso(220001, 1, 2, 1500)
+    r0_emit("pe_d3d12_pipeline_state_record",
+        "\"pso_id\":220001,\"pso_kind\":1,\"shader_count\":2,\"compile_us\":1500,\"target\":\"newRenderPipelineStateWithDescriptor\"")
+
+    record_pso(220002, 1, 5, 4200)
+    r0_emit("pe_d3d12_pipeline_state_record",
+        "\"pso_id\":220002,\"pso_kind\":1,\"shader_count\":5,\"compile_us\":4200,\"target\":\"newRenderPipelineStateWithDescriptor\"")
+
+    record_pso(220003, 2, 1, 800)
+    r0_emit("pe_d3d12_pipeline_state_record",
+        "\"pso_id\":220003,\"pso_kind\":2,\"shader_count\":1,\"compile_us\":800,\"target\":\"newComputePipelineStateWithFunction\"")
+
+    record_pso(220004, 3, 2, 1100)
+    r0_emit("pe_d3d12_pipeline_state_record",
+        "\"pso_id\":220004,\"pso_kind\":3,\"shader_count\":2,\"compile_us\":1100,\"target\":\"newRenderPipelineStateWithMeshDescriptor\"")
+
+    record_pso(220005, 4, 4, 9500)
+    r0_emit("pe_d3d12_pipeline_state_record",
+        "\"pso_id\":220005,\"pso_kind\":4,\"shader_count\":4,\"compile_us\":9500,\"target\":\"MTLBinaryArchive\"")
+
+    // 3. pso_count = 5
+    let c = pso_count()
+    if c != 5 {
+        panic("pe_d3d12_pipeline_state FAIL [pso_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_shader_count = 2+5+1+2+4 = 14
+    let ts = total_shader_count()
+    if ts != 14 {
+        panic("pe_d3d12_pipeline_state FAIL [total_shader_count] expected=14 got=" + to_string(ts))
+    }
+
+    // 5. total_compile_us = 1500+4200+800+1100+9500 = 17100
+    let tc = total_compile_us()
+    if tc != 17100 {
+        panic("pe_d3d12_pipeline_state FAIL [total_compile_us] expected=17100 got=" + to_string(tc))
+    }
+
+    // 6. count_by_pso_kind sanity
+    let k1 = count_by_pso_kind(1)
+    if k1 != 2 {
+        panic("pe_d3d12_pipeline_state FAIL [count_by_pso_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_pso_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d12_pipeline_state FAIL [count_by_pso_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_pso_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d12_pipeline_state FAIL [count_by_pso_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_pso_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d12_pipeline_state FAIL [count_by_pso_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_pso_kind(99)
+    if k99 != 0 {
+        panic("pe_d3d12_pipeline_state FAIL [count_by_pso_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. graphics_count = 2
+    let gc = graphics_count()
+    if gc != 2 {
+        panic("pe_d3d12_pipeline_state FAIL [graphics_count] expected=2 got=" + to_string(gc))
+    }
+
+    // 8. pso_compile_us sanity
+    let cu2 = pso_compile_us(220002)
+    if cu2 != 4200 {
+        panic("pe_d3d12_pipeline_state FAIL [pso_compile_us(220002)] expected=4200 got=" + to_string(cu2))
+    }
+    let cu5 = pso_compile_us(220005)
+    if cu5 != 9500 {
+        panic("pe_d3d12_pipeline_state FAIL [pso_compile_us(220005)] expected=9500 got=" + to_string(cu5))
+    }
+    let cu_miss = pso_compile_us(9999)
+    if cu_miss != 0 {
+        panic("pe_d3d12_pipeline_state FAIL [pso_compile_us(9999)] expected=0 got=" + to_string(cu_miss))
+    }
+
+    // 9. pdps_stats() = [5, 14, 17100, 2]
+    let s = pdps_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_pipeline_state FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d12_pipeline_state FAIL [stats pso_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 14 {
+        panic("pe_d3d12_pipeline_state FAIL [stats total_shader_count] expected=14 got=" + to_string(s[1]))
+    }
+    if s[2] != 17100 {
+        panic("pe_d3d12_pipeline_state FAIL [stats total_compile_us] expected=17100 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d12_pipeline_state FAIL [stats graphics_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d12_pipeline_state_stats",
+        "\"pso_count\":" + to_string(s[0])
+        + ",\"total_shader_count\":" + to_string(s[1])
+        + ",\"total_compile_us\":" + to_string(s[2])
+        + ",\"graphics_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d12_pipeline_state FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdps()
+    let s2 = pdps_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d12_pipeline_state FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_pipeline_state self_test PASS (psos=" + to_string(s[0])
+        + ", shaders=" + to_string(s[1]) + ", compile_us=" + to_string(s[2])
+        + ", graphics=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdps_stats()
+            println("pso_count\t" + to_string(s[0]))
+            println("total_shader_count\t" + to_string(s[1]))
+            println("total_compile_us\t" + to_string(s[2]))
+            println("graphics_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "compile" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("pso_compile_us\t" + to_string(pso_compile_us(pid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_pipeline_state.hexa compile <pso_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_pso_kind\t" + to_string(count_by_pso_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_pipeline_state.hexa count <pso_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdps()
+            println("cleaned: " + pdps_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdps_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_pipeline_state.hexa { self-test | stats | compile <pso_id> | count <pso_kind> | cleanup | dir }")
+}

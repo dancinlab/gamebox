@@ -1,0 +1,369 @@
+// lib/loader/pe_reloc_applier_real.hexa — cycle 80 R2 phase 1 PE base relocation 실 적용 skeleton
+//
+// ImageBase ≠ AllocationBase 시 .reloc directory 의 IMAGE_BASE_RELOCATION block 들을
+// walk + delta(= AllocationBase - ImageBase) 적용. 본 module 은 block walk tracker —
+// 실 memory write (DIR64 8-byte / HIGHLOW 4-byte add) 는 phase 2.
+//
+// IMAGE_BASE_RELOCATION block walking:
+//   block.SizeOfBlock - sizeof(BLOCK) → entry array (uint16: kind<<12 | offset[12])
+//   IMAGE_REL_BASED_DIR64 (10) — PE32+ 64bit absolute, delta 적용
+//   IMAGE_REL_BASED_HIGHLOW (3) — PE32 32bit absolute (i386 binary)
+//   IMAGE_REL_BASED_ABSOLUTE (0) — padding, skip
+//   IMAGE_FILE_RELOCS_STRIPPED → reloc directory 부재 → ImageBase 강제 + 실패
+// own1: PE spec only, Wine relocate.c 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// relocation_kind code (PE spec §6.6 Base Relocation Block):
+//   0  = IMAGE_REL_BASED_ABSOLUTE  (padding, skip)
+//   1  = IMAGE_REL_BASED_HIGH      (high 16 bits)
+//   2  = IMAGE_REL_BASED_LOW       (low 16 bits)
+//   3  = IMAGE_REL_BASED_HIGHLOW   (PE32 32-bit absolute)
+//   10 = IMAGE_REL_BASED_DIR64     (PE32+ 64-bit absolute)
+//
+// persist schema (TSV — blocks.tsv):
+//   block_id<int> \t relocation_kind<int> \t entry_count<int> \t rva_base<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn prar_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_reloc_applier_real"
+}
+
+fn prar_blocks_path() -> str {
+    return prar_dir() + "/blocks.tsv"
+}
+
+fn prar_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + prar_dir() + "'")
+}
+
+fn cleanup_prar() -> void {
+    prar_ensure_dir()
+    let _ = exec("rm -f '" + prar_blocks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prar_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prar_append_row(path: str, row: str) -> void {
+    prar_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_block: IMAGE_BASE_RELOCATION block 1 건 기록 ───
+fn record_block(block_id: int, relocation_kind: int, entry_count: int, rva_base: int) -> void {
+    if block_id <= 0 {
+        panic("pe_reloc_applier_real FAIL [record_block] expected=block_id>0 got=" + to_string(block_id))
+    }
+    if relocation_kind < 0 {
+        panic("pe_reloc_applier_real FAIL [record_block] expected=relocation_kind>=0 got=" + to_string(relocation_kind))
+    }
+    if relocation_kind > 10 {
+        panic("pe_reloc_applier_real FAIL [record_block] expected=relocation_kind<=10 got=" + to_string(relocation_kind))
+    }
+    if entry_count < 0 {
+        panic("pe_reloc_applier_real FAIL [record_block] expected=entry_count>=0 got=" + to_string(entry_count))
+    }
+    if rva_base < 0 {
+        panic("pe_reloc_applier_real FAIL [record_block] expected=rva_base>=0 got=" + to_string(rva_base))
+    }
+    let row = to_string(block_id) + "\t" + to_string(relocation_kind)
+        + "\t" + to_string(entry_count) + "\t" + to_string(rva_base) + "\n"
+    prar_append_row(prar_blocks_path(), row)
+}
+
+// ─── block_count: total block 수 ───
+fn block_count() -> int {
+    let t = prar_read_table(prar_blocks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_entry_count: 모든 block entry_count 합 ───
+fn total_entry_count() -> int {
+    let t = prar_read_table(prar_blocks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_relocation_kind: 특정 relocation_kind 의 block 수 ───
+fn count_by_relocation_kind(kind: int) -> int {
+    let t = prar_read_table(prar_blocks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── dir64_count: IMAGE_REL_BASED_DIR64(10) — PE32+ 만 사용 ───
+fn dir64_count() -> int {
+    return count_by_relocation_kind(10)
+}
+
+// ─── block_entry_count: 특정 block_id 의 entry_count (없으면 0) ───
+fn block_entry_count(block_id: int) -> int {
+    let t = prar_read_table(prar_blocks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == block_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── prar_stats: [block_count, total_entry_count, dir64_count, count_by_relocation_kind(3)] ───
+fn prar_stats() -> array {
+    let mut out = []
+    out.push(block_count())
+    out.push(total_entry_count())
+    out.push(dir64_count())
+    out.push(count_by_relocation_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "prar-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prar()
+
+    // 2. record 5 blocks covering ≥3 relocation_kinds (DIR64=10, HIGHLOW=3, ABSOLUTE=0)
+    //    realistic rva_base values per PE .reloc directory layout.
+    record_block(220001, 10, 128, 4096)  // 0x1000 — DIR64 (PE32+)
+    r0_emit("pe_reloc_applier_real_record",
+        "\"block_id\":220001,\"relocation_kind\":10,\"entry_count\":128,\"rva_base\":4096,\"target\":\"DIR64\"")
+
+    record_block(220002, 10, 64, 8192)   // 0x2000 — DIR64 (PE32+)
+    r0_emit("pe_reloc_applier_real_record",
+        "\"block_id\":220002,\"relocation_kind\":10,\"entry_count\":64,\"rva_base\":8192,\"target\":\"DIR64\"")
+
+    record_block(220003, 3, 32, 12288)   // 0x3000 — HIGHLOW (PE32 i386)
+    r0_emit("pe_reloc_applier_real_record",
+        "\"block_id\":220003,\"relocation_kind\":3,\"entry_count\":32,\"rva_base\":12288,\"target\":\"HIGHLOW\"")
+
+    record_block(220004, 0, 1, 16384)    // 0x4000 — ABSOLUTE padding
+    r0_emit("pe_reloc_applier_real_record",
+        "\"block_id\":220004,\"relocation_kind\":0,\"entry_count\":1,\"rva_base\":16384,\"target\":\"ABSOLUTE\"")
+
+    record_block(220005, 10, 16, 20480)  // 0x5000 — DIR64 (PE32+)
+    r0_emit("pe_reloc_applier_real_record",
+        "\"block_id\":220005,\"relocation_kind\":10,\"entry_count\":16,\"rva_base\":20480,\"target\":\"DIR64\"")
+
+    // 3. block_count = 5
+    let c = block_count()
+    if c != 5 {
+        panic("pe_reloc_applier_real FAIL [block_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_entry_count = 128 + 64 + 32 + 1 + 16 = 241
+    let te = total_entry_count()
+    if te != 241 {
+        panic("pe_reloc_applier_real FAIL [total_entry_count] expected=241 got=" + to_string(te))
+    }
+
+    // 5. count_by_relocation_kind sanity
+    let k0 = count_by_relocation_kind(0)
+    if k0 != 1 {
+        panic("pe_reloc_applier_real FAIL [count_by_relocation_kind(0)] expected=1 got=" + to_string(k0))
+    }
+    let k3 = count_by_relocation_kind(3)
+    if k3 != 1 {
+        panic("pe_reloc_applier_real FAIL [count_by_relocation_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k10 = count_by_relocation_kind(10)
+    if k10 != 3 {
+        panic("pe_reloc_applier_real FAIL [count_by_relocation_kind(10)] expected=3 got=" + to_string(k10))
+    }
+    let k99 = count_by_relocation_kind(99)
+    if k99 != 0 {
+        panic("pe_reloc_applier_real FAIL [count_by_relocation_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. dir64_count = 3 (PE32+ 만 사용)
+    let d64 = dir64_count()
+    if d64 != 3 {
+        panic("pe_reloc_applier_real FAIL [dir64_count] expected=3 got=" + to_string(d64))
+    }
+
+    // 7. block_entry_count sanity
+    let e1 = block_entry_count(220001)
+    if e1 != 128 {
+        panic("pe_reloc_applier_real FAIL [block_entry_count(220001)] expected=128 got=" + to_string(e1))
+    }
+    let e3 = block_entry_count(220003)
+    if e3 != 32 {
+        panic("pe_reloc_applier_real FAIL [block_entry_count(220003)] expected=32 got=" + to_string(e3))
+    }
+    let e_miss = block_entry_count(9999)
+    if e_miss != 0 {
+        panic("pe_reloc_applier_real FAIL [block_entry_count(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 8. prar_stats() = [5, 241, 3, 1]
+    let s = prar_stats()
+    if len(s) != 4 {
+        panic("pe_reloc_applier_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_reloc_applier_real FAIL [stats block_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 241 {
+        panic("pe_reloc_applier_real FAIL [stats total_entry_count] expected=241 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_reloc_applier_real FAIL [stats dir64_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_reloc_applier_real FAIL [stats highlow_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_reloc_applier_real_stats",
+        "\"block_count\":" + to_string(s[0])
+        + ",\"total_entry_count\":" + to_string(s[1])
+        + ",\"dir64_count\":" + to_string(s[2])
+        + ",\"highlow_count\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_reloc_applier_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_prar()
+    let s2 = prar_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_reloc_applier_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_reloc_applier_real self_test PASS (blocks=" + to_string(s[0])
+        + ", entries=" + to_string(s[1]) + ", dir64=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prar_stats()
+            println("block_count\t" + to_string(s[0]))
+            println("total_entry_count\t" + to_string(s[1]))
+            println("dir64_count\t" + to_string(s[2]))
+            println("highlow_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "entries" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                println("block_entry_count\t" + to_string(block_entry_count(bid)))
+                return
+            }
+            println("usage: hexa run pe_reloc_applier_real.hexa entries <block_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_relocation_kind\t" + to_string(count_by_relocation_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_reloc_applier_real.hexa count <relocation_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_prar()
+            println("cleaned: " + prar_dir())
+            return
+        }
+        if sub == "dir" {
+            println(prar_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_reloc_applier_real.hexa { self-test | stats | entries <block_id> | count <relocation_kind> | cleanup | dir }")
+}

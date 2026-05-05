@@ -1,0 +1,223 @@
+// lib/loader/pe_ipc_error_propagate.hexa — stage5 error propagation skeleton
+//
+// host native helper 의 errno (e.g., ENOENT, EACCES) → docker hexa 의 Win32
+// GetLastError 값 (e.g., ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED) translation.
+// Win32 errno equivalence table.
+//
+// own 1 enforcement: Wine / CrossOver / ReactOS error mapping 0 줄.
+//   참조 only — Microsoft 공식 errno / system error spec:
+//     - errno (CRT):              https://learn.microsoft.com/en-us/cpp/c-runtime-library/errno-constants
+//     - System Error Codes:       https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes
+//     - GetLastError:             https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getlasterror
+//
+// own 2 mandate:
+//   - r0_emit ≥ 6 (record × 5 + summary)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_ipc_error_propagate FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — host helper ↔ docker hexa error propagation):
+//   stage5 = propagation instrumentation skeleton (record + count + lookup).
+//   stage6 = 실 errno ↔ Win32 LastError mapping table 구현.
+//
+// kind 정의:
+//   1 = file_not_found       (ENOENT      ↔ ERROR_FILE_NOT_FOUND)
+//   2 = access_denied        (EACCES      ↔ ERROR_ACCESS_DENIED)
+//   3 = invalid_handle       (EBADF       ↔ ERROR_INVALID_HANDLE)
+//   4 = insufficient_buffer  (ENAMETOOLONG↔ ERROR_INSUFFICIENT_BUFFER)
+//   5 = other
+//
+// schema (errors.tsv): error_id<int> | posix_errno<int> | win32_lasterror<int> | kind<int>
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 ───
+fn piep_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_error_propagate"
+}
+
+fn errors_path() -> str {
+    return piep_dir() + "/errors.tsv"
+}
+
+fn ensure_piep_dir() -> void {
+    let _ = exec("mkdir -p '" + piep_dir() + "'")
+}
+
+fn cleanup_piep() -> void {
+    let _ = exec("rm -rf '" + piep_dir() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_piep_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_piep_row(path: str, row: str) -> void {
+    ensure_piep_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_error ───
+//   kind: 1=file_not_found, 2=access_denied, 3=invalid_handle,
+//         4=insufficient_buffer, 5=other
+fn record_error(error_id: int, posix_errno: int, win32_lasterror: int, kind: int) -> void {
+    let row = to_string(error_id) + "\t" + to_string(posix_errno)
+        + "\t" + to_string(win32_lasterror) + "\t" + to_string(kind) + "\n"
+    append_piep_row(errors_path(), row)
+    r0_emit("piep_record", "\"error_id\":" + to_string(error_id)
+        + ",\"posix\":" + to_string(posix_errno)
+        + ",\"win32\":" + to_string(win32_lasterror)
+        + ",\"kind\":" + to_string(kind))
+}
+
+// ─── error_count: 전체 row 수 ───
+fn error_count() -> int {
+    let t = read_piep_table(errors_path())
+    if t == "" {
+        return 0
+    }
+    let r = exec("wc -l < '" + errors_path() + "' | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── count_by_kind: 특정 kind 카운트 ───
+fn count_by_kind(kind: int) -> int {
+    let t = read_piep_table(errors_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v k=" + to_string(kind) + " '$4==k' '" + errors_path() + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── distinct_posix_count: posix_errno 의 distinct 카운트 ───
+fn distinct_posix_count() -> int {
+    let t = read_piep_table(errors_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{print $2}' '" + errors_path() + "' | sort -u | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── error_win32_lasterror: error_id 의 win32_lasterror lookup ───
+fn error_win32_lasterror(error_id: int) -> int {
+    let t = read_piep_table(errors_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v i=" + to_string(error_id) + " '$1==i {print $3; exit}' '" + errors_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── piep_stats: [error_count, count_by_kind(1), count_by_kind(2), distinct_posix_count] ───
+fn piep_stats() -> array {
+    return [error_count(), count_by_kind(1), count_by_kind(2), distinct_posix_count()]
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piep-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_piep()
+
+    // 합성 5 errors — host helper → docker hexa propagation
+    record_error(115001, 2, 2, 1)     // ENOENT → ERROR_FILE_NOT_FOUND
+    record_error(115002, 13, 5, 2)    // EACCES → ERROR_ACCESS_DENIED
+    record_error(115003, 9, 6, 3)     // EBADF → ERROR_INVALID_HANDLE
+    record_error(115004, 122, 122, 4) // ENAMETOOLONG → ERROR_INSUFFICIENT_BUFFER
+    record_error(115005, 2, 2, 1)     // duplicate ENOENT
+
+    // error_count
+    let ec = error_count()
+    if ec != 5 { panic("pe_ipc_error_propagate FAIL [error_count] expected=5 got=" + to_string(ec)) }
+
+    // count_by_kind
+    let c1 = count_by_kind(1)
+    if c1 != 2 { panic("pe_ipc_error_propagate FAIL [count kind=1] expected=2 got=" + to_string(c1)) }
+    let c2 = count_by_kind(2)
+    if c2 != 1 { panic("pe_ipc_error_propagate FAIL [count kind=2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_kind(3)
+    if c3 != 1 { panic("pe_ipc_error_propagate FAIL [count kind=3] expected=1 got=" + to_string(c3)) }
+    let c4 = count_by_kind(4)
+    if c4 != 1 { panic("pe_ipc_error_propagate FAIL [count kind=4] expected=1 got=" + to_string(c4)) }
+    let c5 = count_by_kind(5)
+    if c5 != 0 { panic("pe_ipc_error_propagate FAIL [count kind=5] expected=0 got=" + to_string(c5)) }
+    let c99 = count_by_kind(99)
+    if c99 != 0 { panic("pe_ipc_error_propagate FAIL [count kind=99] expected=0 got=" + to_string(c99)) }
+
+    // distinct_posix_count (ENOENT/EACCES/EBADF/ENAMETOOLONG, ENOENT duplicate 카운트 1)
+    let dp = distinct_posix_count()
+    if dp != 4 { panic("pe_ipc_error_propagate FAIL [distinct_posix] expected=4 got=" + to_string(dp)) }
+
+    // error_win32_lasterror lookup
+    let w1 = error_win32_lasterror(115001)
+    if w1 != 2 { panic("pe_ipc_error_propagate FAIL [win32 115001] expected=2 got=" + to_string(w1)) }
+    let w2 = error_win32_lasterror(115002)
+    if w2 != 5 { panic("pe_ipc_error_propagate FAIL [win32 115002] expected=5 got=" + to_string(w2)) }
+    let w3 = error_win32_lasterror(115003)
+    if w3 != 6 { panic("pe_ipc_error_propagate FAIL [win32 115003] expected=6 got=" + to_string(w3)) }
+    let w_missing = error_win32_lasterror(9999)
+    if w_missing != 0 { panic("pe_ipc_error_propagate FAIL [win32 9999] expected=0 got=" + to_string(w_missing)) }
+
+    // piep_stats
+    let s = piep_stats()
+    if len(s) != 4 { panic("pe_ipc_error_propagate FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 5 { panic("pe_ipc_error_propagate FAIL [stats error_count] expected=5 got=" + to_string(s[0])) }
+    if s[1] != 2 { panic("pe_ipc_error_propagate FAIL [stats kind1] expected=2 got=" + to_string(s[1])) }
+    if s[2] != 1 { panic("pe_ipc_error_propagate FAIL [stats kind2] expected=1 got=" + to_string(s[2])) }
+    if s[3] != 4 { panic("pe_ipc_error_propagate FAIL [stats distinct_posix] expected=4 got=" + to_string(s[3])) }
+
+    // summary emit
+    r0_emit("piep_summary", "\"errors\":" + to_string(s[0])
+        + ",\"file_not_found\":" + to_string(s[1])
+        + ",\"access_denied\":" + to_string(s[2])
+        + ",\"distinct_posix\":" + to_string(s[3]))
+
+    // emit count >= 6 (5 record + 1 summary)
+    let cnt = r0_session_count(sid)
+    if cnt < 6 { panic("pe_ipc_error_propagate FAIL [emit count] expected>=6 got=" + to_string(cnt)) }
+
+    cleanup_piep()
+
+    println("  ✅ pe_ipc_error_propagate self_test PASS (5 errors, kind1=2 kind2=1 kind3=1 kind4=1, distinct_posix=4, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = piep_stats()
+            println("error_count=" + to_string(s[0]) + " file_not_found=" + to_string(s[1]) + " access_denied=" + to_string(s[2]) + " distinct_posix=" + to_string(s[3]))
+            return
+        }
+        if sub == "win32" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println(to_string(error_win32_lasterror(eid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_error_propagate.hexa win32 <error_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(to_string(count_by_kind(k)))
+                return
+            }
+            println("usage: hexa run pe_ipc_error_propagate.hexa count <kind>")
+            return
+        }
+        if sub == "cleanup" { cleanup_piep(); println("cleaned"); return }
+    }
+    println("usage: hexa run pe_ipc_error_propagate.hexa { self-test | stats | win32 <error_id> | count <kind> | cleanup }")
+}

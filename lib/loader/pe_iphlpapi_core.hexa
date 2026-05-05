@@ -1,0 +1,485 @@
+// lib/loader/pe_iphlpapi_core.hexa — IPHLPAPI.dll IP helper surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine iphlpapi source 인용 0.
+//       iphlpapi.dll 직접 binding 0. macOS BSD getifaddrs(3) / sysctl(NET_RT_DUMP) /
+//       sysctl(NET_RT_IFLIST) / route(4) / SystemConfiguration.framework SCDynamicStore /
+//       SCNetworkConfiguration / Network.framework nw_path_monitor_t 직접 binding 0.
+//       NOTE: IPHLPAPI 측 D2R/D4 멀티-NIC routing + Battle.net REST endpoint 24.105.62.129
+//       p2p hole-punching adapter discovery + DNS resolver baseline; GetAdaptersInfo/
+//       GetAdaptersAddresses/GetIpForwardTable/GetIpNetTable/SendARP/GetNetworkParams/
+//       NotifyAddrChange 측 IP_ADAPTER_INFO/MIB_IPFORWARDTABLE round-trip baseline
+//       (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BD4 — IPHLPAPI adapter/routing/arp/dns surface 12 fn skeleton-tier.
+// cycle 50 292/435 (~67.13%) → cycle 51 ~304/435 (~69.89%) (+12 fn, BD bundled part 4/4).
+//
+// 대상 fn (12 fn — 4 group, fn_kind 0..11):
+//   ADAPTER (4): GetAdaptersInfo(0) / GetAdaptersAddresses(1) /
+//                GetIpAddrTable(2) / GetInterfaceInfo(3)
+//   ROUTING (4): GetIpForwardTable(4) / CreateIpForwardEntry(5) /
+//                DeleteIpForwardEntry(6) / GetBestRoute(7)
+//   ARP     (2): GetIpNetTable(8) / SendARP(9)
+//   DNS     (2): GetNetworkParams(10) / NotifyAddrChange(11)
+//
+// synthetic struct families:
+//   IP_ADAPTER_INFO 640B per record: ComboIndex 0 + AdapterName "{12345678-1234-1234-1234-...}" +
+//     Description "Apple M Synthetic Ethernet" + AddressLength 6 + Address 02-50-41-50-50-4C +
+//     Index 1 + Type MIB_IF_TYPE_ETHERNET 6 + DhcpEnabled TRUE 1 +
+//     IpAddressList "192.168.1.42" / Mask "255.255.255.0" + GatewayList "192.168.1.1".
+//   MIB_IPFORWARDTABLE header 8B + entry MIB_IPFORWARDROW 56B per route: Dest 0.0.0.0 +
+//     Mask 0.0.0.0 + NextHop 192.168.1.1 + IfIndex 1 + Type MIB_IPROUTE_TYPE_INDIRECT 4 +
+//     Proto MIB_IPPROTO_NETMGMT 3 + Metric1 25.
+//   MIB_IPNETTABLE header 8B + entry MIB_IPNETROW 24B per ARP: Index 1 + PhysAddrLen 6 +
+//     PhysAddr 02-50-41-50-50-4C + IpAddr 192.168.1.1 + Type MIB_IPNET_TYPE_DYNAMIC 3.
+//   FIXED_INFO 524B: HostName "DESKTOP-D2R" + DomainName "blizzard.com" + DnsServerList
+//     IP_ADDR_STRING chain 8.8.8.8 + 1.1.1.1.
+//   OVERLAPPED 32B: hEvent 0x9F010100 (NotifyAddrChange async).
+//
+// persist schema (TSV — 5 table):
+//   syscall_invoke / adapter_event / routing_event / arp_event / dns_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pip_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_iphlpapi_core"
+}
+
+fn pip_syscall_invoke_path() -> str {
+    return pip_dir() + "/syscall_invoke.tsv"
+}
+
+fn pip_adapter_event_path() -> str {
+    return pip_dir() + "/adapter_event.tsv"
+}
+
+fn pip_routing_event_path() -> str {
+    return pip_dir() + "/routing_event.tsv"
+}
+
+fn pip_arp_event_path() -> str {
+    return pip_dir() + "/arp_event.tsv"
+}
+
+fn pip_dns_event_path() -> str {
+    return pip_dir() + "/dns_event.tsv"
+}
+
+fn pip_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pip_dir() + "'")
+}
+
+fn cleanup_pip() -> void {
+    pip_ensure_dir()
+    let _ = exec("rm -f '" + pip_syscall_invoke_path() + "' '" + pip_adapter_event_path()
+        + "' '" + pip_routing_event_path() + "' '" + pip_arp_event_path()
+        + "' '" + pip_dns_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pip_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pip_append_row(path: str, row: str) -> void {
+    pip_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pip_count_rows(path: str, min_cols: int) -> int {
+    let t = pip_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (12 fn coverage, fn_kind 0..11) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "GetAdaptersInfo" }
+    if k == 1 { return "GetAdaptersAddresses" }
+    if k == 2 { return "GetIpAddrTable" }
+    if k == 3 { return "GetInterfaceInfo" }
+    if k == 4 { return "GetIpForwardTable" }
+    if k == 5 { return "CreateIpForwardEntry" }
+    if k == 6 { return "DeleteIpForwardEntry" }
+    if k == 7 { return "GetBestRoute" }
+    if k == 8 { return "GetIpNetTable" }
+    if k == 9 { return "SendARP" }
+    if k == 10 { return "GetNetworkParams" }
+    if k == 11 { return "NotifyAddrChange" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (4 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "adapter"
+        }
+    }
+    if k >= 4 {
+        if k <= 7 {
+            return "routing"
+        }
+    }
+    if k >= 8 {
+        if k <= 9 {
+            return "arp"
+        }
+    }
+    if k >= 10 {
+        if k <= 11 {
+            return "dns"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: IPHLPAPI fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_iphlpapi_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_iphlpapi_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 11 {
+        panic("pe_iphlpapi_core FAIL [record_syscall_invoke] expected=fn_kind<=11 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_iphlpapi_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_iphlpapi_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pip_append_row(pip_syscall_invoke_path(), row)
+}
+
+// ─── record_adapter_event: GetAdaptersInfo/Addresses/IpAddrTable/InterfaceInfo row ───
+fn record_adapter_event(evt_id: int, a_kind: str, if_index: str, adapter_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_iphlpapi_core FAIL [record_adapter_event] evt_id<=0") }
+    if a_kind == "" { panic("pe_iphlpapi_core FAIL [record_adapter_event] a_kind=empty") }
+    if if_index == "" { panic("pe_iphlpapi_core FAIL [record_adapter_event] if_index=empty") }
+    if adapter_synth == "" { panic("pe_iphlpapi_core FAIL [record_adapter_event] adapter_synth=empty") }
+    if status == "" { panic("pe_iphlpapi_core FAIL [record_adapter_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + a_kind + "\t" + if_index + "\t" + adapter_synth + "\t" + status + "\n"
+    pip_append_row(pip_adapter_event_path(), row)
+}
+
+// ─── record_routing_event: ForwardTable/CreateForward/DeleteForward/BestRoute row ───
+fn record_routing_event(evt_id: int, r_kind: str, dest_ip: str, route_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_iphlpapi_core FAIL [record_routing_event] evt_id<=0") }
+    if r_kind == "" { panic("pe_iphlpapi_core FAIL [record_routing_event] r_kind=empty") }
+    if dest_ip == "" { panic("pe_iphlpapi_core FAIL [record_routing_event] dest_ip=empty") }
+    if route_synth == "" { panic("pe_iphlpapi_core FAIL [record_routing_event] route_synth=empty") }
+    if status == "" { panic("pe_iphlpapi_core FAIL [record_routing_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + r_kind + "\t" + dest_ip + "\t" + route_synth + "\t" + status + "\n"
+    pip_append_row(pip_routing_event_path(), row)
+}
+
+// ─── record_arp_event: GetIpNetTable/SendARP row ───
+fn record_arp_event(evt_id: int, a_kind: str, ip_addr: str, mac_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_iphlpapi_core FAIL [record_arp_event] evt_id<=0") }
+    if a_kind == "" { panic("pe_iphlpapi_core FAIL [record_arp_event] a_kind=empty") }
+    if ip_addr == "" { panic("pe_iphlpapi_core FAIL [record_arp_event] ip_addr=empty") }
+    if mac_synth == "" { panic("pe_iphlpapi_core FAIL [record_arp_event] mac_synth=empty") }
+    if status == "" { panic("pe_iphlpapi_core FAIL [record_arp_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + a_kind + "\t" + ip_addr + "\t" + mac_synth + "\t" + status + "\n"
+    pip_append_row(pip_arp_event_path(), row)
+}
+
+// ─── record_dns_event: GetNetworkParams/NotifyAddrChange row ───
+fn record_dns_event(evt_id: int, d_kind: str, hostname: str, dns_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_iphlpapi_core FAIL [record_dns_event] evt_id<=0") }
+    if d_kind == "" { panic("pe_iphlpapi_core FAIL [record_dns_event] d_kind=empty") }
+    if hostname == "" { panic("pe_iphlpapi_core FAIL [record_dns_event] hostname=empty") }
+    if dns_synth == "" { panic("pe_iphlpapi_core FAIL [record_dns_event] dns_synth=empty") }
+    if status == "" { panic("pe_iphlpapi_core FAIL [record_dns_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + d_kind + "\t" + hostname + "\t" + dns_synth + "\t" + status + "\n"
+    pip_append_row(pip_dns_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pip_count_rows(pip_syscall_invoke_path(), 4)
+}
+
+fn adapter_event_count() -> int {
+    return pip_count_rows(pip_adapter_event_path(), 5)
+}
+
+fn routing_event_count() -> int {
+    return pip_count_rows(pip_routing_event_path(), 5)
+}
+
+fn arp_event_count() -> int {
+    return pip_count_rows(pip_arp_event_path(), 5)
+}
+
+fn dns_event_count() -> int {
+    return pip_count_rows(pip_dns_event_path(), 5)
+}
+
+fn pip_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(adapter_event_count())
+    out.push(routing_event_count())
+    out.push(arp_event_count())
+    out.push(dns_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pip-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pip()
+
+    // ─── 1. syscall_invoke × 12 (one per fn, 4 group coverage) ───
+    //   ADAPTER group (4)
+    record_syscall_invoke(1, 0, "GetAdaptersInfo", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetAdaptersInfo")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"GetAdaptersInfo\",\"fn_group\":\"adapter\",\"status\":\"PARTIAL\",\"out_pAdapterInfo\":\"IP_ADAPTER_INFO_640B_Apple_M_Synthetic_Ethernet_192_168_1_42\",\"out_pOutBufLen\":640,\"struct_bytes\":640,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(2, 1, "GetAdaptersAddresses", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetAdaptersAddresses")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"GetAdaptersAddresses\",\"fn_group\":\"adapter\",\"status\":\"PARTIAL\",\"Family\":\"AF_UNSPEC_0\",\"Flags\":\"GAA_FLAG_INCLUDE_PREFIX_0x0010\",\"Reserved\":0,\"out_pAdapterAddresses\":\"IP_ADAPTER_ADDRESSES_LH_synth_v6_v4_dual_stack\",\"out_pOutBufLen\":2048,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(3, 2, "GetIpAddrTable", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetIpAddrTable")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"GetIpAddrTable\",\"fn_group\":\"adapter\",\"status\":\"PARTIAL\",\"out_pIpAddrTable\":\"MIB_IPADDRTABLE_4B_header_24B_per_row_192_168_1_42\",\"out_pdwSize\":28,\"bOrder\":\"FALSE_0\",\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(4, 3, "GetInterfaceInfo", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetInterfaceInfo")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"GetInterfaceInfo\",\"fn_group\":\"adapter\",\"status\":\"PARTIAL\",\"out_pIfTable\":\"IP_INTERFACE_INFO_4B_header_260B_per_adapter_Apple_M_Eth\",\"out_dwOutBufLen\":264,\"NumAdapters\":1,\"Index\":1,\"return_dword\":\"ERROR_SUCCESS_0\"")
+
+    //   ROUTING group (4)
+    record_syscall_invoke(5, 4, "GetIpForwardTable", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetIpForwardTable")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"GetIpForwardTable\",\"fn_group\":\"routing\",\"status\":\"PARTIAL\",\"out_pIpForwardTable\":\"MIB_IPFORWARDTABLE_8B_header_56B_per_route_default_via_192_168_1_1\",\"out_pdwSize\":64,\"bOrder\":\"TRUE_1\",\"struct_bytes\":56,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(6, 5, "CreateIpForwardEntry", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL CreateIpForwardEntry")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"CreateIpForwardEntry\",\"fn_group\":\"routing\",\"status\":\"PARTIAL\",\"pRoute\":\"MIB_IPFORWARDROW_56B_dest_24_105_62_129_battlenet_rest_via_gw_metric_25\",\"struct_bytes\":56,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(7, 6, "DeleteIpForwardEntry", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL DeleteIpForwardEntry")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"DeleteIpForwardEntry\",\"fn_group\":\"routing\",\"status\":\"PARTIAL\",\"pRoute\":\"MIB_IPFORWARDROW_56B_dest_24_105_62_129\",\"struct_bytes\":56,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(8, 7, "GetBestRoute", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetBestRoute")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"GetBestRoute\",\"fn_group\":\"routing\",\"status\":\"PARTIAL\",\"dwDestAddr\":\"24_105_62_129_battlenet_rest_BE\",\"dwSourceAddr\":0,\"out_pBestRoute\":\"MIB_IPFORWARDROW_56B_NextHop_192_168_1_1_IfIndex_1\",\"struct_bytes\":56,\"return_dword\":\"ERROR_SUCCESS_0\"")
+
+    //   ARP group (2)
+    record_syscall_invoke(9, 8, "GetIpNetTable", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetIpNetTable")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"GetIpNetTable\",\"fn_group\":\"arp\",\"status\":\"PARTIAL\",\"out_IpNetTable\":\"MIB_IPNETTABLE_8B_header_24B_per_arp_192_168_1_1_02_50_41_50_50_4C_dynamic\",\"out_pdwSize\":32,\"bOrder\":\"FALSE_0\",\"struct_bytes\":24,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(10, 9, "SendARP", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL SendARP")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"SendARP\",\"fn_group\":\"arp\",\"status\":\"PARTIAL\",\"DestIP\":\"192_168_1_1_BE_gw\",\"SrcIP\":0,\"out_pMacAddr_6B\":\"02_50_41_50_50_4C\",\"out_PhysAddrLen\":6,\"return_dword\":\"ERROR_SUCCESS_0\"")
+
+    //   DNS group (2)
+    record_syscall_invoke(11, 10, "GetNetworkParams", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL GetNetworkParams")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"GetNetworkParams\",\"fn_group\":\"dns\",\"status\":\"PARTIAL\",\"out_pFixedInfo\":\"FIXED_INFO_524B_HostName_DESKTOP_D2R_DomainName_blizzard_com_DNS_8_8_8_8_1_1_1_1\",\"out_pOutBufLen\":524,\"struct_bytes\":524,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(12, 11, "NotifyAddrChange", "PARTIAL")
+    println("__IPHLPAPI__ PARTIAL NotifyAddrChange")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"NotifyAddrChange\",\"fn_group\":\"dns\",\"status\":\"PARTIAL\",\"out_Handle\":\"0x9F010000\",\"overlapped\":\"OVERLAPPED_32B_hEvent_0x9F010100\",\"struct_bytes\":32,\"return_dword\":\"ERROR_IO_PENDING_997\"")
+
+    // ─── 2. adapter_event × 4 (info_apple_m/addresses_dual_stack/addr_table/interface_info) ───
+    record_adapter_event(1, "info_apple_m_synthetic_ethernet", "1", "IP_ADAPTER_INFO_640B_192_168_1_42_mask_24_gw_192_168_1_1", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"adapter_event\",\"evt_id\":1,\"a_kind\":\"info_apple_m_synthetic_ethernet\",\"if_index\":\"1\",\"adapter_synth\":\"IP_ADAPTER_INFO_640B_192_168_1_42_mask_24_gw_192_168_1_1\",\"struct_bytes\":640,\"AddressLength\":6,\"PhysicalAddress\":\"02_50_41_50_50_4C\",\"DhcpEnabled\":true,\"battle_net_p2p_baseline\":true,\"status\":\"PARTIAL\"")
+    record_adapter_event(2, "addresses_dual_stack_v6_v4", "1", "IP_ADAPTER_ADDRESSES_LH_v6_v4_dual_stack_2001_db8", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"adapter_event\",\"evt_id\":2,\"a_kind\":\"addresses_dual_stack_v6_v4\",\"if_index\":\"1\",\"adapter_synth\":\"IP_ADAPTER_ADDRESSES_LH_v6_v4_dual_stack_2001_db8\",\"Family\":\"AF_UNSPEC_0\",\"Flags\":\"GAA_FLAG_INCLUDE_PREFIX_0x0010\",\"status\":\"PARTIAL\"")
+    record_adapter_event(3, "ip_addr_table_192_168_1_42", "1", "MIB_IPADDRROW_24B_addr_192_168_1_42_mask_255_255_255_0", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"adapter_event\",\"evt_id\":3,\"a_kind\":\"ip_addr_table_192_168_1_42\",\"if_index\":\"1\",\"adapter_synth\":\"MIB_IPADDRROW_24B_addr_192_168_1_42_mask_255_255_255_0\",\"struct_bytes\":24,\"NumEntries\":1,\"status\":\"PARTIAL\"")
+    record_adapter_event(4, "interface_info_index_1", "1", "IP_INTERFACE_INFO_260B_per_adapter_Apple_M_Eth", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"adapter_event\",\"evt_id\":4,\"a_kind\":\"interface_info_index_1\",\"if_index\":\"1\",\"adapter_synth\":\"IP_INTERFACE_INFO_260B_per_adapter_Apple_M_Eth\",\"struct_bytes\":260,\"NumAdapters\":1,\"status\":\"PARTIAL\"")
+
+    // ─── 3. routing_event × 4 (forward_table/create/delete/best_route_battlenet) ───
+    record_routing_event(1, "forward_table_default_route", "0_0_0_0", "MIB_IPFORWARDROW_56B_NextHop_192_168_1_1_metric_25", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"routing_event\",\"evt_id\":1,\"r_kind\":\"forward_table_default_route\",\"dest_ip\":\"0_0_0_0\",\"route_synth\":\"MIB_IPFORWARDROW_56B_NextHop_192_168_1_1_metric_25\",\"struct_bytes\":56,\"NumEntries\":1,\"status\":\"PARTIAL\"")
+    record_routing_event(2, "create_forward_battlenet_rest", "24_105_62_129", "MIB_IPFORWARDROW_dest_24_105_62_129_via_gw", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"routing_event\",\"evt_id\":2,\"r_kind\":\"create_forward_battlenet_rest\",\"dest_ip\":\"24_105_62_129\",\"route_synth\":\"MIB_IPFORWARDROW_dest_24_105_62_129_via_gw\",\"struct_bytes\":56,\"battle_net_rest_endpoint_routing\":true,\"status\":\"PARTIAL\"")
+    record_routing_event(3, "delete_forward_stale", "24_105_62_129", "delete_route_release", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"routing_event\",\"evt_id\":3,\"r_kind\":\"delete_forward_stale\",\"dest_ip\":\"24_105_62_129\",\"route_synth\":\"delete_route_release\",\"return_dword\":\"ERROR_SUCCESS_0\",\"status\":\"PARTIAL\"")
+    record_routing_event(4, "best_route_battlenet_rest_lookup", "24_105_62_129", "best_route_via_192_168_1_1_IfIndex_1", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"routing_event\",\"evt_id\":4,\"r_kind\":\"best_route_battlenet_rest_lookup\",\"dest_ip\":\"24_105_62_129\",\"route_synth\":\"best_route_via_192_168_1_1_IfIndex_1\",\"struct_bytes\":56,\"d2r_d4_p2p_routing_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── 4. arp_event × 2 (ip_net_table/send_arp_gateway) ───
+    record_arp_event(1, "ip_net_table_arp_cache_dump", "192_168_1_1", "MIB_IPNETROW_24B_02_50_41_50_50_4C_dynamic_3", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"arp_event\",\"evt_id\":1,\"a_kind\":\"ip_net_table_arp_cache_dump\",\"ip_addr\":\"192_168_1_1\",\"mac_synth\":\"MIB_IPNETROW_24B_02_50_41_50_50_4C_dynamic_3\",\"struct_bytes\":24,\"NumEntries\":1,\"PhysAddrLen\":6,\"Type\":\"MIB_IPNET_TYPE_DYNAMIC_3\",\"status\":\"PARTIAL\"")
+    record_arp_event(2, "send_arp_gateway_resolve", "192_168_1_1", "02_50_41_50_50_4C_resolved", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"arp_event\",\"evt_id\":2,\"a_kind\":\"send_arp_gateway_resolve\",\"ip_addr\":\"192_168_1_1\",\"mac_synth\":\"02_50_41_50_50_4C_resolved\",\"PhysAddrLen\":6,\"return_dword\":\"ERROR_SUCCESS_0\",\"status\":\"PARTIAL\"")
+
+    // ─── 5. dns_event × 2 (network_params_dns/notify_addr_change_overlapped) ───
+    record_dns_event(1, "network_params_blizzard_com_dns", "DESKTOP-D2R", "FIXED_INFO_524B_DnsServer_8_8_8_8_1_1_1_1", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"dns_event\",\"evt_id\":1,\"d_kind\":\"network_params_blizzard_com_dns\",\"hostname\":\"DESKTOP-D2R\",\"dns_synth\":\"FIXED_INFO_524B_DnsServer_8_8_8_8_1_1_1_1\",\"struct_bytes\":524,\"DomainName\":\"blizzard.com\",\"d2r_d4_dns_resolver_baseline\":true,\"status\":\"PARTIAL\"")
+    record_dns_event(2, "notify_addr_change_overlapped_async", "DESKTOP-D2R", "OVERLAPPED_32B_hEvent_0x9F010100_pending", "PARTIAL")
+    r0_emit("pe_iphlpapi_core_record", "\"kind\":\"dns_event\",\"evt_id\":2,\"d_kind\":\"notify_addr_change_overlapped_async\",\"hostname\":\"DESKTOP-D2R\",\"dns_synth\":\"OVERLAPPED_32B_hEvent_0x9F010100_pending\",\"struct_bytes\":32,\"return_dword\":\"ERROR_IO_PENDING_997\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 12 {
+        panic("pe_iphlpapi_core FAIL [syscall_invoke_count] expected=12 got=" + to_string(si))
+    }
+    let ae = adapter_event_count()
+    if ae != 4 {
+        panic("pe_iphlpapi_core FAIL [adapter_event_count] expected=4 got=" + to_string(ae))
+    }
+    let re = routing_event_count()
+    if re != 4 {
+        panic("pe_iphlpapi_core FAIL [routing_event_count] expected=4 got=" + to_string(re))
+    }
+    let arpe = arp_event_count()
+    if arpe != 2 {
+        panic("pe_iphlpapi_core FAIL [arp_event_count] expected=2 got=" + to_string(arpe))
+    }
+    let de = dns_event_count()
+    if de != 2 {
+        panic("pe_iphlpapi_core FAIL [dns_event_count] expected=2 got=" + to_string(de))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "GetAdaptersInfo" { panic("pe_iphlpapi_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(3) != "GetInterfaceInfo" { panic("pe_iphlpapi_core FAIL [fn_kind_name(3)]") }
+    if fn_kind_name(4) != "GetIpForwardTable" { panic("pe_iphlpapi_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(8) != "GetIpNetTable" { panic("pe_iphlpapi_core FAIL [fn_kind_name(8)]") }
+    if fn_kind_name(11) != "NotifyAddrChange" { panic("pe_iphlpapi_core FAIL [fn_kind_name(11)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_iphlpapi_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "adapter" { panic("pe_iphlpapi_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "routing" { panic("pe_iphlpapi_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(8) != "arp" { panic("pe_iphlpapi_core FAIL [fn_group_name(8)]") }
+    if fn_group_name(10) != "dns" { panic("pe_iphlpapi_core FAIL [fn_group_name(10)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_iphlpapi_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pip_stats()
+    if len(s) != 5 { panic("pe_iphlpapi_core FAIL [stats len] expected=5 got=" + to_string(len(s))) }
+    if s[0] != 12 { panic("pe_iphlpapi_core FAIL [stats syscall_invoke_count] expected=12 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_iphlpapi_core FAIL [stats adapter_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_iphlpapi_core FAIL [stats routing_event_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 2 { panic("pe_iphlpapi_core FAIL [stats arp_event_count] expected=2 got=" + to_string(s[3])) }
+    if s[4] != 2 { panic("pe_iphlpapi_core FAIL [stats dns_event_count] expected=2 got=" + to_string(s[4])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_iphlpapi_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"adapter_event_count\":" + to_string(s[1])
+        + ",\"routing_event_count\":" + to_string(s[2])
+        + ",\"arp_event_count\":" + to_string(s[3])
+        + ",\"dns_event_count\":" + to_string(s[4]))
+
+    r0_emit("pe_iphlpapi_core_summary",
+        "\"target\":\"IPHLPAPI.dll\",\"fn_total\":12,\"fn_emit_partial\":12,\"groups\":[\"adapter\",\"routing\",\"arp\",\"dns\"],\"ip_adapter_info_synth_bytes\":640,\"mib_ipforwardrow_synth_bytes\":56,\"mib_ipnetrow_synth_bytes\":24,\"fixed_info_synth_bytes\":524,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_iphlpapi_core_kpi",
+        "\"adapter_emits\":4,\"routing_emits\":4,\"arp_emits\":2,\"dns_emits\":2,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"d2r_d4_multi_nic_routing_baseline\":true,\"battlenet_rest_24_105_62_129_p2p_baseline\":true,\"bsd_getifaddrs_sysctl_net_rt_dump_route_4_binding\":false,\"sc_dynamic_store_sc_network_configuration_nw_path_monitor_binding\":false")
+
+    // ─── cycle 50 → 51 IPHLPAPI coverage progression evidence emit ───
+    r0_emit("pe_iphlpapi_core_coverage_progression",
+        "\"surface\":\"IPHLPAPI_full_435_fn\",\"cycle_50_count\":292,\"cycle_51_count\":304,\"delta\":12,\"cycle_50_percent\":67.13,\"cycle_51_percent\":69.89,\"cycle_51_module\":\"pe_iphlpapi_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bd4_cycle_increment\":12,\"track_bd_bundled_part_4_of_4\":true,\"track_bd_cumulative_delta\":42")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_iphlpapi_core_round_trip_matrix",
+        "\"surface\":\"IPHLPAPI_core_12_fn\",\"fn_partial\":12,\"fn_groups\":4,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real GetAdaptersInfo + GetIpForwardTable + GetIpNetTable + GetNetworkParams = BSD getifaddrs(3) + sysctl(NET_RT_DUMP/IFLIST) + route(4) + SystemConfiguration.framework SCDynamicStore + Network.framework nw_path_monitor_t bridge pending separate cycle (long-horizon network IP helper pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BD4 expansion emit (cycle 51, IPHLPAPI +12 fn, BD bundled complete) ───
+    r0_emit("pe_iphlpapi_core_bd4_expansion",
+        "\"track\":\"BD4\",\"cycle\":51,\"surface\":\"IPHLPAPI_new\",\"new_fn\":12,\"groups\":[\"adapter\",\"routing\",\"arp\",\"dns\"],\"adapter_count\":4,\"routing_count\":4,\"arp_count\":2,\"dns_count\":2,\"emit_format\":\"__IPHLPAPI__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_3_evidence_augment\":true,\"track_bd_bundled_part_4_of_4\":true,\"track_bd_complete\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_iphlpapi_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pip()
+    let s2 = pip_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_iphlpapi_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_iphlpapi_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", adapter_event=" + to_string(s[1])
+        + ", routing_event=" + to_string(s[2]) + ", arp_event=" + to_string(s[3])
+        + ", dns_event=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pip_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("adapter_event_count\t" + to_string(s[1]))
+            println("routing_event_count\t" + to_string(s[2]))
+            println("arp_event_count\t" + to_string(s[3]))
+            println("dns_event_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_iphlpapi_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_iphlpapi_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pip()
+            println("cleaned: " + pip_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pip_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_iphlpapi_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

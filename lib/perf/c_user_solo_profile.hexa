@@ -1,0 +1,160 @@
+// lib/perf/c_user_solo_profile.hexa — CN-18 PSB-3 보조 (14/15, B=4)
+//
+// 사용자 개인의 PSO/heap 패턴 학습 → personalized optimization.
+// 사용자별 hardware 특성 (M1/M2/M3, 8GB/16GB/32GB) + 플레이 스타일 (캠페인/PvP/coop)
+// 패턴 학습 후 personalized warm/evict policy.
+//
+// own 1 + own 2 mandate. B=4 (mostly launch/setup, not all runtime).
+
+use "./r0_common"
+
+let SOLO_DIR = GAMEBOX_HOME + "/persist/user_solo_profile"
+let PROFILE_PATH = SOLO_DIR + "/profile.tsv"
+let PATTERN_PATH = SOLO_DIR + "/pattern.jsonl"
+
+fn solo_dir() -> str { return SOLO_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + SOLO_DIR + "'")
+}
+
+// ─── 사용자 hardware fingerprint ───
+//   M1/M2/M3 + RAM + macOS version
+fn hw_fingerprint() -> str {
+    let arch = exec("uname -m").trim()
+    let macos = exec("sw_vers -productVersion 2>/dev/null").trim()
+    let mem_gb = exec("sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1073741824)}'").trim()
+    if mem_gb == "" { mem_gb = "0" }
+    return arch + "_" + mem_gb + "GB_" + macos
+}
+
+// ─── play style 등록 ───
+fn register_play_style(game: str, style: str) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = game + "\t" + style + "\t" + ts
+    let tmp = PROFILE_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PROFILE_PATH + "' && rm -f '" + tmp + "'")
+    r0_emit("solo_play_style", "\"game\":\"" + game + "\",\"style\":\"" + style + "\"")
+}
+
+// ─── 패턴 record ───
+//   pattern_kind: "pso_burst" | "heap_pressure" | "zone_dwell" | "session_length"
+fn record_pattern(pattern_kind: str, value: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"kind\":\"" + pattern_kind + "\",\"value\":" + to_string(value) + ",\"ts\":" + ts + "}"
+    let tmp = PATTERN_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PATTERN_PATH + "' && rm -f '" + tmp + "'")
+}
+
+// ─── 추천 최적화 — hardware + play style 조합 ───
+//   returns recommendation string (어떤 axis 강화)
+fn recommend_optimization(hw: str, style: str) -> str {
+    if hw.contains("8GB") {
+        return "prioritize_heap_defrag,aggressive_evict_cold_textures,reduce_shader_cache_size"
+    }
+    if hw.contains("16GB") {
+        if style == "PvP" {
+            return "prioritize_input_latency,boost_metal_queue,minimal_background_io"
+        }
+        return "balanced_warm_cache,moderate_zone_prefetch"
+    }
+    if hw.contains("32GB") || hw.contains("48GB") {
+        return "aggressive_zone_prefetch,large_shader_cache,full_pso_chain_speculation"
+    }
+    return "default_balanced"
+}
+
+// ─── 패턴 통계 ───
+fn pattern_stats() -> array {
+    let exists = exec("test -f '" + PATTERN_PATH + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0] }
+    let total = to_int(exec("wc -l < '" + PATTERN_PATH + "' | tr -d ' '").trim())
+    let kinds = to_int(exec("grep -oE '\"kind\":\"[^\"]+\"' '" + PATTERN_PATH + "' | sort -u | wc -l | tr -d ' '").trim())
+    return [total, kinds]
+}
+
+fn cleanup_solo() -> void {
+    let _ = exec("rm -rf '" + SOLO_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "solo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_solo()
+
+    // hw fingerprint — 무엇이든 형식만 검증
+    let hw = hw_fingerprint()
+    if !hw.contains("_") {
+        panic("c_user_solo_profile FAIL [hw_fingerprint] expected contains '_' got=" + hw)
+    }
+
+    // play style 등록
+    register_play_style("d2r", "campaign")
+    register_play_style("d4", "PvP")
+    register_play_style("d4", "open_world")
+
+    // 패턴 record
+    record_pattern("pso_burst", 50)
+    record_pattern("heap_pressure", 1500)
+    record_pattern("zone_dwell", 300)
+    record_pattern("session_length", 7200)
+
+    // 추천 — 다양한 hw/style 조합
+    let rec_8gb = recommend_optimization("arm64_8GB_15.0", "campaign")
+    if !rec_8gb.contains("aggressive_evict_cold_textures") {
+        panic("c_user_solo_profile FAIL [rec 8GB] expected contains aggressive_evict got=" + rec_8gb)
+    }
+    let rec_16_pvp = recommend_optimization("arm64_16GB_15.0", "PvP")
+    if !rec_16_pvp.contains("input_latency") {
+        panic("c_user_solo_profile FAIL [rec 16GB PvP] expected contains input_latency got=" + rec_16_pvp)
+    }
+    let rec_32 = recommend_optimization("arm64_32GB_15.0", "open_world")
+    if !rec_32.contains("aggressive_zone_prefetch") {
+        panic("c_user_solo_profile FAIL [rec 32GB] got=" + rec_32)
+    }
+
+    // stats
+    let stats = pattern_stats()
+    if stats[0] != 4 {
+        panic("c_user_solo_profile FAIL [stats total] expected=4 got=" + to_string(stats[0]))
+    }
+    if stats[1] != 4 {
+        panic("c_user_solo_profile FAIL [stats kinds] expected=4 got=" + to_string(stats[1]))
+    }
+
+    r0_emit("solo_recommendation", "\"hw\":\"" + hw + "\",\"rec_8gb\":\"" + rec_8gb + "\"")
+    r0_emit("solo_stats", "\"patterns\":" + to_string(stats[0]) + ",\"kinds\":" + to_string(stats[1]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 4 {
+        panic("c_user_solo_profile FAIL [emit count] expected>=4 got=" + to_string(cnt))
+    }
+
+    cleanup_solo()
+
+    println("  ✅ c_user_solo_profile self_test PASS (3 styles, 4 patterns, 3 recs, hw=" + hw + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "fingerprint" { println(hw_fingerprint()); return }
+        if sub == "recommend" {
+            if len(a) >= 5 { println(recommend_optimization(a[3], a[4])); return }
+        }
+        if sub == "stats" {
+            let s = pattern_stats()
+            println("patterns=" + to_string(s[0]) + " kinds=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_solo(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_user_solo_profile.hexa { self-test | fingerprint | recommend <hw> <style> | stats | cleanup }")
+}

@@ -1,0 +1,124 @@
+// lib/perf/c_cdn_chunk_assemble_track.hexa — CN-86 skeleton manjeom 15/15
+//
+// Phase 3 CDN chunk assembly — Battle.net 4MB chunk 다운로드 → manifest 정렬.
+// chunk hash check + offset 정렬 + missing 검출.
+//
+// 무기: chunk table (offset, size, sha) + columnar (chunk × elapsed_ms).
+// 효과: 부분 download 후 resume — 손상 chunk 만 재다운.
+
+use "./r0_common"
+
+let CCAT_DIR = GAMEBOX_HOME + "/persist/cdn_chunk_assemble"
+let CHUNK_LOG = CCAT_DIR + "/chunks.tsv"
+
+fn ccat_dir() -> str { return CCAT_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CCAT_DIR + "'")
+}
+
+fn chunk_size() -> int { return 4194304 }   // 4 MB
+
+fn record_chunk(idx: int, offset: int, sha: str, status: str, elapsed_ms: int) -> void {
+    ensure_dir()
+    let exists = exec("test -f '" + CHUNK_LOG + "' && echo ok").trim()
+    if exists == "ok" {
+        let _ = exec("awk -F'\\t' -v i=" + to_string(idx) + " '$1!=i' '" + CHUNK_LOG + "' > '" + CHUNK_LOG + ".tmp' && mv '" + CHUNK_LOG + ".tmp' '" + CHUNK_LOG + "'")
+    }
+    let line = to_string(idx) + "\t" + to_string(offset) + "\t" + sha + "\t" + status + "\t" + to_string(elapsed_ms)
+    let tmp = CHUNK_LOG + ".add"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + CHUNK_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("cdn_chunk", "\"idx\":" + to_string(idx) + ",\"status\":\"" + status + "\",\"ms\":" + to_string(elapsed_ms))
+}
+
+fn ok_count() -> int {
+    let exists = exec("test -f '" + CHUNK_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$4==\"ok\"' '" + CHUNK_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn corrupt_count() -> int {
+    let exists = exec("test -f '" + CHUNK_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$4==\"corrupt\"' '" + CHUNK_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn missing_count(expected_total: int) -> int {
+    let exists = exec("test -f '" + CHUNK_LOG + "' && echo ok").trim()
+    if exists != "ok" { return expected_total }
+    let have = to_int(exec("wc -l < '" + CHUNK_LOG + "' | tr -d ' '").trim())
+    return expected_total - have
+}
+
+fn cleanup_ccat() -> void {
+    let _ = exec("rm -rf '" + CCAT_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "ccat-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_ccat()
+
+    if chunk_size() != 4194304 { panic("c_cdn_chunk_assemble_track FAIL [chunk size]") }
+
+    // 10 chunks 다운 (idx 0~9), 1 corrupt
+    let i = 0
+    while i < 10 {
+        let st = "ok"
+        if i == 3 { st = "corrupt" }
+        record_chunk(i, i * chunk_size(), "sha_" + to_string(i), st, 200 + i * 10)
+        i = i + 1
+    }
+
+    let ok = ok_count()
+    if ok != 9 { panic("c_cdn_chunk_assemble_track FAIL [ok] expected=9 got=" + to_string(ok)) }
+
+    let cor = corrupt_count()
+    if cor != 1 { panic("c_cdn_chunk_assemble_track FAIL [corrupt] expected=1 got=" + to_string(cor)) }
+
+    // expected manifest 12 chunks → 2 missing
+    let mis = missing_count(12)
+    if mis != 2 { panic("c_cdn_chunk_assemble_track FAIL [missing] expected=2 got=" + to_string(mis)) }
+
+    // re-download corrupt chunk (idx 3 ok)
+    record_chunk(3, 3 * chunk_size(), "sha_3_v2", "ok", 250)
+    let ok2 = ok_count()
+    if ok2 != 10 { panic("c_cdn_chunk_assemble_track FAIL [resume ok] expected=10 got=" + to_string(ok2)) }
+
+    let cor2 = corrupt_count()
+    if cor2 != 0 { panic("c_cdn_chunk_assemble_track FAIL [resume cor] expected=0 got=" + to_string(cor2)) }
+
+    r0_emit("cdn_assemble_summary", "\"ok\":" + to_string(ok2) + ",\"missing\":" + to_string(missing_count(12)))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 10 { panic("c_cdn_chunk_assemble_track FAIL [emit] got=" + to_string(cnt)) }
+
+    cleanup_ccat()
+
+    println("  ✅ c_cdn_chunk_assemble_track self_test PASS (10 chunks, 1 corrupt → resume → 10 ok / 2 missing, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "chunk" && len(a) >= 8 {
+            record_chunk(to_int(a[3]), to_int(a[4]), a[5], a[6], to_int(a[7]))
+            println("recorded")
+            return
+        }
+        if sub == "stats" && len(a) >= 4 {
+            println("ok=" + to_string(ok_count()) + " corrupt=" + to_string(corrupt_count()) + " missing=" + to_string(missing_count(to_int(a[3]))))
+            return
+        }
+        if sub == "cleanup" { cleanup_ccat(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_cdn_chunk_assemble_track.hexa { self-test | chunk <idx> <offset> <sha> <status> <ms> | stats <expected_total> | cleanup }")
+}

@@ -1,0 +1,429 @@
+// lib/loader/pe_setjmp_longjmp_real.hexa — Win32 _setjmp/_setjmpex/longjmp 추적 + jmp_buf layout 매핑
+//
+// MSVC jmp_buf layout (Win64 — setjmp.h spec):
+//   256 byte struct {
+//     uint64 frame;       // frame_regs / setjmpex 시 SEH frame chain head
+//     uint64 rbx;         // saved nonvol GPRs
+//     uint64 rsp;         // stack pointer at setjmp call
+//     uint64 rbp;
+//     uint64 rsi;
+//     uint64 rdi;
+//     uint64 r12;
+//     uint64 r13;
+//     uint64 r14;
+//     uint64 r15;
+//     uint64 rip;         // return address (longjmp 시 jump target)
+//     uint32 mxcsr;
+//     uint16 fpcsr;
+//     uint16 spare;
+//     m128   xmm6..xmm15; // saved nonvol XMM (10 * 16 = 160 byte)
+//   }
+// _setjmp     : 단순 register snapshot (return 0 on capture)
+// _setjmpex   : SEH 통합 — frame chain head 를 jmp_buf.frame 에 저장 → longjmp 시 unwind
+// longjmp     : register restore + ret (ret_value=0 이면 1 로 보정 by spec)
+// own2: Apple sigjmp_buf (sigsetjmp/siglongjmp) 별도 layout → translation layer 로
+//       MSVC jmp_buf <-> sigjmp_buf 매핑 후 호스트 sigsetjmp 위임
+// own1: MSDN setjmp.h spec + Apple sigsetjmp(3) man page only. Wine msvcrt 인용 X
+//
+// op_kind code:
+//   1 = setjmp
+//   2 = setjmpex
+//   3 = longjmp
+//   4 = longjmp_with_value
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t jmp_buf_id<int> \t ret_value<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psjlj_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_setjmp_longjmp_real"
+}
+
+fn psjlj_ops_path() -> str {
+    return psjlj_dir() + "/ops.tsv"
+}
+
+fn psjlj_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psjlj_dir() + "'")
+}
+
+fn cleanup_psjlj() -> void {
+    psjlj_ensure_dir()
+    let _ = exec("rm -f '" + psjlj_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psjlj_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psjlj_append_row(path: str, row: str) -> void {
+    psjlj_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: setjmp/longjmp op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, jmp_buf_id: int, ret_value: int) -> void {
+    if op_id <= 0 {
+        panic("pe_setjmp_longjmp_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_setjmp_longjmp_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_setjmp_longjmp_real FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if jmp_buf_id <= 0 {
+        panic("pe_setjmp_longjmp_real FAIL [record_op] expected=jmp_buf_id>0 got=" + to_string(jmp_buf_id))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(jmp_buf_id) + "\t" + to_string(ret_value) + "\n"
+    psjlj_append_row(psjlj_ops_path(), row)
+}
+
+// ─── op_count: total op row 수 ───
+fn op_count() -> int {
+    let t = psjlj_read_table(psjlj_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 row 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = psjlj_read_table(psjlj_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_jmp_bufs: 등장한 jmp_buf_id distinct count ───
+fn distinct_jmp_bufs() -> int {
+    let t = psjlj_read_table(psjlj_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let jb = to_int(parts[2])
+                let m = len(seen)
+                let j = 0
+                let mut found = false
+                while j < m {
+                    if seen[j] == jb {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    seen.push(jb)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── setjmp_longjmp_balance: (setjmp+setjmpex) - (longjmp+longjmp_with_value) ───
+fn setjmp_longjmp_balance() -> int {
+    let sj = count_by_op_kind(1) + count_by_op_kind(2)
+    let lj = count_by_op_kind(3) + count_by_op_kind(4)
+    return sj - lj
+}
+
+// ─── nonzero_ret_count: ret_value != 0 인 row 수 ───
+fn nonzero_ret_count() -> int {
+    let t = psjlj_read_table(psjlj_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) != 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── op_ret_value: 특정 op_id 의 ret_value (없으면 0) ───
+fn op_ret_value(op_id: int) -> int {
+    let t = psjlj_read_table(psjlj_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psjlj_stats: [op_count, distinct_jmp_bufs, setjmp_longjmp_balance, nonzero_ret_count] ───
+fn psjlj_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(distinct_jmp_bufs())
+    out.push(setjmp_longjmp_balance())
+    out.push(nonzero_ret_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psjlj-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psjlj()
+
+    // 2. record 6 ops covering all 4 op_kinds with ≥2 distinct jmp_bufs
+    //    jmp_buf_id 901 / 902 (2 distinct)
+    record_op(190001, 1, 901, 0)
+    r0_emit("pe_setjmp_longjmp_real_record",
+        "\"op_id\":190001,\"op_kind\":1,\"jmp_buf_id\":901,\"ret_value\":0,\"target\":\"setjmp\"")
+
+    record_op(190002, 2, 902, 0)
+    r0_emit("pe_setjmp_longjmp_real_record",
+        "\"op_id\":190002,\"op_kind\":2,\"jmp_buf_id\":902,\"ret_value\":0,\"target\":\"setjmpex\"")
+
+    record_op(190003, 3, 901, 1)
+    r0_emit("pe_setjmp_longjmp_real_record",
+        "\"op_id\":190003,\"op_kind\":3,\"jmp_buf_id\":901,\"ret_value\":1,\"target\":\"longjmp\"")
+
+    record_op(190004, 4, 902, 42)
+    r0_emit("pe_setjmp_longjmp_real_record",
+        "\"op_id\":190004,\"op_kind\":4,\"jmp_buf_id\":902,\"ret_value\":42,\"target\":\"longjmp_with_value\"")
+
+    record_op(190005, 1, 902, 0)
+    r0_emit("pe_setjmp_longjmp_real_record",
+        "\"op_id\":190005,\"op_kind\":1,\"jmp_buf_id\":902,\"ret_value\":0,\"target\":\"setjmp\"")
+
+    record_op(190006, 4, 901, 7)
+    r0_emit("pe_setjmp_longjmp_real_record",
+        "\"op_id\":190006,\"op_kind\":4,\"jmp_buf_id\":901,\"ret_value\":7,\"target\":\"longjmp_with_value\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_setjmp_longjmp_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (1=2, 2=1, 3=1, 4=2; 99=0)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_setjmp_longjmp_real FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_setjmp_longjmp_real FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_setjmp_longjmp_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 2 {
+        panic("pe_setjmp_longjmp_real FAIL [count_by_op_kind(4)] expected=2 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_setjmp_longjmp_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. distinct_jmp_bufs = 2 (901, 902)
+    let dj = distinct_jmp_bufs()
+    if dj != 2 {
+        panic("pe_setjmp_longjmp_real FAIL [distinct_jmp_bufs] expected=2 got=" + to_string(dj))
+    }
+
+    // 6. setjmp_longjmp_balance = (2+1) - (1+2) = 0
+    let bal = setjmp_longjmp_balance()
+    if bal != 0 {
+        panic("pe_setjmp_longjmp_real FAIL [setjmp_longjmp_balance] expected=0 got=" + to_string(bal))
+    }
+
+    // 7. nonzero_ret_count = 3 (190003=1, 190004=42, 190006=7)
+    let nz = nonzero_ret_count()
+    if nz != 3 {
+        panic("pe_setjmp_longjmp_real FAIL [nonzero_ret_count] expected=3 got=" + to_string(nz))
+    }
+
+    // 8. op_ret_value sanity
+    let r4 = op_ret_value(190004)
+    if r4 != 42 {
+        panic("pe_setjmp_longjmp_real FAIL [op_ret_value(190004)] expected=42 got=" + to_string(r4))
+    }
+    let r1 = op_ret_value(190001)
+    if r1 != 0 {
+        panic("pe_setjmp_longjmp_real FAIL [op_ret_value(190001)] expected=0 got=" + to_string(r1))
+    }
+    let r_miss = op_ret_value(9999)
+    if r_miss != 0 {
+        panic("pe_setjmp_longjmp_real FAIL [op_ret_value(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 9. psjlj_stats() = [6, 2, 0, 3]
+    let s = psjlj_stats()
+    if len(s) != 4 {
+        panic("pe_setjmp_longjmp_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_setjmp_longjmp_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_setjmp_longjmp_real FAIL [stats distinct_jmp_bufs] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 0 {
+        panic("pe_setjmp_longjmp_real FAIL [stats balance] expected=0 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_setjmp_longjmp_real FAIL [stats nonzero_ret_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_setjmp_longjmp_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"distinct_jmp_bufs\":" + to_string(s[1])
+        + ",\"setjmp_longjmp_balance\":" + to_string(s[2])
+        + ",\"nonzero_ret_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_setjmp_longjmp_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_psjlj()
+    let s2 = psjlj_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_setjmp_longjmp_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_setjmp_longjmp_real self_test PASS (ops=" + to_string(s[0])
+        + ", jmp_bufs=" + to_string(s[1]) + ", balance=" + to_string(s[2])
+        + ", nonzero_ret=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psjlj_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("distinct_jmp_bufs\t" + to_string(s[1]))
+            println("setjmp_longjmp_balance\t" + to_string(s[2]))
+            println("nonzero_ret_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "ret" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_ret_value\t" + to_string(op_ret_value(oid)))
+                return
+            }
+            println("usage: hexa run pe_setjmp_longjmp_real.hexa ret <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_setjmp_longjmp_real.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psjlj()
+            println("cleaned: " + psjlj_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psjlj_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_setjmp_longjmp_real.hexa { self-test | stats | ret <op_id> | count <op_kind> | cleanup | dir }")
+}

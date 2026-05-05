@@ -1,0 +1,446 @@
+// lib/loader/pe_shader_sv_mapping.hexa — phase1 HLSL SV_* → MSL attribute mapping skeleton
+//
+// HLSL system value semantics → Metal Shading Language attribute 매핑 tracker.
+// PE/COFF DXBC/DXIL signature 의 SV_* semantic 을 MSL [[attribute]] 로 변환할 때
+// 사용할 mapping table 을 record + aggregate.
+//
+// HLSL SV_* → MSL attribute mapping:
+//   SV_Position             → [[position]]            (vertex_out / fragment_in)
+//   SV_Target0..7           → [[color(0..7)]]         (fragment_out)
+//   SV_VertexID             → [[vertex_id]]           (vertex_in builtin)
+//   SV_InstanceID           → [[instance_id]]         (vertex_in builtin)
+//   SV_PrimitiveID          → [[primitive_id]]        (geometry/tess builtin)
+//   SV_IsFrontFace          → [[front_facing]]        (fragment_in builtin)
+//   SV_Depth                → [[depth(any)]]          (fragment_out)
+//   SV_StencilRef           → [[stencil]]             (fragment_out, M2+)
+//   SV_ClipDistance0..7     → [[clip_distance]]       (vertex_out array)
+//   SV_CullDistance         → 무 — Metal 미지원 → SHADER fallback (DIY hexa)
+// own1: HLSL Reference (Microsoft) + Metal Shading Language Spec only
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 HLSL→MSL semantic mapping tracker — 실 shader compile X (stage2+).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// semantic_kind code:
+//   1  = position
+//   2  = target
+//   3  = vertex_id
+//   4  = instance_id
+//   5  = primitive_id
+//   6  = isfront_face
+//   7  = depth
+//   8  = stencil_ref
+//   9  = clip_distance
+//   10 = cull_distance
+//
+// register_class code:
+//   1 = input
+//   2 = output
+//   3 = builtin
+//
+// persist schema (TSV — mappings.tsv):
+//   mapping_id<int> \t semantic_kind<int> \t index<int> \t register_class<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psvm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_shader_sv_mapping"
+}
+
+fn psvm_mappings_path() -> str {
+    return psvm_dir() + "/mappings.tsv"
+}
+
+fn psvm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psvm_dir() + "'")
+}
+
+fn cleanup_psvm() -> void {
+    psvm_ensure_dir()
+    let _ = exec("rm -f '" + psvm_mappings_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psvm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psvm_append_row(path: str, row: str) -> void {
+    psvm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_mapping: SV_* mapping 1 건 기록 ───
+fn record_mapping(mapping_id: int, semantic_kind: int, index: int, register_class: int) -> void {
+    if mapping_id <= 0 {
+        panic("pe_shader_sv_mapping FAIL [record_mapping] expected=mapping_id>0 got=" + to_string(mapping_id))
+    }
+    if semantic_kind < 1 {
+        panic("pe_shader_sv_mapping FAIL [record_mapping] expected=semantic_kind>=1 got=" + to_string(semantic_kind))
+    }
+    if semantic_kind > 10 {
+        panic("pe_shader_sv_mapping FAIL [record_mapping] expected=semantic_kind<=10 got=" + to_string(semantic_kind))
+    }
+    if index < 0 {
+        panic("pe_shader_sv_mapping FAIL [record_mapping] expected=index>=0 got=" + to_string(index))
+    }
+    if register_class < 1 {
+        panic("pe_shader_sv_mapping FAIL [record_mapping] expected=register_class>=1 got=" + to_string(register_class))
+    }
+    if register_class > 3 {
+        panic("pe_shader_sv_mapping FAIL [record_mapping] expected=register_class<=3 got=" + to_string(register_class))
+    }
+    let row = to_string(mapping_id) + "\t" + to_string(semantic_kind)
+        + "\t" + to_string(index) + "\t" + to_string(register_class) + "\n"
+    psvm_append_row(psvm_mappings_path(), row)
+}
+
+// ─── mapping_count: total mapping 수 ───
+fn mapping_count() -> int {
+    let t = psvm_read_table(psvm_mappings_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_semantic: 특정 semantic_kind 의 mapping 수 ───
+fn count_by_semantic(kind: int) -> int {
+    let t = psvm_read_table(psvm_mappings_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_class: 특정 register_class 의 mapping 수 ───
+fn count_by_class(klass: int) -> int {
+    let t = psvm_read_table(psvm_mappings_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == klass {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_indices: 유니크한 index 값의 개수 (단순 dedupe) ───
+fn distinct_indices() -> int {
+    let t = psvm_read_table(psvm_mappings_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = ""
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let key = "|" + parts[2] + "|"
+                if seen.find(key) < 0 {
+                    seen = seen + key
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── mapping_index: 특정 mapping_id 의 index (없으면 -1) ───
+fn mapping_index(mapping_id: int) -> int {
+    let t = psvm_read_table(psvm_mappings_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == mapping_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── psvm_stats: [mapping_count, distinct_indices, count_by_class(3), count_by_semantic(2)] ───
+fn psvm_stats() -> array {
+    let mut out = []
+    out.push(mapping_count())
+    out.push(distinct_indices())
+    out.push(count_by_class(3))
+    out.push(count_by_semantic(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psvm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psvm()
+
+    // 2. record 6 mappings — 5 distinct semantic_kinds, all 3 register_classes
+    //   id=210001 SV_Position    sem=1  idx=0 class=2 (vertex_out output)
+    //   id=210002 SV_Target0     sem=2  idx=0 class=2 (fragment_out output)
+    //   id=210003 SV_Target1     sem=2  idx=1 class=2 (fragment_out output)
+    //   id=210004 SV_VertexID    sem=3  idx=0 class=3 (vertex_in builtin)
+    //   id=210005 SV_IsFrontFace sem=6  idx=0 class=1 (fragment_in input)
+    //   id=210006 SV_Depth       sem=7  idx=0 class=2 (fragment_out output)
+    record_mapping(210001, 1, 0, 2)
+    r0_emit("pe_shader_sv_mapping_record",
+        "\"mapping_id\":210001,\"semantic_kind\":1,\"index\":0,\"register_class\":2,\"target\":\"position\"")
+
+    record_mapping(210002, 2, 0, 2)
+    r0_emit("pe_shader_sv_mapping_record",
+        "\"mapping_id\":210002,\"semantic_kind\":2,\"index\":0,\"register_class\":2,\"target\":\"color0\"")
+
+    record_mapping(210003, 2, 1, 2)
+    r0_emit("pe_shader_sv_mapping_record",
+        "\"mapping_id\":210003,\"semantic_kind\":2,\"index\":1,\"register_class\":2,\"target\":\"color1\"")
+
+    record_mapping(210004, 3, 0, 3)
+    r0_emit("pe_shader_sv_mapping_record",
+        "\"mapping_id\":210004,\"semantic_kind\":3,\"index\":0,\"register_class\":3,\"target\":\"vertex_id\"")
+
+    record_mapping(210005, 6, 0, 1)
+    r0_emit("pe_shader_sv_mapping_record",
+        "\"mapping_id\":210005,\"semantic_kind\":6,\"index\":0,\"register_class\":1,\"target\":\"front_facing\"")
+
+    record_mapping(210006, 7, 0, 2)
+    r0_emit("pe_shader_sv_mapping_record",
+        "\"mapping_id\":210006,\"semantic_kind\":7,\"index\":0,\"register_class\":2,\"target\":\"depth\"")
+
+    // 3. mapping_count = 6
+    let c = mapping_count()
+    if c != 6 {
+        panic("pe_shader_sv_mapping FAIL [mapping_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_semantic sanity (≥4 semantic_kinds present)
+    let s1 = count_by_semantic(1)
+    if s1 != 1 {
+        panic("pe_shader_sv_mapping FAIL [count_by_semantic(1)] expected=1 got=" + to_string(s1))
+    }
+    let s2 = count_by_semantic(2)
+    if s2 != 2 {
+        panic("pe_shader_sv_mapping FAIL [count_by_semantic(2)] expected=2 got=" + to_string(s2))
+    }
+    let s3 = count_by_semantic(3)
+    if s3 != 1 {
+        panic("pe_shader_sv_mapping FAIL [count_by_semantic(3)] expected=1 got=" + to_string(s3))
+    }
+    let s6 = count_by_semantic(6)
+    if s6 != 1 {
+        panic("pe_shader_sv_mapping FAIL [count_by_semantic(6)] expected=1 got=" + to_string(s6))
+    }
+    let s7 = count_by_semantic(7)
+    if s7 != 1 {
+        panic("pe_shader_sv_mapping FAIL [count_by_semantic(7)] expected=1 got=" + to_string(s7))
+    }
+    let s99 = count_by_semantic(99)
+    if s99 != 0 {
+        panic("pe_shader_sv_mapping FAIL [count_by_semantic(99)] expected=0 got=" + to_string(s99))
+    }
+
+    // 5. count_by_class — all 3 classes present
+    let c1 = count_by_class(1)
+    if c1 != 1 {
+        panic("pe_shader_sv_mapping FAIL [count_by_class(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_class(2)
+    if c2 != 4 {
+        panic("pe_shader_sv_mapping FAIL [count_by_class(2)] expected=4 got=" + to_string(c2))
+    }
+    let c3 = count_by_class(3)
+    if c3 != 1 {
+        panic("pe_shader_sv_mapping FAIL [count_by_class(3)] expected=1 got=" + to_string(c3))
+    }
+
+    // 6. distinct_indices = 2 (idx 0 + idx 1)
+    let di = distinct_indices()
+    if di != 2 {
+        panic("pe_shader_sv_mapping FAIL [distinct_indices] expected=2 got=" + to_string(di))
+    }
+
+    // 7. mapping_index sanity
+    let m3 = mapping_index(210003)
+    if m3 != 1 {
+        panic("pe_shader_sv_mapping FAIL [mapping_index(210003)] expected=1 got=" + to_string(m3))
+    }
+    let m6 = mapping_index(210006)
+    if m6 != 0 {
+        panic("pe_shader_sv_mapping FAIL [mapping_index(210006)] expected=0 got=" + to_string(m6))
+    }
+    let m_miss = mapping_index(9999)
+    if m_miss != -1 {
+        panic("pe_shader_sv_mapping FAIL [mapping_index(9999)] expected=-1 got=" + to_string(m_miss))
+    }
+
+    // 8. psvm_stats() = [6, 2, 1, 2]
+    let st = psvm_stats()
+    if len(st) != 4 {
+        panic("pe_shader_sv_mapping FAIL [stats len] expected=4 got=" + to_string(len(st)))
+    }
+    if st[0] != 6 {
+        panic("pe_shader_sv_mapping FAIL [stats mapping_count] expected=6 got=" + to_string(st[0]))
+    }
+    if st[1] != 2 {
+        panic("pe_shader_sv_mapping FAIL [stats distinct_indices] expected=2 got=" + to_string(st[1]))
+    }
+    if st[2] != 1 {
+        panic("pe_shader_sv_mapping FAIL [stats count_class(3)] expected=1 got=" + to_string(st[2]))
+    }
+    if st[3] != 2 {
+        panic("pe_shader_sv_mapping FAIL [stats count_semantic(2)] expected=2 got=" + to_string(st[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_shader_sv_mapping_stats",
+        "\"mapping_count\":" + to_string(st[0])
+        + ",\"distinct_indices\":" + to_string(st[1])
+        + ",\"class_builtin\":" + to_string(st[2])
+        + ",\"semantic_target\":" + to_string(st[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_shader_sv_mapping FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_psvm()
+    let st2 = psvm_stats()
+    let i = 0
+    while i < len(st2) {
+        if st2[i] != 0 {
+            panic("pe_shader_sv_mapping FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(st2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_shader_sv_mapping self_test PASS (mappings=" + to_string(st[0])
+        + ", distinct_idx=" + to_string(st[1]) + ", builtin=" + to_string(st[2])
+        + ", target=" + to_string(st[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psvm_stats()
+            println("mapping_count\t" + to_string(s[0]))
+            println("distinct_indices\t" + to_string(s[1]))
+            println("count_class_builtin\t" + to_string(s[2]))
+            println("count_semantic_target\t" + to_string(s[3]))
+            return
+        }
+        if sub == "index" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("mapping_index\t" + to_string(mapping_index(mid)))
+                return
+            }
+            println("usage: hexa run pe_shader_sv_mapping.hexa index <mapping_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let val = to_int(a[4])
+                if dim == "semantic" {
+                    println("count_by_semantic\t" + to_string(count_by_semantic(val)))
+                    return
+                }
+                if dim == "class" {
+                    println("count_by_class\t" + to_string(count_by_class(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_shader_sv_mapping.hexa count { semantic <semantic_kind> | class <register_class> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psvm()
+            println("cleaned: " + psvm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psvm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_shader_sv_mapping.hexa { self-test | stats | index <mapping_id> | count semantic <semantic_kind> | count class <register_class> | cleanup | dir }")
+}

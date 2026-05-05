@@ -1,0 +1,339 @@
+// lib/loader/pe_tls_stage2.hexa — stage2 TLS callback dispatch skeleton
+//
+// PE TLS Directory 의 AddressOfCallBacks 배열을 walk + 각 callback 을
+// DLL_PROCESS_ATTACH reason 으로 호출. 본 파일은 instrumentation.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft PE/COFF spec (TLS Directory):
+//     https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section
+//   PIMAGE_TLS_CALLBACK signature: void(PVOID, DWORD reason, PVOID).
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_tls_stage2 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (stage2 — instrumentation only):
+//   stage2 = TLS callback invocation 추적 — synthetic recording.
+//   stage3 = 실제 callback execution (i386_call_frame 통한 thunk).
+//
+// reason 코드 (DLL_PROCESS_ATTACH 등):
+//   1 = DLL_PROCESS_ATTACH
+//   2 = DLL_PROCESS_DETACH
+//   3 = DLL_THREAD_ATTACH
+//   4 = DLL_THREAD_DETACH
+//
+// Schema (TSV): pe_id<int> | callback_idx<int> | reason<int> | elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory ───
+fn pts_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_tls_stage2"
+}
+
+fn pts_table_path() -> str {
+    return pts_dir() + "/callback_history.tsv"
+}
+
+fn ensure_pts_dir() -> void {
+    let _ = exec("mkdir -p '" + pts_dir() + "'")
+}
+
+fn cleanup_pts() -> void {
+    ensure_pts_dir()
+    let _ = exec("rm -f '" + pts_table_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pts_read_table() -> str {
+    let path = pts_table_path()
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pts_append_row(row: str) -> void {
+    ensure_pts_dir()
+    let path = pts_table_path()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_callback: TLS callback invocation 1 행 추가 ───
+//   reason: 1=PROCESS_ATTACH, 2=PROCESS_DETACH, 3=THREAD_ATTACH, 4=THREAD_DETACH
+fn record_callback(pe_id: int, callback_idx: int, reason: int, elapsed_us: int) -> void {
+    let row = to_string(pe_id) + "\t" + to_string(callback_idx)
+        + "\t" + to_string(reason) + "\t" + to_string(elapsed_us) + "\n"
+    pts_append_row(row)
+}
+
+// ─── callback_count: 전체 callback row 수 ───
+fn callback_count() -> int {
+    let t = pts_read_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── count_by_reason: 특정 reason code 의 invocation 수 ───
+fn count_by_reason(reason: int) -> int {
+    let t = pts_read_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    let key = to_string(reason)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[2] == key {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total_elapsed_us: 모든 callback elapsed 합 ───
+fn total_elapsed_us() -> int {
+    let t = pts_read_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── pe_callback_count: 특정 pe_id 의 callback row 수 ───
+fn pe_callback_count(pe_id: int) -> int {
+    let t = pts_read_table()
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    let key = to_string(pe_id)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── pts_stats: [callback_count, total_elapsed_us, count_by_reason(1), count_by_reason(2)] ───
+fn pts_stats() -> array {
+    let mut out = []
+    out.push(callback_count())
+    out.push(total_elapsed_us())
+    out.push(count_by_reason(1))
+    out.push(count_by_reason(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "petls2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pts()
+    if callback_count() != 0 {
+        panic("pe_tls_stage2 FAIL [pre cleanup] expected=0 got=" + to_string(callback_count()))
+    }
+
+    // 2. 4 callbacks across 2 PEs
+    record_callback(75001, 0, 1, 240)
+    record_callback(75001, 1, 1, 180)
+    record_callback(75002, 0, 1, 120)
+    record_callback(75001, 0, 2, 80)
+
+    // emit 1: pts_record (PE 75001 callback 0 attach)
+    r0_emit("pts_record",
+        "\"pe_id\":75001,\"callback_idx\":0,\"reason\":1,\"elapsed_us\":240")
+
+    // emit 2: pts_record (PE 75001 callback 1 attach)
+    r0_emit("pts_record",
+        "\"pe_id\":75001,\"callback_idx\":1,\"reason\":1,\"elapsed_us\":180")
+
+    // emit 3: pts_record (PE 75002 callback 0 attach)
+    r0_emit("pts_record",
+        "\"pe_id\":75002,\"callback_idx\":0,\"reason\":1,\"elapsed_us\":120")
+
+    // emit 4: pts_record (PE 75001 callback 0 detach)
+    r0_emit("pts_record",
+        "\"pe_id\":75001,\"callback_idx\":0,\"reason\":2,\"elapsed_us\":80")
+
+    // 3. callback_count = 4
+    let total = callback_count()
+    if total != 4 {
+        panic("pe_tls_stage2 FAIL [callback_count] expected=4 got=" + to_string(total))
+    }
+
+    // 4. total_elapsed_us = 240+180+120+80 = 620
+    let elapsed = total_elapsed_us()
+    if elapsed != 620 {
+        panic("pe_tls_stage2 FAIL [total_elapsed_us] expected=620 got=" + to_string(elapsed))
+    }
+
+    // 5. count_by_reason(1) = 3, (2) = 1, (3) = 0
+    let r1 = count_by_reason(1)
+    if r1 != 3 {
+        panic("pe_tls_stage2 FAIL [count_by_reason 1] expected=3 got=" + to_string(r1))
+    }
+    let r2 = count_by_reason(2)
+    if r2 != 1 {
+        panic("pe_tls_stage2 FAIL [count_by_reason 2] expected=1 got=" + to_string(r2))
+    }
+    let r3 = count_by_reason(3)
+    if r3 != 0 {
+        panic("pe_tls_stage2 FAIL [count_by_reason 3] expected=0 got=" + to_string(r3))
+    }
+
+    // 6. pe_callback_count(75001) = 3, (75002) = 1, (9999) = 0
+    let pe1 = pe_callback_count(75001)
+    if pe1 != 3 {
+        panic("pe_tls_stage2 FAIL [pe_callback_count 75001] expected=3 got=" + to_string(pe1))
+    }
+    let pe2 = pe_callback_count(75002)
+    if pe2 != 1 {
+        panic("pe_tls_stage2 FAIL [pe_callback_count 75002] expected=1 got=" + to_string(pe2))
+    }
+    let pe_none = pe_callback_count(9999)
+    if pe_none != 0 {
+        panic("pe_tls_stage2 FAIL [pe_callback_count 9999] expected=0 got=" + to_string(pe_none))
+    }
+
+    // 7. pts_stats() = [4, 620, 3, 1]
+    let stats = pts_stats()
+    if len(stats) != 4 {
+        panic("pe_tls_stage2 FAIL [stats len] expected=4 got=" + to_string(len(stats)))
+    }
+    if stats[0] != 4 {
+        panic("pe_tls_stage2 FAIL [stats[0]] expected=4 got=" + to_string(stats[0]))
+    }
+    if stats[1] != 620 {
+        panic("pe_tls_stage2 FAIL [stats[1]] expected=620 got=" + to_string(stats[1]))
+    }
+    if stats[2] != 3 {
+        panic("pe_tls_stage2 FAIL [stats[2]] expected=3 got=" + to_string(stats[2]))
+    }
+    if stats[3] != 1 {
+        panic("pe_tls_stage2 FAIL [stats[3]] expected=1 got=" + to_string(stats[3]))
+    }
+
+    // emit 5: pts_stats summary
+    r0_emit("pts_stats",
+        "\"callback_count\":" + to_string(stats[0])
+        + ",\"total_elapsed_us\":" + to_string(stats[1])
+        + ",\"attach\":" + to_string(stats[2])
+        + ",\"detach\":" + to_string(stats[3]))
+
+    // 8. r0_emit count 검증 (≥ 5; 실제 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_tls_stage2 FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 9. cleanup 후 모두 0
+    cleanup_pts()
+    if callback_count() != 0 {
+        panic("pe_tls_stage2 FAIL [post cleanup count] expected=0 got=" + to_string(callback_count()))
+    }
+    if total_elapsed_us() != 0 {
+        panic("pe_tls_stage2 FAIL [post cleanup elapsed] expected=0 got=" + to_string(total_elapsed_us()))
+    }
+    let stats_after = pts_stats()
+    let i = 0
+    while i < len(stats_after) {
+        if stats_after[i] != 0 {
+            panic("pe_tls_stage2 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(stats_after[i]))
+        }
+        i = i + 1
+    }
+
+    // 10. PASS
+    println("  ✅ pe_tls_stage2 self_test PASS (4 callbacks, 2 PEs, "
+        + to_string(stats[2]) + " attach + " + to_string(stats[3]) + " detach, "
+        + to_string(stats[1]) + "us, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pts_stats()
+            println("callback_count\t" + to_string(s[0]))
+            println("total_elapsed_us\t" + to_string(s[1]))
+            println("attach\t" + to_string(s[2]))
+            println("detach\t" + to_string(s[3]))
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let r = to_int(a[3])
+                println(to_string(count_by_reason(r)))
+                return
+            }
+            println("usage: count <reason>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pts()
+            println("cleaned: " + pts_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_tls_stage2.hexa { self-test | stats | count <reason> | cleanup }")
+}

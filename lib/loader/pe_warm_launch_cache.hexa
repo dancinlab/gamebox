@@ -1,0 +1,435 @@
+// lib/loader/pe_warm_launch_cache.hexa — cycle67 warm launch cache hit/miss tracker skeleton
+//
+// PE 로더 warm launch 시 재사용되는 cache (parse / IAT / reloc / resource) 의 lookup
+// 결과 (hit/miss) + 소요 시간 (us) 를 기록한다. cold launch 와 비교하여 warm path
+// 의 효과를 정량화. 본 skeleton 은 lookup tracker — 실 cache 자료구조 / mmap / 디스크
+// IO 호출 X (후속 stage 에서 통합).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// cache_kind code:
+//   1 = parse     (PE header / section table parse cache)
+//   2 = iat       (Import Address Table 바인딩 cache)
+//   3 = reloc     (relocation 테이블 적용 cache)
+//   4 = resource  (PE resource 디렉토리 cache)
+//
+// persist schema (TSV — lookups.tsv):
+//   cache_id<int> \t cache_kind<int> \t hit<int 0|1> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwlc_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_warm_launch_cache"
+}
+
+fn pwlc_lookups_path() -> str {
+    return pwlc_dir() + "/lookups.tsv"
+}
+
+fn pwlc_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwlc_dir() + "'")
+}
+
+fn cleanup_pwlc() -> void {
+    pwlc_ensure_dir()
+    let _ = exec("rm -f '" + pwlc_lookups_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwlc_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwlc_append_row(path: str, row: str) -> void {
+    pwlc_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_lookup: cache lookup 1 건 기록 ───
+fn record_lookup(cache_id: int, cache_kind: int, hit: int, elapsed_us: int) -> void {
+    if cache_id <= 0 {
+        panic("pe_warm_launch_cache FAIL [record_lookup] expected=cache_id>0 got=" + to_string(cache_id))
+    }
+    if cache_kind < 1 {
+        panic("pe_warm_launch_cache FAIL [record_lookup] expected=cache_kind>=1 got=" + to_string(cache_kind))
+    }
+    if cache_kind > 4 {
+        panic("pe_warm_launch_cache FAIL [record_lookup] expected=cache_kind<=4 got=" + to_string(cache_kind))
+    }
+    if hit < 0 {
+        panic("pe_warm_launch_cache FAIL [record_lookup] expected=hit>=0 got=" + to_string(hit))
+    }
+    if hit > 1 {
+        panic("pe_warm_launch_cache FAIL [record_lookup] expected=hit<=1 got=" + to_string(hit))
+    }
+    if elapsed_us < 0 {
+        panic("pe_warm_launch_cache FAIL [record_lookup] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(cache_id) + "\t" + to_string(cache_kind)
+        + "\t" + to_string(hit) + "\t" + to_string(elapsed_us) + "\n"
+    pwlc_append_row(pwlc_lookups_path(), row)
+}
+
+// ─── lookup_count: 총 lookup 수 ───
+fn lookup_count() -> int {
+    let t = pwlc_read_table(pwlc_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── hit_count: hit=1 인 lookup 수 ───
+fn hit_count() -> int {
+    let t = pwlc_read_table(pwlc_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── miss_count: hit=0 인 lookup 수 ───
+fn miss_count() -> int {
+    let t = pwlc_read_table(pwlc_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_elapsed_us: 모든 lookup elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let t = pwlc_read_table(pwlc_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_kind: 특정 cache_kind 의 lookup 수 ───
+fn count_by_kind(kind: int) -> int {
+    let t = pwlc_read_table(pwlc_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── lookup_elapsed_us: 특정 cache_id 의 elapsed_us (없으면 0) ───
+fn lookup_elapsed_us(cache_id: int) -> int {
+    let t = pwlc_read_table(pwlc_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == cache_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pwlc_stats: [lookup_count, hit_count, miss_count, total_elapsed_us, count_by_kind(2)] ───
+fn pwlc_stats() -> array {
+    let mut out = []
+    out.push(lookup_count())
+    out.push(hit_count())
+    out.push(miss_count())
+    out.push(total_elapsed_us())
+    out.push(count_by_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pwlc-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pwlc()
+
+    // 2. record 6 lookups — 4 kinds covered; 4 hits + 2 misses
+    record_lookup(670001, 1, 1, 12)
+    r0_emit("pe_warm_launch_cache_record",
+        "\"cache_id\":670001,\"cache_kind\":1,\"hit\":1,\"elapsed_us\":12,\"target\":\"parse\"")
+
+    record_lookup(670002, 2, 1, 25)
+    r0_emit("pe_warm_launch_cache_record",
+        "\"cache_id\":670002,\"cache_kind\":2,\"hit\":1,\"elapsed_us\":25,\"target\":\"iat\"")
+
+    record_lookup(670003, 2, 0, 180)
+    r0_emit("pe_warm_launch_cache_record",
+        "\"cache_id\":670003,\"cache_kind\":2,\"hit\":0,\"elapsed_us\":180,\"target\":\"iat\"")
+
+    record_lookup(670004, 3, 1, 40)
+    r0_emit("pe_warm_launch_cache_record",
+        "\"cache_id\":670004,\"cache_kind\":3,\"hit\":1,\"elapsed_us\":40,\"target\":\"reloc\"")
+
+    record_lookup(670005, 3, 0, 220)
+    r0_emit("pe_warm_launch_cache_record",
+        "\"cache_id\":670005,\"cache_kind\":3,\"hit\":0,\"elapsed_us\":220,\"target\":\"reloc\"")
+
+    record_lookup(670006, 4, 1, 18)
+    r0_emit("pe_warm_launch_cache_record",
+        "\"cache_id\":670006,\"cache_kind\":4,\"hit\":1,\"elapsed_us\":18,\"target\":\"resource\"")
+
+    // 3. lookup_count = 6
+    let c = lookup_count()
+    if c != 6 {
+        panic("pe_warm_launch_cache FAIL [lookup_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. hit_count = 4, miss_count = 2
+    let hc = hit_count()
+    if hc != 4 {
+        panic("pe_warm_launch_cache FAIL [hit_count] expected=4 got=" + to_string(hc))
+    }
+    let mc = miss_count()
+    if mc != 2 {
+        panic("pe_warm_launch_cache FAIL [miss_count] expected=2 got=" + to_string(mc))
+    }
+
+    // 5. total_elapsed_us = 12+25+180+40+220+18 = 495
+    let te = total_elapsed_us()
+    if te != 495 {
+        panic("pe_warm_launch_cache FAIL [total_elapsed_us] expected=495 got=" + to_string(te))
+    }
+
+    // 6. count_by_kind sanity (1=1, 2=2, 3=2, 4=1, 99=0)
+    let k1 = count_by_kind(1)
+    if k1 != 1 {
+        panic("pe_warm_launch_cache FAIL [count_by_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_kind(2)
+    if k2 != 2 {
+        panic("pe_warm_launch_cache FAIL [count_by_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_kind(3)
+    if k3 != 2 {
+        panic("pe_warm_launch_cache FAIL [count_by_kind(3)] expected=2 got=" + to_string(k3))
+    }
+    let k4 = count_by_kind(4)
+    if k4 != 1 {
+        panic("pe_warm_launch_cache FAIL [count_by_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_kind(99)
+    if k99 != 0 {
+        panic("pe_warm_launch_cache FAIL [count_by_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. lookup_elapsed_us sanity
+    let e2 = lookup_elapsed_us(670002)
+    if e2 != 25 {
+        panic("pe_warm_launch_cache FAIL [lookup_elapsed_us(670002)] expected=25 got=" + to_string(e2))
+    }
+    let e5 = lookup_elapsed_us(670005)
+    if e5 != 220 {
+        panic("pe_warm_launch_cache FAIL [lookup_elapsed_us(670005)] expected=220 got=" + to_string(e5))
+    }
+    let e_miss = lookup_elapsed_us(9999)
+    if e_miss != 0 {
+        panic("pe_warm_launch_cache FAIL [lookup_elapsed_us(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 8. pwlc_stats() = [6, 4, 2, 495, 2]
+    let s = pwlc_stats()
+    if len(s) != 5 {
+        panic("pe_warm_launch_cache FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_warm_launch_cache FAIL [stats lookup_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_warm_launch_cache FAIL [stats hit_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_warm_launch_cache FAIL [stats miss_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 495 {
+        panic("pe_warm_launch_cache FAIL [stats total_elapsed_us] expected=495 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_warm_launch_cache FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 9. emit stats (7th emit — pushes ≥7 over 6 records)
+    r0_emit("pe_warm_launch_cache_stats",
+        "\"lookup_count\":" + to_string(s[0])
+        + ",\"hit_count\":" + to_string(s[1])
+        + ",\"miss_count\":" + to_string(s[2])
+        + ",\"total_elapsed_us\":" + to_string(s[3])
+        + ",\"kind_iat\":" + to_string(s[4]))
+
+    // 10. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_warm_launch_cache FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pwlc()
+    let s2 = pwlc_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_warm_launch_cache FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_warm_launch_cache self_test PASS (lookups=" + to_string(s[0])
+        + ", hits=" + to_string(s[1]) + ", misses=" + to_string(s[2])
+        + ", elapsed_us=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwlc_stats()
+            println("lookup_count\t" + to_string(s[0]))
+            println("hit_count\t" + to_string(s[1]))
+            println("miss_count\t" + to_string(s[2]))
+            println("total_elapsed_us\t" + to_string(s[3]))
+            println("count_kind_iat\t" + to_string(s[4]))
+            return
+        }
+        if sub == "elapsed" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("lookup_elapsed_us\t" + to_string(lookup_elapsed_us(cid)))
+                return
+            }
+            println("usage: hexa run pe_warm_launch_cache.hexa elapsed <cache_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let which = a[3]
+                if which == "hit" {
+                    println("hit_count\t" + to_string(hit_count()))
+                    return
+                }
+                if which == "miss" {
+                    println("miss_count\t" + to_string(miss_count()))
+                    return
+                }
+                println("usage: hexa run pe_warm_launch_cache.hexa count hit|miss")
+                return
+            }
+            println("usage: hexa run pe_warm_launch_cache.hexa count hit|miss")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwlc()
+            println("cleaned: " + pwlc_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwlc_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_warm_launch_cache.hexa { self-test | stats | elapsed <cache_id> | count hit|miss | cleanup | dir }")
+}

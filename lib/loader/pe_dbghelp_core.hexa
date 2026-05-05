@@ -1,0 +1,431 @@
+// lib/loader/pe_dbghelp_core.hexa — DBGHELP.dll symbol/minidump/stack surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine dbghelp source 인용 0.
+//       dbghelp.dll 직접 binding 0. macOS dyld _dyld_get_image_header / dlsym / dladdr /
+//       backtrace / mach_thread_self / kCFCoreFoundationVersionNumber / lldb_rpc 직접
+//       binding 0. NOTE: DBGHELP 측 D2R/D4 crash dump + Battle.net Agent crash report
+//       upload + symbol resolution baseline; SymInitialize/SymFromAddr/MiniDumpWriteDump/
+//       StackWalk64 측 SYMBOL_INFO/IMAGEHLP_LINE64/MINIDUMP_HEADER/STACKFRAME64 struct
+//       round-trip baseline (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track AZ3 — DBGHELP symbol/minidump/stack surface 10 fn skeleton-tier.
+// cycle 45 242/435 (~55.63%) → cycle 46 ~252/435 (~57.93%) (+10 fn, AZ bundled part 3/4).
+//
+// 대상 fn (10 fn — 3 group, fn_kind 0..9):
+//   SYMBOL   (4): SymInitialize(0) / SymCleanup(1) / SymFromAddr(2) /
+//                 SymGetLineFromAddr64(3)
+//   MINIDUMP (3): MiniDumpWriteDump(4) / MiniDumpReadDumpStream(5) / StackWalk64(6)
+//   STACK    (3): RtlCaptureStackBackTrace(7) / SymFunctionTableAccess64(8) /
+//                 SymGetModuleBase64(9)
+//
+// synthetic struct families:
+//   SYMBOL_INFO 88B header: SizeOfStruct 88 + TypeIndex 0 + Reserved[2] 0 + Index 0x100 +
+//     Size 64 + ModBase 0x9A010000 + Flags 0 + Value 0 + Address 0x9A010100 + Register 0 +
+//     Scope 0 + Tag 5 SymTagFunction + NameLen 16 + MaxNameLen 256 + Name "D2R_main_loop_fn".
+//   IMAGEHLP_LINE64 32B: SizeOfStruct 32 + Key 0 + LineNumber 1234 + FileName ptr 0x9A010200
+//     "C__src__d2r__main.cpp" + Address 0x9A010100.
+//   MINIDUMP_HEADER 32B: Signature 0x504D444D MDMP + Version 0x0000A793 + NumberOfStreams 17 +
+//     StreamDirectoryRva 32 + CheckSum 0 + TimeDateStamp 0x66365A40 + Flags 0x00000000.
+//   MINIDUMP_DIRECTORY 12B: StreamType 0x0006 ExceptionStream + Location_DataSize 168 + Rva 1024.
+//   STACKFRAME64 264B header: AddrPC.Offset 0x9A010100 + AddrReturn.Offset 0x9A010140 +
+//     AddrFrame.Offset 0x7FFFE000 + AddrStack.Offset 0x7FFFE000 + Far 0 + Virtual 0 +
+//     Reserved[3] 0 + KdHelper 12B.
+//   HANDLE hProcess 0x9A020000 (dbghelp session per-process, opaque).
+//   trace_capture 16-frame DWORD64[16]: addr 0x9A010100 .. 0x9A010140 sequential.
+//
+// persist schema (TSV — 4 table): syscall_invoke/symbol_event/minidump_event/stack_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdh_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_dbghelp_core"
+}
+
+fn pdh_syscall_invoke_path() -> str {
+    return pdh_dir() + "/syscall_invoke.tsv"
+}
+
+fn pdh_symbol_event_path() -> str {
+    return pdh_dir() + "/symbol_event.tsv"
+}
+
+fn pdh_minidump_event_path() -> str {
+    return pdh_dir() + "/minidump_event.tsv"
+}
+
+fn pdh_stack_event_path() -> str {
+    return pdh_dir() + "/stack_event.tsv"
+}
+
+fn pdh_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdh_dir() + "'")
+}
+
+fn cleanup_pdh() -> void {
+    pdh_ensure_dir()
+    let _ = exec("rm -f '" + pdh_syscall_invoke_path() + "' '" + pdh_symbol_event_path()
+        + "' '" + pdh_minidump_event_path() + "' '" + pdh_stack_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdh_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdh_append_row(path: str, row: str) -> void {
+    pdh_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pdh_count_rows(path: str, min_cols: int) -> int {
+    let t = pdh_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (10 fn coverage, fn_kind 0..9) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "SymInitialize" }
+    if k == 1 { return "SymCleanup" }
+    if k == 2 { return "SymFromAddr" }
+    if k == 3 { return "SymGetLineFromAddr64" }
+    if k == 4 { return "MiniDumpWriteDump" }
+    if k == 5 { return "MiniDumpReadDumpStream" }
+    if k == 6 { return "StackWalk64" }
+    if k == 7 { return "RtlCaptureStackBackTrace" }
+    if k == 8 { return "SymFunctionTableAccess64" }
+    if k == 9 { return "SymGetModuleBase64" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (3 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "symbol"
+        }
+    }
+    if k >= 4 {
+        if k <= 6 {
+            return "minidump"
+        }
+    }
+    if k >= 7 {
+        if k <= 9 {
+            return "stack"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: DBGHELP fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_dbghelp_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_dbghelp_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 9 {
+        panic("pe_dbghelp_core FAIL [record_syscall_invoke] expected=fn_kind<=9 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_dbghelp_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_dbghelp_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pdh_append_row(pdh_syscall_invoke_path(), row)
+}
+
+// ─── record_symbol_event: SymInitialize/Cleanup/FromAddr/GetLineFromAddr64 row ───
+fn record_symbol_event(evt_id: int, s_kind: str, hproc_hex: str, sym_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_dbghelp_core FAIL [record_symbol_event] evt_id<=0") }
+    if s_kind == "" { panic("pe_dbghelp_core FAIL [record_symbol_event] s_kind=empty") }
+    if hproc_hex == "" { panic("pe_dbghelp_core FAIL [record_symbol_event] hproc_hex=empty") }
+    if sym_synth == "" { panic("pe_dbghelp_core FAIL [record_symbol_event] sym_synth=empty") }
+    if status == "" { panic("pe_dbghelp_core FAIL [record_symbol_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + s_kind + "\t" + hproc_hex + "\t" + sym_synth + "\t" + status + "\n"
+    pdh_append_row(pdh_symbol_event_path(), row)
+}
+
+// ─── record_minidump_event: MiniDumpWriteDump/ReadDumpStream/StackWalk64 row ───
+fn record_minidump_event(evt_id: int, m_kind: str, hproc_hex: str, dump_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_dbghelp_core FAIL [record_minidump_event] evt_id<=0") }
+    if m_kind == "" { panic("pe_dbghelp_core FAIL [record_minidump_event] m_kind=empty") }
+    if hproc_hex == "" { panic("pe_dbghelp_core FAIL [record_minidump_event] hproc_hex=empty") }
+    if dump_synth == "" { panic("pe_dbghelp_core FAIL [record_minidump_event] dump_synth=empty") }
+    if status == "" { panic("pe_dbghelp_core FAIL [record_minidump_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + m_kind + "\t" + hproc_hex + "\t" + dump_synth + "\t" + status + "\n"
+    pdh_append_row(pdh_minidump_event_path(), row)
+}
+
+// ─── record_stack_event: RtlCaptureStackBackTrace/FunctionTableAccess64/GetModuleBase64 row ───
+fn record_stack_event(evt_id: int, st_kind: str, addr_synth: str, frame_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_dbghelp_core FAIL [record_stack_event] evt_id<=0") }
+    if st_kind == "" { panic("pe_dbghelp_core FAIL [record_stack_event] st_kind=empty") }
+    if addr_synth == "" { panic("pe_dbghelp_core FAIL [record_stack_event] addr_synth=empty") }
+    if frame_synth == "" { panic("pe_dbghelp_core FAIL [record_stack_event] frame_synth=empty") }
+    if status == "" { panic("pe_dbghelp_core FAIL [record_stack_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + st_kind + "\t" + addr_synth + "\t" + frame_synth + "\t" + status + "\n"
+    pdh_append_row(pdh_stack_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pdh_count_rows(pdh_syscall_invoke_path(), 4)
+}
+
+fn symbol_event_count() -> int {
+    return pdh_count_rows(pdh_symbol_event_path(), 5)
+}
+
+fn minidump_event_count() -> int {
+    return pdh_count_rows(pdh_minidump_event_path(), 5)
+}
+
+fn stack_event_count() -> int {
+    return pdh_count_rows(pdh_stack_event_path(), 5)
+}
+
+fn pdh_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(symbol_event_count())
+    out.push(minidump_event_count())
+    out.push(stack_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pdh-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pdh()
+
+    // ─── 1. syscall_invoke × 10 (one per fn, 3 group coverage) ───
+    //   SYMBOL group (4)
+    record_syscall_invoke(1, 0, "SymInitialize", "PARTIAL")
+    println("__DBGHELP__ PARTIAL SymInitialize")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"SymInitialize\",\"fn_group\":\"symbol\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"UserSearchPath\":\"C__Symbols__D2R\",\"fInvadeProcess\":\"TRUE_1\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(2, 1, "SymCleanup", "PARTIAL")
+    println("__DBGHELP__ PARTIAL SymCleanup")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"SymCleanup\",\"fn_group\":\"symbol\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(3, 2, "SymFromAddr", "PARTIAL")
+    println("__DBGHELP__ PARTIAL SymFromAddr")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"SymFromAddr\",\"fn_group\":\"symbol\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"Address\":\"0x9A010100\",\"Displacement_out\":0,\"pSymbol_out_synth\":\"SYMBOL_INFO_88B_D2R_main_loop_fn\",\"struct_bytes\":88,\"Tag\":\"SymTagFunction_5\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(4, 3, "SymGetLineFromAddr64", "PARTIAL")
+    println("__DBGHELP__ PARTIAL SymGetLineFromAddr64")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"SymGetLineFromAddr64\",\"fn_group\":\"symbol\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"qwAddr\":\"0x9A010100\",\"pdwDisplacement_out\":0,\"Line64_synth\":\"IMAGEHLP_LINE64_32B_main_cpp_line_1234\",\"struct_bytes\":32,\"FileName\":\"C__src__d2r__main.cpp\",\"LineNumber\":1234,\"return_bool\":\"TRUE_1\"")
+
+    //   MINIDUMP group (3)
+    record_syscall_invoke(5, 4, "MiniDumpWriteDump", "PARTIAL")
+    println("__DBGHELP__ PARTIAL MiniDumpWriteDump")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"MiniDumpWriteDump\",\"fn_group\":\"minidump\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"ProcessId\":12345,\"hFile\":\"0x9A030000\",\"DumpType\":\"MiniDumpNormal_0x00\",\"ExceptionParam_synth\":0,\"UserStreamParam\":0,\"CallbackParam\":0,\"return_bool\":\"TRUE_1\",\"header_synth\":\"MINIDUMP_HEADER_32B_MDMP_v0xA793\"")
+    record_syscall_invoke(6, 5, "MiniDumpReadDumpStream", "PARTIAL")
+    println("__DBGHELP__ PARTIAL MiniDumpReadDumpStream")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"MiniDumpReadDumpStream\",\"fn_group\":\"minidump\",\"status\":\"PARTIAL\",\"BaseOfDump\":\"0x9A040000\",\"StreamNumber\":\"ExceptionStream_6\",\"pDir_out_synth\":\"MINIDUMP_DIRECTORY_12B_StreamType_6\",\"struct_bytes\":12,\"DataSize\":168,\"Rva\":1024,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(7, 6, "StackWalk64", "PARTIAL")
+    println("__DBGHELP__ PARTIAL StackWalk64")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"StackWalk64\",\"fn_group\":\"minidump\",\"status\":\"PARTIAL\",\"MachineType\":\"IMAGE_FILE_MACHINE_AMD64_0x8664\",\"hProcess\":\"0x9A020000\",\"hThread\":\"0x9A020100\",\"StackFrame_synth\":\"STACKFRAME64_264B_AddrPC_0x9A010100\",\"struct_bytes\":264,\"ContextRecord_synth\":\"CONTEXT_x64_1232B\",\"return_bool\":\"TRUE_1\"")
+
+    //   STACK group (3)
+    record_syscall_invoke(8, 7, "RtlCaptureStackBackTrace", "PARTIAL")
+    println("__DBGHELP__ PARTIAL RtlCaptureStackBackTrace")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"RtlCaptureStackBackTrace\",\"fn_group\":\"stack\",\"status\":\"PARTIAL\",\"FramesToSkip\":0,\"FramesToCapture\":16,\"BackTrace_synth\":\"DWORD64_array_16_frames_0x9A010100_to_0x9A010140\",\"BackTraceHash_out\":\"0x12345678\",\"return_word\":12")
+    record_syscall_invoke(9, 8, "SymFunctionTableAccess64", "PARTIAL")
+    println("__DBGHELP__ PARTIAL SymFunctionTableAccess64")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"SymFunctionTableAccess64\",\"fn_group\":\"stack\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"AddrBase\":\"0x9A010100\",\"return_ptr_synth\":\"FPO_DATA_or_RUNTIME_FUNCTION_synth\"")
+    record_syscall_invoke(10, 9, "SymGetModuleBase64", "PARTIAL")
+    println("__DBGHELP__ PARTIAL SymGetModuleBase64")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"SymGetModuleBase64\",\"fn_group\":\"stack\",\"status\":\"PARTIAL\",\"hProcess\":\"0x9A020000\",\"qwAddr\":\"0x9A010100\",\"return_dword64\":\"0x9A010000\",\"module_synth\":\"D2R_exe_image_base\"")
+
+    // ─── 2. symbol_event × 4 (init/cleanup/from_addr/get_line) ───
+    record_symbol_event(1, "init_d2r_symbol_path", "0x9A020000", "C__Symbols__D2R", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"symbol_event\",\"evt_id\":1,\"s_kind\":\"init_d2r_symbol_path\",\"hproc_hex\":\"0x9A020000\",\"sym_synth\":\"C__Symbols__D2R\",\"fInvadeProcess\":true,\"status\":\"PARTIAL\"")
+    record_symbol_event(2, "cleanup_release_session", "0x9A020000", "release_no_symcontext", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"symbol_event\",\"evt_id\":2,\"s_kind\":\"cleanup_release_session\",\"hproc_hex\":\"0x9A020000\",\"sym_synth\":\"release_no_symcontext\",\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+    record_symbol_event(3, "from_addr_d2r_main_loop", "0x9A020000", "SYMBOL_INFO_88B_D2R_main_loop_fn", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"symbol_event\",\"evt_id\":3,\"s_kind\":\"from_addr_d2r_main_loop\",\"hproc_hex\":\"0x9A020000\",\"sym_synth\":\"SYMBOL_INFO_88B_D2R_main_loop_fn\",\"struct_bytes\":88,\"Address\":\"0x9A010100\",\"Tag\":\"SymTagFunction\",\"status\":\"PARTIAL\"")
+    record_symbol_event(4, "get_line_main_cpp_1234", "0x9A020000", "IMAGEHLP_LINE64_32B_main_cpp_line_1234", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"symbol_event\",\"evt_id\":4,\"s_kind\":\"get_line_main_cpp_1234\",\"hproc_hex\":\"0x9A020000\",\"sym_synth\":\"IMAGEHLP_LINE64_32B_main_cpp_line_1234\",\"struct_bytes\":32,\"FileName\":\"C__src__d2r__main.cpp\",\"LineNumber\":1234,\"status\":\"PARTIAL\"")
+
+    // ─── 3. minidump_event × 3 (write_dump/read_stream/stack_walk) ───
+    record_minidump_event(1, "write_dump_d2r_crash", "0x9A020000", "MINIDUMP_HEADER_32B_MDMP_v0xA793_NormalDump", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"minidump_event\",\"evt_id\":1,\"m_kind\":\"write_dump_d2r_crash\",\"hproc_hex\":\"0x9A020000\",\"dump_synth\":\"MINIDUMP_HEADER_32B_MDMP_v0xA793_NormalDump\",\"struct_bytes\":32,\"DumpType\":\"MiniDumpNormal\",\"NumberOfStreams\":17,\"status\":\"PARTIAL\"")
+    record_minidump_event(2, "read_stream_exception_6", "0x9A020000", "MINIDUMP_DIRECTORY_12B_StreamType_6_DataSize_168", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"minidump_event\",\"evt_id\":2,\"m_kind\":\"read_stream_exception_6\",\"hproc_hex\":\"0x9A020000\",\"dump_synth\":\"MINIDUMP_DIRECTORY_12B_StreamType_6_DataSize_168\",\"struct_bytes\":12,\"DataSize\":168,\"Rva\":1024,\"status\":\"PARTIAL\"")
+    record_minidump_event(3, "stack_walk_amd64_d2r_thread", "0x9A020000", "STACKFRAME64_264B_AddrPC_0x9A010100", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"minidump_event\",\"evt_id\":3,\"m_kind\":\"stack_walk_amd64_d2r_thread\",\"hproc_hex\":\"0x9A020000\",\"dump_synth\":\"STACKFRAME64_264B_AddrPC_0x9A010100\",\"struct_bytes\":264,\"MachineType\":\"AMD64\",\"context_bytes\":1232,\"status\":\"PARTIAL\"")
+
+    // ─── 4. stack_event × 3 (capture_backtrace/function_table/module_base) ───
+    record_stack_event(1, "capture_backtrace_16_frames", "0x9A010100", "DWORD64_array_16_frames_to_0x9A010140", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"stack_event\",\"evt_id\":1,\"st_kind\":\"capture_backtrace_16_frames\",\"addr_synth\":\"0x9A010100\",\"frame_synth\":\"DWORD64_array_16_frames_to_0x9A010140\",\"FramesToCapture\":16,\"BackTraceHash\":\"0x12345678\",\"return_word\":12,\"status\":\"PARTIAL\"")
+    record_stack_event(2, "function_table_access_amd64", "0x9A010100", "FPO_DATA_or_RUNTIME_FUNCTION_synth", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"stack_event\",\"evt_id\":2,\"st_kind\":\"function_table_access_amd64\",\"addr_synth\":\"0x9A010100\",\"frame_synth\":\"FPO_DATA_or_RUNTIME_FUNCTION_synth\",\"hProcess\":\"0x9A020000\",\"status\":\"PARTIAL\"")
+    record_stack_event(3, "module_base_d2r_exe_image", "0x9A010100", "D2R_exe_image_base_0x9A010000", "PARTIAL")
+    r0_emit("pe_dbghelp_core_record", "\"kind\":\"stack_event\",\"evt_id\":3,\"st_kind\":\"module_base_d2r_exe_image\",\"addr_synth\":\"0x9A010100\",\"frame_synth\":\"D2R_exe_image_base_0x9A010000\",\"return_dword64\":\"0x9A010000\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 10 {
+        panic("pe_dbghelp_core FAIL [syscall_invoke_count] expected=10 got=" + to_string(si))
+    }
+    let se = symbol_event_count()
+    if se != 4 {
+        panic("pe_dbghelp_core FAIL [symbol_event_count] expected=4 got=" + to_string(se))
+    }
+    let me = minidump_event_count()
+    if me != 3 {
+        panic("pe_dbghelp_core FAIL [minidump_event_count] expected=3 got=" + to_string(me))
+    }
+    let ste = stack_event_count()
+    if ste != 3 {
+        panic("pe_dbghelp_core FAIL [stack_event_count] expected=3 got=" + to_string(ste))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "SymInitialize" { panic("pe_dbghelp_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "SymFromAddr" { panic("pe_dbghelp_core FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "MiniDumpWriteDump" { panic("pe_dbghelp_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(7) != "RtlCaptureStackBackTrace" { panic("pe_dbghelp_core FAIL [fn_kind_name(7)]") }
+    if fn_kind_name(9) != "SymGetModuleBase64" { panic("pe_dbghelp_core FAIL [fn_kind_name(9)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_dbghelp_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "symbol" { panic("pe_dbghelp_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "minidump" { panic("pe_dbghelp_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(7) != "stack" { panic("pe_dbghelp_core FAIL [fn_group_name(7)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_dbghelp_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pdh_stats()
+    if len(s) != 4 { panic("pe_dbghelp_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 10 { panic("pe_dbghelp_core FAIL [stats syscall_invoke_count] expected=10 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_dbghelp_core FAIL [stats symbol_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 3 { panic("pe_dbghelp_core FAIL [stats minidump_event_count] expected=3 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_dbghelp_core FAIL [stats stack_event_count] expected=3 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_dbghelp_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"symbol_event_count\":" + to_string(s[1])
+        + ",\"minidump_event_count\":" + to_string(s[2])
+        + ",\"stack_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_dbghelp_core_summary",
+        "\"target\":\"DBGHELP.dll\",\"fn_total\":10,\"fn_emit_partial\":10,\"groups\":[\"symbol\",\"minidump\",\"stack\"],\"symbol_info_synth_bytes\":88,\"imagehlp_line64_synth_bytes\":32,\"minidump_header_synth_bytes\":32,\"stackframe64_synth_bytes\":264,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_dbghelp_core_kpi",
+        "\"symbol_emits\":4,\"minidump_emits\":3,\"stack_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"d2r_d4_crash_dump_baseline\":true,\"battlenet_agent_crash_report_baseline\":true,\"dyld_dlsym_dladdr_backtrace_binding\":false,\"lldb_rpc_binding\":false")
+
+    // ─── cycle 45 → 46 DBGHELP coverage progression evidence emit ───
+    r0_emit("pe_dbghelp_core_coverage_progression",
+        "\"surface\":\"DBGHELP_full_435_fn\",\"cycle_45_count\":242,\"cycle_46_count\":252,\"delta\":10,\"cycle_45_percent\":55.63,\"cycle_46_percent\":57.93,\"cycle_46_module\":\"pe_dbghelp_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_az3_cycle_increment\":10,\"track_az_bundled_part_3_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_dbghelp_core_round_trip_matrix",
+        "\"surface\":\"DBGHELP_core_10_fn\",\"fn_partial\":10,\"fn_groups\":3,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real SymFromAddr + MiniDumpWriteDump + StackWalk64 = dyld dlsym/dladdr + backtrace(3) + lldb_rpc bridge pending separate cycle (long-horizon crash dump pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track AZ3 expansion emit (cycle 46, DBGHELP +10 fn) ───
+    r0_emit("pe_dbghelp_core_az3_expansion",
+        "\"track\":\"AZ3\",\"cycle\":46,\"surface\":\"DBGHELP_new\",\"new_fn\":10,\"groups\":[\"symbol\",\"minidump\",\"stack\"],\"symbol_count\":4,\"minidump_count\":3,\"stack_count\":3,\"emit_format\":\"__DBGHELP__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_3_evidence_augment\":true,\"track_az_bundled_part_3_of_4\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_dbghelp_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pdh()
+    let s2 = pdh_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_dbghelp_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_dbghelp_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", symbol_event=" + to_string(s[1])
+        + ", minidump_event=" + to_string(s[2]) + ", stack_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdh_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("symbol_event_count\t" + to_string(s[1]))
+            println("minidump_event_count\t" + to_string(s[2]))
+            println("stack_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_dbghelp_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_dbghelp_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdh()
+            println("cleaned: " + pdh_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdh_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_dbghelp_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

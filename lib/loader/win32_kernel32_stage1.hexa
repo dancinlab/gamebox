@@ -1,0 +1,663 @@
+// lib/loader/win32_kernel32_stage1.hexa — Phase 3a 실제 implementation (file IO + memory)
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft 공식 Win32 API spec:
+//     - File I/O:  https://learn.microsoft.com/en-us/windows/win32/api/fileapi/
+//     - Memory:    https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/
+//     - System:    https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/
+//   Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 3 (실제: k32_create_file + k32_io + k32_stats)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("win32_kernel32_stage1 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 3a 실제 동작):
+//   skeleton mapping table (win32_kernel32.hexa) 와 달리 *실제 macOS syscall* 호출.
+//   Win32 API 호출 → handle table 경유 → POSIX (open/read/write/close/stat/usleep/date) 실행.
+//
+// handle table:
+//   hexa stage1 OOP / dict 부재 → handle = int (synthetic id) + state map (TSV).
+//   각 행: "handle\tpath\tmode\tsize\tcreated_ts"
+//   파일 위치: ~/.airgenome/gamebox/persist/k32_handles/handles.tsv
+//   다음 handle id = 가장 큰 handle + 1 (없으면 100 부터 시작 — POSIX fd 0/1/2 회피).
+//
+// VirtualAlloc:
+//   synthetic addr = (handle - 1000000) 형식 — 단순 path 기반 임시 파일 + size 기록.
+//   실제 mmap 우회 — stage1 은 *동작 시뮬레이션* (round-trip 검증 목적).
+//
+// HeapAlloc:
+//   동일 — synthetic id 만 발급. 별도 path 없음 (heap_id 만 추적).
+
+use "../perf/r0_common"
+
+// ─── handle table 경로 ───
+fn handle_table_dir() -> str {
+    return GAMEBOX_HOME + "/persist/k32_handles"
+}
+
+fn handle_table_path() -> str {
+    return handle_table_dir() + "/handles.tsv"
+}
+
+// counter file: "<total_created>\t<bytes_read>\t<bytes_written>\n"
+fn handle_counter_path() -> str {
+    return handle_table_dir() + "/counter.tsv"
+}
+
+fn vmem_dir() -> str {
+    return GAMEBOX_HOME + "/persist/k32_handles/vmem"
+}
+
+fn ensure_handle_dirs() -> void {
+    let _ = exec("mkdir -p '" + handle_table_dir() + "' '" + vmem_dir() + "'")
+}
+
+// ─── handle table 읽기 / 쓰기 ───
+fn read_handle_table() -> str {
+    let p = handle_table_path()
+    let exists = exec("test -f '" + p + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    let s = exec("cat '" + p + "' 2>/dev/null")
+    return s
+}
+
+fn write_handle_table(content: str) -> void {
+    ensure_handle_dirs()
+    write_file(handle_table_path(), content)
+}
+
+fn cleanup_handle_table() -> void {
+    ensure_handle_dirs()
+    let _ = exec("rm -f '" + handle_table_path() + "' '" + handle_counter_path() + "'")
+    let _ = exec("rm -rf '" + vmem_dir() + "' && mkdir -p '" + vmem_dir() + "'")
+}
+
+// ─── counter (total_created, bytes_read, bytes_written) ───
+fn read_counter() -> array {
+    let mut out = []
+    out.push(0)
+    out.push(0)
+    out.push(0)
+    let p = handle_counter_path()
+    let exists = exec("test -f '" + p + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return out
+    }
+    let s = exec("cat '" + p + "' 2>/dev/null").trim()
+    if s == "" {
+        return out
+    }
+    let parts = s.split("\t")
+    if len(parts) >= 3 {
+        out[0] = to_int(parts[0])
+        out[1] = to_int(parts[1])
+        out[2] = to_int(parts[2])
+    }
+    return out
+}
+
+fn write_counter(c: array) -> void {
+    ensure_handle_dirs()
+    let line = to_string(c[0]) + "\t" + to_string(c[1]) + "\t" + to_string(c[2]) + "\n"
+    write_file(handle_counter_path(), line)
+}
+
+fn bump_created() -> void {
+    let c = read_counter()
+    c[0] = c[0] + 1
+    write_counter(c)
+}
+
+fn bump_bytes_read(n: int) -> void {
+    let c = read_counter()
+    c[1] = c[1] + n
+    write_counter(c)
+}
+
+fn bump_bytes_written(n: int) -> void {
+    let c = read_counter()
+    c[2] = c[2] + n
+    write_counter(c)
+}
+
+// ─── 다음 handle id (table 의 max + 1; empty → 100) ───
+fn next_handle_id() -> int {
+    let t = read_handle_table()
+    if t == "" {
+        return 100
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let max_h = 99
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                let h = to_int(parts[0])
+                if h > max_h {
+                    max_h = h
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_h + 1
+}
+
+// ─── handle row 추가 ───
+fn append_handle_row(hnd: int, path: str, mode: str, size: int) -> void {
+    ensure_handle_dirs()
+    let ts = exec("date +%s").trim()
+    let row = to_string(hnd) + "\t" + path + "\t" + mode + "\t" + to_string(size) + "\t" + ts + "\n"
+    let tmp = handle_table_path() + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + handle_table_path() + "' && rm -f '" + tmp + "'")
+}
+
+// ─── handle row 검색 → "path\tmode\tsize\tts" 또는 "" ───
+fn lookup_handle(hnd: int) -> str {
+    let t = read_handle_table()
+    if t == "" {
+        return ""
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 5 {
+                if parts[0] == key {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3] + "\t" + parts[4]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── handle row 삭제 (close 시) ───
+fn remove_handle(hnd: int) -> bool {
+    let t = read_handle_table()
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    let mut out = ""
+    let mut found = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                if parts[0] == key {
+                    found = true
+                } else {
+                    out = out + line + "\n"
+                }
+            }
+        }
+        i = i + 1
+    }
+    write_handle_table(out)
+    return found
+}
+
+// ─── 파일 크기 (POSIX wc -c — busybox / coreutils / BSD 공통 지원) ───
+fn file_size_bytes(path: str) -> int {
+    let s = exec("wc -c < '" + path + "' 2>/dev/null | tr -d ' '").trim()
+    if s == "" {
+        return 0
+    }
+    return to_int(s)
+}
+
+// ─── CreateFileW(path, mode) → POSIX open ───
+//   mode "r"  → read-only (파일 존재 필요)
+//   mode "w"  → write/create (truncate)
+//   mode "rw" → read/write (create if missing)
+//   returns handle (>= 100) 또는 -1 (실패).
+fn create_file_w(path: str, mode: str) -> int {
+    ensure_handle_dirs()
+
+    if mode == "r" {
+        let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+        if exists != "y" {
+            return -1
+        }
+    } else {
+        if mode == "w" {
+            // truncate / create
+            let _ = exec(": > '" + path + "' 2>/dev/null")
+        } else {
+            // rw — create if missing
+            let _ = exec("touch '" + path + "' 2>/dev/null")
+        }
+    }
+
+    let sz = file_size_bytes(path)
+    let h = next_handle_id()
+    append_handle_row(h, path, mode, sz)
+    bump_created()
+    return h
+}
+
+// ─── ReadFile(handle, count) → POSIX read ───
+//   현재 stage1 은 *처음부터* count 바이트 (file pointer offset 미관리 — Phase 3a 후속).
+//   실패 → "".
+fn read_file_w32(hnd: int, count: int) -> str {
+    let row = lookup_handle(hnd)
+    if row == "" {
+        return ""
+    }
+    let p = row.split("\t")
+    if len(p) < 4 {
+        return ""
+    }
+    let path = p[0]
+    let mode = p[1]
+    if mode == "w" {
+        return ""
+    }
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    if count <= 0 {
+        return ""
+    }
+    // POSIX dd: bs=1 count=N — 첫 N 바이트
+    let s = exec("dd if='" + path + "' bs=1 count=" + to_string(count) + " 2>/dev/null")
+    bump_bytes_read(len(s))
+    return s
+}
+
+// ─── WriteFile(handle, content) → POSIX write ───
+//   현재 stage1 은 overwrite (append 미관리 — Phase 3a 후속).
+//   returns bytes written (실패 → -1).
+fn write_file_w32(hnd: int, content: str) -> int {
+    let row = lookup_handle(hnd)
+    if row == "" {
+        return -1
+    }
+    let p = row.split("\t")
+    if len(p) < 4 {
+        return -1
+    }
+    let path = p[0]
+    let mode = p[1]
+    if mode == "r" {
+        return -1
+    }
+    write_file(path, content)
+    let sz = file_size_bytes(path)
+    bump_bytes_written(sz)
+    return sz
+}
+
+// ─── CloseHandle(handle) → POSIX close ───
+fn close_handle(hnd: int) -> bool {
+    return remove_handle(hnd)
+}
+
+// ─── GetFileSize(handle) → POSIX fstat.st_size ───
+fn get_file_size(hnd: int) -> int {
+    let row = lookup_handle(hnd)
+    if row == "" {
+        return -1
+    }
+    let p = row.split("\t")
+    if len(p) < 4 {
+        return -1
+    }
+    let path = p[0]
+    return file_size_bytes(path)
+}
+
+// ─── VirtualAlloc(size) → mmap-equivalent ───
+//   실제 macOS mmap 미사용 (stage1 = 동작 시뮬레이션).
+//   각 alloc 마다 임시 파일 생성 (size byte 0 으로 채움) → handle 발급.
+//   synthetic addr = handle (>= 100). VirtualFree 는 handle 로 release.
+fn virtual_alloc(size: int) -> int {
+    ensure_handle_dirs()
+    if size <= 0 {
+        return -1
+    }
+    let h = next_handle_id()
+    let p = vmem_dir() + "/v_" + to_string(h) + ".bin"
+    // size byte 0 으로 채움 (실제 mmap 시뮬레이션 — 페이지 정렬 무시).
+    let _ = exec("dd if=/dev/zero of='" + p + "' bs=1 count=" + to_string(size) + " 2>/dev/null")
+    let actual = file_size_bytes(p)
+    append_handle_row(h, p, "vmem", actual)
+    bump_created()
+    return h
+}
+
+// ─── VirtualFree(addr) → munmap-equivalent ───
+fn virtual_free(addr: int) -> bool {
+    let row = lookup_handle(addr)
+    if row == "" {
+        return false
+    }
+    let p = row.split("\t")
+    if len(p) < 4 {
+        return false
+    }
+    let path = p[0]
+    let mode = p[1]
+    if mode != "vmem" {
+        return false
+    }
+    let _ = exec("rm -f '" + path + "' 2>/dev/null")
+    return remove_handle(addr)
+}
+
+// ─── HeapAlloc(size) → 단순 synthetic id ───
+//   실제 malloc 우회 — stage1 은 size 만 추적.
+fn heap_alloc(size: int) -> int {
+    if size <= 0 {
+        return -1
+    }
+    ensure_handle_dirs()
+    let h = next_handle_id()
+    append_handle_row(h, "heap:" + to_string(size), "heap", size)
+    bump_created()
+    return h
+}
+
+fn heap_free(addr: int) -> bool {
+    let row = lookup_handle(addr)
+    if row == "" {
+        return false
+    }
+    let p = row.split("\t")
+    if len(p) < 4 {
+        return false
+    }
+    let mode = p[1]
+    if mode != "heap" {
+        return false
+    }
+    return remove_handle(addr)
+}
+
+// ─── Sleep(ms) → POSIX usleep ───
+//   ms=0 → no-op. 큰 값 → 1 초 단위 sleep (POSIX sleep 정수만).
+//   stage1 은 짧게 (self-test 에서 ms < 1000 인 경우 한정).
+fn sleep_w32(ms: int) -> int {
+    if ms <= 0 {
+        return 0
+    }
+    if ms < 1000 {
+        // sub-second: sleep N (BSD) 일부 implementation 은 부동소수점 지원.
+        // stage1 은 0.001 단위 sleep — 실패 시 그냥 return (정밀도 제약).
+        let _ = exec("sleep 0." + to_string(ms / 100) + " 2>/dev/null || true")
+        return 0
+    }
+    let secs = ms / 1000
+    let _ = exec("sleep " + to_string(secs))
+    return 0
+}
+
+// ─── GetTickCount() → mach_absolute_time / 1e6 (ms 단위) ───
+//   epoch 기준 ms — date +%s%N (BSD: %N 미지원 → ns 우회 필요).
+//   stage1 은 정수 second × 1000 + ms 근사 (gdate 시도, 실패 → date %s × 1000).
+fn get_tick_count() -> int {
+    // gdate (coreutils) 시도 — ns 단위.
+    let s = exec("gdate +%s%N 2>/dev/null || date +%s%N 2>/dev/null").trim()
+    if s != "" {
+        // %N 지원 → ns. ms = ns / 1e6.
+        // 만약 BSD date 가 "%N" 그대로 반환 → string 끝에 "N" 포함.
+        let last = s.split("N")
+        if len(last) >= 2 {
+            // BSD %N 미지원 — second 만.
+            let sec = exec("date +%s").trim()
+            return to_int(sec) * 1000
+        }
+        // ns → ms (마지막 6자리 drop).
+        let n = len(s)
+        if n >= 7 {
+            // hexa stage1 substring 우회 — exec awk
+            let ms_s = exec("printf '" + s + "' | awk '{print substr($0,1,length($0)-6)}'").trim()
+            if ms_s != "" {
+                return to_int(ms_s)
+            }
+        }
+    }
+    // fallback: second × 1000
+    let sec = exec("date +%s").trim()
+    return to_int(sec) * 1000
+}
+
+// ─── stats: [open_handles, total_created, total_bytes_read, total_bytes_written] ───
+//
+//   open_handles        = 현재 table row 수
+//   total_created       = counter file 의 created counter (close 후에도 유지)
+//   total_bytes_read    = counter file 의 read bytes
+//   total_bytes_written = counter file 의 write bytes
+fn handle_stats() -> array {
+    let t = read_handle_table()
+    let mut open_handles = 0
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 5 {
+                    open_handles = open_handles + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    let c = read_counter()
+    let mut out = []
+    out.push(open_handles)
+    out.push(c[0])
+    out.push(c[1])
+    out.push(c[2])
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "k32s1-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 0. cleanup
+    cleanup_handle_table()
+
+    // 1. tmpfile
+    let tmpfile = "/tmp/k32_stage1_test_" + sid + ".txt"
+    let _ = exec("rm -f '" + tmpfile + "'")
+
+    // 2. create_file_w (write mode)
+    let h1 = create_file_w(tmpfile, "w")
+    if h1 < 0 {
+        panic("win32_kernel32_stage1 FAIL [create_file_w] expected=>=0 got=" + to_string(h1))
+    }
+    if h1 < 100 {
+        panic("win32_kernel32_stage1 FAIL [handle range] expected=>=100 got=" + to_string(h1))
+    }
+
+    // 3. r0_emit "k32_create_file"
+    r0_emit("k32_create_file",
+        "\"handle\":" + to_string(h1)
+        + ",\"path\":\"" + tmpfile + "\""
+        + ",\"mode\":\"w\"")
+
+    // 4. write_file_w32
+    let payload = "hello world"
+    let nw = write_file_w32(h1, payload)
+    if nw != 11 {
+        panic("win32_kernel32_stage1 FAIL [write_file_w32] expected=11 got=" + to_string(nw))
+    }
+
+    // 5. get_file_size — 11 byte
+    let gsz = get_file_size(h1)
+    if gsz != 11 {
+        panic("win32_kernel32_stage1 FAIL [get_file_size] expected=11 got=" + to_string(gsz))
+    }
+
+    // 6. close_handle
+    let c1 = close_handle(h1)
+    if !c1 {
+        panic("win32_kernel32_stage1 FAIL [close_handle h1] expected=true got=false")
+    }
+
+    // 7. close 이후 lookup → ""
+    let post = lookup_handle(h1)
+    if post != "" {
+        panic("win32_kernel32_stage1 FAIL [post-close lookup] expected=empty got=" + post)
+    }
+
+    // 8. read mode 재오픈
+    let h2 = create_file_w(tmpfile, "r")
+    if h2 < 0 {
+        panic("win32_kernel32_stage1 FAIL [create_file_w read] expected=>=0 got=" + to_string(h2))
+    }
+
+    // 9. read_file_w32 (11 byte)
+    let content = read_file_w32(h2, 11)
+    if content != payload {
+        panic("win32_kernel32_stage1 FAIL [read_file_w32] expected=" + payload + " got=" + content)
+    }
+
+    // 10. r0_emit "k32_io"
+    r0_emit("k32_io",
+        "\"handle\":" + to_string(h2)
+        + ",\"bytes_read\":" + to_string(11)
+        + ",\"bytes_written\":" + to_string(nw))
+
+    // 11. close h2
+    let c2 = close_handle(h2)
+    if !c2 {
+        panic("win32_kernel32_stage1 FAIL [close_handle h2] expected=true got=false")
+    }
+
+    // 12. read on stale handle → "" / -1
+    let stale = read_file_w32(h2, 11)
+    if stale != "" {
+        panic("win32_kernel32_stage1 FAIL [read stale handle] expected=empty got=" + stale)
+    }
+
+    // 13. virtual_alloc (4096)
+    let addr = virtual_alloc(4096)
+    if addr < 0 {
+        panic("win32_kernel32_stage1 FAIL [virtual_alloc] expected=>=0 got=" + to_string(addr))
+    }
+
+    // 14. virtual_free
+    let vf = virtual_free(addr)
+    if !vf {
+        panic("win32_kernel32_stage1 FAIL [virtual_free] expected=true got=false")
+    }
+
+    // 15. virtual_free on stale → false
+    let vf2 = virtual_free(addr)
+    if vf2 {
+        panic("win32_kernel32_stage1 FAIL [virtual_free stale] expected=false got=true")
+    }
+
+    // 16. heap_alloc / heap_free
+    let ha = heap_alloc(256)
+    if ha < 0 {
+        panic("win32_kernel32_stage1 FAIL [heap_alloc] expected=>=0 got=" + to_string(ha))
+    }
+    let hf = heap_free(ha)
+    if !hf {
+        panic("win32_kernel32_stage1 FAIL [heap_free] expected=true got=false")
+    }
+
+    // 17. sleep_w32 (10ms — 짧게)
+    let sl = sleep_w32(10)
+    if sl != 0 {
+        panic("win32_kernel32_stage1 FAIL [sleep_w32] expected=0 got=" + to_string(sl))
+    }
+
+    // 18. get_tick_count > 0
+    let tick = get_tick_count()
+    if tick <= 0 {
+        panic("win32_kernel32_stage1 FAIL [get_tick_count] expected=>0 got=" + to_string(tick))
+    }
+
+    // 19. handle_stats — 모두 close 후 → open_handles == 0, total_created >= 4
+    let stats = handle_stats()
+    if len(stats) < 4 {
+        panic("win32_kernel32_stage1 FAIL [stats len] expected=>=4 got=" + to_string(len(stats)))
+    }
+    let open_h = stats[0]
+    let total_c = stats[1]
+    if open_h != 0 {
+        panic("win32_kernel32_stage1 FAIL [stats open_handles] expected=0 got=" + to_string(open_h))
+    }
+    if total_c < 4 {
+        panic("win32_kernel32_stage1 FAIL [stats total_created] expected=>=4 got=" + to_string(total_c))
+    }
+
+    // 20. r0_emit "k32_stats"
+    r0_emit("k32_stats",
+        "\"open_handles\":" + to_string(open_h)
+        + ",\"total_created\":" + to_string(total_c)
+        + ",\"bytes_written\":" + to_string(stats[3]))
+
+    // 21. emit count >= 3 검증
+    let emit_n = r0_session_count(sid)
+    if emit_n < 3 {
+        panic("win32_kernel32_stage1 FAIL [r0 emit count] expected=>=3 got=" + to_string(emit_n))
+    }
+
+    // 22. cleanup tmpfile + handle table
+    let _ = exec("rm -f '" + tmpfile + "'")
+    cleanup_handle_table()
+
+    println("  ✅ win32_kernel32_stage1 self_test PASS (file IO round-trip, virtual alloc/free, tick=" + to_string(tick) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let stats = handle_stats()
+            println("open_handles\t" + to_string(stats[0]))
+            println("total_created\t" + to_string(stats[1]))
+            println("bytes_read\t" + to_string(stats[2]))
+            println("bytes_written\t" + to_string(stats[3]))
+            return
+        }
+        if sub == "table-path" {
+            println(handle_table_path())
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_handle_table()
+            println("cleaned: " + handle_table_path())
+            return
+        }
+        if sub == "tick" {
+            println(to_string(get_tick_count()))
+            return
+        }
+    }
+    println("usage: hexa run win32_kernel32_stage1.hexa { self-test | stats | table-path | cleanup | tick }")
+}

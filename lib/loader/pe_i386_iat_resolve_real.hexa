@@ -1,0 +1,444 @@
+// lib/loader/pe_i386_iat_resolve_real.hexa — cycle 80 R3 phase 1
+// PE32 (i386) IAT resolve (real walk) skeleton
+//
+// PE32 (i386) Import Directory walk:
+//   IMAGE_IMPORT_DESCRIPTOR { OriginalFirstThunk → ILT, FirstThunk → IAT }
+//   ILT entry (PE32 / i386):
+//     IMAGE_THUNK_DATA32 = 4 byte (vs PE32+ 8 byte).
+//     high bit 0x80000000 set → low 16 bits = ordinal import.
+//     else AddressOfData = RVA → IMAGE_IMPORT_BY_NAME { Hint, Name[1] }.
+//     (hint_match = Hint 가 가리키는 export 와 직접 일치 → name compare skip 가능)
+//     delay_load = IMAGE_DELAYLOAD_DESCRIPTOR (.didat) — 호출 시점 lazy resolve.
+//   resolve: name 또는 ordinal → own2 stub function lookup → IAT slot 에 absolute addr 쓰기
+//   patched flag: 성공 시 1, 실패 (forwarder/api-set/등) 시 0 → fallback 영역
+// own1: PE spec only, Wine __wine_set_unix_funcs 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 i386 import resolve tracker — 실 IAT patch / dlsym X (R3-C 이후).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// dll_kind code (i386 Battle.net Setup focus):
+//   1 = kernel32
+//   2 = user32
+//   3 = crypt32
+//   4 = wininet
+//   5 = other
+//
+// thunk_kind code (IMAGE_THUNK_DATA32 분류):
+//   1 = name        (AddressOfData → IMAGE_IMPORT_BY_NAME)
+//   2 = ordinal     (high bit 0x80000000 set → low 16 = ordinal, e.g. WS2_32)
+//   3 = hint_match  (Hint 직접 일치 → name compare skip)
+//   4 = delay_load  (.didat IMAGE_DELAYLOAD_DESCRIPTOR 경유)
+//
+// Battle.net Setup reference: 16 DLL × ~30 함수 average = 435 imports, 31 ordinal (WS2_32 등).
+//
+// persist schema (TSV — imports.tsv):
+//   import_id<int> \t dll_kind<int> \t thunk_kind<int> \t patched<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piir_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_iat_resolve_real"
+}
+
+fn piir_imports_path() -> str {
+    return piir_dir() + "/imports.tsv"
+}
+
+fn piir_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piir_dir() + "'")
+}
+
+fn cleanup_piir() -> void {
+    piir_ensure_dir()
+    let _ = exec("rm -f '" + piir_imports_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piir_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piir_append_row(path: str, row: str) -> void {
+    piir_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_import: import 1 건 기록 ───
+fn record_import(import_id: int, dll_kind: int, thunk_kind: int, patched: int) -> void {
+    if import_id <= 0 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=import_id>0 got=" + to_string(import_id))
+    }
+    if dll_kind < 1 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=dll_kind>=1 got=" + to_string(dll_kind))
+    }
+    if dll_kind > 5 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=dll_kind<=5 got=" + to_string(dll_kind))
+    }
+    if thunk_kind < 1 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=thunk_kind>=1 got=" + to_string(thunk_kind))
+    }
+    if thunk_kind > 4 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=thunk_kind<=4 got=" + to_string(thunk_kind))
+    }
+    if patched < 0 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=patched>=0 got=" + to_string(patched))
+    }
+    if patched > 1 {
+        panic("pe_i386_iat_resolve_real FAIL [record_import] expected=patched<=1 got=" + to_string(patched))
+    }
+    let row = to_string(import_id) + "\t" + to_string(dll_kind)
+        + "\t" + to_string(thunk_kind) + "\t" + to_string(patched) + "\n"
+    piir_append_row(piir_imports_path(), row)
+}
+
+// ─── import_count: total import 수 ───
+fn import_count() -> int {
+    let t = piir_read_table(piir_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── patched_count: patched=1 인 import 수 ───
+fn patched_count() -> int {
+    let t = piir_read_table(piir_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_dll_kind: 특정 dll_kind 의 import 수 ───
+fn count_by_dll_kind(kind: int) -> int {
+    let t = piir_read_table(piir_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_thunk_kind: 특정 thunk_kind 의 import 수 ───
+fn count_by_thunk_kind(kind: int) -> int {
+    let t = piir_read_table(piir_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── ordinal_count: thunk_kind=2 (high bit 0x80000000 set) import 수 ───
+fn ordinal_count() -> int {
+    return count_by_thunk_kind(2)
+}
+
+// ─── import_dll_kind: 특정 import_id 의 dll_kind 조회 (없으면 0) ───
+fn import_dll_kind(import_id: int) -> int {
+    let t = piir_read_table(piir_imports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == import_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── piir_stats: [import_count, patched_count, ordinal_count, count_by_dll_kind(1)] ───
+fn piir_stats() -> array {
+    let mut out = []
+    out.push(import_count())
+    out.push(patched_count())
+    out.push(ordinal_count())
+    out.push(count_by_dll_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piir-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_piir()
+
+    // 2. record 6 imports across 4 dll_kinds × 4 thunk_kinds
+    //    kernel32 name + kernel32 hint_match + user32 name + crypt32 ordinal + wininet delay_load + other ordinal
+    //    patched: 4 success, 2 fallback (forwarder/api-set 등)
+    record_import(220001, 1, 1, 1)
+    r0_emit("pe_i386_iat_resolve_real_record",
+        "\"import_id\":220001,\"dll_kind\":1,\"thunk_kind\":1,\"name\":\"CreateFileW\",\"patched\":1")
+
+    record_import(220002, 1, 3, 1)
+    r0_emit("pe_i386_iat_resolve_real_record",
+        "\"import_id\":220002,\"dll_kind\":1,\"thunk_kind\":3,\"name\":\"GetProcAddress\",\"patched\":1")
+
+    record_import(220003, 2, 1, 1)
+    r0_emit("pe_i386_iat_resolve_real_record",
+        "\"import_id\":220003,\"dll_kind\":2,\"thunk_kind\":1,\"name\":\"MessageBoxW\",\"patched\":1")
+
+    record_import(220004, 3, 2, 0)
+    r0_emit("pe_i386_iat_resolve_real_record",
+        "\"import_id\":220004,\"dll_kind\":3,\"thunk_kind\":2,\"ordinal\":17,\"patched\":0")
+
+    record_import(220005, 4, 4, 1)
+    r0_emit("pe_i386_iat_resolve_real_record",
+        "\"import_id\":220005,\"dll_kind\":4,\"thunk_kind\":4,\"name\":\"InternetOpenW\",\"patched\":1")
+
+    record_import(220006, 5, 2, 0)
+    r0_emit("pe_i386_iat_resolve_real_record",
+        "\"import_id\":220006,\"dll_kind\":5,\"thunk_kind\":2,\"ordinal\":115,\"name_hint\":\"WS2_32#115\",\"patched\":0")
+
+    // 3. import_count = 6
+    let c = import_count()
+    if c != 6 {
+        panic("pe_i386_iat_resolve_real FAIL [import_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. patched_count = 4
+    let pc = patched_count()
+    if pc != 4 {
+        panic("pe_i386_iat_resolve_real FAIL [patched_count] expected=4 got=" + to_string(pc))
+    }
+
+    // 5. ordinal_count = 2 (thunk_kind=2)
+    let oc = ordinal_count()
+    if oc != 2 {
+        panic("pe_i386_iat_resolve_real FAIL [ordinal_count] expected=2 got=" + to_string(oc))
+    }
+
+    // 6. count_by_dll_kind sanity (≥3 dll_kinds covered)
+    let k1 = count_by_dll_kind(1)
+    if k1 != 2 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_dll_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_dll_kind(2)
+    if k2 != 1 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_dll_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_dll_kind(3)
+    if k3 != 1 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_dll_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_dll_kind(4)
+    if k4 != 1 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_dll_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_dll_kind(5)
+    if k5 != 1 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_dll_kind(5)] expected=1 got=" + to_string(k5))
+    }
+
+    // 7. count_by_thunk_kind sanity (≥3 thunk_kinds covered: name, ordinal, hint_match, delay_load)
+    let t1 = count_by_thunk_kind(1)
+    if t1 != 2 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_thunk_kind(1)] expected=2 got=" + to_string(t1))
+    }
+    let t2 = count_by_thunk_kind(2)
+    if t2 != 2 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_thunk_kind(2)] expected=2 got=" + to_string(t2))
+    }
+    let t3 = count_by_thunk_kind(3)
+    if t3 != 1 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_thunk_kind(3)] expected=1 got=" + to_string(t3))
+    }
+    let t4 = count_by_thunk_kind(4)
+    if t4 != 1 {
+        panic("pe_i386_iat_resolve_real FAIL [count_by_thunk_kind(4)] expected=1 got=" + to_string(t4))
+    }
+
+    // 8. import_dll_kind lookup (220004 → crypt32=3, miss → 0)
+    let dk = import_dll_kind(220004)
+    if dk != 3 {
+        panic("pe_i386_iat_resolve_real FAIL [import_dll_kind(220004)] expected=3 got=" + to_string(dk))
+    }
+    let dk_miss = import_dll_kind(999999)
+    if dk_miss != 0 {
+        panic("pe_i386_iat_resolve_real FAIL [import_dll_kind(miss)] expected=0 got=" + to_string(dk_miss))
+    }
+
+    // 9. piir_stats() = [6, 4, 2, 2]
+    let s = piir_stats()
+    if len(s) != 4 {
+        panic("pe_i386_iat_resolve_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_i386_iat_resolve_real FAIL [stats import_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_iat_resolve_real FAIL [stats patched_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_i386_iat_resolve_real FAIL [stats ordinal_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_i386_iat_resolve_real FAIL [stats kind_kernel32] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_i386_iat_resolve_real_stats",
+        "\"import_count\":" + to_string(s[0])
+        + ",\"patched_count\":" + to_string(s[1])
+        + ",\"ordinal_count\":" + to_string(s[2])
+        + ",\"kind_kernel32\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_i386_iat_resolve_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_piir()
+    let s2 = piir_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_iat_resolve_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_iat_resolve_real self_test PASS (imports=" + to_string(s[0])
+        + ", patched=" + to_string(s[1]) + ", ordinal=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piir_stats()
+            println("import_count\t" + to_string(s[0]))
+            println("patched_count\t" + to_string(s[1]))
+            println("ordinal_count\t" + to_string(s[2]))
+            println("kind_kernel32\t" + to_string(s[3]))
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_dll_kind\t" + to_string(count_by_dll_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_i386_iat_resolve_real.hexa count <dll_kind>")
+            return
+        }
+        if sub == "thunk" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_thunk_kind\t" + to_string(count_by_thunk_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_i386_iat_resolve_real.hexa thunk <thunk_kind>")
+            return
+        }
+        if sub == "lookup" {
+            if len(a) >= 4 {
+                let id = to_int(a[3])
+                println("import_dll_kind\t" + to_string(import_dll_kind(id)))
+                return
+            }
+            println("usage: hexa run pe_i386_iat_resolve_real.hexa lookup <import_id>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piir()
+            println("cleaned: " + piir_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piir_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_iat_resolve_real.hexa { self-test | stats | count <dll_kind> | thunk <thunk_kind> | lookup <import_id> | cleanup | dir }")
+}

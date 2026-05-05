@@ -1,0 +1,183 @@
+// lib/perf/c_shader_warm.hexa — C-SHADER-WARM (R-list 10/10)
+//
+// D3DMetal shader cache pre-populate — M4 의 SHBF + PSO seed 사용.
+// 단순 버전 (M13 SHADER-WARM++ 가 진화 — Holt forecast + AC trie 추가).
+//
+// 무기: SHBF (M4 import) + filesystem copy + GPTK version invalidation.
+// stage1 우회: bit ops 없음 → linear array SHBF (c_pso 와 동일 접근).
+
+use "./r0_common"
+
+let SHADER_WARM_DIR = GAMEBOX_HOME + "/persist/shader_warm"
+let SHADER_LIVE_DIR = HOME + "/Library/Caches/com.apple.metal"
+let GPTK_VER_FILE = SHADER_WARM_DIR + "/gptk_version.txt"
+
+// GPTK version 감지 — env > brew > "unknown"
+fn current_gptk_version() -> str {
+    let v = exec("printf '%s' \"$GPTK_VERSION\"").trim()
+    if v != "" { return v }
+    let bv = exec("brew list --versions game-porting-toolkit 2>/dev/null | awk '{print $2}'").trim()
+    if bv != "" { return bv }
+    return "unknown"
+}
+
+// version 디렉토리 ensure
+fn version_dir(ver: str) -> str {
+    let d = SHADER_WARM_DIR + "/" + ver
+    let _mk = exec("mkdir -p '" + d + "'")
+    return d
+}
+
+// SHBF — M4 의 c_pso shbf 와 동일 접근 (linear array). 1 KB 크기 가정.
+fn shbf_init() -> array {
+    return []
+}
+
+fn shbf_add(state: array, hash: int) -> array {
+    // linear search dedup
+    let i = 0
+    while i < len(state) {
+        if state[i] == hash { return state }
+        i = i + 1
+    }
+    return state + [hash]
+}
+
+fn shbf_contains(state: array, hash: int) -> bool {
+    let i = 0
+    while i < len(state) {
+        if state[i] == hash { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// seed 디렉토리 → live cache 로 pre-populate
+//   src 의 *.bin / *.metal / *.air / *.shdrcache → dst 로 cp -n (skip existing)
+fn pre_populate(seed_dir: str, live_dir: str) -> int {
+    let _check = exec("test -d '" + seed_dir + "' && echo ok").trim()
+    if _check != "ok" {
+        r0_emit("warm_populate_skip", "\"reason\":\"seed_dir_missing\",\"seed_dir\":\"" + seed_dir + "\"")
+        return 0
+    }
+    let _mk = exec("mkdir -p '" + live_dir + "'")
+    let cmd = "find '" + seed_dir + "' -type f \\( -name '*.bin' -o -name '*.metal' -o -name '*.air' -o -name '*.shdrcache' \\) | while read f; do cp -n \"$f\" '" + live_dir + "/' 2>/dev/null && echo copied; done | wc -l | tr -d ' '"
+    let count_str = exec(cmd).trim()
+    let count = to_int(count_str)
+    r0_emit("warm_populate", "\"seed_dir\":\"" + seed_dir + "\",\"live_dir\":\"" + live_dir + "\",\"copied\":" + to_string(count))
+    return count
+}
+
+// version mismatch nuke — current_ver != stored_ver 면 SHADER_WARM_DIR 의 다른 version dir 모두 제거
+fn nuke_stale(current_ver: str) -> int {
+    let _check = exec("test -d '" + SHADER_WARM_DIR + "' && echo ok").trim()
+    if _check != "ok" { return 0 }
+    let cmd = "ls -1 '" + SHADER_WARM_DIR + "' 2>/dev/null | grep -v '^" + current_ver + "$' | grep -v '^gptk_version.txt$'"
+    let listing = exec(cmd)
+    if listing == "" { return 0 }
+    let n_str = exec("printf '%s' '" + listing + "' | grep -c .").trim()
+    let n = to_int(n_str)
+    let _rm = exec("printf '%s' '" + listing + "' | while read d; do rm -rf '" + SHADER_WARM_DIR + "/'\"$d\"; done")
+    write_file(GPTK_VER_FILE, current_ver)
+    r0_emit("warm_nuke_stale", "\"current_ver\":\"" + current_ver + "\",\"nuked\":" + to_string(n))
+    return n
+}
+
+// seed 등록 — 알려진 PSO hash array → seed 디렉토리에 placeholder 파일 (실제 PSO 바이너리는 게임 실행 후 R0 가 수집)
+fn register_seed(version_dir: str, hashes: array) -> int {
+    let i = 0
+    while i < len(hashes) {
+        let h = hashes[i]
+        let f = version_dir + "/seed_" + to_string(h) + ".bin"
+        write_file(f, "seed-placeholder-" + to_string(h))
+        i = i + 1
+    }
+    r0_emit("warm_seed", "\"version_dir\":\"" + version_dir + "\",\"count\":" + to_string(len(hashes)))
+    return len(hashes)
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "cwarm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. version detect
+    let ver = current_gptk_version()
+    if ver == "" { panic("c_shader_warm FAIL [version] empty") }
+
+    // 2. SHBF round-trip
+    let s = shbf_init()
+    s = shbf_add(s, 12345)
+    s = shbf_add(s, 67890)
+    s = shbf_add(s, 12345)  // dup
+    if len(s) != 2 {
+        panic("c_shader_warm FAIL [shbf dedup] expected=2 got=" + to_string(len(s)))
+    }
+    if !shbf_contains(s, 12345) {
+        panic("c_shader_warm FAIL [shbf contains 12345]")
+    }
+    if shbf_contains(s, 99999) {
+        panic("c_shader_warm FAIL [shbf false positive 99999]")
+    }
+
+    // 3. seed 등록 + pre-populate round-trip — 임시 디렉토리
+    let tmp = "/tmp/cwarm-test-" + exec("date +%s").trim()
+    let seed = tmp + "/seed"
+    let live = tmp + "/live"
+    let _mk = exec("mkdir -p '" + seed + "' '" + live + "'")
+
+    let n_seed = register_seed(seed, [11111, 22222, 33333])
+    if n_seed != 3 {
+        panic("c_shader_warm FAIL [seed register] expected=3 got=" + to_string(n_seed))
+    }
+
+    let n_copied = pre_populate(seed, live)
+    if n_copied != 3 {
+        panic("c_shader_warm FAIL [pre_populate] expected=3 got=" + to_string(n_copied))
+    }
+
+    // 4. live 디렉토리에 3 개 파일 있는지 확인
+    let live_count = to_int(exec("ls -1 '" + live + "' | wc -l | tr -d ' '").trim())
+    if live_count != 3 {
+        panic("c_shader_warm FAIL [live count] expected=3 got=" + to_string(live_count))
+    }
+
+    // 5. nuke_stale — version 'old' 디렉토리 만들고 nuke 시 제거되는지
+    let _mk_stale = exec("mkdir -p '" + SHADER_WARM_DIR + "/old_version'")
+    let nuked = nuke_stale(ver)
+    if nuked < 1 {
+        panic("c_shader_warm FAIL [nuke] expected>=1 got=" + to_string(nuked))
+    }
+    let exists_old = exec("test -d '" + SHADER_WARM_DIR + "/old_version' && echo yes").trim()
+    if exists_old == "yes" {
+        panic("c_shader_warm FAIL [nuke didn't remove old_version]")
+    }
+
+    // cleanup
+    let _rm = exec("rm -rf '" + tmp + "'")
+
+    println("  ✅ c_shader_warm self_test PASS (ver=" + ver + ", SHBF 2/dedup, seed=3, populated=3, nuked>=1, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "version" {
+            println(current_gptk_version())
+            return
+        }
+        if sub == "populate" {
+            let ver = current_gptk_version()
+            let vdir = version_dir(ver)
+            let n = pre_populate(vdir, SHADER_LIVE_DIR)
+            println("populated: " + to_string(n))
+            return
+        }
+    }
+    println("usage: hexa run c_shader_warm.hexa { self-test | version | populate }")
+}

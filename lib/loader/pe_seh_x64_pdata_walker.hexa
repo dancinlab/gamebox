@@ -1,0 +1,419 @@
+// lib/loader/pe_seh_x64_pdata_walker.hexa — PE x64 .pdata directory walker
+//
+// x64 .pdata = IMAGE_DATA_DIRECTORY → RUNTIME_FUNCTION { BeginAddress, EndAddress, UnwindData }.
+// UNWIND_INFO { Version, Flags, SizeOfProlog, CountOfCodes, FrameRegister, FrameOffset, UnwindCode[] }.
+// UNWIND_OP_CODES decode for arm64 frame chain emit.
+// own1: PE/COFF spec + MS x64 ABI only. Wine 인용 X.
+//
+// unwind_op code (Microsoft x64 ABI — UNWIND_CODE.UnwindOp):
+//   0 = UWOP_PUSH_NONVOL       — push nonvolatile integer reg (1 slot)
+//   1 = UWOP_ALLOC_LARGE       — alloc large (>128B) stack space
+//   2 = UWOP_ALLOC_SMALL       — alloc small (8..128B) stack space
+//   3 = UWOP_SET_FPREG         — set frame pointer reg
+//   4 = UWOP_SAVE_NONVOL       — save nonvol reg (16-bit offset)
+//   5 = UWOP_SAVE_NONVOL_FAR   — save nonvol reg (32-bit offset)
+//   8 = UWOP_SAVE_XMM128       — save XMM128 (16-bit offset)
+//   9 = UWOP_SAVE_XMM128_FAR   — save XMM128 (32-bit offset)
+//  10 = UWOP_PUSH_MACHFRAME    — push machine frame (interrupt/exception)
+//
+// persist schema (TSV — entries.tsv):
+//   entry_id<int> \t unwind_op<int> \t code_offset<int> \t slot_value<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pspw_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_seh_x64_pdata_walker"
+}
+
+fn pspw_entries_path() -> str {
+    return pspw_dir() + "/entries.tsv"
+}
+
+fn pspw_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pspw_dir() + "'")
+}
+
+fn cleanup_pspw() -> void {
+    pspw_ensure_dir()
+    let _ = exec("rm -f '" + pspw_entries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pspw_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pspw_append_row(path: str, row: str) -> void {
+    pspw_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_entry: RUNTIME_FUNCTION 1 건 + UNWIND_CODE 1 슬롯 기록 ───
+fn record_entry(entry_id: int, unwind_op: int, code_offset: int, slot_value: int) -> void {
+    if entry_id <= 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    if unwind_op < 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] expected=unwind_op>=0 got=" + to_string(unwind_op))
+    }
+    if unwind_op > 10 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] expected=unwind_op<=10 got=" + to_string(unwind_op))
+    }
+    if unwind_op == 6 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] unwind_op=6 reserved")
+    }
+    if unwind_op == 7 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] unwind_op=7 reserved")
+    }
+    if code_offset < 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] expected=code_offset>=0 got=" + to_string(code_offset))
+    }
+    if code_offset > 255 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] expected=code_offset<=255 got=" + to_string(code_offset))
+    }
+    if slot_value < 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [record_entry] expected=slot_value>=0 got=" + to_string(slot_value))
+    }
+    let row = to_string(entry_id) + "\t" + to_string(unwind_op)
+        + "\t" + to_string(code_offset) + "\t" + to_string(slot_value) + "\n"
+    pspw_append_row(pspw_entries_path(), row)
+}
+
+// ─── entry_count: total entry row 수 ───
+fn entry_count() -> int {
+    let t = pspw_read_table(pspw_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_unwind_op: 특정 unwind_op 의 entry 수 ───
+fn count_by_unwind_op(op: int) -> int {
+    let t = pspw_read_table(pspw_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == op {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_alloc_bytes: ALLOC_LARGE(1) + ALLOC_SMALL(2) slot_value 합 ───
+fn total_alloc_bytes() -> int {
+    let t = pspw_read_table(pspw_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let op = to_int(parts[1])
+                if op == 1 {
+                    sum = sum + to_int(parts[3])
+                }
+                if op == 2 {
+                    sum = sum + to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── xmm_save_count: SAVE_XMM128(8) + SAVE_XMM128_FAR(9) 합 ───
+fn xmm_save_count() -> int {
+    return count_by_unwind_op(8) + count_by_unwind_op(9)
+}
+
+// ─── nonvol_save_count: PUSH_NONVOL(0) + SAVE_NONVOL(4) + SAVE_NONVOL_FAR(5) 합 ───
+fn nonvol_save_count() -> int {
+    return count_by_unwind_op(0) + count_by_unwind_op(4) + count_by_unwind_op(5)
+}
+
+// ─── entry_slot_value: 특정 entry_id 의 slot_value (없으면 0) ───
+fn entry_slot_value(entry_id: int) -> int {
+    let t = pspw_read_table(pspw_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == entry_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pspw_stats: [entry_count, total_alloc_bytes, xmm_save_count, nonvol_save_count] ───
+fn pspw_stats() -> array {
+    let mut out = []
+    out.push(entry_count())
+    out.push(total_alloc_bytes())
+    out.push(xmm_save_count())
+    out.push(nonvol_save_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pspw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pspw()
+
+    // 2. record 7 entries covering ≥5 unwind_ops
+    //    op=0 PUSH_NONVOL, op=2 ALLOC_SMALL, op=1 ALLOC_LARGE, op=3 SET_FPREG,
+    //    op=4 SAVE_NONVOL, op=8 SAVE_XMM128, op=10 PUSH_MACHFRAME
+    record_entry(190001, 0, 1, 5)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190001,\"unwind_op\":0,\"code_offset\":1,\"slot_value\":5,\"target\":\"push_nonvol\"")
+
+    record_entry(190002, 2, 4, 32)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190002,\"unwind_op\":2,\"code_offset\":4,\"slot_value\":32,\"target\":\"alloc_small\"")
+
+    record_entry(190003, 1, 7, 4096)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190003,\"unwind_op\":1,\"code_offset\":7,\"slot_value\":4096,\"target\":\"alloc_large\"")
+
+    record_entry(190004, 3, 9, 0)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190004,\"unwind_op\":3,\"code_offset\":9,\"slot_value\":0,\"target\":\"set_fpreg\"")
+
+    record_entry(190005, 4, 12, 16)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190005,\"unwind_op\":4,\"code_offset\":12,\"slot_value\":16,\"target\":\"save_nonvol\"")
+
+    record_entry(190006, 8, 15, 48)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190006,\"unwind_op\":8,\"code_offset\":15,\"slot_value\":48,\"target\":\"save_xmm128\"")
+
+    record_entry(190007, 10, 0, 0)
+    r0_emit("pe_seh_x64_pdata_walker_record",
+        "\"entry_id\":190007,\"unwind_op\":10,\"code_offset\":0,\"slot_value\":0,\"target\":\"push_machframe\"")
+
+    // 3. entry_count = 7
+    let c = entry_count()
+    if c != 7 {
+        panic("pe_seh_x64_pdata_walker FAIL [entry_count] expected=7 got=" + to_string(c))
+    }
+
+    // 4. count_by_unwind_op sanity (each present op = 1; absent = 0)
+    let c0 = count_by_unwind_op(0)
+    if c0 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(0)] expected=1 got=" + to_string(c0))
+    }
+    let c1 = count_by_unwind_op(1)
+    if c1 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_unwind_op(2)
+    if c2 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(2)] expected=1 got=" + to_string(c2))
+    }
+    let c3 = count_by_unwind_op(3)
+    if c3 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(3)] expected=1 got=" + to_string(c3))
+    }
+    let c4 = count_by_unwind_op(4)
+    if c4 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(4)] expected=1 got=" + to_string(c4))
+    }
+    let c5 = count_by_unwind_op(5)
+    if c5 != 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(5)] expected=0 got=" + to_string(c5))
+    }
+    let c8 = count_by_unwind_op(8)
+    if c8 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(8)] expected=1 got=" + to_string(c8))
+    }
+    let c9 = count_by_unwind_op(9)
+    if c9 != 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(9)] expected=0 got=" + to_string(c9))
+    }
+    let c10 = count_by_unwind_op(10)
+    if c10 != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [count_by_unwind_op(10)] expected=1 got=" + to_string(c10))
+    }
+
+    // 5. total_alloc_bytes = 32 (ALLOC_SMALL) + 4096 (ALLOC_LARGE) = 4128
+    let ab = total_alloc_bytes()
+    if ab != 4128 {
+        panic("pe_seh_x64_pdata_walker FAIL [total_alloc_bytes] expected=4128 got=" + to_string(ab))
+    }
+
+    // 6. xmm_save_count = 1 (op=8) + 0 (op=9) = 1
+    let xs = xmm_save_count()
+    if xs != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [xmm_save_count] expected=1 got=" + to_string(xs))
+    }
+
+    // 7. nonvol_save_count = 1 (op=0) + 1 (op=4) + 0 (op=5) = 2
+    let nv = nonvol_save_count()
+    if nv != 2 {
+        panic("pe_seh_x64_pdata_walker FAIL [nonvol_save_count] expected=2 got=" + to_string(nv))
+    }
+
+    // 8. entry_slot_value sanity
+    let sv3 = entry_slot_value(190003)
+    if sv3 != 4096 {
+        panic("pe_seh_x64_pdata_walker FAIL [entry_slot_value(190003)] expected=4096 got=" + to_string(sv3))
+    }
+    let sv6 = entry_slot_value(190006)
+    if sv6 != 48 {
+        panic("pe_seh_x64_pdata_walker FAIL [entry_slot_value(190006)] expected=48 got=" + to_string(sv6))
+    }
+    let sv_miss = entry_slot_value(9999)
+    if sv_miss != 0 {
+        panic("pe_seh_x64_pdata_walker FAIL [entry_slot_value(9999)] expected=0 got=" + to_string(sv_miss))
+    }
+
+    // 9. pspw_stats() = [7, 4128, 1, 2]
+    let s = pspw_stats()
+    if len(s) != 4 {
+        panic("pe_seh_x64_pdata_walker FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 7 {
+        panic("pe_seh_x64_pdata_walker FAIL [stats entry_count] expected=7 got=" + to_string(s[0]))
+    }
+    if s[1] != 4128 {
+        panic("pe_seh_x64_pdata_walker FAIL [stats total_alloc_bytes] expected=4128 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_seh_x64_pdata_walker FAIL [stats xmm_save_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_seh_x64_pdata_walker FAIL [stats nonvol_save_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_seh_x64_pdata_walker_stats",
+        "\"entry_count\":" + to_string(s[0])
+        + ",\"total_alloc_bytes\":" + to_string(s[1])
+        + ",\"xmm_save_count\":" + to_string(s[2])
+        + ",\"nonvol_save_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 8 (7 records + 1 stats = 8)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 8 {
+        panic("pe_seh_x64_pdata_walker FAIL [r0 emit count] expected=>=8 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pspw()
+    let s2 = pspw_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_seh_x64_pdata_walker FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_seh_x64_pdata_walker self_test PASS (entries=" + to_string(s[0])
+        + ", alloc_bytes=" + to_string(s[1]) + ", xmm=" + to_string(s[2])
+        + ", nonvol=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pspw_stats()
+            println("entry_count\t" + to_string(s[0]))
+            println("total_alloc_bytes\t" + to_string(s[1]))
+            println("xmm_save_count\t" + to_string(s[2]))
+            println("nonvol_save_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "slot" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println("entry_slot_value\t" + to_string(entry_slot_value(eid)))
+                return
+            }
+            println("usage: hexa run pe_seh_x64_pdata_walker.hexa slot <entry_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let op = to_int(a[3])
+                println("count_by_unwind_op\t" + to_string(count_by_unwind_op(op)))
+                return
+            }
+            println("usage: hexa run pe_seh_x64_pdata_walker.hexa count <unwind_op>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pspw()
+            println("cleaned: " + pspw_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pspw_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_seh_x64_pdata_walker.hexa { self-test | stats | slot <entry_id> | count <unwind_op> | cleanup | dir }")
+}

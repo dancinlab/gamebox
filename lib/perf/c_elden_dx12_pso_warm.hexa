@@ -1,0 +1,214 @@
+// lib/perf/c_elden_dx12_pso_warm.hexa — CN-168 skeleton manjeom 15/15
+//
+// Elden Ring DX12 PSO (Pipeline State Object) cache warm-up 추적 — D4 PSO
+// warmup 와 동형. Elden Ring (offline mode) 의 DX12 PSO 컴파일 비용 (1 PSO
+// 당 ~30-80ms) 으로 cold 첫 진입 시 hundreds of PSO 컴파일 → frame hitch
+// 발생. PSO cache 가 warm 되면 비용 회피. 본 모듈은 zone × pso_count ×
+// compile_us × cache_hit 4-key 컬럼 로그 단위 집계만 담당 — 실제 PSO
+// serialize / replay 는 host 측 책임. D4 c_d4_pso_warmup_priority 와
+// generic 흡수 가능.
+//
+// 무기: zone × pso_count × compile_us × cache_hit_count 4-key columnar log.
+// 효과: Elden Ring zone 별 PSO warm-up 정량화 (Lands Between → Realm of
+// Shadow 진입 시 cache reuse → cold-zone hitch 회피).
+
+use "./r0_common"
+
+let EDPW_DIR = GAMEBOX_HOME + "/persist/elden_dx12_pso_warm"
+let ZONE_LOG = EDPW_DIR + "/zones.tsv"
+
+fn edpw_dir() -> str { return EDPW_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + EDPW_DIR + "'")
+}
+
+// ─── zone 등록 ───
+//   zone_id (Limgrave / Stormveil / Realm of Shadow 등 logical zone id),
+//   pso_count (이 zone 에서 컴파일된 PSO 수),
+//   compile_us (이 zone 의 누적 PSO 컴파일 시간 us),
+//   cache_hit_count (warm cache 적중으로 skip 한 PSO 수).
+fn record_zone(zone_id: int, pso_count: int, compile_us: int, cache_hit_count: int) -> void {
+    ensure_dir()
+    let line = to_string(zone_id) + "\t" + to_string(pso_count) + "\t" + to_string(compile_us) + "\t" + to_string(cache_hit_count)
+    let tmp = ZONE_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + ZONE_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("elden_dx12_pso_zone", "\"zone\":" + to_string(zone_id) + ",\"psos\":" + to_string(pso_count) + ",\"compile_us\":" + to_string(compile_us) + ",\"hits\":" + to_string(cache_hit_count))
+}
+
+// ─── zone_count — 등록된 zone 행 수 ───
+fn zone_count() -> int {
+    let exists = exec("test -f '" + ZONE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + ZONE_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_pso_count — 모든 zone pso_count 합 ───
+fn total_pso_count() -> int {
+    let exists = exec("test -f '" + ZONE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + ZONE_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_compile_us — 모든 zone compile_us 합 ───
+fn total_compile_us() -> int {
+    let exists = exec("test -f '" + ZONE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + ZONE_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_cache_hits — 모든 zone cache_hit_count 합 ───
+fn total_cache_hits() -> int {
+    let exists = exec("test -f '" + ZONE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + ZONE_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── cache_hit_rate_pct — (total_cache_hits * 100) / total_pso_count ───
+//   total_pso_count 0 이면 0 반환 (divide-by-zero guard).
+fn cache_hit_rate_pct() -> int {
+    let tp = total_pso_count()
+    if tp == 0 { return 0 }
+    let th = total_cache_hits()
+    return (th * 100) / tp
+}
+
+// ─── zone_compile_us — 특정 zone_id 의 compile_us ───
+//   zone_id 미등록이면 0.
+fn zone_compile_us(zone_id: int) -> int {
+    let exists = exec("test -f '" + ZONE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v z=" + to_string(zone_id) + " '$1==z {s+=$3} END{print s+0}' '" + ZONE_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── edpw_stats — [zone_count, total_pso_count, total_compile_us, cache_hit_rate_pct] ───
+fn edpw_stats() -> array {
+    return [zone_count(), total_pso_count(), total_compile_us(), cache_hit_rate_pct()]
+}
+
+fn cleanup_edpw() -> void {
+    let _ = exec("rm -rf '" + EDPW_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "edpw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_edpw()
+
+    // 합성 zone 3 종:
+    //   Limgrave (id=22001) — base 첫 zone, cold     : 240 PSO / 12000000 us / 0 hits
+    //   Stormveil Castle (id=22002) — partial cache  : 180 PSO / 4800000 us  / 120 hits
+    //   Realm of Shadow (id=22003) — SotE warm cache : 320 PSO / 3200000 us  / 280 hits
+    record_zone(22001, 240, 12000000, 0)
+    record_zone(22002, 180, 4800000, 120)
+    record_zone(22003, 320, 3200000, 280)
+
+    // zone_count = 3
+    let zc = zone_count()
+    if zc != 3 { panic("c_elden_dx12_pso_warm FAIL [zone_count] expected=3 got=" + to_string(zc)) }
+
+    // total_pso_count = 240+180+320 = 740
+    let tp = total_pso_count()
+    if tp != 740 { panic("c_elden_dx12_pso_warm FAIL [total_pso_count] expected=740 got=" + to_string(tp)) }
+
+    // total_compile_us = 12000000+4800000+3200000 = 20000000
+    let tc = total_compile_us()
+    if tc != 20000000 { panic("c_elden_dx12_pso_warm FAIL [total_compile_us] expected=20000000 got=" + to_string(tc)) }
+
+    // total_cache_hits = 0+120+280 = 400
+    let th = total_cache_hits()
+    if th != 400 { panic("c_elden_dx12_pso_warm FAIL [total_cache_hits] expected=400 got=" + to_string(th)) }
+
+    // cache_hit_rate_pct = (400 * 100) / 740 = 40000/740 = 54 (int trunc)
+    let rate = cache_hit_rate_pct()
+    if rate != 54 { panic("c_elden_dx12_pso_warm FAIL [cache_hit_rate_pct] expected=54 got=" + to_string(rate)) }
+
+    // zone_compile_us per zone
+    let z1 = zone_compile_us(22001)
+    if z1 != 12000000 { panic("c_elden_dx12_pso_warm FAIL [zone_compile_us 22001] expected=12000000 got=" + to_string(z1)) }
+    let z2 = zone_compile_us(22002)
+    if z2 != 4800000 { panic("c_elden_dx12_pso_warm FAIL [zone_compile_us 22002] expected=4800000 got=" + to_string(z2)) }
+    let z3 = zone_compile_us(22003)
+    if z3 != 3200000 { panic("c_elden_dx12_pso_warm FAIL [zone_compile_us 22003] expected=3200000 got=" + to_string(z3)) }
+    // 미등록 zone_id 는 0
+    let z4 = zone_compile_us(9999)
+    if z4 != 0 { panic("c_elden_dx12_pso_warm FAIL [zone_compile_us unknown] expected=0 got=" + to_string(z4)) }
+
+    let stats = edpw_stats()
+    if stats[0] != 3 { panic("c_elden_dx12_pso_warm FAIL [stats zones] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 740 { panic("c_elden_dx12_pso_warm FAIL [stats psos] expected=740 got=" + to_string(stats[1])) }
+    if stats[2] != 20000000 { panic("c_elden_dx12_pso_warm FAIL [stats compile_us] expected=20000000 got=" + to_string(stats[2])) }
+    if stats[3] != 54 { panic("c_elden_dx12_pso_warm FAIL [stats hit_rate] expected=54 got=" + to_string(stats[3])) }
+
+    r0_emit("elden_dx12_pso_summary", "\"zones\":" + to_string(stats[0]) + ",\"psos\":" + to_string(stats[1]) + ",\"compile_us\":" + to_string(stats[2]) + ",\"hits\":" + to_string(th) + ",\"hit_rate_pct\":" + to_string(stats[3]))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_elden_dx12_pso_warm FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic Elden Ring retired_intentional posture annotation (Track AS) ───
+    //
+    // Track AS mission: Elden Ring blk.1 retired_intentional posture annotation
+    // (mirror D4 Track V/AJ/AL pattern, EAC anti-tamper class). .roadmap.elden_ring
+    // blk.1 status_enum_adopted = retired_intentional (block-acknowledged =
+    // PASS-equivalent posture, own1 Wine 0 + own2 honest emit, no AC bypass / no
+    // anti-tamper bypass). 본 module 측 DX12 PSO warm-up zone-aware compile-time
+    // 4-key trace (zone × pso_count × compile_us × hit_count) = synthetic. Elden
+    // Ring live session X (production binary smoke 측 EAC kernel driver block
+    // transitive). cond.2 status `partial` 영구 유지 (retired_intentional posture
+    // per blk.1 영구 lock).
+    // pattern reference:
+    //     lib/perf/c_d4_pso_warmup_priority.hexa (Track V predecessor, PSO mirror)
+    //
+    // synthetic posture row column header:
+    //     domain                "dx12_pso_warm"
+    //     posture               "retired_intentional"
+    //     production_smoke      "no_attempt"
+    //     drm_bypass            "0"                    (own1 Wine 0)
+    //     ac_bypass             "0"                    (own1 honest acknowledgment)
+    //     anti_tamper_bypass    "0"                    (EAC anti-tamper boundary)
+    //     blocker_ref           "elden_ring.blk.1"     (eac_anti_tamper)
+    //     adoption_iso          "2026-05-03"           (Track C 4-game retired_intentional)
+    r0_emit("c_elden_dx12_pso_warm_retired_intentional",
+        "\"stage\":\"elden_ring_engine_synthetic\",\"domain\":\"dx12_pso_warm\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"ac_bypass\":0,\"anti_tamper_bypass\":0,\"blocker_ref\":\"elden_ring.blk.1\",\"blocker_class\":\"eac_anti_tamper\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"elden_ring.cond.2\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\"")
+    println("__ELDEN_DX12_PSO_WARM__ RETIRED_INTENTIONAL elden_ring_engine_synthetic")
+
+    cleanup_edpw()
+
+    println("  ✅ c_elden_dx12_pso_warm self_test PASS (3 zones, 740 PSOs, compile_us=20000000, hits=400, hit_rate=54%, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = edpw_stats()
+            println("zones=" + to_string(s[0]) + " psos=" + to_string(s[1]) + " compile_us=" + to_string(s[2]) + " hit_rate_pct=" + to_string(s[3]))
+            return
+        }
+        if sub == "compile" {
+            if len(a) >= 4 {
+                let zid = to_int(a[3])
+                let us = zone_compile_us(zid)
+                println(to_string(us))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_edpw(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_elden_dx12_pso_warm.hexa { self-test | stats | compile <zone_id> | cleanup }")
+}

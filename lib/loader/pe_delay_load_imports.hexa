@@ -1,0 +1,333 @@
+// lib/loader/pe_delay_load_imports.hexa — stage3 PE delay-load imports skeleton
+//
+// PE Delay-Load Directory: lazy DLL load. first-call 까지 LoadLibrary +
+// GetProcAddress 지연. __delayLoadHelper2 thunk 가 fallback handler.
+//
+// own 1 enforcement: Wine / CrossOver / community PE loader 코드 0 줄.
+//   참조 only — Microsoft PE/COFF spec (learn.microsoft.com),
+//   Optional Header Data Directory[13] = IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT.
+// own 2 mandate:
+//   - r0_emit ≥ 5 (record_delay_load × 4 + cleanup|stats marker)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_delay_load_imports FAIL [<sub>] expected=X got=Y")
+//
+// table schema (TSV, 4-key):
+//   pdli_log.tsv — "pe_id\tdll_id\tfn_count\ttriggered\n"
+//
+// 동작 흐름 (skeleton):
+//   1. record_delay_load(pe_id, dll_id, fn_count, triggered)
+//      pdli_log.tsv 에 행 append. triggered = first-call 발생해서
+//      actual LoadLibrary + GetProcAddress 된 함수 수.
+//   2. delay_load_count() — 행 수.
+//   3. total_functions() / total_triggered() — 합계.
+//   4. pe_dll_count(pe_id) — pe_id 의 distinct dll_id 수.
+//   5. pdli_stats() — [count, total_fn, total_triggered, total_pending].
+//
+// 실 delay-load thunk (__delayLoadHelper2 dispatch) 는 stage4.
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 (4-key 작업 영역) ───
+fn pdli_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_delay_load_imports"
+}
+
+fn pdli_log_path() -> str {
+    return pdli_dir() + "/pdli_log.tsv"
+}
+
+fn ensure_pdli_dir() -> void {
+    let _ = exec("mkdir -p '" + pdli_dir() + "'")
+}
+
+fn cleanup_pdli() -> void {
+    ensure_pdli_dir()
+    let _ = exec("rm -f '" + pdli_log_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdli_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdli_append_row(path: str, row: str) -> void {
+    ensure_pdli_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_delay_load: pdli_log.tsv 행 추가 + r0_emit ───
+fn record_delay_load(pe_id: int, dll_id: int, fn_count: int, triggered: int) -> void {
+    let row = to_string(pe_id) + "\t" + to_string(dll_id)
+        + "\t" + to_string(fn_count) + "\t" + to_string(triggered) + "\n"
+    pdli_append_row(pdli_log_path(), row)
+    r0_emit("pdli_record",
+        "\"pe_id\":" + to_string(pe_id)
+        + ",\"dll_id\":" + to_string(dll_id)
+        + ",\"fn_count\":" + to_string(fn_count)
+        + ",\"triggered\":" + to_string(triggered))
+}
+
+// ─── delay_load_count: log 의 행 수 ───
+fn delay_load_count() -> int {
+    let mut row_n = 0
+    let t = pdli_read_table(pdli_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    row_n = row_n + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    return row_n
+}
+
+// ─── total_functions: fn_count 합 ───
+fn total_functions() -> int {
+    let mut sum_fn = 0
+    let t = pdli_read_table(pdli_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum_fn = sum_fn + to_int(parts[2])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum_fn
+}
+
+// ─── total_triggered: triggered 합 ───
+fn total_triggered() -> int {
+    let mut sum_t = 0
+    let t = pdli_read_table(pdli_log_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum_t = sum_t + to_int(parts[3])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum_t
+}
+
+// ─── pe_dll_count: pe_id 의 distinct dll_id 수 ───
+fn pe_dll_count(pe_id: int) -> int {
+    let t = pdli_read_table(pdli_log_path())
+    if t == "" {
+        return 0
+    }
+    let target = to_string(pe_id)
+    let mut seen = []
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == target {
+                    let dll = parts[1]
+                    let mut dup = false
+                    let j = 0
+                    while j < len(seen) {
+                        if seen[j] == dll {
+                            dup = true
+                        }
+                        j = j + 1
+                    }
+                    if !dup {
+                        seen.push(dll)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── pdli_stats: [count, total_fn, total_triggered, total_pending] ───
+fn pdli_stats() -> array {
+    let mut out = []
+    let c = delay_load_count()
+    let f = total_functions()
+    let g = total_triggered()
+    out.push(c)
+    out.push(f)
+    out.push(g)
+    out.push(f - g)
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdli-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup → log empty
+    cleanup_pdli()
+    let s0 = pdli_stats()
+    if s0[0] != 0 {
+        panic("pe_delay_load_imports FAIL [stats[0] init] expected=0 got=" + to_string(s0[0]))
+    }
+
+    // 2. synthesize 4 entries — Battle.net + D2R delay-load patterns
+    //    Battle.net (pe_id=89001):
+    //      CRYPT32 (dll_id=1) — 12 fn, 8 triggered (partial use)
+    //      WININET (dll_id=2) — 6 fn, 6 triggered (fully used)
+    //      WINHTTP (dll_id=3) — 4 fn, 0 triggered (not used yet)
+    //    D2R (pe_id=89002):
+    //      ADVAPI32 (dll_id=4) — 18 fn, 18 triggered (fully used)
+    record_delay_load(89001, 1, 12, 8)
+    record_delay_load(89001, 2, 6, 6)
+    record_delay_load(89001, 3, 4, 0)
+    record_delay_load(89002, 4, 18, 18)
+
+    // 3. delay_load_count 검증 = 4
+    let c = delay_load_count()
+    if c != 4 {
+        panic("pe_delay_load_imports FAIL [delay_load_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_functions 검증 = 12+6+4+18 = 40
+    let tf = total_functions()
+    if tf != 40 {
+        panic("pe_delay_load_imports FAIL [total_functions] expected=40 got=" + to_string(tf))
+    }
+
+    // 5. total_triggered 검증 = 8+6+0+18 = 32
+    let tt = total_triggered()
+    if tt != 32 {
+        panic("pe_delay_load_imports FAIL [total_triggered] expected=32 got=" + to_string(tt))
+    }
+
+    // 6. pe_dll_count(89001) = 3, pe_dll_count(89002) = 1, pe_dll_count(9999) = 0
+    let dc1 = pe_dll_count(89001)
+    if dc1 != 3 {
+        panic("pe_delay_load_imports FAIL [pe_dll_count 89001] expected=3 got=" + to_string(dc1))
+    }
+    let dc2 = pe_dll_count(89002)
+    if dc2 != 1 {
+        panic("pe_delay_load_imports FAIL [pe_dll_count 89002] expected=1 got=" + to_string(dc2))
+    }
+    let dc3 = pe_dll_count(9999)
+    if dc3 != 0 {
+        panic("pe_delay_load_imports FAIL [pe_dll_count 9999] expected=0 got=" + to_string(dc3))
+    }
+
+    // 7. pdli_stats() = [4, 40, 32, 8]
+    let s = pdli_stats()
+    if len(s) != 4 {
+        panic("pe_delay_load_imports FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_delay_load_imports FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 40 {
+        panic("pe_delay_load_imports FAIL [stats[1]] expected=40 got=" + to_string(s[1]))
+    }
+    if s[2] != 32 {
+        panic("pe_delay_load_imports FAIL [stats[2]] expected=32 got=" + to_string(s[2]))
+    }
+    if s[3] != 8 {
+        panic("pe_delay_load_imports FAIL [stats[3] pending] expected=8 got=" + to_string(s[3]))
+    }
+
+    // 8. r0_emit summary marker (ensures emit count ≥ 5)
+    r0_emit("pdli_summary",
+        "\"count\":" + to_string(s[0])
+        + ",\"total_fn\":" + to_string(s[1])
+        + ",\"triggered\":" + to_string(s[2])
+        + ",\"pending\":" + to_string(s[3]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_delay_load_imports FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 9. cleanup → stats reset
+    cleanup_pdli()
+    let s_after = pdli_stats()
+    let j = 0
+    while j < len(s_after) {
+        if s_after[j] != 0 {
+            panic("pe_delay_load_imports FAIL [cleanup stats[" + to_string(j)
+                + "]] expected=0 got=" + to_string(s_after[j]))
+        }
+        j = j + 1
+    }
+
+    println("  ✅ pe_delay_load_imports self_test PASS (4 entries, 40 fn, 32 triggered, 8 pending, sid="
+        + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdli_stats()
+            println("delay_load_count\t" + to_string(s[0]))
+            println("total_functions\t" + to_string(s[1]))
+            println("total_triggered\t" + to_string(s[2]))
+            println("total_pending\t" + to_string(s[3]))
+            return
+        }
+        if sub == "dlls" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                let dc = pe_dll_count(pid)
+                println("pe_id\t" + to_string(pid))
+                println("dll_count\t" + to_string(dc))
+                return
+            }
+            println("usage: dlls <pe_id>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdli()
+            println("cleaned: " + pdli_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdli_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_delay_load_imports.hexa { self-test | stats | dlls <pe_id> | cleanup | dir }")
+}

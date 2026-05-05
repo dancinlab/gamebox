@@ -1,0 +1,581 @@
+// lib/loader/pe_msvc_abort_path_avoidance.hexa — MSVC abort path (INT3 / __fastfail / abort) 회피 tracker
+//
+// MSVC (cl.exe) 빌드된 PE binary 가 비정상 분기 (stack overrun / cookie mismatch /
+// CFG violation / C++ exception terminate) 를 감지하면 다음 abort code path 로
+// 분기한다 — 본 module 은 이 분기 들을 i386 interpreter 가 인식하고 회피한 결정을
+// 추적하는 hexa-pure tracker.
+//
+//   - INT3 (0xCC) : __debugbreak() / cookie mismatch path 의 단일 byte trap
+//                   (context_kind 0=__debugbreak / 1=__fastfail / 2=stack_check / 3=unknown)
+//   - __fastfail  : `int 0x29` (i386) — reason argument (ECX) 종류
+//                   (reason_kind 0=stack_buffer_overrun / 1=cookie_mismatch /
+//                    2=cfg_violation / 3=cpp_exception_terminate)
+//   - abort()     : MSVCR runtime abort entry — 회피 action 으로 처리
+//                   (action_kind 0=skip_eip / 1=fake_eax_zero / 2=stack_unwind / 3=halt)
+//
+// 회피 action 후 interpreter 가 도달한 상태 (post_avoidance_state) 와
+// stack_unwind 의 단계별 ret 횟수 (unwind_step) 를 기록한다.
+//
+// 본 hexa module 은 instrumentation tracker — 실제 INT3 / int 0x29 detect 는
+// native side (pe_to_macho_shim.cpp i386 interpreter) 에서 결정하고 결과만
+// record_*() API 로 hexa 측 persist 에 흘려 보낸다 — Hexa pure module + Apple
+// SDK 호출 X.
+//
+// own 1 enforcement: Wine / CrossOver / Box86 / GPTK / Whisky / Hangover / FEX / community 0 줄.
+//   - Wine wine/dlls/msvcrt/except.c (CRT abort path) 인용 X
+//   - Wine ntdll/signal_i386.c (__fastfail emulation) 인용 X
+//   - Box86 dynarec_arm64_emit_signal.c 인용 X
+//   - QEMU target/i386/excp_helper.c 인용 X
+//   - Microsoft 공식 docs (Windows Internals / __fastfail intrinsic / Intel SDM Vol 2 INT)
+//     자체 구현만 OK
+// own 2 mandate: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   int3_event.tsv          : int3_id<int>     \t eip<int>            \t context_kind<int>
+//   fast_fail.tsv           : ff_id<int>       \t reason_kind<int>
+//   avoidance_action.tsv    : action_id<int>   \t target_int3_id<int> \t action_kind<int>     \t success<int>
+//   unwind_step.tsv         : unwind_id<int>   \t ret_count<int>      \t final_eip<int>
+//   post_state.tsv          : state_id<int>    \t eax<int>            \t esp<int>             \t instructions_continued<int>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지.
+//   식별자: int3_id / eip / context_kind
+//           ff_id / reason_kind
+//           action_id / target_int3_id / action_kind / success
+//           unwind_id / ret_count / final_eip
+//           state_id / eax / esp / instructions_continued
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmapa_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_abort_path_avoidance"
+}
+
+fn pmapa_int3_path() -> str {
+    return pmapa_dir() + "/int3_event.tsv"
+}
+
+fn pmapa_ff_path() -> str {
+    return pmapa_dir() + "/fast_fail.tsv"
+}
+
+fn pmapa_action_path() -> str {
+    return pmapa_dir() + "/avoidance_action.tsv"
+}
+
+fn pmapa_unwind_path() -> str {
+    return pmapa_dir() + "/unwind_step.tsv"
+}
+
+fn pmapa_state_path() -> str {
+    return pmapa_dir() + "/post_state.tsv"
+}
+
+fn pmapa_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmapa_dir() + "'")
+}
+
+fn cleanup_pmapa() -> void {
+    pmapa_ensure_dir()
+    let _ = exec("rm -f '" + pmapa_int3_path()
+        + "' '" + pmapa_ff_path()
+        + "' '" + pmapa_action_path()
+        + "' '" + pmapa_unwind_path()
+        + "' '" + pmapa_state_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmapa_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmapa_append_row(path: str, row: str) -> void {
+    pmapa_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int (no 0x prefix) ───
+fn pmapa_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_abort_path_avoidance FAIL [pmapa_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── context_name: 0..3 → __debugbreak / __fastfail / stack_check / unknown ───
+fn context_name(k: int) -> str {
+    if k == 0 { return "__debugbreak" }
+    if k == 1 { return "__fastfail"   }
+    if k == 2 { return "stack_check"  }
+    if k == 3 { return "unknown"      }
+    return ""
+}
+
+// ─── reason_name: 0..3 → stack_buffer_overrun / cookie_mismatch / cfg_violation / cpp_exception_terminate ───
+fn reason_name(k: int) -> str {
+    if k == 0 { return "stack_buffer_overrun"   }
+    if k == 1 { return "cookie_mismatch"        }
+    if k == 2 { return "cfg_violation"          }
+    if k == 3 { return "cpp_exception_terminate" }
+    return ""
+}
+
+// ─── action_name: 0..3 → skip_eip / fake_eax_zero / stack_unwind / halt ───
+fn action_name(k: int) -> str {
+    if k == 0 { return "skip_eip"      }
+    if k == 1 { return "fake_eax_zero" }
+    if k == 2 { return "stack_unwind"  }
+    if k == 3 { return "halt"          }
+    return ""
+}
+
+// ─── record_int3_event: INT3 (0xCC) trap 발생 ───
+//   context_kind 0=__debugbreak / 1=__fastfail / 2=stack_check / 3=unknown
+fn record_int3_event(int3_id: int, eip_hex: str, context_kind: int) -> void {
+    if int3_id <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_int3_event] expected=int3_id>0 got=" + to_string(int3_id))
+    }
+    let eip = pmapa_hex_to_int(eip_hex)
+    if eip < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_int3_event] expected=eip>=0 got=" + to_string(eip))
+    }
+    if context_kind < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_int3_event] expected=context_kind>=0 got=" + to_string(context_kind))
+    }
+    if context_kind > 3 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_int3_event] expected=context_kind<=3 got=" + to_string(context_kind))
+    }
+    let row = to_string(int3_id) + "\t" + to_string(eip) + "\t"
+        + to_string(context_kind) + "\n"
+    pmapa_append_row(pmapa_int3_path(), row)
+}
+
+// ─── record_fast_fail: __fastfail (int 0x29) reason ───
+//   reason_kind 0=stack_buffer_overrun / 1=cookie_mismatch / 2=cfg_violation / 3=cpp_exception_terminate
+fn record_fast_fail(ff_id: int, reason_kind: int) -> void {
+    if ff_id <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_fast_fail] expected=ff_id>0 got=" + to_string(ff_id))
+    }
+    if reason_kind < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_fast_fail] expected=reason_kind>=0 got=" + to_string(reason_kind))
+    }
+    if reason_kind > 3 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_fast_fail] expected=reason_kind<=3 got=" + to_string(reason_kind))
+    }
+    let row = to_string(ff_id) + "\t" + to_string(reason_kind) + "\n"
+    pmapa_append_row(pmapa_ff_path(), row)
+}
+
+// ─── record_avoidance_action: 회피 행위 결정 ───
+//   action_kind 0=skip_eip / 1=fake_eax_zero / 2=stack_unwind / 3=halt
+//   success 0=실패 / 1=성공
+fn record_avoidance_action(action_id: int, target_int3_id: int, action_kind: int, success: int) -> void {
+    if action_id <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_avoidance_action] expected=action_id>0 got=" + to_string(action_id))
+    }
+    if target_int3_id <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_avoidance_action] expected=target_int3_id>0 got=" + to_string(target_int3_id))
+    }
+    if action_kind < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_avoidance_action] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 3 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_avoidance_action] expected=action_kind<=3 got=" + to_string(action_kind))
+    }
+    if success < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_avoidance_action] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_avoidance_action] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(action_id) + "\t" + to_string(target_int3_id) + "\t"
+        + to_string(action_kind) + "\t" + to_string(success) + "\n"
+    pmapa_append_row(pmapa_action_path(), row)
+}
+
+// ─── record_unwind_step: stack_unwind action 의 ret 횟수 + 도달 EIP ───
+fn record_unwind_step(unwind_id: int, ret_count: int, final_eip_hex: str) -> void {
+    if unwind_id <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_unwind_step] expected=unwind_id>0 got=" + to_string(unwind_id))
+    }
+    if ret_count <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_unwind_step] expected=ret_count>0 got=" + to_string(ret_count))
+    }
+    if ret_count > 64 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_unwind_step] expected=ret_count<=64 got=" + to_string(ret_count))
+    }
+    let final_eip = pmapa_hex_to_int(final_eip_hex)
+    if final_eip < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_unwind_step] expected=final_eip>=0 got=" + to_string(final_eip))
+    }
+    let row = to_string(unwind_id) + "\t" + to_string(ret_count) + "\t"
+        + to_string(final_eip) + "\n"
+    pmapa_append_row(pmapa_unwind_path(), row)
+}
+
+// ─── record_post_avoidance_state: 회피 후 EAX / ESP / 진행 instruction 수 ───
+fn record_post_avoidance_state(state_id: int, eax_hex: str, esp_hex: str, instructions_continued: int) -> void {
+    if state_id <= 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_post_avoidance_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    let eax = pmapa_hex_to_int(eax_hex)
+    if eax < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_post_avoidance_state] expected=eax>=0 got=" + to_string(eax))
+    }
+    let esp = pmapa_hex_to_int(esp_hex)
+    if esp < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_post_avoidance_state] expected=esp>=0 got=" + to_string(esp))
+    }
+    if instructions_continued < 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [record_post_avoidance_state] expected=instructions_continued>=0 got=" + to_string(instructions_continued))
+    }
+    let row = to_string(state_id) + "\t" + to_string(eax) + "\t"
+        + to_string(esp) + "\t" + to_string(instructions_continued) + "\n"
+    pmapa_append_row(pmapa_state_path(), row)
+}
+
+// ─── 통계 헬퍼 ───
+fn pmapa_count_rows(path: str, min_cols: int) -> int {
+    let t = pmapa_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn int3_count() -> int {
+    return pmapa_count_rows(pmapa_int3_path(), 3)
+}
+
+fn fast_fail_count() -> int {
+    return pmapa_count_rows(pmapa_ff_path(), 2)
+}
+
+fn avoidance_action_count() -> int {
+    return pmapa_count_rows(pmapa_action_path(), 4)
+}
+
+fn unwind_step_count() -> int {
+    return pmapa_count_rows(pmapa_unwind_path(), 3)
+}
+
+fn post_state_count() -> int {
+    return pmapa_count_rows(pmapa_state_path(), 4)
+}
+
+// ─── pmapa_stats: [int3, fast_fail, avoidance_action, unwind_step, post_state] ───
+fn pmapa_stats() -> array {
+    let mut out = []
+    out.push(int3_count())
+    out.push(fast_fail_count())
+    out.push(avoidance_action_count())
+    out.push(unwind_step_count())
+    out.push(post_state_count())
+    return out
+}
+
+// ─── self_test (≥ 12 record + ≥ 14 r0 emit) ───
+fn self_test() -> void {
+    let sid = "pmapa-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmapa()
+
+    // 2. record_int3_event 4종 (__debugbreak / __fastfail / stack_check / unknown)
+    //    int3_id=1: __debugbreak() at 0x00401234
+    //    int3_id=2: __fastfail() trap point at 0x00405678
+    //    int3_id=3: stack_check (cookie mismatch path INT3) at 0x00408A00
+    //    int3_id=4: unknown INT3 at 0x0040ABCD
+    record_int3_event(1, "00401234", 0)
+    r0_emit("pe_msvc_abort_path_avoidance_record_int3_event",
+        "\"int3_id\":1,\"eip\":\"0x00401234\",\"context_kind\":0,\"context_name\":\"__debugbreak\"")
+
+    record_int3_event(2, "00405678", 1)
+    r0_emit("pe_msvc_abort_path_avoidance_record_int3_event",
+        "\"int3_id\":2,\"eip\":\"0x00405678\",\"context_kind\":1,\"context_name\":\"__fastfail\"")
+
+    record_int3_event(3, "00408A00", 2)
+    r0_emit("pe_msvc_abort_path_avoidance_record_int3_event",
+        "\"int3_id\":3,\"eip\":\"0x00408A00\",\"context_kind\":2,\"context_name\":\"stack_check\"")
+
+    record_int3_event(4, "0040ABCD", 3)
+    r0_emit("pe_msvc_abort_path_avoidance_record_int3_event",
+        "\"int3_id\":4,\"eip\":\"0x0040ABCD\",\"context_kind\":3,\"context_name\":\"unknown\"")
+
+    // 3. record_fast_fail 2종 (cookie_mismatch / cfg_violation)
+    //    ff_id=1: cookie_mismatch (reason=1)
+    //    ff_id=2: cfg_violation   (reason=2)
+    record_fast_fail(1, 1)
+    r0_emit("pe_msvc_abort_path_avoidance_record_fast_fail",
+        "\"ff_id\":1,\"reason_kind\":1,\"reason_name\":\"cookie_mismatch\"")
+
+    record_fast_fail(2, 2)
+    r0_emit("pe_msvc_abort_path_avoidance_record_fast_fail",
+        "\"ff_id\":2,\"reason_kind\":2,\"reason_name\":\"cfg_violation\"")
+
+    // 4. record_avoidance_action 4종 (skip_eip / fake_eax_zero / stack_unwind / halt)
+    //    action_id=1 → target_int3_id=1 skip_eip success
+    //    action_id=2 → target_int3_id=2 fake_eax_zero success
+    //    action_id=3 → target_int3_id=3 stack_unwind success
+    //    action_id=4 → target_int3_id=4 halt
+    record_avoidance_action(1, 1, 0, 1)
+    r0_emit("pe_msvc_abort_path_avoidance_record_avoidance_action",
+        "\"action_id\":1,\"target_int3_id\":1,\"action_kind\":0,\"action_name\":\"skip_eip\",\"success\":1")
+
+    record_avoidance_action(2, 2, 1, 1)
+    r0_emit("pe_msvc_abort_path_avoidance_record_avoidance_action",
+        "\"action_id\":2,\"target_int3_id\":2,\"action_kind\":1,\"action_name\":\"fake_eax_zero\",\"success\":1")
+
+    record_avoidance_action(3, 3, 2, 1)
+    r0_emit("pe_msvc_abort_path_avoidance_record_avoidance_action",
+        "\"action_id\":3,\"target_int3_id\":3,\"action_kind\":2,\"action_name\":\"stack_unwind\",\"success\":1")
+
+    record_avoidance_action(4, 4, 3, 0)
+    r0_emit("pe_msvc_abort_path_avoidance_record_avoidance_action",
+        "\"action_id\":4,\"target_int3_id\":4,\"action_kind\":3,\"action_name\":\"halt\",\"success\":0")
+
+    // 5. record_unwind_step 2종 (ret_count 1 / 5)
+    //    unwind_id=1 → ret_count=1 final_eip=0x00401200
+    //    unwind_id=2 → ret_count=5 final_eip=0x004013F0
+    record_unwind_step(1, 1, "00401200")
+    r0_emit("pe_msvc_abort_path_avoidance_record_unwind_step",
+        "\"unwind_id\":1,\"ret_count\":1,\"final_eip\":\"0x00401200\"")
+
+    record_unwind_step(2, 5, "004013F0")
+    r0_emit("pe_msvc_abort_path_avoidance_record_unwind_step",
+        "\"unwind_id\":2,\"ret_count\":5,\"final_eip\":\"0x004013F0\"")
+
+    // 6. record_post_avoidance_state 2종 (instructions_continued 100 / 200)
+    //    state_id=1: eax=0 esp=0x0019FF80 continued=100
+    //    state_id=2: eax=0 esp=0x0019FFA0 continued=200
+    record_post_avoidance_state(1, "0", "0019FF80", 100)
+    r0_emit("pe_msvc_abort_path_avoidance_record_post_avoidance_state",
+        "\"state_id\":1,\"eax\":\"0x0\",\"esp\":\"0x0019FF80\",\"instructions_continued\":100")
+
+    record_post_avoidance_state(2, "0", "0019FFA0", 200)
+    r0_emit("pe_msvc_abort_path_avoidance_record_post_avoidance_state",
+        "\"state_id\":2,\"eax\":\"0x0\",\"esp\":\"0x0019FFA0\",\"instructions_continued\":200")
+
+    // 7. assertion: int3_count == 4
+    let ic = int3_count()
+    if ic != 4 {
+        panic("pe_msvc_abort_path_avoidance FAIL [int3_count] expected=4 got=" + to_string(ic))
+    }
+
+    // 8. assertion: fast_fail_count == 2
+    let fc = fast_fail_count()
+    if fc != 2 {
+        panic("pe_msvc_abort_path_avoidance FAIL [fast_fail_count] expected=2 got=" + to_string(fc))
+    }
+
+    // 9. assertion: avoidance_action_count == 4
+    let ac = avoidance_action_count()
+    if ac != 4 {
+        panic("pe_msvc_abort_path_avoidance FAIL [avoidance_action_count] expected=4 got=" + to_string(ac))
+    }
+
+    // 10. assertion: unwind_step_count == 2
+    let uc = unwind_step_count()
+    if uc != 2 {
+        panic("pe_msvc_abort_path_avoidance FAIL [unwind_step_count] expected=2 got=" + to_string(uc))
+    }
+
+    // 11. assertion: post_state_count == 2
+    let pc = post_state_count()
+    if pc != 2 {
+        panic("pe_msvc_abort_path_avoidance FAIL [post_state_count] expected=2 got=" + to_string(pc))
+    }
+
+    // 12. context_name sanity (0..3 + invalid)
+    if context_name(0) != "__debugbreak" {
+        panic("pe_msvc_abort_path_avoidance FAIL [context_name(0)] expected=__debugbreak got=" + context_name(0))
+    }
+    if context_name(1) != "__fastfail" {
+        panic("pe_msvc_abort_path_avoidance FAIL [context_name(1)] expected=__fastfail got=" + context_name(1))
+    }
+    if context_name(2) != "stack_check" {
+        panic("pe_msvc_abort_path_avoidance FAIL [context_name(2)] expected=stack_check got=" + context_name(2))
+    }
+    if context_name(3) != "unknown" {
+        panic("pe_msvc_abort_path_avoidance FAIL [context_name(3)] expected=unknown got=" + context_name(3))
+    }
+    if context_name(4) != "" {
+        panic("pe_msvc_abort_path_avoidance FAIL [context_name(4)] expected=empty got=" + context_name(4))
+    }
+
+    // 13. reason_name sanity (0..3 + invalid)
+    if reason_name(0) != "stack_buffer_overrun" {
+        panic("pe_msvc_abort_path_avoidance FAIL [reason_name(0)] expected=stack_buffer_overrun got=" + reason_name(0))
+    }
+    if reason_name(1) != "cookie_mismatch" {
+        panic("pe_msvc_abort_path_avoidance FAIL [reason_name(1)] expected=cookie_mismatch got=" + reason_name(1))
+    }
+    if reason_name(2) != "cfg_violation" {
+        panic("pe_msvc_abort_path_avoidance FAIL [reason_name(2)] expected=cfg_violation got=" + reason_name(2))
+    }
+    if reason_name(3) != "cpp_exception_terminate" {
+        panic("pe_msvc_abort_path_avoidance FAIL [reason_name(3)] expected=cpp_exception_terminate got=" + reason_name(3))
+    }
+    if reason_name(4) != "" {
+        panic("pe_msvc_abort_path_avoidance FAIL [reason_name(4)] expected=empty got=" + reason_name(4))
+    }
+
+    // 14. action_name sanity (0..3 + invalid)
+    if action_name(0) != "skip_eip" {
+        panic("pe_msvc_abort_path_avoidance FAIL [action_name(0)] expected=skip_eip got=" + action_name(0))
+    }
+    if action_name(1) != "fake_eax_zero" {
+        panic("pe_msvc_abort_path_avoidance FAIL [action_name(1)] expected=fake_eax_zero got=" + action_name(1))
+    }
+    if action_name(2) != "stack_unwind" {
+        panic("pe_msvc_abort_path_avoidance FAIL [action_name(2)] expected=stack_unwind got=" + action_name(2))
+    }
+    if action_name(3) != "halt" {
+        panic("pe_msvc_abort_path_avoidance FAIL [action_name(3)] expected=halt got=" + action_name(3))
+    }
+    if action_name(4) != "" {
+        panic("pe_msvc_abort_path_avoidance FAIL [action_name(4)] expected=empty got=" + action_name(4))
+    }
+
+    // 15. hex parser sanity
+    let h_eip = pmapa_hex_to_int("00401234")
+    if h_eip != 4198964 {
+        panic("pe_msvc_abort_path_avoidance FAIL [pmapa_hex_to_int(00401234)] expected=4198964 got=" + to_string(h_eip))
+    }
+    let h_zero = pmapa_hex_to_int("0")
+    if h_zero != 0 {
+        panic("pe_msvc_abort_path_avoidance FAIL [pmapa_hex_to_int(0)] expected=0 got=" + to_string(h_zero))
+    }
+
+    // 16. pmapa_stats() = [4, 2, 4, 2, 2]
+    let s = pmapa_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_abort_path_avoidance FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_abort_path_avoidance FAIL [stats int3_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvc_abort_path_avoidance FAIL [stats fast_fail_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_abort_path_avoidance FAIL [stats avoidance_action_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_abort_path_avoidance FAIL [stats unwind_step_count] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_abort_path_avoidance FAIL [stats post_state_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 17. emit stats summary
+    r0_emit("pe_msvc_abort_path_avoidance_stats",
+        "\"int3_count\":" + to_string(s[0])
+        + ",\"fast_fail_count\":" + to_string(s[1])
+        + ",\"avoidance_action_count\":" + to_string(s[2])
+        + ",\"unwind_step_count\":" + to_string(s[3])
+        + ",\"post_state_count\":" + to_string(s[4]))
+
+    // 18. r0 emit count assertion (≥ 14)
+    //     실제 emit: 4 int3 + 2 fast_fail + 4 action + 2 unwind + 2 state + 1 stats = 15
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_abort_path_avoidance FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 19. cleanup → stats 모두 0
+    cleanup_pmapa()
+    let s2 = pmapa_stats()
+    let mut j = 0
+    while j < len(s2) {
+        if s2[j] != 0 {
+            panic("pe_msvc_abort_path_avoidance FAIL [cleanup stats[" + to_string(j)
+                + "]] expected=0 got=" + to_string(s2[j]))
+        }
+        j = j + 1
+    }
+
+    println("  ✅ pe_msvc_abort_path_avoidance self_test PASS (int3=" + to_string(s[0])
+        + ", fast_fail=" + to_string(s[1]) + ", action=" + to_string(s[2])
+        + ", unwind=" + to_string(s[3]) + ", state=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmapa_stats()
+            println("int3_count\t" + to_string(s[0]))
+            println("fast_fail_count\t" + to_string(s[1]))
+            println("avoidance_action_count\t" + to_string(s[2]))
+            println("unwind_step_count\t" + to_string(s[3]))
+            println("post_state_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmapa()
+            println("cleaned: " + pmapa_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmapa_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_abort_path_avoidance.hexa { self-test | stats | cleanup | dir }")
+}

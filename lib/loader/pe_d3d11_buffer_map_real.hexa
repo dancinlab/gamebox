@@ -1,0 +1,447 @@
+// lib/loader/pe_d3d11_buffer_map_real.hexa — D3D11 Map/Unmap → MTLBuffer contents() bridge tracker
+//
+// ID3D11DeviceContext::Map / Unmap 호출의 buffer access 추적기.
+// 본 module 은 map/unmap op record/aggregate 만 — 실 Map/Unmap →
+// MTLBuffer contents() / didModifyRange 호출은 stage2 native helper(D3DMetal binary 위임)
+// 에서 처리.
+//
+// D3D11 Map → Metal MTLBuffer:
+//   D3D11_MAP_WRITE_DISCARD       → MTLBuffer newBuffer (orphan + reuse pool)
+//                                   기존 storage 버리고 새 buffer 발급, prior GPU work 와 무관.
+//                                   Metal 에서는 frame-pool 또는 ring-buffer 로 재활용.
+//   D3D11_MAP_READ                → contents() (Managed mode 에서 synchronizeResource 선행)
+//                                   GPU → CPU sync 가 필요하면 blit encoder synchronizeResource 후
+//                                   contents() pointer 반환.
+//   D3D11_MAP_WRITE               → contents() (Shared mode 직접 write)
+//   D3D11_MAP_READ_WRITE          → contents() + synchronizeResource + didModifyRange
+//   D3D11_MAP_WRITE_NO_OVERWRITE  → contents() (CPU 가 GPU 미사용 영역만 덮어쓴다고 약속)
+//   Unmap                         → didModifyRange (Managed mode CPU→GPU 반영)
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11DeviceContext::Map.
+//       MoltenVK/DXVK 인용 X.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = map
+//   2 = unmap
+//
+// map_type code (D3D11_MAP):
+//   1 = read
+//   2 = write
+//   3 = read_write
+//   4 = write_discard
+//   5 = write_no_overwrite
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t map_type<int> \t bytes_mapped<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdbm_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_buffer_map_real"
+}
+
+fn pdbm_ops_path() -> str {
+    return pdbm_dir() + "/ops.tsv"
+}
+
+fn pdbm_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdbm_dir() + "'")
+}
+
+fn cleanup_pdbm() -> void {
+    pdbm_ensure_dir()
+    let _ = exec("rm -f '" + pdbm_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdbm_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdbm_append_row(path: str, row: str) -> void {
+    pdbm_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: map/unmap op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, map_type: int, bytes_mapped: int) -> void {
+    if op_id <= 0 {
+        panic("pe_d3d11_buffer_map_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_d3d11_buffer_map_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 2 {
+        panic("pe_d3d11_buffer_map_real FAIL [record_op] expected=op_kind<=2 got=" + to_string(op_kind))
+    }
+    if map_type < 1 {
+        panic("pe_d3d11_buffer_map_real FAIL [record_op] expected=map_type>=1 got=" + to_string(map_type))
+    }
+    if map_type > 5 {
+        panic("pe_d3d11_buffer_map_real FAIL [record_op] expected=map_type<=5 got=" + to_string(map_type))
+    }
+    if bytes_mapped < 0 {
+        panic("pe_d3d11_buffer_map_real FAIL [record_op] expected=bytes_mapped>=0 got=" + to_string(bytes_mapped))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(map_type) + "\t" + to_string(bytes_mapped) + "\n"
+    pdbm_append_row(pdbm_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pdbm_read_table(pdbm_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(op_kind: int) -> int {
+    let t = pdbm_read_table(pdbm_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == op_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_map_type: 특정 map_type 의 op 수 ───
+fn count_by_map_type(map_type: int) -> int {
+    let t = pdbm_read_table(pdbm_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == map_type {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes_mapped: 모든 op 의 bytes_mapped 합 ───
+fn total_bytes_mapped() -> int {
+    let t = pdbm_read_table(pdbm_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── discard_count: WRITE_DISCARD (map_type=4) op 수 ───
+fn discard_count() -> int {
+    return count_by_map_type(4)
+}
+
+// ─── op_bytes: 특정 op_id 의 bytes_mapped (없으면 0) ───
+fn op_bytes(op_id: int) -> int {
+    let t = pdbm_read_table(pdbm_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdbm_stats: [op_count, total_bytes_mapped, count_by_op_kind(1), discard_count] ───
+fn pdbm_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_bytes_mapped())
+    out.push(count_by_op_kind(1))
+    out.push(discard_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdbm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdbm()
+
+    // 2. record 6 ops — both op_kinds (map/unmap), ≥4 map_types
+    //    o1: map write_discard 4096 (dynamic vertex buffer orphan + reuse)
+    record_op(420001, 1, 4, 4096)
+    r0_emit("pe_d3d11_buffer_map_real_record",
+        "\"op_id\":420001,\"op_kind\":1,\"map_type\":4,\"bytes_mapped\":4096,\"target\":\"newBuffer_orphan\"")
+
+    //    o2: unmap (paired with o1) 4096
+    record_op(420002, 2, 4, 4096)
+    r0_emit("pe_d3d11_buffer_map_real_record",
+        "\"op_id\":420002,\"op_kind\":2,\"map_type\":4,\"bytes_mapped\":4096,\"target\":\"didModifyRange\"")
+
+    //    o3: map read 2048 (staging readback — synchronizeResource)
+    record_op(420003, 1, 1, 2048)
+    r0_emit("pe_d3d11_buffer_map_real_record",
+        "\"op_id\":420003,\"op_kind\":1,\"map_type\":1,\"bytes_mapped\":2048,\"target\":\"contents_synchronizeResource\"")
+
+    //    o4: map write 256 (constant buffer write — Shared contents)
+    record_op(420004, 1, 2, 256)
+    r0_emit("pe_d3d11_buffer_map_real_record",
+        "\"op_id\":420004,\"op_kind\":1,\"map_type\":2,\"bytes_mapped\":256,\"target\":\"contents\"")
+
+    //    o5: map write_no_overwrite 1024 (sub-region streaming)
+    record_op(420005, 1, 5, 1024)
+    r0_emit("pe_d3d11_buffer_map_real_record",
+        "\"op_id\":420005,\"op_kind\":1,\"map_type\":5,\"bytes_mapped\":1024,\"target\":\"contents_subregion\"")
+
+    //    o6: unmap (paired with o5) 1024
+    record_op(420006, 2, 5, 1024)
+    r0_emit("pe_d3d11_buffer_map_real_record",
+        "\"op_id\":420006,\"op_kind\":2,\"map_type\":5,\"bytes_mapped\":1024,\"target\":\"didModifyRange\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_d3d11_buffer_map_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_bytes_mapped = 4096+4096+2048+256+1024+1024 = 12544
+    let tb = total_bytes_mapped()
+    if tb != 12544 {
+        panic("pe_d3d11_buffer_map_real FAIL [total_bytes_mapped] expected=12544 got=" + to_string(tb))
+    }
+
+    // 5. count_by_op_kind sanity
+    //    op_kind=1 map → o1, o3, o4, o5 = 4
+    let k1 = count_by_op_kind(1)
+    if k1 != 4 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_op_kind(1)] expected=4 got=" + to_string(k1))
+    }
+    //    op_kind=2 unmap → o2, o6 = 2
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+
+    // 6. count_by_map_type sanity
+    //    map_type=1 read → o3 = 1
+    let m1 = count_by_map_type(1)
+    if m1 != 1 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_map_type(1)] expected=1 got=" + to_string(m1))
+    }
+    //    map_type=2 write → o4 = 1
+    let m2 = count_by_map_type(2)
+    if m2 != 1 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_map_type(2)] expected=1 got=" + to_string(m2))
+    }
+    //    map_type=3 read_write → none = 0
+    let m3 = count_by_map_type(3)
+    if m3 != 0 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_map_type(3)] expected=0 got=" + to_string(m3))
+    }
+    //    map_type=4 write_discard → o1, o2 = 2
+    let m4 = count_by_map_type(4)
+    if m4 != 2 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_map_type(4)] expected=2 got=" + to_string(m4))
+    }
+    //    map_type=5 write_no_overwrite → o5, o6 = 2
+    let m5 = count_by_map_type(5)
+    if m5 != 2 {
+        panic("pe_d3d11_buffer_map_real FAIL [count_by_map_type(5)] expected=2 got=" + to_string(m5))
+    }
+
+    // 7. discard_count = 2 (alias for count_by_map_type(4))
+    let dc = discard_count()
+    if dc != 2 {
+        panic("pe_d3d11_buffer_map_real FAIL [discard_count] expected=2 got=" + to_string(dc))
+    }
+
+    // 8. op_bytes sanity
+    let b1 = op_bytes(420001)
+    if b1 != 4096 {
+        panic("pe_d3d11_buffer_map_real FAIL [op_bytes(420001)] expected=4096 got=" + to_string(b1))
+    }
+    let b3 = op_bytes(420003)
+    if b3 != 2048 {
+        panic("pe_d3d11_buffer_map_real FAIL [op_bytes(420003)] expected=2048 got=" + to_string(b3))
+    }
+    let b_miss = op_bytes(99999)
+    if b_miss != 0 {
+        panic("pe_d3d11_buffer_map_real FAIL [op_bytes(99999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 9. pdbm_stats() = [6, 12544, 4, 2]
+    let s = pdbm_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_buffer_map_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d11_buffer_map_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 12544 {
+        panic("pe_d3d11_buffer_map_real FAIL [stats total_bytes_mapped] expected=12544 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_d3d11_buffer_map_real FAIL [stats map_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d11_buffer_map_real FAIL [stats discard_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d11_buffer_map_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_bytes_mapped\":" + to_string(s[1])
+        + ",\"map_count\":" + to_string(s[2])
+        + ",\"discard_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d11_buffer_map_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdbm()
+    let s2 = pdbm_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_buffer_map_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_buffer_map_real self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", maps=" + to_string(s[2])
+        + ", discard=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdbm_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_bytes_mapped\t" + to_string(s[1]))
+            println("map_count\t" + to_string(s[2]))
+            println("discard_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_bytes\t" + to_string(op_bytes(oid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_buffer_map_real.hexa bytes <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "op_kind" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+                if kind == "map_type" {
+                    println("count_by_map_type\t" + to_string(count_by_map_type(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_buffer_map_real.hexa count { op_kind <kind> | map_type <type> }")
+                return
+            }
+            println("usage: hexa run pe_d3d11_buffer_map_real.hexa count { op_kind <kind> | map_type <type> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdbm()
+            println("cleaned: " + pdbm_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdbm_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_buffer_map_real.hexa { self-test | stats | bytes <op_id> | count op_kind <kind> | count map_type <type> | cleanup | dir }")
+}

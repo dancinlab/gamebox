@@ -1,0 +1,572 @@
+// lib/loader/pe_msvc_cxx_funclet_invoke.hexa
+// — MSVC C++ EH funclet invoke (catch / finally / unwind) + register restore tracker
+//
+// 본 module 은 MSVC C++ EH 의 funclet 호출 메커니즘 — catch handler / finally /
+// unwind funclet / __except_handler4 — 을 spec 차원에서 추적한다. ThrowInfo
+// dispatch (pe_msvc_cxx_throw_dispatch) 는 throw → catch dispatch chain 을 본다면,
+// 본 module 은 그 후속에 일어나는 funclet 진입 + register restore + object
+// copy/init + return → continue_eip + unwind chain 을 본다.
+//
+// research-3 (Wine MSVCRT funclet invoke — algorithm direction only):
+//   x86/x64 MSVCRT 의 catch funclet 은 nested function 처럼 호출되며, parent
+//   frame 의 stack/regs 일부를 복원한다. catch funclet entry 는 caller frame_va
+//   를 ECX (x86) / RDX (x64) 로 받고, finally funclet 은 abnormal_termination
+//   flag 를 받는다. unwind funclet 은 destructor table walk, __except_handler4
+//   는 SEH security cookie 검증 후 dispatch.
+//
+// own 1 enforcement: Wine/CrossOver/GPTK/Whisky/Box86/QEMU 코드 0 줄 import.
+//                   research-3 spec direction 만 참조. 본 module 은 pure tracker —
+//                   실 funclet invoke X. Apple SDK 호출 X.
+// own 2 mandate: panic + r0_emit ≥ 14 + self_test() + main() dispatch.
+//
+// persist schema (TSV — records.tsv):
+//   record_id<int> \t kind<str> \t link_id<int> \t a<int> \t b<int>
+//     \t c<int> \t d<int> \t e<int> \t f<int>
+//
+//   kind 별 의미:
+//     "funclet_call"     — link_id=call_id, a=funclet_kind, b=funclet_va,
+//                          c=caller_frame_va
+//     "register_state"   — link_id=state_id, a=call_id, b=register_idx,
+//                          c=before_value, d=after_value
+//     "object_copy"      — link_id=copy_id, a=call_id, b=src_va, c=dst_va,
+//                          d=copy_kind
+//     "funclet_return"   — link_id=return_id, a=call_id, b=returned_value,
+//                          c=continue_eip
+//     "unwind_chain"     — link_id=chain_id, a=call_id, b=unwind_step_index,
+//                          c=restored_state
+//
+// funclet_kind code (record_funclet_call):
+//   0 = catch                — try/catch 의 catch handler funclet
+//   1 = finally              — __try/__finally / SEH finally funclet
+//   2 = unwind               — destructor unwind funclet (object cleanup)
+//   3 = __except_handler4    — SEH /GS-protected dispatch funclet
+//
+// copy_kind code (record_object_copy):
+//   0 = trivial              — memcpy 로 충분 (POD)
+//   1 = copy_ctor            — copy constructor 호출
+//   2 = move_ctor            — move constructor 호출 (C++11+)
+//   3 = zero_init            — zero-initialize (catch-by-value default)
+//
+// register_name (record_register_state) — index 매핑:
+//   "esp"=0, "ebp"=1, "eip"=2, "eax"=3, "ecx"=4, "edx"=5
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmcf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_cxx_funclet_invoke"
+}
+
+fn pmcf_records_path() -> str {
+    return pmcf_dir() + "/records.tsv"
+}
+
+fn pmcf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmcf_dir() + "'")
+}
+
+fn cleanup_pmcf() -> void {
+    pmcf_ensure_dir()
+    let _ = exec("rm -f '" + pmcf_records_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmcf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmcf_append_row(path: str, row: str) -> void {
+    pmcf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int ───
+fn pmcf_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_cxx_funclet_invoke FAIL [pmcf_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── funclet_kind_name: 0/1/2/3 → spec 이름 ───
+fn funclet_kind_name(k: int) -> str {
+    if k == 0 { return "catch" }
+    if k == 1 { return "finally" }
+    if k == 2 { return "unwind" }
+    if k == 3 { return "__except_handler4" }
+    return "?"
+}
+
+// ─── copy_kind_name: 0/1/2/3 → spec 이름 ───
+fn copy_kind_name(k: int) -> str {
+    if k == 0 { return "trivial" }
+    if k == 1 { return "copy_ctor" }
+    if k == 2 { return "move_ctor" }
+    if k == 3 { return "zero_init" }
+    return "?"
+}
+
+// ─── register_name → index ───
+fn pmcf_register_idx(name: str) -> int {
+    if name == "esp" { return 0 }
+    if name == "ebp" { return 1 }
+    if name == "eip" { return 2 }
+    if name == "eax" { return 3 }
+    if name == "ecx" { return 4 }
+    if name == "edx" { return 5 }
+    panic("pe_msvc_cxx_funclet_invoke FAIL [pmcf_register_idx] expected=esp/ebp/eip/eax/ecx/edx got=" + name)
+    return -1
+}
+
+// ─── record_funclet_call: catch/finally/unwind funclet 진입 ───
+fn record_funclet_call(call_id: int, funclet_kind: int, funclet_va_hex: str, caller_frame_hex: str) -> void {
+    if call_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if funclet_kind < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_call] expected=funclet_kind>=0 got=" + to_string(funclet_kind))
+    }
+    if funclet_kind > 3 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_call] expected=funclet_kind<=3 got=" + to_string(funclet_kind))
+    }
+    let f_va = pmcf_hex_to_int(funclet_va_hex)
+    if f_va < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_call] expected=funclet_va>=0 got=" + to_string(f_va))
+    }
+    let c_va = pmcf_hex_to_int(caller_frame_hex)
+    if c_va < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_call] expected=caller_frame>=0 got=" + to_string(c_va))
+    }
+    let row = to_string(call_id) + "\tfunclet_call\t" + to_string(call_id)
+        + "\t" + to_string(funclet_kind) + "\t" + to_string(f_va)
+        + "\t" + to_string(c_va) + "\t0\t0\t0\n"
+    pmcf_append_row(pmcf_records_path(), row)
+}
+
+// ─── record_register_state: register before/after restore 추적 ───
+fn record_register_state(state_id: int, call_id: int, register_name: str, before_value_hex: str, after_value_hex: str) -> void {
+    if state_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_register_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if call_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_register_state] expected=call_id>0 got=" + to_string(call_id))
+    }
+    let r_idx = pmcf_register_idx(register_name)
+    let bv = pmcf_hex_to_int(before_value_hex)
+    if bv < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_register_state] expected=before_value>=0 got=" + to_string(bv))
+    }
+    let av = pmcf_hex_to_int(after_value_hex)
+    if av < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_register_state] expected=after_value>=0 got=" + to_string(av))
+    }
+    let row = to_string(state_id) + "\tregister_state\t" + to_string(state_id)
+        + "\t" + to_string(call_id) + "\t" + to_string(r_idx)
+        + "\t" + to_string(bv) + "\t" + to_string(av) + "\t0\t0\n"
+    pmcf_append_row(pmcf_records_path(), row)
+}
+
+// ─── record_object_copy: catch object copy/init 추적 ───
+fn record_object_copy(copy_id: int, call_id: int, src_va_hex: str, dst_va_hex: str, copy_kind: int) -> void {
+    if copy_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_object_copy] expected=copy_id>0 got=" + to_string(copy_id))
+    }
+    if call_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_object_copy] expected=call_id>0 got=" + to_string(call_id))
+    }
+    let s_va = pmcf_hex_to_int(src_va_hex)
+    if s_va < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_object_copy] expected=src_va>=0 got=" + to_string(s_va))
+    }
+    let d_va = pmcf_hex_to_int(dst_va_hex)
+    if d_va < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_object_copy] expected=dst_va>=0 got=" + to_string(d_va))
+    }
+    if copy_kind < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_object_copy] expected=copy_kind>=0 got=" + to_string(copy_kind))
+    }
+    if copy_kind > 3 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_object_copy] expected=copy_kind<=3 got=" + to_string(copy_kind))
+    }
+    let row = to_string(copy_id) + "\tobject_copy\t" + to_string(copy_id)
+        + "\t" + to_string(call_id) + "\t" + to_string(s_va)
+        + "\t" + to_string(d_va) + "\t" + to_string(copy_kind) + "\t0\t0\n"
+    pmcf_append_row(pmcf_records_path(), row)
+}
+
+// ─── record_funclet_return: funclet return → continue_eip ───
+fn record_funclet_return(return_id: int, call_id: int, returned_value_hex: str, continue_eip_hex: str) -> void {
+    if return_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_return] expected=return_id>0 got=" + to_string(return_id))
+    }
+    if call_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_return] expected=call_id>0 got=" + to_string(call_id))
+    }
+    let rv = pmcf_hex_to_int(returned_value_hex)
+    if rv < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_return] expected=returned_value>=0 got=" + to_string(rv))
+    }
+    let eip = pmcf_hex_to_int(continue_eip_hex)
+    if eip < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_funclet_return] expected=continue_eip>=0 got=" + to_string(eip))
+    }
+    let row = to_string(return_id) + "\tfunclet_return\t" + to_string(return_id)
+        + "\t" + to_string(call_id) + "\t" + to_string(rv)
+        + "\t" + to_string(eip) + "\t0\t0\t0\n"
+    pmcf_append_row(pmcf_records_path(), row)
+}
+
+// ─── record_unwind_chain: destructor walk chain step ───
+fn record_unwind_chain(chain_id: int, call_id: int, unwind_step_index: int, restored_state: int) -> void {
+    if chain_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_unwind_chain] expected=chain_id>0 got=" + to_string(chain_id))
+    }
+    if call_id <= 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_unwind_chain] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if unwind_step_index < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_unwind_chain] expected=unwind_step_index>=0 got=" + to_string(unwind_step_index))
+    }
+    if restored_state < 0 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [record_unwind_chain] expected=restored_state>=0 got=" + to_string(restored_state))
+    }
+    let row = to_string(chain_id) + "\tunwind_chain\t" + to_string(chain_id)
+        + "\t" + to_string(call_id) + "\t" + to_string(unwind_step_index)
+        + "\t" + to_string(restored_state) + "\t0\t0\t0\n"
+    pmcf_append_row(pmcf_records_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn pmcf_count_kind(kind_filter: str) -> int {
+    let t = pmcf_read_table(pmcf_records_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 9 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn funclet_call_count() -> int {
+    return pmcf_count_kind("funclet_call")
+}
+
+fn register_state_count() -> int {
+    return pmcf_count_kind("register_state")
+}
+
+fn object_copy_count() -> int {
+    return pmcf_count_kind("object_copy")
+}
+
+fn funclet_return_count() -> int {
+    return pmcf_count_kind("funclet_return")
+}
+
+fn unwind_chain_count() -> int {
+    return pmcf_count_kind("unwind_chain")
+}
+
+fn pmcf_stats() -> array {
+    let mut out = []
+    out.push(funclet_call_count())
+    out.push(register_state_count())
+    out.push(object_copy_count())
+    out.push(funclet_return_count())
+    out.push(unwind_chain_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pmcf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmcf()
+
+    // ─── 4 funclet_call — 4 funclet_kind (catch / finally / unwind / __except_handler4) ───
+    record_funclet_call(1, 0, "00405100", "0012FF00")  // catch
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_call\",\"call_id\":1,\"funclet_kind\":0,\"funclet_va\":\"0x00405100\",\"caller_frame\":\"0x0012FF00\",\"name\":\"catch\"")
+
+    record_funclet_call(2, 1, "00405200", "0012FEC0")  // finally
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_call\",\"call_id\":2,\"funclet_kind\":1,\"funclet_va\":\"0x00405200\",\"caller_frame\":\"0x0012FEC0\",\"name\":\"finally\"")
+
+    record_funclet_call(3, 2, "00405300", "0012FE80")  // unwind
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_call\",\"call_id\":3,\"funclet_kind\":2,\"funclet_va\":\"0x00405300\",\"caller_frame\":\"0x0012FE80\",\"name\":\"unwind\"")
+
+    record_funclet_call(4, 3, "00405400", "0012FE40")  // __except_handler4
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_call\",\"call_id\":4,\"funclet_kind\":3,\"funclet_va\":\"0x00405400\",\"caller_frame\":\"0x0012FE40\",\"name\":\"__except_handler4\"")
+
+    // ─── 6 register_state — esp/ebp/eip/eax/ecx/edx ───
+    record_register_state(1, 1, "esp", "0012FE00", "0012FF00")
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"register_state\",\"state_id\":1,\"call_id\":1,\"register\":\"esp\",\"before\":\"0x0012FE00\",\"after\":\"0x0012FF00\"")
+
+    record_register_state(2, 1, "ebp", "0012FE10", "0012FF0C")
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"register_state\",\"state_id\":2,\"call_id\":1,\"register\":\"ebp\",\"before\":\"0x0012FE10\",\"after\":\"0x0012FF0C\"")
+
+    record_register_state(3, 2, "eip", "00405200", "00401200")
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"register_state\",\"state_id\":3,\"call_id\":2,\"register\":\"eip\",\"before\":\"0x00405200\",\"after\":\"0x00401200\"")
+
+    record_register_state(4, 2, "eax", "00000000", "00000001")
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"register_state\",\"state_id\":4,\"call_id\":2,\"register\":\"eax\",\"before\":\"0x00000000\",\"after\":\"0x00000001\"")
+
+    record_register_state(5, 3, "ecx", "0012FE80", "0012FE80")
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"register_state\",\"state_id\":5,\"call_id\":3,\"register\":\"ecx\",\"before\":\"0x0012FE80\",\"after\":\"0x0012FE80\"")
+
+    record_register_state(6, 4, "edx", "DEADBEEF", "00000000")
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"register_state\",\"state_id\":6,\"call_id\":4,\"register\":\"edx\",\"before\":\"0xDEADBEEF\",\"after\":\"0x00000000\"")
+
+    // ─── 4 object_copy — 4 copy_kind (trivial / copy_ctor / move_ctor / zero_init) ───
+    record_object_copy(1, 1, "0012F800", "0012FF20", 0)  // trivial
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"object_copy\",\"copy_id\":1,\"call_id\":1,\"src_va\":\"0x0012F800\",\"dst_va\":\"0x0012FF20\",\"copy_kind\":0,\"name\":\"trivial\"")
+
+    record_object_copy(2, 1, "0012F820", "0012FF40", 1)  // copy_ctor
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"object_copy\",\"copy_id\":2,\"call_id\":1,\"src_va\":\"0x0012F820\",\"dst_va\":\"0x0012FF40\",\"copy_kind\":1,\"name\":\"copy_ctor\"")
+
+    record_object_copy(3, 4, "0012F840", "0012FF60", 2)  // move_ctor
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"object_copy\",\"copy_id\":3,\"call_id\":4,\"src_va\":\"0x0012F840\",\"dst_va\":\"0x0012FF60\",\"copy_kind\":2,\"name\":\"move_ctor\"")
+
+    record_object_copy(4, 2, "00000000", "0012FF80", 3)  // zero_init
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"object_copy\",\"copy_id\":4,\"call_id\":2,\"src_va\":\"0x00000000\",\"dst_va\":\"0x0012FF80\",\"copy_kind\":3,\"name\":\"zero_init\"")
+
+    // ─── 3 funclet_return — return_value + continue_eip ───
+    record_funclet_return(1, 1, "00000000", "00401050")  // catch return → continue
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_return\",\"return_id\":1,\"call_id\":1,\"returned\":\"0x00000000\",\"continue_eip\":\"0x00401050\"")
+
+    record_funclet_return(2, 2, "00000001", "00401120")  // finally normal termination
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_return\",\"return_id\":2,\"call_id\":2,\"returned\":\"0x00000001\",\"continue_eip\":\"0x00401120\"")
+
+    record_funclet_return(3, 4, "00000001", "004013A0")  // __except_handler4 → ExceptionContinueExecution
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"funclet_return\",\"return_id\":3,\"call_id\":4,\"returned\":\"0x00000001\",\"continue_eip\":\"0x004013A0\"")
+
+    // ─── 3 unwind_chain — destructor walk chain ───
+    record_unwind_chain(1, 3, 0, 6)
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"unwind_chain\",\"chain_id\":1,\"call_id\":3,\"unwind_step_index\":0,\"restored_state\":6")
+
+    record_unwind_chain(2, 3, 1, 7)
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"unwind_chain\",\"chain_id\":2,\"call_id\":3,\"unwind_step_index\":1,\"restored_state\":7")
+
+    record_unwind_chain(3, 3, 2, 8)
+    r0_emit("pe_msvc_cxx_funclet_invoke_record",
+        "\"kind\":\"unwind_chain\",\"chain_id\":3,\"call_id\":3,\"unwind_step_index\":2,\"restored_state\":8")
+
+    // ─── assertions ───
+    let fc = funclet_call_count()
+    if fc != 4 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [funclet_call_count] expected=4 got=" + to_string(fc))
+    }
+    let rs = register_state_count()
+    if rs != 6 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [register_state_count] expected=6 got=" + to_string(rs))
+    }
+    let oc = object_copy_count()
+    if oc != 4 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [object_copy_count] expected=4 got=" + to_string(oc))
+    }
+    let fr = funclet_return_count()
+    if fr != 3 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [funclet_return_count] expected=3 got=" + to_string(fr))
+    }
+    let uc = unwind_chain_count()
+    if uc != 3 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [unwind_chain_count] expected=3 got=" + to_string(uc))
+    }
+
+    // ─── funclet_kind_name lookups ───
+    let n_catch = funclet_kind_name(0)
+    if n_catch != "catch" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [funclet_kind_name(0)] expected=catch got=" + n_catch)
+    }
+    let n_fin = funclet_kind_name(1)
+    if n_fin != "finally" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [funclet_kind_name(1)] expected=finally got=" + n_fin)
+    }
+    let n_unw = funclet_kind_name(2)
+    if n_unw != "unwind" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [funclet_kind_name(2)] expected=unwind got=" + n_unw)
+    }
+    let n_eh4 = funclet_kind_name(3)
+    if n_eh4 != "__except_handler4" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [funclet_kind_name(3)] expected=__except_handler4 got=" + n_eh4)
+    }
+
+    // ─── copy_kind_name lookups ───
+    let c_triv = copy_kind_name(0)
+    if c_triv != "trivial" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [copy_kind_name(0)] expected=trivial got=" + c_triv)
+    }
+    let c_cc = copy_kind_name(1)
+    if c_cc != "copy_ctor" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [copy_kind_name(1)] expected=copy_ctor got=" + c_cc)
+    }
+    let c_mc = copy_kind_name(2)
+    if c_mc != "move_ctor" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [copy_kind_name(2)] expected=move_ctor got=" + c_mc)
+    }
+    let c_zi = copy_kind_name(3)
+    if c_zi != "zero_init" {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [copy_kind_name(3)] expected=zero_init got=" + c_zi)
+    }
+
+    // ─── hex parser sanity ───
+    let h_va = pmcf_hex_to_int("00405100")
+    if h_va != 4215040 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [pmcf_hex_to_int(00405100)] expected=4215040 got=" + to_string(h_va))
+    }
+
+    // ─── stats sanity ───
+    let s = pmcf_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [stats funclet_call] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 6 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [stats register_state] expected=6 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [stats object_copy] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [stats funclet_return] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [stats unwind_chain] expected=3 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (위 record 20 + summary 1 + stats 1 = ≥ 14) ───
+    r0_emit("pe_msvc_cxx_funclet_invoke_stats",
+        "\"funclet_call_count\":" + to_string(s[0])
+        + ",\"register_state_count\":" + to_string(s[1])
+        + ",\"object_copy_count\":" + to_string(s[2])
+        + ",\"funclet_return_count\":" + to_string(s[3])
+        + ",\"unwind_chain_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_cxx_funclet_invoke_summary",
+        "\"phase\":\"cxx_funclet_invoke_complete\""
+        + ",\"research\":\"wine_msvcrt_funclet_direction_only\""
+        + ",\"funclet_kinds\":4"
+        + ",\"register_set\":6"
+        + ",\"copy_kinds\":4"
+        + ",\"unwind_steps\":3")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_cxx_funclet_invoke FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmcf()
+    let s2 = pmcf_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_cxx_funclet_invoke FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_cxx_funclet_invoke self_test PASS (call=" + to_string(s[0])
+        + ", reg=" + to_string(s[1]) + ", copy=" + to_string(s[2])
+        + ", ret=" + to_string(s[3]) + ", unwind=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmcf_stats()
+            println("funclet_call_count\t" + to_string(s[0]))
+            println("register_state_count\t" + to_string(s[1]))
+            println("object_copy_count\t" + to_string(s[2]))
+            println("funclet_return_count\t" + to_string(s[3]))
+            println("unwind_chain_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmcf()
+            println("cleaned: " + pmcf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmcf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_cxx_funclet_invoke.hexa { self-test | stats | cleanup | dir }")
+}

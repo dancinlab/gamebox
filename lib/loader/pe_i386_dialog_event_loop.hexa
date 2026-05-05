@@ -1,0 +1,426 @@
+// lib/loader/pe_i386_dialog_event_loop.hexa — first dialog 표시 + Win32 message
+// queue + AppKit NSEvent translation tracker (R3-12 closure hexa instrumentation).
+//
+// own 1: Wine / CrossOver / Whisky / community GUI translation 0 줄. AppKit
+//        NSEvent / Cocoa / AppKit 직접 호출 X — 추적/매핑만 기록한다. 본 module
+//        은 native side 의 NSEvent → Win32 msg 변환을 검증할 수 있는 hexa 측
+//        spec & telemetry sink.
+// own 2: r0_emit ≥ 13 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// Win32 spec 참조 (구현 X — telemetry only):
+//   - GetMessage / PeekMessage : thread message queue 에서 dequeue
+//   - PostMessage / SendMessage: thread message queue 에 enqueue (sync vs async)
+//   - WM_QUIT (0x0012)        : message loop 종료 신호
+//   - DialogBoxA/W            : CreateWindowEx 후 자체 message loop 진입 (modal)
+//   - EndDialog                : modal loop exit_code 설정 (예: IDOK=1, IDCANCEL=2)
+//   - MsgWaitForMultipleObjects: modal loop block (timeout/wake on input)
+//
+// AppKit NSEvent → Win32 msg translation map (native side 가 변환):
+//   NSEvent.LeftMouseDown    → WM_LBUTTONDOWN (0x0201)
+//   NSEvent.LeftMouseUp      → WM_LBUTTONUP   (0x0202)
+//   NSEvent.KeyDown          → WM_KEYDOWN     (0x0100)
+//   NSEvent.KeyUp            → WM_KEYUP       (0x0101)
+//   NSEvent.MouseMoved       → WM_MOUSEMOVE   (0x0200)
+//   NSWindowDidResignKey     → WM_KILLFOCUS   (0x0008)
+//   NSWindowDidBecomeKey     → WM_SETFOCUS    (0x0007)
+//
+// persist schema (TSV — 5 separate tables):
+//   dialog.tsv      : dialog_id<int>      \t hwnd_hex<str>     \t parent_hwnd_hex<str> \t template_id<int>
+//   message_post.tsv: msg_id<int>         \t hwnd_hex<str>     \t message_code_hex<str> \t source_kind<int>
+//   message_get.tsv : msg_id<int>         \t hwnd_hex<str>     \t message_code_hex<str> \t blocked_ms<int>
+//   appkit.tsv      : translation_id<int> \t ns_event_kind<str>\t win32_msg_code_hex<str>
+//   modal.tsv       : loop_id<int>        \t dialog_id<int>    \t iterations<int>       \t exit_code<int>
+//
+// 식별자 주의: type/mod/resume/handle 은 hexa 예약어 → dialog_id / msg_id /
+// source_kind / translation_id / ns_event_kind / win32_msg_code / loop_id /
+// exit_code 만 사용.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pidel_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_dialog_event_loop"
+}
+
+fn pidel_events_path() -> str {
+    return pidel_dir() + "/events.tsv"
+}
+
+fn pidel_dialog_path() -> str {
+    return pidel_dir() + "/dialog.tsv"
+}
+
+fn pidel_message_post_path() -> str {
+    return pidel_dir() + "/message_post.tsv"
+}
+
+fn pidel_message_get_path() -> str {
+    return pidel_dir() + "/message_get.tsv"
+}
+
+fn pidel_appkit_path() -> str {
+    return pidel_dir() + "/appkit.tsv"
+}
+
+fn pidel_modal_path() -> str {
+    return pidel_dir() + "/modal.tsv"
+}
+
+fn pidel_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pidel_dir() + "'")
+}
+
+fn cleanup_pidel() -> void {
+    pidel_ensure_dir()
+    let _ = exec("rm -f '" + pidel_dialog_path() + "' '" + pidel_message_post_path()
+        + "' '" + pidel_message_get_path() + "' '" + pidel_appkit_path()
+        + "' '" + pidel_modal_path() + "' '" + pidel_events_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pidel_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pidel_append_row(path: str, row: str) -> void {
+    pidel_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pidel_count_rows(path: str, min_cols: int) -> int {
+    let t = pidel_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+fn source_name(s: int) -> str {
+    if s == 0 { return "PostMessage" }
+    if s == 1 { return "SendMessage" }
+    if s == 2 { return "AppKit" }
+    return "?"
+}
+
+// ─── record_dialog_open: DialogBoxA/W 에 의한 dialog 표시 기록 ───
+fn record_dialog_open(dialog_id: int, hwnd_hex: str, parent_hwnd_hex: str, template_id: int) -> void {
+    if dialog_id <= 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_dialog_open] expected=dialog_id>0 got=" + to_string(dialog_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_dialog_open] expected=hwnd_hex!=empty got=empty")
+    }
+    if template_id < 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_dialog_open] expected=template_id>=0 got=" + to_string(template_id))
+    }
+    let row = to_string(dialog_id) + "\t" + hwnd_hex + "\t" + parent_hwnd_hex
+        + "\t" + to_string(template_id) + "\n"
+    pidel_append_row(pidel_dialog_path(), row)
+}
+
+// ─── record_message_post: PostMessage/SendMessage/AppKit-translated enqueue 기록 ───
+// source_kind: 0=PostMessage 1=SendMessage 2=AppKit_translated
+fn record_message_post(msg_id: int, hwnd_hex: str, message_code_hex: str, source_kind: int) -> void {
+    if msg_id <= 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_post] expected=msg_id>0 got=" + to_string(msg_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_post] expected=hwnd_hex!=empty got=empty")
+    }
+    if message_code_hex == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_post] expected=message_code_hex!=empty got=empty")
+    }
+    if source_kind < 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_post] expected=source_kind>=0 got=" + to_string(source_kind))
+    }
+    if source_kind > 2 {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_post] expected=source_kind<=2 got=" + to_string(source_kind))
+    }
+    let row = to_string(msg_id) + "\t" + hwnd_hex + "\t" + message_code_hex
+        + "\t" + to_string(source_kind) + "\n"
+    pidel_append_row(pidel_message_post_path(), row)
+}
+
+// ─── record_message_get: GetMessage / PeekMessage dequeue 기록 ───
+fn record_message_get(msg_id: int, hwnd_hex: str, message_code_hex: str, blocked_ms: int) -> void {
+    if msg_id <= 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_get] expected=msg_id>0 got=" + to_string(msg_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_get] expected=hwnd_hex!=empty got=empty")
+    }
+    if message_code_hex == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_get] expected=message_code_hex!=empty got=empty")
+    }
+    if blocked_ms < 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_message_get] expected=blocked_ms>=0 got=" + to_string(blocked_ms))
+    }
+    let row = to_string(msg_id) + "\t" + hwnd_hex + "\t" + message_code_hex
+        + "\t" + to_string(blocked_ms) + "\n"
+    pidel_append_row(pidel_message_get_path(), row)
+}
+
+// ─── record_appkit_translation: NSEvent → Win32 msg translation 기록 ───
+fn record_appkit_translation(translation_id: int, ns_event_kind: str, win32_msg_code_hex: str) -> void {
+    if translation_id <= 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_appkit_translation] expected=translation_id>0 got=" + to_string(translation_id))
+    }
+    if ns_event_kind == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_appkit_translation] expected=ns_event_kind!=empty got=empty")
+    }
+    if win32_msg_code_hex == "" {
+        panic("pe_i386_dialog_event_loop FAIL [record_appkit_translation] expected=win32_msg_code_hex!=empty got=empty")
+    }
+    let row = to_string(translation_id) + "\t" + ns_event_kind + "\t" + win32_msg_code_hex + "\n"
+    pidel_append_row(pidel_appkit_path(), row)
+}
+
+// ─── record_modal_loop: ModalLoop (MsgWaitForMultipleObjects) 1 회 종료 기록 ───
+fn record_modal_loop(loop_id: int, dialog_id: int, iterations: int, exit_code: int) -> void {
+    if loop_id <= 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_modal_loop] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if dialog_id <= 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_modal_loop] expected=dialog_id>0 got=" + to_string(dialog_id))
+    }
+    if iterations < 0 {
+        panic("pe_i386_dialog_event_loop FAIL [record_modal_loop] expected=iterations>=0 got=" + to_string(iterations))
+    }
+    let row = to_string(loop_id) + "\t" + to_string(dialog_id)
+        + "\t" + to_string(iterations) + "\t" + to_string(exit_code) + "\n"
+    pidel_append_row(pidel_modal_path(), row)
+}
+
+// ─── statistics ───
+fn dialog_open_count() -> int {
+    return pidel_count_rows(pidel_dialog_path(), 4)
+}
+
+fn message_post_count() -> int {
+    return pidel_count_rows(pidel_message_post_path(), 4)
+}
+
+fn message_get_count() -> int {
+    return pidel_count_rows(pidel_message_get_path(), 4)
+}
+
+fn appkit_translation_count() -> int {
+    return pidel_count_rows(pidel_appkit_path(), 3)
+}
+
+fn modal_loop_count() -> int {
+    return pidel_count_rows(pidel_modal_path(), 4)
+}
+
+fn pidel_stats() -> array {
+    let mut out = []
+    out.push(dialog_open_count())
+    out.push(message_post_count())
+    out.push(message_get_count())
+    out.push(appkit_translation_count())
+    out.push(modal_loop_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pidel-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pidel()
+
+    // 1. dialog open — Battle.net Setup main dialog (template_id=101)
+    record_dialog_open(1, "0x0001", "0x0000", 101)
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"dialog_open\",\"dialog_id\":1,\"hwnd\":\"0x0001\",\"parent\":\"0x0000\",\"template_id\":101")
+
+    // 2. AppKit → Win32 translation × 4
+    record_appkit_translation(1, "LeftMouseDown", "0x0201")
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"appkit\",\"translation_id\":1,\"ns_event_kind\":\"LeftMouseDown\",\"win32_msg_code\":\"0x0201\"")
+
+    record_appkit_translation(2, "KeyDown", "0x0100")
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"appkit\",\"translation_id\":2,\"ns_event_kind\":\"KeyDown\",\"win32_msg_code\":\"0x0100\"")
+
+    record_appkit_translation(3, "MouseMoved", "0x0200")
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"appkit\",\"translation_id\":3,\"ns_event_kind\":\"MouseMoved\",\"win32_msg_code\":\"0x0200\"")
+
+    record_appkit_translation(4, "LeftMouseUp", "0x0202")
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"appkit\",\"translation_id\":4,\"ns_event_kind\":\"LeftMouseUp\",\"win32_msg_code\":\"0x0202\"")
+
+    // 3. message_post × 4 — 모두 AppKit-translated (source_kind=2) 로 dialog hwnd 0x0001 에 enqueue
+    record_message_post(1, "0x0001", "0x0201", 2)  // WM_LBUTTONDOWN
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_post\",\"msg_id\":1,\"hwnd\":\"0x0001\",\"message_code\":\"0x0201\",\"source_kind\":2,\"source\":\"AppKit\"")
+
+    record_message_post(2, "0x0001", "0x0100", 2)  // WM_KEYDOWN
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_post\",\"msg_id\":2,\"hwnd\":\"0x0001\",\"message_code\":\"0x0100\",\"source_kind\":2,\"source\":\"AppKit\"")
+
+    record_message_post(3, "0x0001", "0x0200", 2)  // WM_MOUSEMOVE
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_post\",\"msg_id\":3,\"hwnd\":\"0x0001\",\"message_code\":\"0x0200\",\"source_kind\":2,\"source\":\"AppKit\"")
+
+    record_message_post(4, "0x0001", "0x0202", 2)  // WM_LBUTTONUP
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_post\",\"msg_id\":4,\"hwnd\":\"0x0001\",\"message_code\":\"0x0202\",\"source_kind\":2,\"source\":\"AppKit\"")
+
+    // 4. message_get × 3 — WM_PAINT / WM_LBUTTONDOWN / WM_QUIT
+    record_message_get(101, "0x0001", "0x000F", 4)   // WM_PAINT (queued by InvalidateRect)
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_get\",\"msg_id\":101,\"hwnd\":\"0x0001\",\"message_code\":\"0x000F\",\"blocked_ms\":4")
+
+    record_message_get(102, "0x0001", "0x0201", 0)   // WM_LBUTTONDOWN (translated)
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_get\",\"msg_id\":102,\"hwnd\":\"0x0001\",\"message_code\":\"0x0201\",\"blocked_ms\":0")
+
+    record_message_get(103, "0x0001", "0x0012", 0)   // WM_QUIT — modal loop exit
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"message_get\",\"msg_id\":103,\"hwnd\":\"0x0001\",\"message_code\":\"0x0012\",\"blocked_ms\":0")
+
+    // 5. modal_loop — 128 iter, exit_code=IDOK(1)
+    record_modal_loop(1, 1, 128, 1)
+    r0_emit("pe_i386_dialog_event_loop_record",
+        "\"kind\":\"modal_loop\",\"loop_id\":1,\"dialog_id\":1,\"iterations\":128,\"exit_code\":1")
+
+    // ─── assertions ───
+    let d = dialog_open_count()
+    if d != 1 {
+        panic("pe_i386_dialog_event_loop FAIL [dialog_open_count] expected=1 got=" + to_string(d))
+    }
+    let mp = message_post_count()
+    if mp != 4 {
+        panic("pe_i386_dialog_event_loop FAIL [message_post_count] expected=4 got=" + to_string(mp))
+    }
+    let mg = message_get_count()
+    if mg != 3 {
+        panic("pe_i386_dialog_event_loop FAIL [message_get_count] expected=3 got=" + to_string(mg))
+    }
+    let ak = appkit_translation_count()
+    if ak != 4 {
+        panic("pe_i386_dialog_event_loop FAIL [appkit_translation_count] expected=4 got=" + to_string(ak))
+    }
+    let ml = modal_loop_count()
+    if ml != 1 {
+        panic("pe_i386_dialog_event_loop FAIL [modal_loop_count] expected=1 got=" + to_string(ml))
+    }
+
+    // ─── name lookup assertions ───
+    let n_post = source_name(0)
+    if n_post != "PostMessage" {
+        panic("pe_i386_dialog_event_loop FAIL [source_name(0)] expected=PostMessage got=" + n_post)
+    }
+    let n_send = source_name(1)
+    if n_send != "SendMessage" {
+        panic("pe_i386_dialog_event_loop FAIL [source_name(1)] expected=SendMessage got=" + n_send)
+    }
+    let n_appkit = source_name(2)
+    if n_appkit != "AppKit" {
+        panic("pe_i386_dialog_event_loop FAIL [source_name(2)] expected=AppKit got=" + n_appkit)
+    }
+
+    // ─── stats sanity ───
+    let s = pidel_stats()
+    if len(s) != 5 {
+        panic("pe_i386_dialog_event_loop FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 1 {
+        panic("pe_i386_dialog_event_loop FAIL [stats dialog_open] expected=1 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_dialog_event_loop FAIL [stats message_post] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_i386_dialog_event_loop FAIL [stats message_get] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_i386_dialog_event_loop FAIL [stats appkit] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_i386_dialog_event_loop FAIL [stats modal] expected=1 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (전체 emit ≥ 13 보장: 위 record 13 + 이 1 = 14) ───
+    r0_emit("pe_i386_dialog_event_loop_stats",
+        "\"dialog_open_count\":" + to_string(s[0])
+        + ",\"message_post_count\":" + to_string(s[1])
+        + ",\"message_get_count\":" + to_string(s[2])
+        + ",\"appkit_translation_count\":" + to_string(s[3])
+        + ",\"modal_loop_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 13 {
+        panic("pe_i386_dialog_event_loop FAIL [r0 emit count] expected=>=13 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pidel()
+    let s2 = pidel_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_dialog_event_loop FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_dialog_event_loop self_test PASS (dialog=" + to_string(s[0])
+        + ", post=" + to_string(s[1]) + ", get=" + to_string(s[2])
+        + ", appkit=" + to_string(s[3]) + ", modal=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pidel_stats()
+            println("dialog_open_count\t" + to_string(s[0]))
+            println("message_post_count\t" + to_string(s[1]))
+            println("message_get_count\t" + to_string(s[2]))
+            println("appkit_translation_count\t" + to_string(s[3]))
+            println("modal_loop_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pidel()
+            println("cleaned: " + pidel_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pidel_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_dialog_event_loop.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,299 @@
+// lib/loader/pe_parser.hexa — Phase 0a — PE/COFF 헤더 파싱
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// Microsoft PE/COFF spec (learn.microsoft.com) 만 참조.
+//
+// 입력: Windows PE32 / PE32+ binary (.exe / .dll) 경로
+// 출력: DOS / NT / FileHeader / OptionalHeader / SectionHeaders 파싱 결과
+//
+// stage1 우회: hexa 의 binary I/O 미흡 → `od -An -tu2/-tu4 -N -j OFFSET file` exec
+//              little-endian 자동 (host Apple Silicon LE)
+// upstream candidate: native binary read (offset/length/typed) — 현재 fork 비용 큼
+
+use "../perf/r0_common"
+
+// ─── 저레벨 byte read 헬퍼 ───
+fn read_u8(path: str, offset: int) -> int {
+    let cmd = "od -An -tu1 -N1 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn read_u16(path: str, offset: int) -> int {
+    let cmd = "od -An -tu2 -N2 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn read_u32(path: str, offset: int) -> int {
+    let cmd = "od -An -tu4 -N4 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn read_str(path: str, offset: int, length: int) -> str {
+    // ASCII string, NUL-padded — section name 같은 8-byte fixed
+    let cmd = "dd if='" + path + "' bs=1 skip=" + to_string(offset) + " count=" + to_string(length) + " 2>/dev/null | tr -d '\\0'"
+    return exec(cmd).trim()
+}
+
+// ─── DOS header — offset 0, 64 bytes ───
+//   magic (uint16, "MZ" = 0x5A4D) at 0
+//   e_lfanew (uint32) at 0x3C — offset to NT headers
+fn pe_read_dos(path: str) -> array {
+    let magic = read_u16(path, 0)
+    let e_lfanew = read_u32(path, 60)
+    return [magic, e_lfanew]
+}
+
+// ─── NT headers (PE signature + FileHeader + OptionalHeader) ───
+//   PE signature (uint32, 0x00004550) at e_lfanew
+//   FileHeader (20 bytes) at e_lfanew + 4
+//     Machine (uint16)              at +0
+//     NumberOfSections (uint16)     at +2
+//     TimeDateStamp (uint32)        at +4
+//     PointerToSymbolTable (uint32) at +8
+//     NumberOfSymbols (uint32)      at +12
+//     SizeOfOptionalHeader (uint16) at +16
+//     Characteristics (uint16)      at +18
+fn pe_read_nt_signature(path: str, e_lfanew: int) -> int {
+    return read_u32(path, e_lfanew)
+}
+
+fn pe_read_file_header(path: str, e_lfanew: int) -> array {
+    let base = e_lfanew + 4
+    return [
+        read_u16(path, base + 0),    // Machine
+        read_u16(path, base + 2),    // NumberOfSections
+        read_u32(path, base + 4),    // TimeDateStamp
+        read_u16(path, base + 16),   // SizeOfOptionalHeader
+        read_u16(path, base + 18)    // Characteristics
+    ]
+}
+
+// ─── OptionalHeader — base = e_lfanew + 24 ───
+//   Magic (uint16) at +0   — 0x10B = PE32, 0x20B = PE32+
+//   AddressOfEntryPoint (uint32) at +16
+//   ImageBase: PE32 = uint32 at +28, PE32+ = uint64 at +24 (low) / +28 (high)
+//   SectionAlignment (uint32) at +32 (PE32) / +32 (PE32+)
+//   FileAlignment (uint32)    at +36 (PE32) / +36 (PE32+)
+//   SizeOfImage (uint32)      at +56 (PE32) / +56 (PE32+)
+fn pe_read_optional_header(path: str, e_lfanew: int) -> array {
+    let base = e_lfanew + 24
+    let magic = read_u16(path, base + 0)
+    let entry_point = read_u32(path, base + 16)
+    let size_of_image = read_u32(path, base + 56)
+
+    // ImageBase: PE32 = uint32 at +28, PE32+ = uint64 at +24
+    // For minimal Phase 0a, read low 32 bits for both (sufficient for most cases)
+    let image_base_lo = 0
+    let image_base_hi = 0
+    if magic == 267 {  // 0x10B = PE32
+        image_base_lo = read_u32(path, base + 28)
+    }
+    if magic == 523 {  // 0x20B = PE32+
+        image_base_lo = read_u32(path, base + 24)
+        image_base_hi = read_u32(path, base + 28)
+    }
+    return [magic, entry_point, image_base_lo, image_base_hi, size_of_image]
+}
+
+// ─── Section headers ───
+//   start at: e_lfanew + 4 + 20 + SizeOfOptionalHeader = e_lfanew + 24 + SizeOfOptionalHeader
+//   each 40 bytes:
+//     Name (8 bytes, NUL-padded)              at +0
+//     VirtualSize (uint32)                    at +8
+//     VirtualAddress (uint32)                 at +12
+//     SizeOfRawData (uint32)                  at +16
+//     PointerToRawData (uint32)               at +20
+//     Characteristics (uint32)                at +36
+fn pe_read_section(path: str, section_offset: int) -> array {
+    return [
+        read_str(path, section_offset + 0, 8),       // Name
+        read_u32(path, section_offset + 8),           // VirtualSize
+        read_u32(path, section_offset + 12),          // VirtualAddress
+        read_u32(path, section_offset + 16),          // SizeOfRawData
+        read_u32(path, section_offset + 20),          // PointerToRawData
+        read_u32(path, section_offset + 36)           // Characteristics
+    ]
+}
+
+fn pe_section_table_offset(e_lfanew: int, size_of_optional_header: int) -> int {
+    return e_lfanew + 24 + size_of_optional_header
+}
+
+// ─── 통합 파싱 + R0 emit ───
+fn pe_parse(path: str) -> int {
+    r0_emit("pe_parse_start", "\"path\":\"" + path + "\"")
+
+    let dos = pe_read_dos(path)
+    let dos_magic = dos[0]
+    let e_lfanew = dos[1]
+
+    if dos_magic != 23117 {  // 0x5A4D = "MZ"
+        r0_emit("pe_parse_err", "\"reason\":\"dos_magic_mismatch\",\"got\":" + to_string(dos_magic))
+        return 0
+    }
+
+    let nt_sig = pe_read_nt_signature(path, e_lfanew)
+    if nt_sig != 17744 {  // 0x00004550 = "PE\0\0"
+        r0_emit("pe_parse_err", "\"reason\":\"pe_signature_mismatch\",\"got\":" + to_string(nt_sig))
+        return 0
+    }
+
+    let fh = pe_read_file_header(path, e_lfanew)
+    let machine = fh[0]
+    let num_sections = fh[1]
+    let timestamp = fh[2]
+    let size_opt = fh[3]
+    let characteristics = fh[4]
+
+    let oh = pe_read_optional_header(path, e_lfanew)
+    let oh_magic = oh[0]
+    let entry_point = oh[1]
+    let image_base_lo = oh[2]
+    let image_base_hi = oh[3]
+    let size_of_image = oh[4]
+
+    r0_emit("pe_parse_headers",
+        "\"e_lfanew\":" + to_string(e_lfanew)
+        + ",\"machine\":" + to_string(machine)
+        + ",\"num_sections\":" + to_string(num_sections)
+        + ",\"timestamp\":" + to_string(timestamp)
+        + ",\"size_opt_header\":" + to_string(size_opt)
+        + ",\"characteristics\":" + to_string(characteristics)
+        + ",\"opt_magic\":" + to_string(oh_magic)
+        + ",\"entry_point_rva\":" + to_string(entry_point)
+        + ",\"image_base_lo\":" + to_string(image_base_lo)
+        + ",\"image_base_hi\":" + to_string(image_base_hi)
+        + ",\"size_of_image\":" + to_string(size_of_image)
+    )
+
+    // Section headers
+    let sect_off = pe_section_table_offset(e_lfanew, size_opt)
+    let i = 0
+    while i < num_sections {
+        let s = pe_read_section(path, sect_off + i * 40)
+        r0_emit("pe_section",
+            "\"index\":" + to_string(i)
+            + ",\"name\":\"" + s[0] + "\""
+            + ",\"vsize\":" + to_string(s[1])
+            + ",\"vaddr\":" + to_string(s[2])
+            + ",\"raw_size\":" + to_string(s[3])
+            + ",\"raw_offset\":" + to_string(s[4])
+            + ",\"characteristics\":" + to_string(s[5])
+        )
+        i = i + 1
+    }
+
+    r0_emit("pe_parse_done", "\"num_sections\":" + to_string(num_sections))
+    return num_sections
+}
+
+// ─── human-readable summary ───
+fn pe_summary(path: str) -> void {
+    let dos = pe_read_dos(path)
+    println("DOS magic:    " + to_string(dos[0]) + " (expected 23117 = 0x5A4D = MZ)")
+    println("e_lfanew:     " + to_string(dos[1]))
+    let nt_sig = pe_read_nt_signature(path, dos[1])
+    println("NT signature: " + to_string(nt_sig) + " (expected 17744 = 0x00004550 = PE\\0\\0)")
+    let fh = pe_read_file_header(path, dos[1])
+    println("Machine:      " + to_string(fh[0]) + " (0x14C=i386, 0x8664=AMD64)")
+    println("Sections:     " + to_string(fh[1]))
+    let oh = pe_read_optional_header(path, dos[1])
+    println("Opt magic:    " + to_string(oh[0]) + " (267=PE32, 523=PE32+)")
+    println("Entry RVA:    " + to_string(oh[1]))
+    println("ImageBase lo: " + to_string(oh[2]))
+    if oh[0] == 523 {
+        println("ImageBase hi: " + to_string(oh[3]))
+    }
+    println("SizeOfImage:  " + to_string(oh[4]))
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "petest-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. Battle.net-Setup.exe (x64 PE32+) 로 검증
+    let test_pe = HOME + "/Downloads/gamebox/Battle.net-Setup.exe"
+    let exists = exec("test -f '" + test_pe + "' && echo ok").trim()
+    if exists != "ok" {
+        // fallback — system 의 PE 가 있나? 없으면 self-test skip
+        println("  ⚠ test PE not found at " + test_pe)
+        println("  ⚠ self_test SKIP (PE binary absent)")
+        return
+    }
+
+    // DOS magic 검증
+    let dos = pe_read_dos(test_pe)
+    if dos[0] != 23117 {
+        panic("pe_parser FAIL [DOS magic] expected=23117 got=" + to_string(dos[0]))
+    }
+    let e_lfanew = dos[1]
+    if e_lfanew < 64 {
+        panic("pe_parser FAIL [e_lfanew] too small: " + to_string(e_lfanew))
+    }
+
+    // PE signature 검증
+    let nt_sig = pe_read_nt_signature(test_pe, e_lfanew)
+    if nt_sig != 17744 {
+        panic("pe_parser FAIL [PE signature] expected=17744 got=" + to_string(nt_sig))
+    }
+
+    // FileHeader 검증 (Battle.net-Setup.exe 는 x64 = AMD64 = 0x8664 = 34404)
+    let fh = pe_read_file_header(test_pe, e_lfanew)
+    if fh[0] != 34404 && fh[0] != 332 {
+        panic("pe_parser FAIL [Machine] expected=34404 (AMD64) or 332 (i386), got=" + to_string(fh[0]))
+    }
+    let num_sections = fh[1]
+    if num_sections < 1 || num_sections > 96 {
+        panic("pe_parser FAIL [num_sections] unreasonable: " + to_string(num_sections))
+    }
+
+    // OptionalHeader 검증
+    let oh = pe_read_optional_header(test_pe, e_lfanew)
+    if oh[0] != 267 && oh[0] != 523 {
+        panic("pe_parser FAIL [opt_magic] expected=267 (PE32) or 523 (PE32+), got=" + to_string(oh[0]))
+    }
+    if oh[1] == 0 {
+        panic("pe_parser FAIL [entry_point] zero — invalid")
+    }
+
+    // Section headers — 모두 read + 첫 번째 검증 (보통 .text 또는 비슷)
+    let n_parsed = pe_parse(test_pe)
+    if n_parsed != num_sections {
+        panic("pe_parser FAIL [pe_parse count] expected=" + to_string(num_sections) + " got=" + to_string(n_parsed))
+    }
+
+    let sess_cnt = r0_session_count(sid)
+    // pe_parse_start + pe_parse_headers + N section + pe_parse_done = 3 + N
+    let expected_events = 3 + num_sections
+    if sess_cnt != expected_events {
+        panic("pe_parser FAIL [r0 events] expected=" + to_string(expected_events) + " got=" + to_string(sess_cnt))
+    }
+
+    println("  ✅ pe_parser self_test PASS (DOS+NT+FileHeader+OptionalHeader+" + to_string(num_sections) + " sections, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "summary" {
+            if len(a) >= 4 {
+                pe_summary(a[3])
+                return
+            }
+        }
+        if sub == "parse" {
+            if len(a) >= 4 {
+                let n = pe_parse(a[3])
+                println("sections: " + to_string(n))
+                return
+            }
+        }
+    }
+    println("usage: hexa run pe_parser.hexa { self-test | summary <path> | parse <path> }")
+}

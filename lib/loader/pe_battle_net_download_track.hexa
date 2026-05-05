@@ -1,0 +1,445 @@
+// lib/loader/pe_battle_net_download_track.hexa — cycle 82 bonus
+//
+// Battle.net download protocol — manifest.cfg + content_table.dat + N chunks
+//   (HTTP range request). bnetcdn / akamaihd 우선, 사용자 동의 시 P2P.
+//   SHA-256 verify per chunk. patch_apply = file diff + rename.
+// own1: Battle.net protocol observation only. Wine bnet patch 인용 X.
+//
+// phase_kind code:
+//   1 = manifest_fetch
+//   2 = chunk_download
+//   3 = integrity_verify     (SHA-256)
+//   4 = patch_apply          (file diff + rename)
+//   5 = resume_download      (range request resume)
+//   6 = cleanup
+//
+// cdn_kind code:
+//   1 = bnetcdn
+//   2 = akamaihd
+//   3 = p2p
+//   4 = local_cache
+//
+// persist schema (TSV — chunks.tsv):
+//   chunk_id<int> \t phase_kind<int> \t bytes_downloaded<int> \t cdn_kind<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pbndt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_battle_net_download_track"
+}
+
+fn pbndt_chunks_path() -> str {
+    return pbndt_dir() + "/chunks.tsv"
+}
+
+fn pbndt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pbndt_dir() + "'")
+}
+
+fn cleanup_pbndt() -> void {
+    pbndt_ensure_dir()
+    let _ = exec("rm -f '" + pbndt_chunks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pbndt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbndt_append_row(path: str, row: str) -> void {
+    pbndt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_chunk: download chunk 1 건 기록 ───
+fn record_chunk(chunk_id: int, phase_kind: int, bytes_downloaded: int, cdn_kind: int) -> void {
+    if chunk_id <= 0 {
+        panic("pe_battle_net_download_track FAIL [record_chunk] expected=chunk_id>0 got=" + to_string(chunk_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_battle_net_download_track FAIL [record_chunk] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 6 {
+        panic("pe_battle_net_download_track FAIL [record_chunk] expected=phase_kind<=6 got=" + to_string(phase_kind))
+    }
+    if bytes_downloaded < 0 {
+        panic("pe_battle_net_download_track FAIL [record_chunk] expected=bytes_downloaded>=0 got=" + to_string(bytes_downloaded))
+    }
+    if cdn_kind < 1 {
+        panic("pe_battle_net_download_track FAIL [record_chunk] expected=cdn_kind>=1 got=" + to_string(cdn_kind))
+    }
+    if cdn_kind > 4 {
+        panic("pe_battle_net_download_track FAIL [record_chunk] expected=cdn_kind<=4 got=" + to_string(cdn_kind))
+    }
+    let row = to_string(chunk_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(bytes_downloaded) + "\t" + to_string(cdn_kind) + "\n"
+    pbndt_append_row(pbndt_chunks_path(), row)
+}
+
+// ─── chunk_count: total chunk 수 ───
+fn chunk_count() -> int {
+    let t = pbndt_read_table(pbndt_chunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 chunk 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pbndt_read_table(pbndt_chunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_cdn_kind: 특정 cdn_kind 의 chunk 수 ───
+fn count_by_cdn_kind(cdn_kind: int) -> int {
+    let t = pbndt_read_table(pbndt_chunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == cdn_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes_downloaded: 모든 chunk bytes_downloaded 합 ───
+fn total_bytes_downloaded() -> int {
+    let t = pbndt_read_table(pbndt_chunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── verify_count: phase_kind=3 (integrity_verify SHA-256) chunk 수 ───
+fn verify_count() -> int {
+    return count_by_phase_kind(3)
+}
+
+// ─── chunk_bytes: 특정 chunk_id 의 bytes_downloaded (없으면 0) ───
+fn chunk_bytes(chunk_id: int) -> int {
+    let t = pbndt_read_table(pbndt_chunks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == chunk_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pbndt_stats: [chunk_count, total_bytes_downloaded, verify_count, count_by_cdn_kind(1)] ───
+fn pbndt_stats() -> array {
+    let mut out = []
+    out.push(chunk_count())
+    out.push(total_bytes_downloaded())
+    out.push(verify_count())
+    out.push(count_by_cdn_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pbndt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pbndt()
+
+    // 2. record 8 download chunks covering all 6 phase_kinds and ≥3 cdn_kinds
+    //    phase_kinds: manifest_fetch(1), chunk_download(2), integrity_verify(3),
+    //                 patch_apply(4), resume_download(5), cleanup(6)
+    //    cdn_kinds:   bnetcdn(1), akamaihd(2), p2p(3), local_cache(4)
+    record_chunk(830001, 1, 2048, 1)         // manifest_fetch + bnetcdn
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830001,\"phase_kind\":1,\"bytes_downloaded\":2048,\"cdn_kind\":1,\"target\":\"manifest_fetch/bnetcdn\"")
+
+    record_chunk(830002, 2, 1048576, 1)      // chunk_download + bnetcdn (1MB)
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830002,\"phase_kind\":2,\"bytes_downloaded\":1048576,\"cdn_kind\":1,\"target\":\"chunk_download/bnetcdn\"")
+
+    record_chunk(830003, 2, 1048576, 2)      // chunk_download + akamaihd (1MB)
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830003,\"phase_kind\":2,\"bytes_downloaded\":1048576,\"cdn_kind\":2,\"target\":\"chunk_download/akamaihd\"")
+
+    record_chunk(830004, 3, 0, 1)            // integrity_verify (SHA-256, no bytes)
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830004,\"phase_kind\":3,\"bytes_downloaded\":0,\"cdn_kind\":1,\"target\":\"integrity_verify/sha256\"")
+
+    record_chunk(830005, 5, 524288, 2)       // resume_download + akamaihd (range request)
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830005,\"phase_kind\":5,\"bytes_downloaded\":524288,\"cdn_kind\":2,\"target\":\"resume_download/akamaihd\"")
+
+    record_chunk(830006, 4, 0, 4)            // patch_apply + local_cache (file diff + rename)
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830006,\"phase_kind\":4,\"bytes_downloaded\":0,\"cdn_kind\":4,\"target\":\"patch_apply/local_cache\"")
+
+    record_chunk(830007, 3, 0, 4)            // integrity_verify (post-patch SHA-256)
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830007,\"phase_kind\":3,\"bytes_downloaded\":0,\"cdn_kind\":4,\"target\":\"integrity_verify/post_patch\"")
+
+    record_chunk(830008, 6, 0, 4)            // cleanup + local_cache
+    r0_emit("pe_battle_net_download_track_record",
+        "\"chunk_id\":830008,\"phase_kind\":6,\"bytes_downloaded\":0,\"cdn_kind\":4,\"target\":\"cleanup/local_cache\"")
+
+    // 3. chunk_count = 8
+    let c = chunk_count()
+    if c != 8 {
+        panic("pe_battle_net_download_track FAIL [chunk_count] expected=8 got=" + to_string(c))
+    }
+
+    // 4. total_bytes_downloaded = 2048 + 1048576 + 1048576 + 0 + 524288 + 0 + 0 + 0 = 2623488
+    let tb = total_bytes_downloaded()
+    if tb != 2623488 {
+        panic("pe_battle_net_download_track FAIL [total_bytes_downloaded] expected=2623488 got=" + to_string(tb))
+    }
+
+    // 5. count_by_phase_kind sanity (all 6 covered)
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 2 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(2)] expected=2 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 2 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(3)] expected=2 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_battle_net_download_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 6. count_by_cdn_kind sanity (≥3 distinct kinds: 1,2,4)
+    let c1 = count_by_cdn_kind(1)
+    if c1 != 3 {
+        panic("pe_battle_net_download_track FAIL [count_by_cdn_kind(1)] expected=3 got=" + to_string(c1))
+    }
+    let c2 = count_by_cdn_kind(2)
+    if c2 != 2 {
+        panic("pe_battle_net_download_track FAIL [count_by_cdn_kind(2)] expected=2 got=" + to_string(c2))
+    }
+    let c4 = count_by_cdn_kind(4)
+    if c4 != 3 {
+        panic("pe_battle_net_download_track FAIL [count_by_cdn_kind(4)] expected=3 got=" + to_string(c4))
+    }
+    let c3 = count_by_cdn_kind(3)
+    if c3 != 0 {
+        panic("pe_battle_net_download_track FAIL [count_by_cdn_kind(3)] expected=0 got=" + to_string(c3))
+    }
+
+    // 7. verify_count = 2 (phase_kind=3 SHA-256)
+    let vc = verify_count()
+    if vc != 2 {
+        panic("pe_battle_net_download_track FAIL [verify_count] expected=2 got=" + to_string(vc))
+    }
+
+    // 8. chunk_bytes sanity
+    let b2 = chunk_bytes(830002)
+    if b2 != 1048576 {
+        panic("pe_battle_net_download_track FAIL [chunk_bytes(830002)] expected=1048576 got=" + to_string(b2))
+    }
+    let b5 = chunk_bytes(830005)
+    if b5 != 524288 {
+        panic("pe_battle_net_download_track FAIL [chunk_bytes(830005)] expected=524288 got=" + to_string(b5))
+    }
+    let b_miss = chunk_bytes(9999)
+    if b_miss != 0 {
+        panic("pe_battle_net_download_track FAIL [chunk_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 9. pbndt_stats() = [8, 2623488, 2, 3]
+    let s = pbndt_stats()
+    if len(s) != 4 {
+        panic("pe_battle_net_download_track FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_battle_net_download_track FAIL [stats chunk_count] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 2623488 {
+        panic("pe_battle_net_download_track FAIL [stats total_bytes_downloaded] expected=2623488 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_battle_net_download_track FAIL [stats verify_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_battle_net_download_track FAIL [stats count_cdn(1)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_battle_net_download_track_stats",
+        "\"chunk_count\":" + to_string(s[0])
+        + ",\"total_bytes_downloaded\":" + to_string(s[1])
+        + ",\"verify_count\":" + to_string(s[2])
+        + ",\"cdn_bnetcdn\":" + to_string(s[3]))
+
+    // 11. emit count >= 9 (8 records + 1 stats = 9)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 9 {
+        panic("pe_battle_net_download_track FAIL [r0 emit count] expected=>=9 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pbndt()
+    let s2 = pbndt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_battle_net_download_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battle_net_download_track self_test PASS (chunks=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", verifies=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pbndt_stats()
+            println("chunk_count\t" + to_string(s[0]))
+            println("total_bytes_downloaded\t" + to_string(s[1]))
+            println("verify_count\t" + to_string(s[2]))
+            println("count_cdn_bnetcdn\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("chunk_bytes\t" + to_string(chunk_bytes(cid)))
+                return
+            }
+            println("usage: hexa run pe_battle_net_download_track.hexa bytes <chunk_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let val = to_int(a[4])
+                if dim == "phase" {
+                    println("count_by_phase_kind\t" + to_string(count_by_phase_kind(val)))
+                    return
+                }
+                if dim == "cdn" {
+                    println("count_by_cdn_kind\t" + to_string(count_by_cdn_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_battle_net_download_track.hexa count { phase <phase_kind> | cdn <cdn_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pbndt()
+            println("cleaned: " + pbndt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pbndt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_battle_net_download_track.hexa { self-test | stats | bytes <chunk_id> | count phase <phase_kind> | count cdn <cdn_kind> | cleanup | dir }")
+}

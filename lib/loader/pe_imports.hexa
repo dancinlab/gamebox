@@ -1,0 +1,397 @@
+// lib/loader/pe_imports.hexa — Phase 0b — PE Import Directory parser
+//
+// own 1: DIY hexa PE 로더, Wine / CrossOver / community 코드 0 줄.
+// own 2: r0_emit ≥ 1 + self_test() + main() dispatch + headless + panic 일관 형식.
+// Microsoft PE/COFF spec (learn.microsoft.com) 만 참조.
+//
+// 입력: Windows PE32 / PE32+ binary (.exe / .dll) 경로
+// 출력:
+//   - DataDirectories[1] (Import Directory) RVA + Size
+//   - IMAGE_IMPORT_DESCRIPTOR list (DLL 단위) — name + ILT/IAT RVA
+//   - 각 DLL 의 imported function names (hint 포함)
+//   - 종속 DLL 이름 리스트
+//
+// stage1 우회 (raw#9 hexa-only):
+//   - bit ops 없음 → high-bit 검증 = "v >= 0x80000000" 비교 (32-bit ILT entry)
+//   - 64-bit ILT entry (PE32+) 의 high bit = ordinal flag — low 32-bit 만 read 후 high 32-bit
+//     별도 read 하여 high bit 검증 (high32 >= 0x80000000)
+//   - NUL-term string read = `dd ... | tr '\0' '\n' | head -1`
+//
+// upstream candidate:
+//   - native NUL-term string read (현재 dd + tr 우회)
+//   - native bit ops (& | << >>) — high-bit / low-16 ordinal 직접 검증
+
+use "../perf/r0_common"
+
+// ─── 저레벨 byte read 헬퍼 (pe_parser.hexa 와 동일) ───
+fn r_u16(path: str, offset: int) -> int {
+    let cmd = "od -An -tu2 -N2 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+fn r_u32(path: str, offset: int) -> int {
+    let cmd = "od -An -tu4 -N4 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    return to_int(exec(cmd).trim())
+}
+
+// NUL-terminated ASCII string read at offset (max 256 bytes, truncate at first NUL).
+// `head -1` 의 trailing newline 제거 위해 .trim().
+fn r_cstr(path: str, offset: int) -> str {
+    let cmd = "dd if='" + path + "' bs=1 skip=" + to_string(offset)
+        + " count=256 2>/dev/null | tr '\\0' '\\n' | head -1"
+    return exec(cmd).trim()
+}
+
+// ─── DataDirectories[1] = Import Directory (RVA, Size) ───
+// OptionalHeader base = e_lfanew + 24
+//   PE32 : DataDirectories start at OptionalHeader + 96  → Import Dir = +96 + 8 = +104
+//   PE32+: DataDirectories start at OptionalHeader + 112 → Import Dir = +112 + 8 = +120
+// Spec note: spec text "+128 / +144" counts e_lfanew + 24 + offset = 128 / 144.
+fn import_dir_info(pe_path: str, e_lfanew: int, opt_magic: int) -> array {
+    let oh_base = e_lfanew + 24
+    let dd_off = 0
+    if opt_magic == 267 {       // 0x10B = PE32
+        dd_off = oh_base + 96 + 8     // = e_lfanew + 128
+    } else {
+        if opt_magic == 523 {   // 0x20B = PE32+
+            dd_off = oh_base + 112 + 8    // = e_lfanew + 144
+        } else {
+            return [0, 0]
+        }
+    }
+    let rva = r_u32(pe_path, dd_off + 0)
+    let size = r_u32(pe_path, dd_off + 4)
+    return [rva, size]
+}
+
+// ─── RVA → file offset 변환 ───
+// section table 을 walk 하여 RVA 를 contained section 에서 raw_offset + (rva - vaddr) 로 매핑.
+// 못 찾으면 -1 반환.
+fn rva_to_file_offset(pe_path: str, e_lfanew: int, rva: int) -> int {
+    // FileHeader: NumberOfSections @ +6 (e_lfanew + 4 + 2), SizeOfOptionalHeader @ +20 (e_lfanew + 4 + 16)
+    let num_sections = r_u16(pe_path, e_lfanew + 6)
+    let size_opt = r_u16(pe_path, e_lfanew + 20)
+    let sect_off = e_lfanew + 24 + size_opt
+
+    let i = 0
+    while i < num_sections {
+        let s_base = sect_off + i * 40
+        let vsize = r_u32(pe_path, s_base + 8)
+        let vaddr = r_u32(pe_path, s_base + 12)
+        let raw_size = r_u32(pe_path, s_base + 16)
+        let raw_off = r_u32(pe_path, s_base + 20)
+        // RVA falls within section if vaddr <= rva < vaddr + max(vsize, raw_size)
+        let span = vsize
+        if raw_size > vsize {
+            span = raw_size
+        }
+        if rva >= vaddr {
+            if rva < vaddr + span {
+                return raw_off + (rva - vaddr)
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── IMAGE_IMPORT_DESCRIPTOR list ───
+// 각 entry = 20 bytes:
+//   OriginalFirstThunk (uint32) +0   - RVA to ILT
+//   TimeDateStamp      (uint32) +4
+//   ForwarderChain     (uint32) +8
+//   Name               (uint32) +12  - RVA to DLL name (NUL-term)
+//   FirstThunk         (uint32) +16  - RVA to IAT
+// terminator = all-zero entry (Name == 0 && OriginalFirstThunk == 0).
+//
+// 반환: array of [name_str, ilt_rva, iat_rva].
+fn parse_import_descriptors(pe_path: str, e_lfanew: int, opt_magic: int) -> array {
+    let info = import_dir_info(pe_path, e_lfanew, opt_magic)
+    let imp_rva = info[0]
+    let imp_size = info[1]
+    let result = []
+
+    if imp_rva == 0 {
+        return result
+    }
+
+    let imp_off = rva_to_file_offset(pe_path, e_lfanew, imp_rva)
+    if imp_off < 0 {
+        return result
+    }
+
+    let max_entries = 4096    // safety bound (typical PE has < 200 imports)
+    let i = 0
+    while i < max_entries {
+        let base = imp_off + i * 20
+        let oft = r_u32(pe_path, base + 0)
+        let name_rva = r_u32(pe_path, base + 12)
+        let ft = r_u32(pe_path, base + 16)
+        // null terminator
+        if oft == 0 {
+            if name_rva == 0 {
+                if ft == 0 {
+                    return result
+                }
+            }
+        }
+        let name_off = rva_to_file_offset(pe_path, e_lfanew, name_rva)
+        let dll_name = ""
+        if name_off >= 0 {
+            dll_name = r_cstr(pe_path, name_off)
+        }
+        result.push([dll_name, oft, ft])
+        i = i + 1
+    }
+    return result
+}
+
+// ─── 특정 DLL 의 imported function names ───
+// ILT (Import Lookup Table) 또는 IAT 둘 다 동일 layout (loader 가 IAT 를 resolve 후 overwrite,
+// 그러나 file 상에서는 ILT 와 IAT 모두 같은 hint/name RVA pointers 갖음).
+// PE32+: 8-byte entries. high bit (entry >= 0x8000_0000_0000_0000) 면 ordinal import (low 16-bit = ordinal).
+// PE32 : 4-byte entries. high bit (entry >= 0x8000_0000) 면 ordinal import.
+// import-by-name: low 31-bit (PE32) / low 63-bit (PE32+) = RVA to IMAGE_IMPORT_BY_NAME = uint16 hint + NUL name.
+//
+// stage1: low 32-bit RVA 만 read (PE32+ entries 의 high 32-bit 는 별도 read 하여 high-bit 검증 +
+// ordinal vs name 분기). RVA 자체는 32-bit 안에 들어가는 것이 일반적.
+fn parse_imported_names(pe_path: str, e_lfanew: int, opt_magic: int, dll_index: int) -> array {
+    let descs = parse_import_descriptors(pe_path, e_lfanew, opt_magic)
+    let result = []
+    if dll_index < 0 {
+        return result
+    }
+    if dll_index >= len(descs) {
+        return result
+    }
+    let desc = descs[dll_index]
+    let ilt_rva = desc[1]   // OriginalFirstThunk
+    let iat_rva = desc[2]   // FirstThunk — fallback if ILT 0
+    let table_rva = ilt_rva
+    if table_rva == 0 {
+        table_rva = iat_rva
+    }
+    if table_rva == 0 {
+        return result
+    }
+
+    let table_off = rva_to_file_offset(pe_path, e_lfanew, table_rva)
+    if table_off < 0 {
+        return result
+    }
+
+    let entry_size = 4
+    if opt_magic == 523 {
+        entry_size = 8
+    }
+
+    let max_entries = 65536   // safety bound
+    let i = 0
+    while i < max_entries {
+        let e_off = table_off + i * entry_size
+        let lo = r_u32(pe_path, e_off + 0)
+        let hi = 0
+        if entry_size == 8 {
+            hi = r_u32(pe_path, e_off + 4)
+        }
+        // null terminator: all zeros
+        if lo == 0 {
+            if hi == 0 {
+                return result
+            }
+        }
+        // ordinal-flag detection (no bit ops):
+        //   PE32  : hi == 0; ordinal flag = (lo >= 0x80000000)
+        //   PE32+ : ordinal flag = (hi >= 0x80000000)  [bit 63]
+        let is_ordinal = false
+        if entry_size == 8 {
+            if hi >= 2147483648 {       // 0x80000000
+                is_ordinal = true
+            }
+        } else {
+            if lo >= 2147483648 {
+                is_ordinal = true
+            }
+        }
+        if is_ordinal {
+            // low 16 bits of `lo` = ordinal number; emit pseudo-name
+            let ord = lo - (lo / 65536) * 65536    // lo % 65536 — ordinal
+            result.push("#" + to_string(ord))
+        } else {
+            // import by name: lo = RVA to IMAGE_IMPORT_BY_NAME (uint16 hint + NUL name)
+            let ibn_off = rva_to_file_offset(pe_path, e_lfanew, lo)
+            if ibn_off >= 0 {
+                let name = r_cstr(pe_path, ibn_off + 2)   // skip 2-byte hint
+                result.push(name)
+            } else {
+                result.push("?")
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ─── 모든 종속 DLL 이름 ───
+fn list_dependencies(pe_path: str) -> array {
+    // PE/headers re-read minimally
+    let e_lfanew = r_u32(pe_path, 60)
+    let opt_magic = r_u16(pe_path, e_lfanew + 24)
+    let descs = parse_import_descriptors(pe_path, e_lfanew, opt_magic)
+    let names = []
+    let i = 0
+    while i < len(descs) {
+        names.push(descs[i][0])
+        i = i + 1
+    }
+    return names
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "peimp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    let test_pe = HOME + "/Downloads/gamebox/Battle.net-Setup.exe"
+    let exists = exec("test -f '" + test_pe + "' && echo ok").trim()
+    if exists != "ok" {
+        println("  ⚠ test PE not found at " + test_pe)
+        println("  ⚠ pe_imports self_test SKIP (PE binary absent)")
+        return
+    }
+
+    // header re-read
+    let e_lfanew = r_u32(test_pe, 60)
+    let opt_magic = r_u16(test_pe, e_lfanew + 24)
+
+    // step 1: Import Directory info
+    let info = import_dir_info(test_pe, e_lfanew, opt_magic)
+    if info[0] == 0 {
+        panic("pe_imports FAIL [import_dir_rva] expected=>0 got=0 (PE has no imports?)")
+    }
+    if info[1] == 0 {
+        panic("pe_imports FAIL [import_dir_size] expected=>0 got=0")
+    }
+
+    // step 2: rva_to_file_offset round-trip — entry point RVA must map within file
+    let entry_rva = r_u32(test_pe, e_lfanew + 24 + 16)
+    let entry_off = rva_to_file_offset(test_pe, e_lfanew, entry_rva)
+    if entry_off < 0 {
+        panic("pe_imports FAIL [rva_to_file_offset] expected=>=0 got=-1 for entry_rva=" + to_string(entry_rva))
+    }
+
+    // step 3: list_dependencies
+    let dlls = list_dependencies(test_pe)
+    let n = len(dlls)
+    if n == 0 {
+        panic("pe_imports FAIL [dlls.len] expected=>0 got=0")
+    }
+
+    // build first-5 list (or fewer)
+    let show_n = n
+    if show_n > 5 {
+        show_n = 5
+    }
+    let list_str = "["
+    let i = 0
+    while i < show_n {
+        if i > 0 {
+            list_str = list_str + ","
+        }
+        list_str = list_str + "\"" + dlls[i] + "\""
+        i = i + 1
+    }
+    list_str = list_str + "]"
+
+    r0_emit("pe_imports_dlls",
+        "\"count\":" + to_string(n)
+        + ",\"list\":" + list_str
+        + ",\"import_rva\":" + to_string(info[0])
+        + ",\"import_size\":" + to_string(info[1])
+    )
+
+    // step 4: 핵심 DLL 포함 검증 (case-insensitive)
+    let joined = ""
+    let j = 0
+    while j < n {
+        joined = joined + dlls[j] + "\n"
+        j = j + 1
+    }
+    // shell tr 로 lowercase
+    let tmp = HOME + "/.airgenome/gamebox/r0/peimp_check.tmp"
+    write_file(tmp, joined)
+    let lower = exec("tr 'A-Z' 'a-z' < '" + tmp + "'")
+    let _rm = exec("rm -f '" + tmp + "'")
+
+    let has_kernel = lower.contains("kernel32")
+    let has_ntdll = lower.contains("ntdll")
+    let has_user = lower.contains("user32")
+    let has_advapi = lower.contains("advapi32")
+    if !has_kernel {
+        if !has_ntdll {
+            if !has_user {
+                if !has_advapi {
+                    panic("pe_imports FAIL [core_dll] expected=kernel32|ntdll|user32|advapi32 got=" + joined)
+                }
+            }
+        }
+    }
+
+    // step 5: parse_imported_names round-trip on dll index 0 (just must not panic + return list)
+    let names0 = parse_imported_names(test_pe, e_lfanew, opt_magic, 0)
+    r0_emit("pe_imports_dll0_names",
+        "\"dll\":\"" + dlls[0] + "\""
+        + ",\"name_count\":" + to_string(len(names0))
+    )
+
+    // session 검증: emit 최소 2 (own 2 mandate ≥ 1)
+    let cnt = r0_session_count(sid)
+    if cnt < 1 {
+        panic("pe_imports FAIL [r0 events] expected=>=1 got=" + to_string(cnt))
+    }
+
+    println("  ✅ pe_imports self_test PASS (" + to_string(n) + " DLLs, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "deps" {
+            if len(a) >= 4 {
+                let dlls = list_dependencies(a[3])
+                let i = 0
+                while i < len(dlls) {
+                    println(dlls[i])
+                    i = i + 1
+                }
+                return
+            }
+        }
+        if sub == "names" {
+            // names <path> <dll_index>
+            if len(a) >= 5 {
+                let path = a[3]
+                let idx = to_int(a[4])
+                let e_lfanew = r_u32(path, 60)
+                let opt_magic = r_u16(path, e_lfanew + 24)
+                let dlls = list_dependencies(path)
+                if idx < len(dlls) {
+                    println("# " + dlls[idx])
+                }
+                let ns = parse_imported_names(path, e_lfanew, opt_magic, idx)
+                let i = 0
+                while i < len(ns) {
+                    println(ns[i])
+                    i = i + 1
+                }
+                return
+            }
+        }
+    }
+    println("usage: hexa run pe_imports.hexa { self-test | deps <path> | names <path> <dll_index> }")
+}

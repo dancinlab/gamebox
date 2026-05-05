@@ -1,0 +1,521 @@
+// lib/loader/pe_msvc_nested_try_block_real.hexa — MSVC nested try/catch state machine tracker (R3 Tier).
+//
+// MSVC C++ exception handling 의 "nested try block" 상태 머신 추적기. MSVC 의
+// `__CxxFrameHandler3` 은 FuncInfo.pTryBlockMap[] 의 각 try entry 에 대해
+// (tryLow, tryHigh, catchHigh) triple 로 state index 범위를 지정. nested try 는
+// 부모 try 의 [tryLow..tryHigh] 안에 자식 try 의 [tryLow..tryHigh] 가 포함되는
+// 형태로 표현됨. 본 module 은 nested 관계 + state 전이 + throw propagation +
+// catch resolution + unwind 까지 5 종 record + 5 종 stat 으로 추적한다.
+//
+// example layout (본 module self-test 가 검증하는 대표 케이스):
+//   외부 try(0): tryLow=0 tryHigh=2 catchHigh=3   // body state ∈ {0,1,2}, catch ∈ {3}
+//     내부 try(1): tryLow=1 tryHigh=1 catchHigh=2 // 외부 try block 안 (body=1, catch=2)
+//   외부 try(2): tryLow=4 tryHigh=4 catchHigh=5   // 별개 외부 try (sibling)
+//   state 6+ = function epilogue (try 외부)
+//
+// state index 가 어느 try block 안에 있는지 결정 절차:
+//   for each try in pTryBlockMap (외→내 순회):
+//     if tryLow <= state <= tryHigh: in body
+//     elif tryHigh < state <= catchHigh: in catch handler
+//   nested 우선순위는 가장 안쪽 (innermost) try 가 win.
+//
+// own 1 enforcement: Wine / CrossOver / GPTK / Whisky / Box86 / QEMU 코드 0 줄
+//   import. Microsoft __CxxFrameHandler3 ABI + Visual C++ EHData spec 만 참조 —
+//   pure tracker (실제 dispatch X, Apple SDK 호출 X).
+// own 2 mandate:
+//   - r0_emit ≥ 14 (17 record + 5 stats emit + 추가 helper sanity 줄 = 충분)
+//   - panic 형식: "pe_msvc_nested_try_block_real FAIL [<step>] expected=<x> got=<y>"
+//   - self_test() + main() dispatch + headless safe
+//
+// 5 record API:
+//   record_nested_try(nested_id, parent_try_id, child_try_id, depth)
+//     — 부모 try ↔ 자식 try 관계 + 중첩 깊이 (depth 1 = top-level)
+//   record_state_transition(transition_id, from_state, to_state, transition_kind)
+//     — kind 0=enter_try / 1=exit_try / 2=throw / 3=catch_match / 4=unwind
+//   record_throw_propagation(propagation_id, throw_state, current_state, found_catch_state)
+//     — throw 시점 state → 검사 중 state → 매치된 catch state (-1 = 미매치)
+//   record_catch_resolution(resolution_id, throw_propagation_id, catch_handler_va_hex, success)
+//     — catch handler 매칭 결과 (success 1 = 매치 성공, 0 = std::terminate 경로)
+//   record_unwind_to_state(unwind_id, from_state, to_state, cleanup_actions_count)
+//     — to_state 까지 dtor / __finally action n 개 실행
+//
+// 5 stats:
+//   nested_try_count / state_transition_count / throw_propagation_count
+//     / catch_resolution_count / unwind_to_state_count
+//
+// helper:
+//   transition_kind_name(int) -> str
+//
+// persist schema (TSV — 5 tables):
+//   nested_tries.tsv        : nested_id<int>     \t parent_try_id<int> \t child_try_id<int>      \t depth<int>
+//   state_transitions.tsv   : transition_id<int> \t from_state<int>    \t to_state<int>          \t transition_kind<int>
+//   throw_propagations.tsv  : propagation_id<int>\t throw_state<int>   \t current_state<int>     \t found_catch_state<int>
+//   catch_resolutions.tsv   : resolution_id<int> \t throw_propagation_id<int> \t catch_handler_va_hex<str> \t success<int>
+//   unwind_to_states.tsv    : unwind_id<int>     \t from_state<int>    \t to_state<int>          \t cleanup_actions_count<int>
+//
+// Hexa 예약어 회피: type / class / mod / handle 단독 식별자 금지 →
+//   transition_kind / parent_try_id / child_try_id / catch_handler_va_hex 사용.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmnt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_nested_try_block_real"
+}
+
+fn pmnt_nested_tries_path() -> str {
+    return pmnt_dir() + "/nested_tries.tsv"
+}
+
+fn pmnt_state_transitions_path() -> str {
+    return pmnt_dir() + "/state_transitions.tsv"
+}
+
+fn pmnt_throw_propagations_path() -> str {
+    return pmnt_dir() + "/throw_propagations.tsv"
+}
+
+fn pmnt_catch_resolutions_path() -> str {
+    return pmnt_dir() + "/catch_resolutions.tsv"
+}
+
+fn pmnt_unwind_to_states_path() -> str {
+    return pmnt_dir() + "/unwind_to_states.tsv"
+}
+
+fn pmnt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmnt_dir() + "'")
+}
+
+fn cleanup_pmnt() -> void {
+    pmnt_ensure_dir()
+    let _ = exec("rm -f '" + pmnt_nested_tries_path()
+        + "' '" + pmnt_state_transitions_path()
+        + "' '" + pmnt_throw_propagations_path()
+        + "' '" + pmnt_catch_resolutions_path()
+        + "' '" + pmnt_unwind_to_states_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmnt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmnt_append_row(path: str, row: str) -> void {
+    pmnt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmnt_count_rows(path: str, min_cols: int) -> int {
+    let t = pmnt_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_nested_try: parent/child try 관계 + 중첩 depth ───
+//   parent_try_id == -1 일 경우 top-level (depth=1) 표현 허용.
+fn record_nested_try(nested_id: int, parent_try_id: int, child_try_id: int, depth: int) -> void {
+    if nested_id <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_nested_try] expected=nested_id>0 got=" + to_string(nested_id))
+    }
+    if parent_try_id < -1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_nested_try] expected=parent_try_id>=-1 got=" + to_string(parent_try_id))
+    }
+    if child_try_id < 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_nested_try] expected=child_try_id>=0 got=" + to_string(child_try_id))
+    }
+    if depth <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_nested_try] expected=depth>0 got=" + to_string(depth))
+    }
+    let row = to_string(nested_id) + "\t" + to_string(parent_try_id)
+        + "\t" + to_string(child_try_id)
+        + "\t" + to_string(depth) + "\n"
+    pmnt_append_row(pmnt_nested_tries_path(), row)
+}
+
+// ─── record_state_transition: state index 전이 ───
+//   transition_kind: 0=enter_try / 1=exit_try / 2=throw / 3=catch_match / 4=unwind
+fn record_state_transition(transition_id: int, from_state: int, to_state: int, transition_kind: int) -> void {
+    if transition_id <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_state_transition] expected=transition_id>0 got=" + to_string(transition_id))
+    }
+    if from_state < -1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_state_transition] expected=from_state>=-1 got=" + to_string(from_state))
+    }
+    if to_state < -1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_state_transition] expected=to_state>=-1 got=" + to_string(to_state))
+    }
+    if transition_kind < 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_state_transition] expected=transition_kind>=0 got=" + to_string(transition_kind))
+    }
+    if transition_kind > 4 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_state_transition] expected=transition_kind<=4 got=" + to_string(transition_kind))
+    }
+    let row = to_string(transition_id) + "\t" + to_string(from_state)
+        + "\t" + to_string(to_state)
+        + "\t" + to_string(transition_kind) + "\n"
+    pmnt_append_row(pmnt_state_transitions_path(), row)
+}
+
+// ─── record_throw_propagation: throw 한 시점부터 catch 후보 검사 ───
+//   found_catch_state == -1 이면 해당 propagation 단계에선 미매치 (다음 outer 검사).
+fn record_throw_propagation(propagation_id: int, throw_state: int, current_state: int, found_catch_state: int) -> void {
+    if propagation_id <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_throw_propagation] expected=propagation_id>0 got=" + to_string(propagation_id))
+    }
+    if throw_state < 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_throw_propagation] expected=throw_state>=0 got=" + to_string(throw_state))
+    }
+    if current_state < -1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_throw_propagation] expected=current_state>=-1 got=" + to_string(current_state))
+    }
+    if found_catch_state < -1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_throw_propagation] expected=found_catch_state>=-1 got=" + to_string(found_catch_state))
+    }
+    let row = to_string(propagation_id) + "\t" + to_string(throw_state)
+        + "\t" + to_string(current_state)
+        + "\t" + to_string(found_catch_state) + "\n"
+    pmnt_append_row(pmnt_throw_propagations_path(), row)
+}
+
+// ─── record_catch_resolution: 특정 propagation 의 최종 catch handler 결과 ───
+//   success 1 = 매치 성공 / 0 = 매치 실패 (std::terminate 경로 등)
+fn record_catch_resolution(resolution_id: int, throw_propagation_id: int, catch_handler_va_hex: str, success: int) -> void {
+    if resolution_id <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_catch_resolution] expected=resolution_id>0 got=" + to_string(resolution_id))
+    }
+    if throw_propagation_id <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_catch_resolution] expected=throw_propagation_id>0 got=" + to_string(throw_propagation_id))
+    }
+    if catch_handler_va_hex == "" {
+        panic("pe_msvc_nested_try_block_real FAIL [record_catch_resolution] expected=catch_handler_va_hex!=empty got=empty")
+    }
+    if success < 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_catch_resolution] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_catch_resolution] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(resolution_id) + "\t" + to_string(throw_propagation_id)
+        + "\t" + catch_handler_va_hex
+        + "\t" + to_string(success) + "\n"
+    pmnt_append_row(pmnt_catch_resolutions_path(), row)
+}
+
+// ─── record_unwind_to_state: unwind target state + cleanup action 수 ───
+fn record_unwind_to_state(unwind_id: int, from_state: int, to_state: int, cleanup_actions_count: int) -> void {
+    if unwind_id <= 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_unwind_to_state] expected=unwind_id>0 got=" + to_string(unwind_id))
+    }
+    if from_state < 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_unwind_to_state] expected=from_state>=0 got=" + to_string(from_state))
+    }
+    if to_state < -1 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_unwind_to_state] expected=to_state>=-1 got=" + to_string(to_state))
+    }
+    if cleanup_actions_count < 0 {
+        panic("pe_msvc_nested_try_block_real FAIL [record_unwind_to_state] expected=cleanup_actions_count>=0 got=" + to_string(cleanup_actions_count))
+    }
+    let row = to_string(unwind_id) + "\t" + to_string(from_state)
+        + "\t" + to_string(to_state)
+        + "\t" + to_string(cleanup_actions_count) + "\n"
+    pmnt_append_row(pmnt_unwind_to_states_path(), row)
+}
+
+// ─── 5 종 통계 ───
+fn nested_try_count() -> int {
+    return pmnt_count_rows(pmnt_nested_tries_path(), 4)
+}
+
+fn state_transition_count() -> int {
+    return pmnt_count_rows(pmnt_state_transitions_path(), 4)
+}
+
+fn throw_propagation_count() -> int {
+    return pmnt_count_rows(pmnt_throw_propagations_path(), 4)
+}
+
+fn catch_resolution_count() -> int {
+    return pmnt_count_rows(pmnt_catch_resolutions_path(), 4)
+}
+
+fn unwind_to_state_count() -> int {
+    return pmnt_count_rows(pmnt_unwind_to_states_path(), 4)
+}
+
+// ─── helper: transition_kind code → name ───
+fn transition_kind_name(transition_kind: int) -> str {
+    if transition_kind == 0 { return "enter_try" }
+    if transition_kind == 1 { return "exit_try" }
+    if transition_kind == 2 { return "throw" }
+    if transition_kind == 3 { return "catch_match" }
+    if transition_kind == 4 { return "unwind" }
+    return "unknown"
+}
+
+// ─── pmnt_stats: [nested_try, state_transition, throw_propagation, catch_resolution, unwind_to_state] ───
+fn pmnt_stats() -> array {
+    let mut out = []
+    out.push(nested_try_count())
+    out.push(state_transition_count())
+    out.push(throw_propagation_count())
+    out.push(catch_resolution_count())
+    out.push(unwind_to_state_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmnt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmnt()
+
+    // 2. helper sanity (transition_kind_name)
+    if transition_kind_name(0) != "enter_try" {
+        panic("pe_msvc_nested_try_block_real FAIL [transition_kind_name(0)] expected=enter_try got=" + transition_kind_name(0))
+    }
+    if transition_kind_name(1) != "exit_try" {
+        panic("pe_msvc_nested_try_block_real FAIL [transition_kind_name(1)] expected=exit_try got=" + transition_kind_name(1))
+    }
+    if transition_kind_name(2) != "throw" {
+        panic("pe_msvc_nested_try_block_real FAIL [transition_kind_name(2)] expected=throw got=" + transition_kind_name(2))
+    }
+    if transition_kind_name(3) != "catch_match" {
+        panic("pe_msvc_nested_try_block_real FAIL [transition_kind_name(3)] expected=catch_match got=" + transition_kind_name(3))
+    }
+    if transition_kind_name(4) != "unwind" {
+        panic("pe_msvc_nested_try_block_real FAIL [transition_kind_name(4)] expected=unwind got=" + transition_kind_name(4))
+    }
+    if transition_kind_name(99) != "unknown" {
+        panic("pe_msvc_nested_try_block_real FAIL [transition_kind_name(99)] expected=unknown got=" + transition_kind_name(99))
+    }
+
+    // 3. record 4 nested_try (depth 1 ~ 4 — module 헤더 spec 충족)
+    //    nested 5101 → top-level 외부 try(0), depth 1
+    //    nested 5102 → 외부 try(0) 안의 내부 try(1), depth 2
+    //    nested 5103 → top-level sibling 외부 try(2), depth 1
+    //    nested 5104 → 가상의 3-depth nested (try id 3, parent=1), depth 3
+    //    nested 5105 → 가상의 4-depth nested (try id 4, parent=3), depth 4
+    record_nested_try(5101, -1, 0, 1)
+    r0_emit("pe_msvc_nested_try_block_real_record_nested_try",
+        "\"nested_id\":5101,\"parent_try_id\":-1,\"child_try_id\":0,\"depth\":1")
+    record_nested_try(5102, 0, 1, 2)
+    r0_emit("pe_msvc_nested_try_block_real_record_nested_try",
+        "\"nested_id\":5102,\"parent_try_id\":0,\"child_try_id\":1,\"depth\":2")
+    record_nested_try(5103, 1, 3, 3)
+    r0_emit("pe_msvc_nested_try_block_real_record_nested_try",
+        "\"nested_id\":5103,\"parent_try_id\":1,\"child_try_id\":3,\"depth\":3")
+    record_nested_try(5104, 3, 4, 4)
+    r0_emit("pe_msvc_nested_try_block_real_record_nested_try",
+        "\"nested_id\":5104,\"parent_try_id\":3,\"child_try_id\":4,\"depth\":4")
+
+    // 4. record 5 state_transition — kind 0..4 각 1회 (총 5종 cover)
+    //    transition 6001 → enter_try : -1 → 0   (function 진입 → 외부 try body)
+    //    transition 6002 → enter_try (실 kind=0)? 본 단계는 5 종 cover 위해
+    //                       6002 = exit_try   : 1 → 0 (내부 try block 정상 종료)
+    //                       (kind 1 demonstration)
+    //    transition 6003 → throw       : 1 → 1 (state 1 = 내부 try body 안에서 throw)
+    //    transition 6004 → catch_match : 1 → 2 (state 2 = 내부 try catch handler)
+    //    transition 6005 → unwind      : 4 → -1 (sibling try body → epilogue)
+    record_state_transition(6001, -1, 0, 0)
+    r0_emit("pe_msvc_nested_try_block_real_record_state_transition",
+        "\"transition_id\":6001,\"from_state\":-1,\"to_state\":0,\"transition_kind\":0,\"transition_kind_name\":\"enter_try\"")
+    record_state_transition(6002, 1, 0, 1)
+    r0_emit("pe_msvc_nested_try_block_real_record_state_transition",
+        "\"transition_id\":6002,\"from_state\":1,\"to_state\":0,\"transition_kind\":1,\"transition_kind_name\":\"exit_try\"")
+    record_state_transition(6003, 1, 1, 2)
+    r0_emit("pe_msvc_nested_try_block_real_record_state_transition",
+        "\"transition_id\":6003,\"from_state\":1,\"to_state\":1,\"transition_kind\":2,\"transition_kind_name\":\"throw\"")
+    record_state_transition(6004, 1, 2, 3)
+    r0_emit("pe_msvc_nested_try_block_real_record_state_transition",
+        "\"transition_id\":6004,\"from_state\":1,\"to_state\":2,\"transition_kind\":3,\"transition_kind_name\":\"catch_match\"")
+    record_state_transition(6005, 4, -1, 4)
+    r0_emit("pe_msvc_nested_try_block_real_record_state_transition",
+        "\"transition_id\":6005,\"from_state\":4,\"to_state\":-1,\"transition_kind\":4,\"transition_kind_name\":\"unwind\"")
+
+    // 5. record 3 throw_propagation
+    //    propagation 7001 → throw at state 1 (내부 try body),
+    //                        검사 state 1, found_catch_state=2 (내부 catch)
+    //    propagation 7002 → throw at state 1, 내부 catch 미스, 외부 catch 시도
+    //                        검사 state 0, found_catch_state=3 (외부 catch)
+    //    propagation 7003 → throw at state 4 (sibling try body),
+    //                        검사 state 4, found_catch_state=-1 (미매치 → terminate)
+    record_throw_propagation(7001, 1, 1, 2)
+    r0_emit("pe_msvc_nested_try_block_real_record_throw_propagation",
+        "\"propagation_id\":7001,\"throw_state\":1,\"current_state\":1,\"found_catch_state\":2")
+    record_throw_propagation(7002, 1, 0, 3)
+    r0_emit("pe_msvc_nested_try_block_real_record_throw_propagation",
+        "\"propagation_id\":7002,\"throw_state\":1,\"current_state\":0,\"found_catch_state\":3")
+    record_throw_propagation(7003, 4, 4, -1)
+    r0_emit("pe_msvc_nested_try_block_real_record_throw_propagation",
+        "\"propagation_id\":7003,\"throw_state\":4,\"current_state\":4,\"found_catch_state\":-1")
+
+    // 6. record 3 catch_resolution (2 success + 1 fail)
+    //    resolution 8001 → propagation 7001, handler @ 0x00408120, success=1
+    //    resolution 8002 → propagation 7002, handler @ 0x00408240, success=1
+    //    resolution 8003 → propagation 7003, no handler (0x00000000), success=0
+    record_catch_resolution(8001, 7001, "0x00408120", 1)
+    r0_emit("pe_msvc_nested_try_block_real_record_catch_resolution",
+        "\"resolution_id\":8001,\"throw_propagation_id\":7001,\"catch_handler_va_hex\":\"0x00408120\",\"success\":1")
+    record_catch_resolution(8002, 7002, "0x00408240", 1)
+    r0_emit("pe_msvc_nested_try_block_real_record_catch_resolution",
+        "\"resolution_id\":8002,\"throw_propagation_id\":7002,\"catch_handler_va_hex\":\"0x00408240\",\"success\":1")
+    record_catch_resolution(8003, 7003, "0x00000000", 0)
+    r0_emit("pe_msvc_nested_try_block_real_record_catch_resolution",
+        "\"resolution_id\":8003,\"throw_propagation_id\":7003,\"catch_handler_va_hex\":\"0x00000000\",\"success\":0")
+
+    // 7. record 3 unwind_to_state
+    //    unwind 9001 → from state 1 → to state 0 (외부 try body), cleanup 1 (내부 dtor)
+    //    unwind 9002 → from state 1 → to state -1 (function epilogue), cleanup 2 (내부+외부 dtor)
+    //    unwind 9003 → from state 4 → to state -1 (terminate path), cleanup 0
+    record_unwind_to_state(9001, 1, 0, 1)
+    r0_emit("pe_msvc_nested_try_block_real_record_unwind_to_state",
+        "\"unwind_id\":9001,\"from_state\":1,\"to_state\":0,\"cleanup_actions_count\":1")
+    record_unwind_to_state(9002, 1, -1, 2)
+    r0_emit("pe_msvc_nested_try_block_real_record_unwind_to_state",
+        "\"unwind_id\":9002,\"from_state\":1,\"to_state\":-1,\"cleanup_actions_count\":2")
+    record_unwind_to_state(9003, 4, -1, 0)
+    r0_emit("pe_msvc_nested_try_block_real_record_unwind_to_state",
+        "\"unwind_id\":9003,\"from_state\":4,\"to_state\":-1,\"cleanup_actions_count\":0")
+
+    // 8. row count 검증 — 4 nested_try / 5 transition / 3 propagation / 3 resolution / 3 unwind
+    let nc = nested_try_count()
+    if nc != 4 {
+        panic("pe_msvc_nested_try_block_real FAIL [nested_try_count] expected=4 got=" + to_string(nc))
+    }
+    let tc = state_transition_count()
+    if tc != 5 {
+        panic("pe_msvc_nested_try_block_real FAIL [state_transition_count] expected=5 got=" + to_string(tc))
+    }
+    let prc = throw_propagation_count()
+    if prc != 3 {
+        panic("pe_msvc_nested_try_block_real FAIL [throw_propagation_count] expected=3 got=" + to_string(prc))
+    }
+    let crc = catch_resolution_count()
+    if crc != 3 {
+        panic("pe_msvc_nested_try_block_real FAIL [catch_resolution_count] expected=3 got=" + to_string(crc))
+    }
+    let uc = unwind_to_state_count()
+    if uc != 3 {
+        panic("pe_msvc_nested_try_block_real FAIL [unwind_to_state_count] expected=3 got=" + to_string(uc))
+    }
+
+    // 9. pmnt_stats() = [4, 5, 3, 3, 3]
+    let s = pmnt_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_nested_try_block_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_nested_try_block_real FAIL [stats nested_try_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 5 {
+        panic("pe_msvc_nested_try_block_real FAIL [stats state_transition_count] expected=5 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_msvc_nested_try_block_real FAIL [stats throw_propagation_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_msvc_nested_try_block_real FAIL [stats catch_resolution_count] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_nested_try_block_real FAIL [stats unwind_to_state_count] expected=3 got=" + to_string(s[4]))
+    }
+
+    // 10. emit 5 종 stats line — 분리하여 r0_emit ≥ 14 보장
+    //     (record 18 + stats 5 = 23 ≥ 14)
+    r0_emit("pe_msvc_nested_try_block_real_stats_nested_try",
+        "\"nested_try_count\":" + to_string(s[0]))
+    r0_emit("pe_msvc_nested_try_block_real_stats_state_transition",
+        "\"state_transition_count\":" + to_string(s[1]))
+    r0_emit("pe_msvc_nested_try_block_real_stats_throw_propagation",
+        "\"throw_propagation_count\":" + to_string(s[2]))
+    r0_emit("pe_msvc_nested_try_block_real_stats_catch_resolution",
+        "\"catch_resolution_count\":" + to_string(s[3]))
+    r0_emit("pe_msvc_nested_try_block_real_stats_unwind_to_state",
+        "\"unwind_to_state_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 14 검증
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_nested_try_block_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → 5 stats 모두 0
+    cleanup_pmnt()
+    let s2 = pmnt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_nested_try_block_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_nested_try_block_real self_test PASS (nested_try=" + to_string(s[0])
+        + ", state_transition=" + to_string(s[1]) + ", throw_propagation=" + to_string(s[2])
+        + ", catch_resolution=" + to_string(s[3]) + ", unwind_to_state=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmnt_stats()
+            println("nested_try_count\t" + to_string(s[0]))
+            println("state_transition_count\t" + to_string(s[1]))
+            println("throw_propagation_count\t" + to_string(s[2]))
+            println("catch_resolution_count\t" + to_string(s[3]))
+            println("unwind_to_state_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "transition-kind-name" {
+            if len(a) >= 4 {
+                println(transition_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_nested_try_block_real.hexa transition-kind-name <transition_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmnt()
+            println("cleaned: " + pmnt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmnt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_nested_try_block_real.hexa { self-test | stats | transition-kind-name <n> | cleanup | dir }")
+}

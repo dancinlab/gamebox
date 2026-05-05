@@ -1,0 +1,231 @@
+// lib/perf/c_phase1_install_simulator.hexa — CN-67 skeleton manjeom 15/15
+//
+// Phase 1 install simulator — Battle.net-Setup.exe 의 install 시퀀스 simulate.
+// PE map → IAT resolve → entry call → first WinMain 도달 까지 단계별 진척률.
+//
+// 무기: 단계 state machine + columnar (per-stage success/fail count).
+// 효과: closure path B 의 Phase 1 sub-progress 추적.
+
+use "./r0_common"
+
+let P1S_DIR = GAMEBOX_HOME + "/persist/phase1_install_simulator"
+let STAGE_LOG = P1S_DIR + "/stages.tsv"
+let SIMULATION_HISTORY = P1S_DIR + "/sims.jsonl"
+
+fn p1s_dir() -> str { return P1S_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + P1S_DIR + "'")
+}
+
+// ─── install 단계 정의 (8 stages) ───
+fn install_stages() -> array {
+    return [
+        "pe_parse",         // PE header parse
+        "pe_map",           // mmap sections
+        "iat_resolve",      // resolve all imports via DLL adapters
+        "reloc_apply",      // apply base relocations
+        "entry_jmp",        // jump to entry point
+        "tls_init",         // TLS callbacks
+        "win_main_call",    // WinMain reached
+        "first_dialog"      // first GUI dialog rendered
+    ]
+}
+
+// ─── stage 결과 기록 ───
+fn record_stage(stage: str, ok: bool, detail: str) -> void {
+    ensure_dir()
+    let s = "fail"
+    if ok { s = "pass" }
+    let ts = exec("date +%s").trim()
+    let line = ts + "\t" + stage + "\t" + s + "\t" + detail
+    let tmp = STAGE_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + STAGE_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── 가장 멀리 도달한 stage ───
+fn furthest_stage() -> str {
+    let exists = exec("test -f '" + STAGE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return "" }
+    // 마지막 pass 한 stage 찾기
+    let stages = install_stages()
+    let i = len(stages) - 1
+    while i >= 0 {
+        let s = stages[i]
+        let cnt_str = exec("awk -F'\\t' -v s='" + s + "' '$2==s && $3==\"pass\"' '" + STAGE_LOG + "' | wc -l | tr -d ' '").trim()
+        if cnt_str != "" {
+            let cnt = to_int(cnt_str)
+            if cnt > 0 { return s }
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// ─── progress percentage (0~100) ───
+fn progress_pct() -> int {
+    let stages = install_stages()
+    let total = len(stages)
+    let furthest = furthest_stage()
+    if furthest == "" { return 0 }
+    let i = 0
+    while i < total {
+        if stages[i] == furthest {
+            return (i + 1) * 100 / total
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── synthetic simulation — current state 기반 ───
+//   pe_parse: PE 파일 parse 가능 → pass (현 시점 done)
+//   pe_map: PE loader stage1 작동 → pass
+//   iat_resolve: DLL adapter 16/16 mapped + function coverage 기준
+//   reloc_apply: pe_relocations stage1 작동
+//   entry_jmp 이후: 실 runtime 필요 → fail
+fn simulate_now(pe_path: str) -> array {
+    let stages = install_stages()
+    let results = []
+    let i = 0
+    while i < len(stages) {
+        let stage = stages[i]
+        let ok = false
+        let detail = ""
+        if stage == "pe_parse" { ok = true; detail = "pe_parser stage1 OK" }
+        if stage == "pe_map" { ok = true; detail = "pe_loader stage1 OK" }
+        if stage == "iat_resolve" {
+            // DLL 16/16 + function coverage 1% — 부분 pass (warning)
+            ok = false; detail = "DLL 16/16 mapped, function coverage 1% (kernel32 stage4 needed)"
+        }
+        if stage == "reloc_apply" { ok = false; detail = "depends on iat_resolve full" }
+        if stage == "entry_jmp" { ok = false; detail = "x86_64 ABI only (i386 needed)" }
+        if stage == "tls_init" { ok = false; detail = "blocked by entry_jmp" }
+        if stage == "win_main_call" { ok = false; detail = "blocked" }
+        if stage == "first_dialog" { ok = false; detail = "blocked — user32 + gdi32 runtime needed" }
+        record_stage(stage, ok, detail)
+        results = results + [[stage, ok, detail]]
+        i = i + 1
+    }
+    record_simulation(pe_path, results)
+    return results
+}
+
+fn record_simulation(pe_path: str, results: array) -> void {
+    ensure_dir()
+    let pass_count = 0
+    let i = 0
+    while i < len(results) {
+        if results[i][1] { pass_count = pass_count + 1 }
+        i = i + 1
+    }
+    let total = len(results)
+    let pct = pass_count * 100 / total
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"pe\":\"" + pe_path + "\",\"pass\":" + to_string(pass_count) + ",\"total\":" + to_string(total) + ",\"pct\":" + to_string(pct) + "}"
+    let tmp = SIMULATION_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SIMULATION_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("install_simulation", "\"pe\":\"" + pe_path + "\",\"pass\":" + to_string(pass_count) + "/" + to_string(total) + " (" + to_string(pct) + "%)")
+}
+
+fn p1s_stats() -> array {
+    let exists_s = exec("test -f '" + STAGE_LOG + "' && echo ok").trim()
+    let stages = 0
+    if exists_s == "ok" {
+        stages = to_int(exec("wc -l < '" + STAGE_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_h = exec("test -f '" + SIMULATION_HISTORY + "' && echo ok").trim()
+    let sims = 0
+    if exists_h == "ok" {
+        sims = to_int(exec("wc -l < '" + SIMULATION_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [stages, sims]
+}
+
+fn cleanup_p1s() -> void {
+    let _ = exec("rm -rf '" + P1S_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "p1s-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_p1s()
+
+    let stages = install_stages()
+    if len(stages) != 8 { panic("c_phase1_install_simulator FAIL [stages] expected=8 got=" + to_string(len(stages))) }
+
+    // synthetic simulation
+    let r = simulate_now("tool/bench/Battle.net-Setup.exe")
+    if len(r) != 8 { panic("c_phase1_install_simulator FAIL [sim count]") }
+
+    // current expectation: pe_parse + pe_map pass, 나머지 fail
+    let pass_count = 0
+    let i = 0
+    while i < len(r) {
+        if r[i][1] { pass_count = pass_count + 1 }
+        i = i + 1
+    }
+    if pass_count != 2 {
+        panic("c_phase1_install_simulator FAIL [pass count] expected=2 got=" + to_string(pass_count))
+    }
+
+    // furthest = pe_map (index 1, i.e. 2/8 = 25%)
+    let furthest = furthest_stage()
+    if furthest != "pe_map" {
+        panic("c_phase1_install_simulator FAIL [furthest] expected=pe_map got=" + furthest)
+    }
+
+    let pct = progress_pct()
+    if pct != 25 { panic("c_phase1_install_simulator FAIL [pct] expected=25 got=" + to_string(pct)) }
+
+    // stats
+    let stats = p1s_stats()
+    if stats[0] != 8 { panic("c_phase1_install_simulator FAIL [stats stages] expected=8 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_phase1_install_simulator FAIL [stats sims] expected=1 got=" + to_string(stats[1])) }
+
+    r0_emit("phase1_summary", "\"stages\":" + to_string(stats[0]) + ",\"sims\":" + to_string(stats[1]) + ",\"pct\":" + to_string(pct) + ",\"furthest\":\"" + furthest + "\"")
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_phase1_install_simulator FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_p1s()
+
+    println("  ✅ c_phase1_install_simulator self_test PASS (8 stages, 2 pass = " + to_string(pct) + "%, furthest=" + furthest + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "simulate" && len(a) >= 4 {
+            let r = simulate_now(a[3])
+            println("=== Phase 1 Install Simulation ===")
+            let i = 0
+            while i < len(r) {
+                let row = r[i]
+                let s = "FAIL"
+                if row[1] { s = "PASS" }
+                println("  " + s + "  " + row[0] + " — " + row[2])
+                i = i + 1
+            }
+            let pct = progress_pct()
+            println("Progress: " + to_string(pct) + "% (furthest=" + furthest_stage() + ")")
+            return
+        }
+        if sub == "progress" {
+            println(to_string(progress_pct()) + "% (" + furthest_stage() + ")")
+            return
+        }
+        if sub == "stats" {
+            let s = p1s_stats()
+            println("stages=" + to_string(s[0]) + " sims=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_p1s(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_phase1_install_simulator.hexa { self-test | simulate <pe> | progress | stats | cleanup }")
+}

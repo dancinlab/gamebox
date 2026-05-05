@@ -1,0 +1,171 @@
+// lib/perf/c_bnet_login_state_track.hexa — CN-79 skeleton manjeom 15/15
+//
+// Battle.net login state machine — Phase 2 OAuth flow.
+// 6 단계: idle → tcp_connect → tls_handshake → oauth_redirect → token_recv → authed.
+//
+// 무기: state transition + columnar (per-state elapsed_ms).
+// 효과: login slow path 진단 (어느 단계에서 가장 느린지).
+
+use "./r0_common"
+
+let BLST_DIR = GAMEBOX_HOME + "/persist/bnet_login_state"
+let LOGIN_LOG = BLST_DIR + "/transitions.tsv"
+
+fn blst_dir() -> str { return BLST_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + BLST_DIR + "'")
+}
+
+fn states() -> array {
+    return ["idle", "tcp_connect", "tls_handshake", "oauth_redirect", "token_recv", "authed"]
+}
+
+fn next_valid(from: str) -> str {
+    if from == "idle" { return "tcp_connect" }
+    if from == "tcp_connect" { return "tls_handshake" }
+    if from == "tls_handshake" { return "oauth_redirect" }
+    if from == "oauth_redirect" { return "token_recv" }
+    if from == "token_recv" { return "authed" }
+    return ""
+}
+
+fn record_step(from: str, to: str, elapsed_ms: int, ok: bool) -> void {
+    ensure_dir()
+    let valid = next_valid(from) == to
+    let s = "fail"
+    if ok { s = "pass" }
+    let v = "0"
+    if valid { v = "1" }
+    let ts = exec("date +%s").trim()
+    let line = ts + "\t" + from + "\t" + to + "\t" + to_string(elapsed_ms) + "\t" + s + "\t" + v
+    let tmp = LOGIN_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + LOGIN_LOG + "' && rm -f '" + tmp + "'")
+    if ok && valid {
+        r0_emit("bnet_login_step", "\"from\":\"" + from + "\",\"to\":\"" + to + "\",\"ms\":" + to_string(elapsed_ms))
+    } else {
+        r0_emit("bnet_login_blocked", "\"from\":\"" + from + "\",\"to\":\"" + to + "\"")
+    }
+}
+
+fn furthest_state() -> str {
+    let exists = exec("test -f '" + LOGIN_LOG + "' && echo ok").trim()
+    if exists != "ok" { return "" }
+    let s = states()
+    let i = len(s) - 1
+    while i >= 0 {
+        let cnt = exec("awk -F'\\t' -v t='" + s[i] + "' '$3==t && $5==\"pass\"' '" + LOGIN_LOG + "' | wc -l | tr -d ' '").trim()
+        if cnt != "" && to_int(cnt) > 0 { return s[i] }
+        i = i - 1
+    }
+    return "idle"
+}
+
+fn slowest_step() -> str {
+    let exists = exec("test -f '" + LOGIN_LOG + "' && echo ok").trim()
+    if exists != "ok" { return "" }
+    let r = exec("awk -F'\\t' '$5==\"pass\"{if($4>m){m=$4; n=$2\"->\"$3}} END{print n}' '" + LOGIN_LOG + "'").trim()
+    return r
+}
+
+fn cleanup_blst() -> void {
+    let _ = exec("rm -rf '" + BLST_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "blst-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_blst()
+
+    let s = states()
+    if len(s) != 6 { panic("c_bnet_login_state_track FAIL [states] expected=6 got=" + to_string(len(s))) }
+
+    if next_valid("tls_handshake") != "oauth_redirect" {
+        panic("c_bnet_login_state_track FAIL [next_valid]")
+    }
+
+    record_step("idle", "tcp_connect", 50, true)
+    record_step("tcp_connect", "tls_handshake", 200, true)
+    record_step("tls_handshake", "oauth_redirect", 800, true)
+    record_step("oauth_redirect", "token_recv", 1500, true)   // slowest
+    record_step("token_recv", "authed", 100, true)
+
+    let f = furthest_state()
+    if f != "authed" { panic("c_bnet_login_state_track FAIL [furthest] got=" + f) }
+
+    let sl = slowest_step()
+    if sl != "oauth_redirect->token_recv" { panic("c_bnet_login_state_track FAIL [slowest] got=" + sl) }
+
+    // invalid transition
+    record_step("idle", "authed", 10, false)
+
+    r0_emit("bnet_login_summary", "\"furthest\":\"" + f + "\",\"slowest\":\"" + sl + "\"")
+
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_bnet_login_state_track FAIL [emit] got=" + to_string(cnt)) }
+
+    // ─── synthetic login state machine round-trip (Track-N cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track-N mission: battlenet cond.3 (OAuth 2-leg + login state track live)
+    // 측 evidence augment. cond.3 status `partial` 영구 유지 — 실 us.battle.net OAuth2
+    // endpoint + 실 token validate round-trip 측 production smoke gate transitive
+    // (network-dependent, blk.1 + Track-K Win32 syscall perfection long-horizon 정합).
+    //
+    // synthetic login state machine: PRE_AUTH → OAUTH_REQUEST → TOKEN_VALIDATE
+    // → SESSION_ACTIVE → TOKEN_EXPIRY 5 transition. hexa-native loop only —
+    // 실 OAuth2 endpoint 0, TLS handshake 0, token signing key 0, session cookie 0.
+    // payload = session_id + oauth_step_kind + token_lifetime_simulated_sec.
+    // round-trip emit = `__BNET_LOGIN__ PARTIAL <state>` per row.
+    //
+    // own1: Wine 0 / OAuth credential bypass 0 / token spoof 0.
+    // own2: PARTIAL emit explicit (NOT PASS — production smoke deferred).
+    let session_id = "sid-synth-" + exec("date +%s").trim()
+
+    println("__BNET_LOGIN__ PARTIAL PRE_AUTH")
+    r0_emit("c_bnet_login_state_synthetic_state",
+        "\"stage\":\"login_state_machine\",\"session_id\":\"" + session_id + "\",\"oauth_step_kind\":\"PRE_AUTH\",\"token_lifetime_simulated_sec\":0,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"permanent_until_real_network — blk.1 transitive\"")
+
+    println("__BNET_LOGIN__ PARTIAL OAUTH_REQUEST")
+    r0_emit("c_bnet_login_state_synthetic_state",
+        "\"stage\":\"login_state_machine\",\"session_id\":\"" + session_id + "\",\"oauth_step_kind\":\"OAUTH_REQUEST\",\"token_lifetime_simulated_sec\":0,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__BNET_LOGIN__ PARTIAL TOKEN_VALIDATE")
+    r0_emit("c_bnet_login_state_synthetic_state",
+        "\"stage\":\"login_state_machine\",\"session_id\":\"" + session_id + "\",\"oauth_step_kind\":\"TOKEN_VALIDATE\",\"token_lifetime_simulated_sec\":3600,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__BNET_LOGIN__ PARTIAL SESSION_ACTIVE")
+    r0_emit("c_bnet_login_state_synthetic_state",
+        "\"stage\":\"login_state_machine\",\"session_id\":\"" + session_id + "\",\"oauth_step_kind\":\"SESSION_ACTIVE\",\"token_lifetime_simulated_sec\":3600,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__BNET_LOGIN__ PARTIAL TOKEN_EXPIRY")
+    r0_emit("c_bnet_login_state_synthetic_state",
+        "\"stage\":\"login_state_machine\",\"session_id\":\"" + session_id + "\",\"oauth_step_kind\":\"TOKEN_EXPIRY\",\"token_lifetime_simulated_sec\":0,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    r0_emit("c_bnet_login_state_synthetic_round_trip_matrix",
+        "\"states_total\":5,\"states_partial\":5,\"states_pass\":0,\"session_id\":\"" + session_id + "\",\"transport_kind\":\"synthetic_inline\",\"network\":\"none\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"track\":\"N2\",\"lockin_iso\":\"2026-05-03\"")
+
+    cleanup_blst()
+
+    println("  ✅ c_bnet_login_state_track self_test PASS (6 states, furthest=authed, slowest=" + sl + ", +5 synthetic state PARTIAL transitions, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "step" && len(a) >= 6 {
+            record_step(a[3], a[4], to_int(a[5]), true)
+            println("recorded")
+            return
+        }
+        if sub == "stats" {
+            println("furthest=" + furthest_state() + " slowest=" + slowest_step())
+            return
+        }
+        if sub == "cleanup" { cleanup_blst(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_bnet_login_state_track.hexa { self-test | step <from> <to> <ms> | stats | cleanup }")
+}

@@ -1,0 +1,381 @@
+// lib/loader/pe_registry_transactional.hexa — cycle 72 Win32 transactional registry telemetry
+//
+// Win32 transactional registry — CreateRegistryTransaction / RegCreateKeyTransacted
+// / CommitTransaction / RollbackTransaction. txn 단위로 outcome + 영향받은 key 수
+// + elevated 권한 여부를 추적.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 transactional registry tracker — 실 KTM API 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// outcome_kind code:
+//   1 = committed
+//   2 = rolled_back
+//   3 = in_progress
+//   4 = aborted
+//
+// elevated:
+//   0 = standard token
+//   1 = elevated (admin) token
+//
+// persist schema (TSV — txns.tsv):
+//   txn_id<int> \t outcome_kind<int> \t keys_modified<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn prt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_registry_transactional"
+}
+
+fn prt_txns_path() -> str {
+    return prt_dir() + "/txns.tsv"
+}
+
+fn prt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + prt_dir() + "'")
+}
+
+fn cleanup_prt() -> void {
+    prt_ensure_dir()
+    let _ = exec("rm -f '" + prt_txns_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prt_append_row(path: str, row: str) -> void {
+    prt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_txn: txn 1 건 기록 ───
+fn record_txn(txn_id: int, outcome_kind: int, keys_modified: int, elevated: int) -> void {
+    if txn_id <= 0 {
+        panic("pe_registry_transactional FAIL [record_txn] expected=txn_id>0 got=" + to_string(txn_id))
+    }
+    if outcome_kind < 1 {
+        panic("pe_registry_transactional FAIL [record_txn] expected=outcome_kind>=1 got=" + to_string(outcome_kind))
+    }
+    if outcome_kind > 4 {
+        panic("pe_registry_transactional FAIL [record_txn] expected=outcome_kind<=4 got=" + to_string(outcome_kind))
+    }
+    if keys_modified < 0 {
+        panic("pe_registry_transactional FAIL [record_txn] expected=keys_modified>=0 got=" + to_string(keys_modified))
+    }
+    if elevated < 0 {
+        panic("pe_registry_transactional FAIL [record_txn] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_registry_transactional FAIL [record_txn] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(txn_id) + "\t" + to_string(outcome_kind)
+        + "\t" + to_string(keys_modified) + "\t" + to_string(elevated) + "\n"
+    prt_append_row(prt_txns_path(), row)
+}
+
+// ─── txn_count: total txn 수 ───
+fn txn_count() -> int {
+    let t = prt_read_table(prt_txns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_keys_modified: 모든 txn keys_modified 합 ───
+fn total_keys_modified() -> int {
+    let t = prt_read_table(prt_txns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_outcome: 특정 outcome_kind 의 txn 수 ───
+fn count_by_outcome(kind: int) -> int {
+    let t = prt_read_table(prt_txns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── committed_count: outcome_kind=1 인 txn 수 ───
+fn committed_count() -> int {
+    return count_by_outcome(1)
+}
+
+// ─── rolled_back_count: outcome_kind=2 인 txn 수 ───
+fn rolled_back_count() -> int {
+    return count_by_outcome(2)
+}
+
+// ─── txn_keys: 특정 txn_id 의 keys_modified (없으면 0) ───
+fn txn_keys(txn_id: int) -> int {
+    let t = prt_read_table(prt_txns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == txn_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── prt_stats: [txn_count, total_keys_modified, committed_count, rolled_back_count] ───
+fn prt_stats() -> array {
+    let mut out = []
+    out.push(txn_count())
+    out.push(total_keys_modified())
+    out.push(committed_count())
+    out.push(rolled_back_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "prt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prt()
+
+    // 2. record 5 txns spanning 4 outcome_kinds (1,2,3,4) + mixed elevated
+    record_txn(720001, 1, 4, 0)
+    r0_emit("pe_registry_transactional_record",
+        "\"txn_id\":720001,\"outcome_kind\":1,\"keys_modified\":4,\"elevated\":0,\"target\":\"committed\"")
+
+    record_txn(720002, 1, 6, 1)
+    r0_emit("pe_registry_transactional_record",
+        "\"txn_id\":720002,\"outcome_kind\":1,\"keys_modified\":6,\"elevated\":1,\"target\":\"committed\"")
+
+    record_txn(720003, 2, 3, 0)
+    r0_emit("pe_registry_transactional_record",
+        "\"txn_id\":720003,\"outcome_kind\":2,\"keys_modified\":3,\"elevated\":0,\"target\":\"rolled_back\"")
+
+    record_txn(720004, 3, 2, 1)
+    r0_emit("pe_registry_transactional_record",
+        "\"txn_id\":720004,\"outcome_kind\":3,\"keys_modified\":2,\"elevated\":1,\"target\":\"in_progress\"")
+
+    record_txn(720005, 4, 1, 0)
+    r0_emit("pe_registry_transactional_record",
+        "\"txn_id\":720005,\"outcome_kind\":4,\"keys_modified\":1,\"elevated\":0,\"target\":\"aborted\"")
+
+    // 3. txn_count = 5
+    let c = txn_count()
+    if c != 5 {
+        panic("pe_registry_transactional FAIL [txn_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_keys_modified = 16
+    let tk = total_keys_modified()
+    if tk != 16 {
+        panic("pe_registry_transactional FAIL [total_keys_modified] expected=16 got=" + to_string(tk))
+    }
+
+    // 5. count_by_outcome sanity
+    let o1 = count_by_outcome(1)
+    if o1 != 2 {
+        panic("pe_registry_transactional FAIL [count_by_outcome(1)] expected=2 got=" + to_string(o1))
+    }
+    let o2 = count_by_outcome(2)
+    if o2 != 1 {
+        panic("pe_registry_transactional FAIL [count_by_outcome(2)] expected=1 got=" + to_string(o2))
+    }
+    let o3 = count_by_outcome(3)
+    if o3 != 1 {
+        panic("pe_registry_transactional FAIL [count_by_outcome(3)] expected=1 got=" + to_string(o3))
+    }
+    let o4 = count_by_outcome(4)
+    if o4 != 1 {
+        panic("pe_registry_transactional FAIL [count_by_outcome(4)] expected=1 got=" + to_string(o4))
+    }
+    let o99 = count_by_outcome(99)
+    if o99 != 0 {
+        panic("pe_registry_transactional FAIL [count_by_outcome(99)] expected=0 got=" + to_string(o99))
+    }
+
+    // 6. committed_count = 2, rolled_back_count = 1
+    let cc = committed_count()
+    if cc != 2 {
+        panic("pe_registry_transactional FAIL [committed_count] expected=2 got=" + to_string(cc))
+    }
+    let rb = rolled_back_count()
+    if rb != 1 {
+        panic("pe_registry_transactional FAIL [rolled_back_count] expected=1 got=" + to_string(rb))
+    }
+
+    // 7. txn_keys sanity
+    let k2 = txn_keys(720002)
+    if k2 != 6 {
+        panic("pe_registry_transactional FAIL [txn_keys(720002)] expected=6 got=" + to_string(k2))
+    }
+    let k3 = txn_keys(720003)
+    if k3 != 3 {
+        panic("pe_registry_transactional FAIL [txn_keys(720003)] expected=3 got=" + to_string(k3))
+    }
+    let k_miss = txn_keys(9999)
+    if k_miss != 0 {
+        panic("pe_registry_transactional FAIL [txn_keys(9999)] expected=0 got=" + to_string(k_miss))
+    }
+
+    // 8. prt_stats() = [5, 16, 2, 1]
+    let s = prt_stats()
+    if len(s) != 4 {
+        panic("pe_registry_transactional FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_registry_transactional FAIL [stats txn_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 16 {
+        panic("pe_registry_transactional FAIL [stats total_keys_modified] expected=16 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_registry_transactional FAIL [stats committed_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_registry_transactional FAIL [stats rolled_back_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_registry_transactional_stats",
+        "\"txn_count\":" + to_string(s[0])
+        + ",\"total_keys_modified\":" + to_string(s[1])
+        + ",\"committed_count\":" + to_string(s[2])
+        + ",\"rolled_back_count\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_registry_transactional FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_prt()
+    let s2 = prt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_registry_transactional FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_registry_transactional self_test PASS (txns=" + to_string(s[0])
+        + ", keys=" + to_string(s[1]) + ", committed=" + to_string(s[2])
+        + ", rolled_back=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prt_stats()
+            println("txn_count\t" + to_string(s[0]))
+            println("total_keys_modified\t" + to_string(s[1]))
+            println("committed_count\t" + to_string(s[2]))
+            println("rolled_back_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "keys" {
+            if len(a) >= 4 {
+                let tid = to_int(a[3])
+                println("txn_keys\t" + to_string(txn_keys(tid)))
+                return
+            }
+            println("usage: hexa run pe_registry_transactional.hexa keys <txn_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_outcome\t" + to_string(count_by_outcome(kind)))
+                return
+            }
+            println("usage: hexa run pe_registry_transactional.hexa count <outcome_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_prt()
+            println("cleaned: " + prt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(prt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_registry_transactional.hexa { self-test | stats | keys <txn_id> | count <outcome_kind> | cleanup | dir }")
+}

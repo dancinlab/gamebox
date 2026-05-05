@@ -1,0 +1,415 @@
+// lib/loader/pe_ntdll_nt_query_info_proc_real.hexa — cycle 83 NtQuery/SetInformationProcess tracker
+//
+// NtQueryInformationProcess (anti-debug 표적):
+//   ProcessDebugPort (7)        → kp_proc.p_flag & P_TRACED 검사 → fake null
+//   ProcessDebugObjectHandle (26) → fake null (no debug object)
+//   ProcessDebugFlags (31)      → 1 (NotDebugged)
+//   ProcessBasicInformation (0) → PROCESS_BASIC_INFORMATION { ExitStatus, PebBaseAddress, ... }
+//     → PEB synthesize (cycle 69 pe_peb_struct cross-ref)
+//   D2R/D4/anti-cheat 의 anti-debug 1차 path
+// own1: NTDLL spec + Apple kp_proc/sysctl. Wine ntdll/process.c 인용 X
+//
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// info_class code (Windows NTDLL spec):
+//   0  = ProcessBasicInformation
+//   7  = ProcessDebugPort        (anti-debug)
+//   26 = ProcessDebugObjectHandle (anti-debug)
+//   30 = ProcessHandleCount
+//   31 = ProcessDebugFlags       (anti-debug)
+//
+// nt_status code:
+//   0          = STATUS_SUCCESS
+//   != 0       = error (e.g. STATUS_PORT_NOT_SET = 0xC0000353)
+//
+// persist schema (TSV — queries.tsv):
+//   query_id<int> \t info_class<int> \t nt_status<int> \t data_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnqipr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_nt_query_info_proc_real"
+}
+
+fn pnqipr_queries_path() -> str {
+    return pnqipr_dir() + "/queries.tsv"
+}
+
+fn pnqipr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnqipr_dir() + "'")
+}
+
+fn cleanup_pnqipr() -> void {
+    pnqipr_ensure_dir()
+    let _ = exec("rm -f '" + pnqipr_queries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnqipr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnqipr_append_row(path: str, row: str) -> void {
+    pnqipr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_query: NtQueryInformationProcess 1 건 기록 ───
+fn record_query(query_id: int, info_class: int, nt_status: int, data_size_bytes: int) -> void {
+    if query_id <= 0 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [record_query] expected=query_id>0 got=" + to_string(query_id))
+    }
+    if info_class < 0 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [record_query] expected=info_class>=0 got=" + to_string(info_class))
+    }
+    if nt_status < 0 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [record_query] expected=nt_status>=0 got=" + to_string(nt_status))
+    }
+    if data_size_bytes < 0 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [record_query] expected=data_size_bytes>=0 got=" + to_string(data_size_bytes))
+    }
+    let row = to_string(query_id) + "\t" + to_string(info_class)
+        + "\t" + to_string(nt_status) + "\t" + to_string(data_size_bytes) + "\n"
+    pnqipr_append_row(pnqipr_queries_path(), row)
+}
+
+// ─── query_count: total query 수 ───
+fn query_count() -> int {
+    let t = pnqipr_read_table(pnqipr_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_info_class: 특정 info_class 의 query 수 ───
+fn count_by_info_class(info_class: int) -> int {
+    let t = pnqipr_read_table(pnqipr_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == info_class {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: nt_status=0 인 query 수 ───
+fn success_count() -> int {
+    let t = pnqipr_read_table(pnqipr_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_data_bytes: 모든 query data_size_bytes 합 ───
+fn total_data_bytes() -> int {
+    let t = pnqipr_read_table(pnqipr_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── debug_query_count: anti-debug 표적 info_class 합 ───
+//   ProcessDebugPort (7) + ProcessDebugObjectHandle (26) + ProcessDebugFlags (31)
+fn debug_query_count() -> int {
+    return count_by_info_class(7) + count_by_info_class(26) + count_by_info_class(31)
+}
+
+// ─── query_data_size: 특정 query_id 의 data_size_bytes (없으면 0) ───
+fn query_data_size(query_id: int) -> int {
+    let t = pnqipr_read_table(pnqipr_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == query_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pnqipr_stats: [query_count, total_data_bytes, success_count, debug_query_count] ───
+fn pnqipr_stats() -> array {
+    let mut out = []
+    out.push(query_count())
+    out.push(total_data_bytes())
+    out.push(success_count())
+    out.push(debug_query_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnqipr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnqipr()
+
+    // 2. record 6 queries across ≥4 info_classes with ≥2 debug-related
+    //    ProcessBasicInformation (0)        → 48 bytes (PROCESS_BASIC_INFORMATION)
+    //    ProcessDebugPort (7)               → 8 bytes  (HANDLE = 0 fake null)
+    //    ProcessDebugObjectHandle (26)      → 8 bytes  (HANDLE = 0)
+    //    ProcessDebugFlags (31)             → 4 bytes  (ULONG = 1 NotDebugged)
+    //    ProcessHandleCount (30)            → 4 bytes  (ULONG)
+    //    ProcessBasicInformation (0) again  → 48 bytes (second call)
+    record_query(830001, 0, 0, 48)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_record",
+        "\"query_id\":830001,\"info_class\":0,\"nt_status\":0,\"data_size_bytes\":48,\"target\":\"ProcessBasicInformation\"")
+
+    record_query(830002, 7, 0, 8)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_record",
+        "\"query_id\":830002,\"info_class\":7,\"nt_status\":0,\"data_size_bytes\":8,\"target\":\"ProcessDebugPort\"")
+
+    record_query(830003, 26, 0, 8)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_record",
+        "\"query_id\":830003,\"info_class\":26,\"nt_status\":0,\"data_size_bytes\":8,\"target\":\"ProcessDebugObjectHandle\"")
+
+    record_query(830004, 31, 0, 4)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_record",
+        "\"query_id\":830004,\"info_class\":31,\"nt_status\":0,\"data_size_bytes\":4,\"target\":\"ProcessDebugFlags\"")
+
+    record_query(830005, 30, 0, 4)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_record",
+        "\"query_id\":830005,\"info_class\":30,\"nt_status\":0,\"data_size_bytes\":4,\"target\":\"ProcessHandleCount\"")
+
+    record_query(830006, 0, 0, 48)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_record",
+        "\"query_id\":830006,\"info_class\":0,\"nt_status\":0,\"data_size_bytes\":48,\"target\":\"ProcessBasicInformation\"")
+
+    // 3. query_count = 6
+    let c = query_count()
+    if c != 6 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [query_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_data_bytes = 48 + 8 + 8 + 4 + 4 + 48 = 120
+    let tb = total_data_bytes()
+    if tb != 120 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [total_data_bytes] expected=120 got=" + to_string(tb))
+    }
+
+    // 5. count_by_info_class sanity (≥4 distinct info_classes: 0, 7, 26, 30, 31)
+    let k0 = count_by_info_class(0)
+    if k0 != 2 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [count_by_info_class(0)] expected=2 got=" + to_string(k0))
+    }
+    let k7 = count_by_info_class(7)
+    if k7 != 1 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [count_by_info_class(7)] expected=1 got=" + to_string(k7))
+    }
+    let k26 = count_by_info_class(26)
+    if k26 != 1 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [count_by_info_class(26)] expected=1 got=" + to_string(k26))
+    }
+    let k30 = count_by_info_class(30)
+    if k30 != 1 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [count_by_info_class(30)] expected=1 got=" + to_string(k30))
+    }
+    let k31 = count_by_info_class(31)
+    if k31 != 1 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [count_by_info_class(31)] expected=1 got=" + to_string(k31))
+    }
+    let k99 = count_by_info_class(99)
+    if k99 != 0 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [count_by_info_class(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. success_count = 6
+    let sc = success_count()
+    if sc != 6 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [success_count] expected=6 got=" + to_string(sc))
+    }
+
+    // 7. debug_query_count = 1 + 1 + 1 = 3 (≥2 debug-related satisfied)
+    let dq = debug_query_count()
+    if dq != 3 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [debug_query_count] expected=3 got=" + to_string(dq))
+    }
+
+    // 8. query_data_size sanity
+    let d2 = query_data_size(830002)
+    if d2 != 8 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [query_data_size(830002)] expected=8 got=" + to_string(d2))
+    }
+    let d4 = query_data_size(830004)
+    if d4 != 4 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [query_data_size(830004)] expected=4 got=" + to_string(d4))
+    }
+    let d_miss = query_data_size(9999)
+    if d_miss != 0 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [query_data_size(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 9. pnqipr_stats() = [6, 120, 6, 3]
+    let s = pnqipr_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [stats query_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 120 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [stats total_data_bytes] expected=120 got=" + to_string(s[1]))
+    }
+    if s[2] != 6 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [stats success_count] expected=6 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [stats debug_query_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit minimum — 6 records + 1 stats)
+    r0_emit("pe_ntdll_nt_query_info_proc_real_stats",
+        "\"query_count\":" + to_string(s[0])
+        + ",\"total_data_bytes\":" + to_string(s[1])
+        + ",\"success_count\":" + to_string(s[2])
+        + ",\"debug_query_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_ntdll_nt_query_info_proc_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pnqipr()
+    let s2 = pnqipr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_nt_query_info_proc_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_nt_query_info_proc_real self_test PASS (queries=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", success=" + to_string(s[2])
+        + ", debug=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnqipr_stats()
+            println("query_count\t" + to_string(s[0]))
+            println("total_data_bytes\t" + to_string(s[1]))
+            println("success_count\t" + to_string(s[2]))
+            println("debug_query_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let qid = to_int(a[3])
+                println("query_data_size\t" + to_string(query_data_size(qid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_nt_query_info_proc_real.hexa size <query_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let ic = to_int(a[3])
+                println("count_by_info_class\t" + to_string(count_by_info_class(ic)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_nt_query_info_proc_real.hexa count <info_class>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnqipr()
+            println("cleaned: " + pnqipr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnqipr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_nt_query_info_proc_real.hexa { self-test | stats | size <query_id> | count <info_class> | cleanup | dir }")
+}

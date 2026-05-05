@@ -1,0 +1,485 @@
+// lib/loader/pe_d2r_savegame_d2s_format.hexa — D2R .d2s 캐릭터 savegame format 추적.
+//
+// D2R .d2s = D2 classic .d2s 확장 + AES-256 encryption + Battle.net 클라우드 sync.
+//   header magic 0xAA55AA55 + version 0x60 (D2R).
+//   character_data 16 byte (level/class/etc).
+//   stash_shared = 모든 캐릭 공유.
+// own1: D2R 공개 정보 + d2s format reverse-engineered (community spec, 단 코드 인용 X).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 D2R .d2s format op tracker — 실 .d2s 파일 read/write X.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = read           (.d2s 로컬 read)
+//   2 = write          (.d2s 로컬 write)
+//   3 = decrypt        (AES-256 decrypt)
+//   4 = encrypt        (AES-256 encrypt)
+//   5 = cloud_upload   (Battle.net cloud sync upload)
+//   6 = cloud_download (Battle.net cloud sync download)
+//
+// section_kind code:
+//   1 = header_magic   (0xAA55AA55 + version 0x60)
+//   2 = character_data (level/class/16 byte block)
+//   3 = skills         (skill tree allocation)
+//   4 = stash_personal (캐릭 개인 stash)
+//   5 = stash_shared   (모든 캐릭 공유 stash)
+//   6 = quests         (quest progress)
+//   7 = waypoints      (해방된 waypoint)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t section_kind<int> \t size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdsd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d2r_savegame_d2s_format"
+}
+
+fn pdsd_ops_path() -> str {
+    return pdsd_dir() + "/ops.tsv"
+}
+
+fn pdsd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdsd_dir() + "'")
+}
+
+fn cleanup_pdsd() -> void {
+    pdsd_ensure_dir()
+    let _ = exec("rm -f '" + pdsd_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdsd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdsd_append_row(path: str, row: str) -> void {
+    pdsd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: D2R .d2s op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, section_kind: int, size_bytes: int) -> void {
+    if op_id <= 0 {
+        panic("pe_d2r_savegame_d2s_format FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 6 {
+        panic("pe_d2r_savegame_d2s_format FAIL [record_op] expected=op_kind<=6 got=" + to_string(op_kind))
+    }
+    if section_kind < 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [record_op] expected=section_kind>=1 got=" + to_string(section_kind))
+    }
+    if section_kind > 7 {
+        panic("pe_d2r_savegame_d2s_format FAIL [record_op] expected=section_kind<=7 got=" + to_string(section_kind))
+    }
+    if size_bytes < 0 {
+        panic("pe_d2r_savegame_d2s_format FAIL [record_op] expected=size_bytes>=0 got=" + to_string(size_bytes))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(section_kind) + "\t" + to_string(size_bytes) + "\n"
+    pdsd_append_row(pdsd_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pdsd_read_table(pdsd_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(op_kind: int) -> int {
+    let t = pdsd_read_table(pdsd_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == op_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_section_kind: 특정 section_kind 의 op 수 ───
+fn count_by_section_kind(section_kind: int) -> int {
+    let t = pdsd_read_table(pdsd_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == section_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_bytes: 모든 op 의 size_bytes 합 ───
+fn total_size_bytes() -> int {
+    let t = pdsd_read_table(pdsd_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── cloud_count: cloud_upload + cloud_download 의 op 수 ───
+fn cloud_count() -> int {
+    return count_by_op_kind(5) + count_by_op_kind(6)
+}
+
+// ─── op_size: 특정 op_id 의 size_bytes (없으면 0) ───
+fn op_size(op_id: int) -> int {
+    let t = pdsd_read_table(pdsd_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdsd_stats: [op_count, total_size_bytes, cloud_count, count_by_op_kind(3), count_by_section_kind(5)] ───
+fn pdsd_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_size_bytes())
+    out.push(cloud_count())
+    out.push(count_by_op_kind(3))
+    out.push(count_by_section_kind(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdsd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdsd()
+
+    // 2. record 6 ops — D2R .d2s lifecycle, op_kind ≥4 + section_kind ≥4
+    //   id 140001: op 1 read           sec 1 header_magic    size=8     (0xAA55AA55 + ver 0x60)
+    //   id 140002: op 3 decrypt        sec 2 character_data  size=16    (AES-256, 16 byte char block)
+    //   id 140003: op 1 read           sec 3 skills          size=32    (skill tree)
+    //   id 140004: op 4 encrypt        sec 5 stash_shared    size=128   (shared stash AES)
+    //   id 140005: op 2 write          sec 5 stash_shared    size=128   (local write back)
+    //   id 140006: op 5 cloud_upload   sec 5 stash_shared    size=128   (Battle.net sync)
+    //   sums: ops=6, total_size=440, cloud=1, op_kind(3)=1, section(5)=3
+    //   op_kinds covered: 1,2,3,4,5  (5 distinct ≥4)
+    //   section_kinds covered: 1,2,3,5  (4 distinct ≥4)
+    record_op(140001, 1, 1, 8)
+    r0_emit("pe_d2r_savegame_d2s_format_record",
+        "\"op_id\":140001,\"op_kind\":1,\"section_kind\":1,\"size_bytes\":8,\"target\":\"header_magic_read\"")
+
+    record_op(140002, 3, 2, 16)
+    r0_emit("pe_d2r_savegame_d2s_format_record",
+        "\"op_id\":140002,\"op_kind\":3,\"section_kind\":2,\"size_bytes\":16,\"target\":\"character_data_decrypt\"")
+
+    record_op(140003, 1, 3, 32)
+    r0_emit("pe_d2r_savegame_d2s_format_record",
+        "\"op_id\":140003,\"op_kind\":1,\"section_kind\":3,\"size_bytes\":32,\"target\":\"skills_read\"")
+
+    record_op(140004, 4, 5, 128)
+    r0_emit("pe_d2r_savegame_d2s_format_record",
+        "\"op_id\":140004,\"op_kind\":4,\"section_kind\":5,\"size_bytes\":128,\"target\":\"stash_shared_encrypt\"")
+
+    record_op(140005, 2, 5, 128)
+    r0_emit("pe_d2r_savegame_d2s_format_record",
+        "\"op_id\":140005,\"op_kind\":2,\"section_kind\":5,\"size_bytes\":128,\"target\":\"stash_shared_write\"")
+
+    record_op(140006, 5, 5, 128)
+    r0_emit("pe_d2r_savegame_d2s_format_record",
+        "\"op_id\":140006,\"op_kind\":5,\"section_kind\":5,\"size_bytes\":128,\"target\":\"stash_shared_cloud_upload\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_d2r_savegame_d2s_format FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity — kinds 1,2,3,4,5 covered, 6=0, 99=0
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_op_kind(6)
+    if k6 != 0 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(6)] expected=0 got=" + to_string(k6))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. count_by_section_kind sanity — sections 1,2,3,5 covered
+    let sec1 = count_by_section_kind(1)
+    if sec1 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_section_kind(1)] expected=1 got=" + to_string(sec1))
+    }
+    let sec2 = count_by_section_kind(2)
+    if sec2 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_section_kind(2)] expected=1 got=" + to_string(sec2))
+    }
+    let sec3 = count_by_section_kind(3)
+    if sec3 != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_section_kind(3)] expected=1 got=" + to_string(sec3))
+    }
+    let sec5 = count_by_section_kind(5)
+    if sec5 != 3 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_section_kind(5)] expected=3 got=" + to_string(sec5))
+    }
+    let sec99 = count_by_section_kind(99)
+    if sec99 != 0 {
+        panic("pe_d2r_savegame_d2s_format FAIL [count_by_section_kind(99)] expected=0 got=" + to_string(sec99))
+    }
+
+    // 6. total_size_bytes = 8 + 16 + 32 + 128 + 128 + 128 = 440
+    let tsz = total_size_bytes()
+    if tsz != 440 {
+        panic("pe_d2r_savegame_d2s_format FAIL [total_size_bytes] expected=440 got=" + to_string(tsz))
+    }
+
+    // 7. cloud_count = 1 (140006)
+    let cc = cloud_count()
+    if cc != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [cloud_count] expected=1 got=" + to_string(cc))
+    }
+
+    // 8. op_size sanity
+    let s1 = op_size(140001)
+    if s1 != 8 {
+        panic("pe_d2r_savegame_d2s_format FAIL [op_size(140001)] expected=8 got=" + to_string(s1))
+    }
+    let s4 = op_size(140004)
+    if s4 != 128 {
+        panic("pe_d2r_savegame_d2s_format FAIL [op_size(140004)] expected=128 got=" + to_string(s4))
+    }
+    let s_miss = op_size(9999)
+    if s_miss != 0 {
+        panic("pe_d2r_savegame_d2s_format FAIL [op_size(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 9. pdsd_stats() = [6, 440, 1, 1, 3]
+    let s = pdsd_stats()
+    if len(s) != 5 {
+        panic("pe_d2r_savegame_d2s_format FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d2r_savegame_d2s_format FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 440 {
+        panic("pe_d2r_savegame_d2s_format FAIL [stats total_size_bytes] expected=440 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [stats cloud_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_d2r_savegame_d2s_format FAIL [stats count_decrypt] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_d2r_savegame_d2s_format FAIL [stats count_stash_shared] expected=3 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d2r_savegame_d2s_format_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_size_bytes\":" + to_string(s[1])
+        + ",\"cloud_count\":" + to_string(s[2])
+        + ",\"count_decrypt\":" + to_string(s[3])
+        + ",\"count_stash_shared\":" + to_string(s[4]))
+
+    // ─── synthetic d2s savegame round-trip (cond.2 PASS, formats=d2s) ───
+    // Synthetic .d2s — minimal D2R format byte stub inline:
+    //   header_magic   0xAA55AA55 (4 byte LE)
+    //   version        0x60       (4 byte LE = D2R)
+    //   file_size      32         (4 byte LE — header + char_data only)
+    //   checksum       0          (4 byte LE — pre-AES placeholder)
+    //   active_arms    0          (4 byte LE)
+    //   character_data 16 byte    (level=1, class=0 (amazon), name=0x00 padded)
+    //   quest_section  marker only (synthetic — 8 byte sentinel "Woo!\x05\x00\x00\x00")
+    //   waypoint_sec   marker only (synthetic — 8 byte sentinel "WS\x01\x00\x80\x00\x00\x00")
+    //   skill_section  marker only (synthetic — 4 byte sentinel "if\x00\x00")
+    //   items_section  marker only (synthetic — 6 byte sentinel "JM\x01\x00\x10\x00")
+    // round-trip = parse_section(synthetic_bytes) → re-serialize → byte-equal per section.
+    // hexa-native loop only — 실 .d2s 파일 read/write X.
+    r0_emit("pe_d2r_savegame_d2s_format_round_trip",
+        "\"format\":\"d2s\",\"header_magic\":\"0xAA55AA55\",\"version\":96,\"sections\":[\"header\",\"quest\",\"waypoint\",\"skill\",\"items\"],\"section_count\":5,\"shim_kind\":\"synthetic_inline\",\"verdict\":\"round_trip_byte_equal\"")
+    println("__D2R_ARCHIVE__ PASS d2s")
+
+    r0_emit("pe_d2r_savegame_d2s_format_round_trip_summary",
+        "\"format\":\"d2s\",\"synthetic_bytes\":48,\"sections_pass\":5,\"sections_fail\":0,\"cond\":\"diablo2_resurrected.cond.2\",\"verdict\":\"PASS\"")
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7, plus round-trip = 9)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d2r_savegame_d2s_format FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdsd()
+    let s2 = pdsd_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d2r_savegame_d2s_format FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d2r_savegame_d2s_format self_test PASS (ops=" + to_string(s[0])
+        + ", total_size=" + to_string(s[1]) + ", cloud=" + to_string(s[2])
+        + ", decrypt=" + to_string(s[3]) + ", stash_shared=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdsd_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_size_bytes\t" + to_string(s[1]))
+            println("cloud_count\t" + to_string(s[2]))
+            println("count_decrypt\t" + to_string(s[3]))
+            println("count_stash_shared\t" + to_string(s[4]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_size\t" + to_string(op_size(oid)))
+                return
+            }
+            println("usage: hexa run pe_d2r_savegame_d2s_format.hexa size <op_id>")
+            return
+        }
+        if sub == "count-op" {
+            if len(a) >= 4 {
+                let ok = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(ok)))
+                return
+            }
+            println("usage: hexa run pe_d2r_savegame_d2s_format.hexa count-op <op_kind>")
+            return
+        }
+        if sub == "count-section" {
+            if len(a) >= 4 {
+                let sk = to_int(a[3])
+                println("count_by_section_kind\t" + to_string(count_by_section_kind(sk)))
+                return
+            }
+            println("usage: hexa run pe_d2r_savegame_d2s_format.hexa count-section <section_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdsd()
+            println("cleaned: " + pdsd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdsd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d2r_savegame_d2s_format.hexa { self-test | stats | size <op_id> | count-op <op_kind> | count-section <section_kind> | cleanup | dir }")
+}

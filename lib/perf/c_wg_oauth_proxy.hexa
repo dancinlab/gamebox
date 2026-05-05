@@ -1,0 +1,236 @@
+// lib/perf/c_wg_oauth_proxy.hexa — CN-157 skeleton manjeom 15/15
+//
+// Wargaming.net account OAuth flow proxy 추적 — WGC (Wargaming Game Center)
+// 부팅 시 Wargaming account 로그인이 OAuth Authorization Code → token exchange
+// → token refresh 의 3 stage 로 진행된다. Battle.net (D2R/D4) / Steam (CS2) /
+// PLAYNC (PURPLE) / Tencent (DF) 에 이은 5번째 launcher OAuth 흐름을 generic
+// 모듈에 흡수하기 위한 후보 — session × stage × elapsed 의 단순 columnar log
+// 만 보존하고 상위 모듈이 launcher 별 정책을 입힌다.
+//
+// 무기: session × stage × elapsed × success 4-key columnar log + sum/count.
+// 효과: WG launcher OAuth latency profile 정량화 → generic OAuth 5번째 자연
+// 흡수, cross-launcher token-exchange 병목 비교 가능.
+
+use "./r0_common"
+
+let WGOP_DIR = GAMEBOX_HOME + "/persist/wg_oauth_proxy"
+let OAUTH_LOG = WGOP_DIR + "/oauth.tsv"
+
+fn wgop_dir() -> str { return WGOP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + WGOP_DIR + "'")
+}
+
+// ─── OAuth 이벤트 등록 ───
+//   session_id (WGC 부팅 세션 식별자),
+//   stage (1=auth_code, 2=token_exchange, 3=token_refresh),
+//   elapsed_us (해당 stage 누적 us),
+//   success (1=성공 / 0=실패).
+fn record_oauth(session_id: int, stage: int, elapsed_us: int, success: int) -> void {
+    ensure_dir()
+    let line = to_string(session_id) + "\t" + to_string(stage) + "\t" + to_string(elapsed_us) + "\t" + to_string(success)
+    let tmp = OAUTH_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + OAUTH_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("wg_oauth_record", "\"session\":" + to_string(session_id) + ",\"stage\":" + to_string(stage) + ",\"elapsed_us\":" + to_string(elapsed_us) + ",\"success\":" + to_string(success))
+}
+
+// ─── oauth_count — 등록된 OAuth 이벤트 행 수 ───
+fn oauth_count() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + OAUTH_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── success_count — success=1 인 이벤트 수 ───
+fn success_count() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("awk -F'\\t' '$4==1 {c++} END{print c+0}' '" + OAUTH_LOG + "'").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── fail_count — success=0 인 이벤트 수 ───
+fn fail_count() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("awk -F'\\t' '$4==0 {c++} END{print c+0}' '" + OAUTH_LOG + "'").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_elapsed_us — 모든 stage elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + OAUTH_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── count_by_stage — 특정 stage 의 이벤트 수 ───
+fn count_by_stage(stage: int) -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("awk -F'\\t' -v s=" + to_string(stage) + " '$2==s {c++} END{print c+0}' '" + OAUTH_LOG + "'").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── session_elapsed — 해당 session 의 마지막 stage elapsed_us ───
+//   동일 session_id 의 행 중 마지막(파일 순서 기준) elapsed_us.
+//   미등록 session 은 0 반환.
+fn session_elapsed(session_id: int) -> int {
+    let exists = exec("test -f '" + OAUTH_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let v = exec("awk -F'\\t' -v sid=" + to_string(session_id) + " '$1==sid {last=$3} END{print last+0}' '" + OAUTH_LOG + "'").trim()
+    if v == "" { return 0 }
+    return to_int(v)
+}
+
+// ─── wgop_stats — [oauth_count, success_count, total_elapsed_us, count_by_stage(2)] ───
+fn wgop_stats() -> array {
+    return [oauth_count(), success_count(), total_elapsed_us(), count_by_stage(2)]
+}
+
+fn cleanup_wgop() -> void {
+    let _ = exec("rm -rf '" + WGOP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "wgop-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_wgop()
+
+    // 합성 OAuth 이벤트 4 종 (3 sessions):
+    //   session 11001 — auth_code 160000 us 성공, token_exchange 220000 us 성공
+    //   session 11002 — auth_code 180000 us 실패
+    //   session 11003 — token_refresh 110000 us 성공
+    record_oauth(11001, 1, 160000, 1)
+    record_oauth(11001, 2, 220000, 1)
+    record_oauth(11002, 1, 180000, 0)
+    record_oauth(11003, 3, 110000, 1)
+
+    // oauth_count = 4
+    let oc = oauth_count()
+    if oc != 4 { panic("c_wg_oauth_proxy FAIL [oauth_count] expected=4 got=" + to_string(oc)) }
+
+    // success_count = 3
+    let sc = success_count()
+    if sc != 3 { panic("c_wg_oauth_proxy FAIL [success_count] expected=3 got=" + to_string(sc)) }
+
+    // fail_count = 1
+    let fc = fail_count()
+    if fc != 1 { panic("c_wg_oauth_proxy FAIL [fail_count] expected=1 got=" + to_string(fc)) }
+
+    // total_elapsed_us = 160000+220000+180000+110000 = 670000
+    let te = total_elapsed_us()
+    if te != 670000 { panic("c_wg_oauth_proxy FAIL [total_elapsed_us] expected=670000 got=" + to_string(te)) }
+
+    // count_by_stage(1)=2, (2)=1, (3)=1, (99)=0
+    let cs1 = count_by_stage(1)
+    if cs1 != 2 { panic("c_wg_oauth_proxy FAIL [count_by_stage 1] expected=2 got=" + to_string(cs1)) }
+    let cs2 = count_by_stage(2)
+    if cs2 != 1 { panic("c_wg_oauth_proxy FAIL [count_by_stage 2] expected=1 got=" + to_string(cs2)) }
+    let cs3 = count_by_stage(3)
+    if cs3 != 1 { panic("c_wg_oauth_proxy FAIL [count_by_stage 3] expected=1 got=" + to_string(cs3)) }
+    let cs99 = count_by_stage(99)
+    if cs99 != 0 { panic("c_wg_oauth_proxy FAIL [count_by_stage 99] expected=0 got=" + to_string(cs99)) }
+
+    // session_elapsed: 11001 → last=220000 (stage 2), 11002 → 180000, 11003 → 110000, 9999 → 0
+    let se1 = session_elapsed(11001)
+    if se1 != 220000 { panic("c_wg_oauth_proxy FAIL [session_elapsed 11001] expected=220000 got=" + to_string(se1)) }
+    let se2 = session_elapsed(11002)
+    if se2 != 180000 { panic("c_wg_oauth_proxy FAIL [session_elapsed 11002] expected=180000 got=" + to_string(se2)) }
+    let se3 = session_elapsed(11003)
+    if se3 != 110000 { panic("c_wg_oauth_proxy FAIL [session_elapsed 11003] expected=110000 got=" + to_string(se3)) }
+    let se9 = session_elapsed(9999)
+    if se9 != 0 { panic("c_wg_oauth_proxy FAIL [session_elapsed unknown] expected=0 got=" + to_string(se9)) }
+
+    let stats = wgop_stats()
+    if stats[0] != 4 { panic("c_wg_oauth_proxy FAIL [stats oauth_count] expected=4 got=" + to_string(stats[0])) }
+    if stats[1] != 3 { panic("c_wg_oauth_proxy FAIL [stats success_count] expected=3 got=" + to_string(stats[1])) }
+    if stats[2] != 670000 { panic("c_wg_oauth_proxy FAIL [stats total_elapsed_us] expected=670000 got=" + to_string(stats[2])) }
+    if stats[3] != 1 { panic("c_wg_oauth_proxy FAIL [stats count_by_stage 2] expected=1 got=" + to_string(stats[3])) }
+
+    r0_emit("wg_oauth_summary", "\"oauth_count\":" + to_string(stats[0]) + ",\"success\":" + to_string(stats[1]) + ",\"fail\":" + to_string(fc) + ",\"total_elapsed_us\":" + to_string(stats[2]) + ",\"token_exchange_count\":" + to_string(stats[3]))
+
+    // record × 4 + summary × 1 = 5 emits ≥ 5
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_wg_oauth_proxy FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    // ─── synthetic WG OAuth proxy round-trip (Track BJ — battlenet cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track BJ mission: c_wg/c_wgc_* family completion cycle (6/6) — c_wg_oauth_proxy
+    // 측 WG OAuth2 proxy synthetic round-trip. OAuth lifecycle
+    // (probe_endpoint → exchange_token → refresh_grant → audit_session) 측 spec freeze.
+    // Production smoke gated on user network smoke (battlenet blk.1 transitive)
+    // + 자연 환경 정합 long-horizon work, met 승격 X.
+    //
+    // (a) synthetic 4-phase OAuth proxy pipeline —
+    //     probe_oauth_endpoint → exchange_authcode_token → refresh_token_grant → audit_session_event:
+    //     phase_count               4
+    //     oauth_proxy_off           0x14014C000         (synthetic WG OAuth proxy RVA)
+    //     pipeline_kind             "synthetic_inline"  (실 OAuth POST /token 호출 X)
+    //
+    // (b) synthetic grant_kind × outcome 16-slot OAuth matrix —
+    //     4 grant_kind (authcode/refresh/client_cred/device) × 4 outcome (success/expired/revoked/error) = 16 slots:
+    //     slot_total                16
+    //     success_slot_count        4                   (outcome = success)
+    //     fail_slot_count           12                  (outcome ≠ success)
+    //     matrix_kind               "synthetic_inline"
+    //
+    // round-trip = synthesize_oauth_phase(scaffold) → walk_grant_matrix(scaffold).
+    //              hexa-native loop only — 실 HTTPS handshake 0,
+    //              real bearer token mutation 0.
+    //
+    // synthetic OAuth proxy phase emit
+    r0_emit("c_wg_oauth_proxy_synthetic_phase",
+        "\"stage\":\"oauth_proxy_phase\",\"phase_count\":4,\"oauth_proxy_off\":\"0x14014C000\",\"pipeline_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"network_gap\":\"production smoke gated on user network smoke + 자연 환경 정합 long-horizon\"")
+    println("__WG_OAUTH__ PARTIAL oauth_proxy_phase")
+
+    // synthetic grant × outcome matrix emit
+    r0_emit("c_wg_oauth_proxy_synthetic_matrix",
+        "\"stage\":\"grant_matrix\",\"slot_total\":16,\"success_slot_count\":4,\"fail_slot_count\":12,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"network_gap\":\"production smoke gated on user network smoke + 자연 환경 정합 long-horizon\"")
+    println("__WG_OAUTH__ PARTIAL grant_matrix")
+
+    cleanup_wgop()
+
+    println("  ✅ c_wg_oauth_proxy self_test PASS (4 oauth events, 3 success / 1 fail, total_elapsed_us=670000, token_exchange=1, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = wgop_stats()
+            println("oauth_count=" + to_string(s[0]) + " success=" + to_string(s[1]) + " total_elapsed_us=" + to_string(s[2]) + " token_exchange=" + to_string(s[3]))
+            return
+        }
+        if sub == "elapsed" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                let v = session_elapsed(sid)
+                println(to_string(v))
+                return
+            }
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let st = to_int(a[3])
+                let v = count_by_stage(st)
+                println(to_string(v))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_wgop(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_wg_oauth_proxy.hexa { self-test | stats | elapsed <session_id> | count <stage> | cleanup }")
+}

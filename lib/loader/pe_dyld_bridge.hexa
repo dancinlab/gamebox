@@ -1,0 +1,381 @@
+// lib/loader/pe_dyld_bridge.hexa — stage3 macOS dyld ↔ PE loader bridge skeleton
+//
+// Apple Silicon Mac 의 dyld API (dlopen/dlsym/dyld_image_count) 통해 macOS
+// framework 함수 주소 lookup. PE 의 Win32 stub 이 macOS native 호출할 때
+// 의 transition. 본 파일은 instrumentation — 실 dlopen 은 stage4.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Apple dyld(3) man page 만 참조.
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// framework_kind:
+//   1 = CoreFoundation
+//   2 = Foundation
+//   3 = AppKit
+//   4 = Metal
+//   5 = AVFoundation
+//
+// persist schema (TSV — lookup_history.tsv):
+//   image_id<int> \t framework_kind<int> \t function_count<int> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdb_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_dyld_bridge"
+}
+
+fn pdb_history_path() -> str {
+    return pdb_dir() + "/lookup_history.tsv"
+}
+
+fn pdb_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdb_dir() + "'")
+}
+
+fn cleanup_pdb() -> void {
+    pdb_ensure_dir()
+    let _ = exec("rm -f '" + pdb_history_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdb_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdb_append_row(path: str, row: str) -> void {
+    pdb_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_lookup: dyld lookup 1건 기록 ───
+//   stage4 에서 실 dlopen + dlsym + dyld_get_image_address 로 교체.
+fn record_lookup(image_id: int, framework_kind: int, function_count: int, elapsed_us: int) -> void {
+    if image_id <= 0 {
+        panic("pe_dyld_bridge FAIL [record_lookup] expected=image_id>0 got=" + to_string(image_id))
+    }
+    if framework_kind < 1 {
+        panic("pe_dyld_bridge FAIL [record_lookup] expected=framework_kind>=1 got=" + to_string(framework_kind))
+    }
+    if framework_kind > 5 {
+        panic("pe_dyld_bridge FAIL [record_lookup] expected=framework_kind<=5 got=" + to_string(framework_kind))
+    }
+    if function_count <= 0 {
+        panic("pe_dyld_bridge FAIL [record_lookup] expected=function_count>0 got=" + to_string(function_count))
+    }
+    if elapsed_us < 0 {
+        panic("pe_dyld_bridge FAIL [record_lookup] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(image_id) + "\t" + to_string(framework_kind)
+        + "\t" + to_string(function_count) + "\t" + to_string(elapsed_us) + "\n"
+    pdb_append_row(pdb_history_path(), row)
+}
+
+// ─── lookup_count: 총 lookup 수 ───
+fn lookup_count() -> int {
+    let mut cnt = 0
+    let t = pdb_read_table(pdb_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_functions: function_count 합계 ───
+fn total_functions() -> int {
+    let mut sum = 0
+    let t = pdb_read_table(pdb_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_elapsed_us: elapsed_us 합계 ───
+fn total_elapsed_us() -> int {
+    let mut sum = 0
+    let t = pdb_read_table(pdb_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_framework: 특정 framework_kind 의 lookup 수 ───
+fn count_by_framework(kind: int) -> int {
+    let mut cnt = 0
+    let t = pdb_read_table(pdb_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── image_function_count: 특정 image_id 의 function_count 합계 ───
+fn image_function_count(image_id: int) -> int {
+    let mut sum = 0
+    let t = pdb_read_table(pdb_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == image_id {
+                    sum = sum + to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── pdb_stats: [lookup_count, total_functions, total_elapsed_us, count_by_framework(1)] ───
+fn pdb_stats() -> array {
+    let mut out = []
+    out.push(lookup_count())
+    out.push(total_functions())
+    out.push(total_elapsed_us())
+    out.push(count_by_framework(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdyldbr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdb()
+
+    // 2. record 4 lookups (CoreFoundation / Foundation / AppKit / Metal)
+    record_lookup(80001, 1, 240, 1200)
+    r0_emit("pe_dyld_bridge_lookup",
+        "\"image_id\":80001,\"framework_kind\":1,\"function_count\":240,\"elapsed_us\":1200,\"framework\":\"CoreFoundation\"")
+
+    record_lookup(80002, 2, 480, 2400)
+    r0_emit("pe_dyld_bridge_lookup",
+        "\"image_id\":80002,\"framework_kind\":2,\"function_count\":480,\"elapsed_us\":2400,\"framework\":\"Foundation\"")
+
+    record_lookup(80003, 3, 320, 1600)
+    r0_emit("pe_dyld_bridge_lookup",
+        "\"image_id\":80003,\"framework_kind\":3,\"function_count\":320,\"elapsed_us\":1600,\"framework\":\"AppKit\"")
+
+    record_lookup(80004, 4, 180, 800)
+    r0_emit("pe_dyld_bridge_lookup",
+        "\"image_id\":80004,\"framework_kind\":4,\"function_count\":180,\"elapsed_us\":800,\"framework\":\"Metal\"")
+
+    // 3. lookup_count = 4
+    let lc = lookup_count()
+    if lc != 4 {
+        panic("pe_dyld_bridge FAIL [lookup_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 4. total_functions = 240+480+320+180 = 1220
+    let tf = total_functions()
+    if tf != 1220 {
+        panic("pe_dyld_bridge FAIL [total_functions] expected=1220 got=" + to_string(tf))
+    }
+
+    // 5. total_elapsed_us = 1200+2400+1600+800 = 6000
+    let te = total_elapsed_us()
+    if te != 6000 {
+        panic("pe_dyld_bridge FAIL [total_elapsed_us] expected=6000 got=" + to_string(te))
+    }
+
+    // 6. count_by_framework
+    let c1 = count_by_framework(1)
+    if c1 != 1 {
+        panic("pe_dyld_bridge FAIL [count_by_framework(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_framework(2)
+    if c2 != 1 {
+        panic("pe_dyld_bridge FAIL [count_by_framework(2)] expected=1 got=" + to_string(c2))
+    }
+    let c3 = count_by_framework(3)
+    if c3 != 1 {
+        panic("pe_dyld_bridge FAIL [count_by_framework(3)] expected=1 got=" + to_string(c3))
+    }
+    let c4 = count_by_framework(4)
+    if c4 != 1 {
+        panic("pe_dyld_bridge FAIL [count_by_framework(4)] expected=1 got=" + to_string(c4))
+    }
+    let c99 = count_by_framework(99)
+    if c99 != 0 {
+        panic("pe_dyld_bridge FAIL [count_by_framework(99)] expected=0 got=" + to_string(c99))
+    }
+
+    // 7. image_function_count
+    let if1 = image_function_count(80001)
+    if if1 != 240 {
+        panic("pe_dyld_bridge FAIL [image_function_count(80001)] expected=240 got=" + to_string(if1))
+    }
+    let if4 = image_function_count(80004)
+    if if4 != 180 {
+        panic("pe_dyld_bridge FAIL [image_function_count(80004)] expected=180 got=" + to_string(if4))
+    }
+    let if0 = image_function_count(9999)
+    if if0 != 0 {
+        panic("pe_dyld_bridge FAIL [image_function_count(9999)] expected=0 got=" + to_string(if0))
+    }
+
+    // 8. pdb_stats() = [4, 1220, 6000, 1]
+    let s = pdb_stats()
+    if len(s) != 4 {
+        panic("pe_dyld_bridge FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_dyld_bridge FAIL [stats lookup_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 1220 {
+        panic("pe_dyld_bridge FAIL [stats total_functions] expected=1220 got=" + to_string(s[1]))
+    }
+    if s[2] != 6000 {
+        panic("pe_dyld_bridge FAIL [stats total_elapsed_us] expected=6000 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_dyld_bridge FAIL [stats count_by_framework(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_dyld_bridge_stats",
+        "\"lookup_count\":" + to_string(s[0])
+        + ",\"total_functions\":" + to_string(s[1])
+        + ",\"total_elapsed_us\":" + to_string(s[2])
+        + ",\"count_cf\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (실제: 4 lookups + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_dyld_bridge FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pdb()
+    let s2 = pdb_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_dyld_bridge FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_dyld_bridge self_test PASS (4 lookups, funcs=" + to_string(s[1])
+        + ", elapsed_us=" + to_string(s[2]) + ", cf=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdb_stats()
+            println("lookup_count\t" + to_string(s[0]))
+            println("total_functions\t" + to_string(s[1]))
+            println("total_elapsed_us\t" + to_string(s[2]))
+            println("count_by_framework(1)\t" + to_string(s[3]))
+            return
+        }
+        if sub == "functions" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("image_function_count(" + to_string(iid) + ")\t" + to_string(image_function_count(iid)))
+                return
+            }
+            println("usage: hexa run pe_dyld_bridge.hexa functions <image_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println("count_by_framework(" + to_string(k) + ")\t" + to_string(count_by_framework(k)))
+                return
+            }
+            println("usage: hexa run pe_dyld_bridge.hexa count <framework_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdb()
+            println("cleaned: " + pdb_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdb_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_dyld_bridge.hexa { self-test | stats | functions <image_id> | count <framework_kind> | cleanup | dir }")
+}

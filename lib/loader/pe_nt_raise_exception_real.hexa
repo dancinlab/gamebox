@@ -1,0 +1,540 @@
+// lib/loader/pe_nt_raise_exception_real.hexa — NTDLL exception/unwind tracker (R3 Tier).
+//
+// PE 실 NTDLL 의 exception 관련 함수 호출 흐름을 추적:
+//   - RaiseException / RtlRaiseException / RaiseFailFastException
+//   - RtlUnwind / RtlUnwindEx (local/global/collided/consolidate)
+//   - __C_specific_handler / SEH frame walker handler search
+//   - UnhandledExceptionFilter / SetUnhandledExceptionFilter chain
+//   - continuation action (continue execution / continue search / execute handler / process terminate)
+//
+// own1 enforcement: MSDN spec + WinNT.h + ECMA-335 only.
+//   Wine ntdll/exception.c, CrossOver, Whisky, GPTk 0줄 인용.
+//   Apple-native 구현 측면 — 본 module 은 추적기 (record API + TSV persist) 자체.
+//
+// own2 mandate:
+//   - r0_emit ≥ 14 (15 record + 5 stats emit = 20)
+//   - self_test() + main() dispatch + headless safe + panic 형식 검증.
+//
+// fn_kind code (record_raise / record_continue_action.raise_id 매칭용):
+//   0 = RaiseException        (kernel32-level wrapper)
+//   1 = RtlRaiseException     (ntdll low-level)
+//   2 = RaiseFailFastException (Win10+ fast-fail path, no SEH walk)
+//
+// unwind_kind code (record_unwind):
+//   0 = local         (RtlUnwind — single function frame)
+//   1 = global        (RtlUnwindEx — multi-frame stack walk)
+//   2 = collided      (collided unwind — handler raise during unwind)
+//   3 = consolidate   (consolidate unwind — __C_specific_handler 의 EH_CONSOLIDATE)
+//
+// action_kind code (record_continue_action):
+//   0 = continue_execution  (EXCEPTION_CONTINUE_EXECUTION — fix up + resume)
+//   1 = continue_search     (EXCEPTION_CONTINUE_SEARCH    — pass to next frame)
+//   2 = execute_handler     (EXCEPTION_EXECUTE_HANDLER    — __except 진입)
+//   3 = process_terminate   (terminate — UEF returned, no handler)
+//
+// persist schema (TSV — 5 tables):
+//   raises.tsv           : raise_id<int> \t exception_code_hex<str> \t fault_va_hex<str> \t fn_kind<int>
+//   unwinds.tsv          : unwind_id<int> \t target_frame_hex<str> \t target_ip_hex<str> \t kind<int>
+//   handler_searches.tsv : search_id<int> \t raise_id<int> \t frame_addr_hex<str> \t handler_va_hex<str> \t disposition<int>
+//   uhf.tsv              : uhf_id<int> \t filter_va_hex<str> \t called<int>
+//   continue_actions.tsv : action_id<int> \t raise_id<int> \t action_kind<int>
+//
+// Hexa 예약어 회피: type / mod / handle / class / kind 단독 식별자 금지 → fn_kind / unwind_kind / action_kind.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnre_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_nt_raise_exception_real"
+}
+
+fn pnre_raises_path() -> str {
+    return pnre_dir() + "/raises.tsv"
+}
+
+fn pnre_unwinds_path() -> str {
+    return pnre_dir() + "/unwinds.tsv"
+}
+
+fn pnre_handler_searches_path() -> str {
+    return pnre_dir() + "/handler_searches.tsv"
+}
+
+fn pnre_uhf_path() -> str {
+    return pnre_dir() + "/uhf.tsv"
+}
+
+fn pnre_continue_actions_path() -> str {
+    return pnre_dir() + "/continue_actions.tsv"
+}
+
+fn pnre_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnre_dir() + "'")
+}
+
+fn cleanup_pnre() -> void {
+    pnre_ensure_dir()
+    let _ = exec("rm -f '" + pnre_raises_path()
+        + "' '" + pnre_unwinds_path()
+        + "' '" + pnre_handler_searches_path()
+        + "' '" + pnre_uhf_path()
+        + "' '" + pnre_continue_actions_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnre_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnre_append_row(path: str, row: str) -> void {
+    pnre_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pnre_count_rows(path: str, min_cols: int) -> int {
+    let t = pnre_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_raise: NTDLL raise-class 함수 호출 1 건 ───
+fn record_raise(raise_id: int, exception_code_hex: str, fault_va_hex: str, fn_kind: int) -> void {
+    if raise_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_raise] expected=raise_id>0 got=" + to_string(raise_id))
+    }
+    if exception_code_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_raise] expected=exception_code_hex!=empty got=empty")
+    }
+    if fault_va_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_raise] expected=fault_va_hex!=empty got=empty")
+    }
+    if fn_kind < 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_raise] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 2 {
+        panic("pe_nt_raise_exception_real FAIL [record_raise] expected=fn_kind<=2 got=" + to_string(fn_kind))
+    }
+    let row = to_string(raise_id) + "\t" + exception_code_hex
+        + "\t" + fault_va_hex + "\t" + to_string(fn_kind) + "\n"
+    pnre_append_row(pnre_raises_path(), row)
+}
+
+// ─── record_unwind: RtlUnwind / RtlUnwindEx 호출 1 건 ───
+fn record_unwind(unwind_id: int, target_frame_hex: str, target_ip_hex: str, kind: int) -> void {
+    if unwind_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_unwind] expected=unwind_id>0 got=" + to_string(unwind_id))
+    }
+    if target_frame_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_unwind] expected=target_frame_hex!=empty got=empty")
+    }
+    if target_ip_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_unwind] expected=target_ip_hex!=empty got=empty")
+    }
+    if kind < 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_unwind] expected=kind>=0 got=" + to_string(kind))
+    }
+    if kind > 3 {
+        panic("pe_nt_raise_exception_real FAIL [record_unwind] expected=kind<=3 got=" + to_string(kind))
+    }
+    let row = to_string(unwind_id) + "\t" + target_frame_hex
+        + "\t" + target_ip_hex + "\t" + to_string(kind) + "\n"
+    pnre_append_row(pnre_unwinds_path(), row)
+}
+
+// ─── record_handler_search: SEH frame walker handler search 1 건 ───
+fn record_handler_search(search_id: int, raise_id: int, frame_addr_hex: str, handler_va_hex: str, disposition: int) -> void {
+    if search_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_handler_search] expected=search_id>0 got=" + to_string(search_id))
+    }
+    if raise_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_handler_search] expected=raise_id>0 got=" + to_string(raise_id))
+    }
+    if frame_addr_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_handler_search] expected=frame_addr_hex!=empty got=empty")
+    }
+    if handler_va_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_handler_search] expected=handler_va_hex!=empty got=empty")
+    }
+    if disposition < 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_handler_search] expected=disposition>=0 got=" + to_string(disposition))
+    }
+    let row = to_string(search_id) + "\t" + to_string(raise_id)
+        + "\t" + frame_addr_hex + "\t" + handler_va_hex
+        + "\t" + to_string(disposition) + "\n"
+    pnre_append_row(pnre_handler_searches_path(), row)
+}
+
+// ─── record_unhandled_filter: UnhandledExceptionFilter chain 1 건 ───
+fn record_unhandled_filter(uhf_id: int, filter_va_hex: str, called: int) -> void {
+    if uhf_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_unhandled_filter] expected=uhf_id>0 got=" + to_string(uhf_id))
+    }
+    if filter_va_hex == "" {
+        panic("pe_nt_raise_exception_real FAIL [record_unhandled_filter] expected=filter_va_hex!=empty got=empty")
+    }
+    if called < 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_unhandled_filter] expected=called>=0 got=" + to_string(called))
+    }
+    if called > 1 {
+        panic("pe_nt_raise_exception_real FAIL [record_unhandled_filter] expected=called<=1 got=" + to_string(called))
+    }
+    let row = to_string(uhf_id) + "\t" + filter_va_hex
+        + "\t" + to_string(called) + "\n"
+    pnre_append_row(pnre_uhf_path(), row)
+}
+
+// ─── record_continue_action: continuation action 1 건 ───
+fn record_continue_action(action_id: int, raise_id: int, action_kind: int) -> void {
+    if action_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_continue_action] expected=action_id>0 got=" + to_string(action_id))
+    }
+    if raise_id <= 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_continue_action] expected=raise_id>0 got=" + to_string(raise_id))
+    }
+    if action_kind < 0 {
+        panic("pe_nt_raise_exception_real FAIL [record_continue_action] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 3 {
+        panic("pe_nt_raise_exception_real FAIL [record_continue_action] expected=action_kind<=3 got=" + to_string(action_kind))
+    }
+    let row = to_string(action_id) + "\t" + to_string(raise_id)
+        + "\t" + to_string(action_kind) + "\n"
+    pnre_append_row(pnre_continue_actions_path(), row)
+}
+
+// ─── 5 종 통계 ───
+fn raise_count() -> int {
+    return pnre_count_rows(pnre_raises_path(), 4)
+}
+
+fn unwind_count() -> int {
+    return pnre_count_rows(pnre_unwinds_path(), 4)
+}
+
+fn handler_search_count() -> int {
+    return pnre_count_rows(pnre_handler_searches_path(), 5)
+}
+
+fn unhandled_filter_count() -> int {
+    return pnre_count_rows(pnre_uhf_path(), 3)
+}
+
+fn continue_action_count() -> int {
+    return pnre_count_rows(pnre_continue_actions_path(), 3)
+}
+
+// ─── helper: code → name ───
+fn fn_kind_name(fn_kind: int) -> str {
+    if fn_kind == 0 { return "RaiseException" }
+    if fn_kind == 1 { return "RtlRaiseException" }
+    if fn_kind == 2 { return "RaiseFailFast" }
+    return "unknown"
+}
+
+fn unwind_kind_name(kind: int) -> str {
+    if kind == 0 { return "local" }
+    if kind == 1 { return "global" }
+    if kind == 2 { return "collided" }
+    if kind == 3 { return "consolidate" }
+    return "unknown"
+}
+
+fn action_kind_name(action_kind: int) -> str {
+    if action_kind == 0 { return "continue_execution" }
+    if action_kind == 1 { return "continue_search" }
+    if action_kind == 2 { return "execute_handler" }
+    if action_kind == 3 { return "process_terminate" }
+    return "unknown"
+}
+
+// ─── pnre_stats: [raise, unwind, handler_search, uhf, continue_action] ───
+fn pnre_stats() -> array {
+    let mut out = []
+    out.push(raise_count())
+    out.push(unwind_count())
+    out.push(handler_search_count())
+    out.push(unhandled_filter_count())
+    out.push(continue_action_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnre-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnre()
+
+    // 2. helper sanity (이름 매핑) — 호출 자체는 emit 미발생, panic 만 검증.
+    if fn_kind_name(0) != "RaiseException" {
+        panic("pe_nt_raise_exception_real FAIL [fn_kind_name(0)] expected=RaiseException got=" + fn_kind_name(0))
+    }
+    if fn_kind_name(1) != "RtlRaiseException" {
+        panic("pe_nt_raise_exception_real FAIL [fn_kind_name(1)] expected=RtlRaiseException got=" + fn_kind_name(1))
+    }
+    if fn_kind_name(2) != "RaiseFailFast" {
+        panic("pe_nt_raise_exception_real FAIL [fn_kind_name(2)] expected=RaiseFailFast got=" + fn_kind_name(2))
+    }
+    if fn_kind_name(99) != "unknown" {
+        panic("pe_nt_raise_exception_real FAIL [fn_kind_name(99)] expected=unknown got=" + fn_kind_name(99))
+    }
+    if unwind_kind_name(0) != "local" {
+        panic("pe_nt_raise_exception_real FAIL [unwind_kind_name(0)] expected=local got=" + unwind_kind_name(0))
+    }
+    if unwind_kind_name(1) != "global" {
+        panic("pe_nt_raise_exception_real FAIL [unwind_kind_name(1)] expected=global got=" + unwind_kind_name(1))
+    }
+    if unwind_kind_name(2) != "collided" {
+        panic("pe_nt_raise_exception_real FAIL [unwind_kind_name(2)] expected=collided got=" + unwind_kind_name(2))
+    }
+    if unwind_kind_name(3) != "consolidate" {
+        panic("pe_nt_raise_exception_real FAIL [unwind_kind_name(3)] expected=consolidate got=" + unwind_kind_name(3))
+    }
+    if action_kind_name(0) != "continue_execution" {
+        panic("pe_nt_raise_exception_real FAIL [action_kind_name(0)] expected=continue_execution got=" + action_kind_name(0))
+    }
+    if action_kind_name(1) != "continue_search" {
+        panic("pe_nt_raise_exception_real FAIL [action_kind_name(1)] expected=continue_search got=" + action_kind_name(1))
+    }
+    if action_kind_name(2) != "execute_handler" {
+        panic("pe_nt_raise_exception_real FAIL [action_kind_name(2)] expected=execute_handler got=" + action_kind_name(2))
+    }
+    if action_kind_name(3) != "process_terminate" {
+        panic("pe_nt_raise_exception_real FAIL [action_kind_name(3)] expected=process_terminate got=" + action_kind_name(3))
+    }
+
+    // 3. record 3 raise (3 fn_kind)
+    //    raise 4001 = RaiseException (kernel32) — 0xC0000005 access violation @ 00407A12
+    //    raise 4002 = RtlRaiseException        — 0xE06D7363 C++ EH @ 00408C31
+    //    raise 4003 = RaiseFailFast            — 0xC0000409 fast-fail STACK_BUFFER_OVERRUN @ 0040AB55
+    record_raise(4001, "C0000005", "00407A12", 0)
+    r0_emit("pe_nt_raise_exception_real_record_raise",
+        "\"raise_id\":4001,\"exception_code_hex\":\"C0000005\",\"fault_va_hex\":\"00407A12\",\"fn_kind\":0,\"target\":\"RaiseException\"")
+
+    record_raise(4002, "E06D7363", "00408C31", 1)
+    r0_emit("pe_nt_raise_exception_real_record_raise",
+        "\"raise_id\":4002,\"exception_code_hex\":\"E06D7363\",\"fault_va_hex\":\"00408C31\",\"fn_kind\":1,\"target\":\"RtlRaiseException\"")
+
+    record_raise(4003, "C0000409", "0040AB55", 2)
+    r0_emit("pe_nt_raise_exception_real_record_raise",
+        "\"raise_id\":4003,\"exception_code_hex\":\"C0000409\",\"fault_va_hex\":\"0040AB55\",\"fn_kind\":2,\"target\":\"RaiseFailFast\"")
+
+    // 4. record 4 unwind (4 kind)
+    //    unwind 5001 = local       (RtlUnwind) frame 0019F800 → ip 00407B00
+    //    unwind 5002 = global      (RtlUnwindEx) frame 0019F900 → ip 00408D00
+    //    unwind 5003 = collided    (handler raise during unwind) frame 0019FA00 → ip 0040AC00
+    //    unwind 5004 = consolidate (__C_specific_handler EH_CONSOLIDATE) frame 0019FB00 → ip 0040BC00
+    record_unwind(5001, "0019F800", "00407B00", 0)
+    r0_emit("pe_nt_raise_exception_real_record_unwind",
+        "\"unwind_id\":5001,\"target_frame_hex\":\"0019F800\",\"target_ip_hex\":\"00407B00\",\"kind\":0,\"target\":\"local\"")
+
+    record_unwind(5002, "0019F900", "00408D00", 1)
+    r0_emit("pe_nt_raise_exception_real_record_unwind",
+        "\"unwind_id\":5002,\"target_frame_hex\":\"0019F900\",\"target_ip_hex\":\"00408D00\",\"kind\":1,\"target\":\"global\"")
+
+    record_unwind(5003, "0019FA00", "0040AC00", 2)
+    r0_emit("pe_nt_raise_exception_real_record_unwind",
+        "\"unwind_id\":5003,\"target_frame_hex\":\"0019FA00\",\"target_ip_hex\":\"0040AC00\",\"kind\":2,\"target\":\"collided\"")
+
+    record_unwind(5004, "0019FB00", "0040BC00", 3)
+    r0_emit("pe_nt_raise_exception_real_record_unwind",
+        "\"unwind_id\":5004,\"target_frame_hex\":\"0019FB00\",\"target_ip_hex\":\"0040BC00\",\"kind\":3,\"target\":\"consolidate\"")
+
+    // 5. record 3 handler_search
+    //    search 6001 → raise 4001, frame 0019F800, handler 00407C00, disposition 1 (CONTINUE_SEARCH)
+    //    search 6002 → raise 4002, frame 0019F900, handler 00408E00, disposition 0 (CONTINUE_EXECUTION)
+    //    search 6003 → raise 4002, frame 0019FA00, handler 0040A100, disposition 2 (EXECUTE_HANDLER)
+    record_handler_search(6001, 4001, "0019F800", "00407C00", 1)
+    r0_emit("pe_nt_raise_exception_real_record_handler_search",
+        "\"search_id\":6001,\"raise_id\":4001,\"frame_addr_hex\":\"0019F800\",\"handler_va_hex\":\"00407C00\",\"disposition\":1")
+
+    record_handler_search(6002, 4002, "0019F900", "00408E00", 0)
+    r0_emit("pe_nt_raise_exception_real_record_handler_search",
+        "\"search_id\":6002,\"raise_id\":4002,\"frame_addr_hex\":\"0019F900\",\"handler_va_hex\":\"00408E00\",\"disposition\":0")
+
+    record_handler_search(6003, 4002, "0019FA00", "0040A100", 2)
+    r0_emit("pe_nt_raise_exception_real_record_handler_search",
+        "\"search_id\":6003,\"raise_id\":4002,\"frame_addr_hex\":\"0019FA00\",\"handler_va_hex\":\"0040A100\",\"disposition\":2")
+
+    // 6. record 1 unhandled_filter
+    //    uhf 7001 = SetUnhandledExceptionFilter 등록된 filter @ 0040FF00, 호출됨 (called=1)
+    record_unhandled_filter(7001, "0040FF00", 1)
+    r0_emit("pe_nt_raise_exception_real_record_unhandled_filter",
+        "\"uhf_id\":7001,\"filter_va_hex\":\"0040FF00\",\"called\":1")
+
+    // 7. record 4 continue_action (4 kind)
+    //    action 8001 = raise 4001 → continue_execution (filter fixed-up + resume)
+    //    action 8002 = raise 4002 → continue_search    (no handler in this frame)
+    //    action 8003 = raise 4002 → execute_handler    (next frame __except 진입)
+    //    action 8004 = raise 4003 → process_terminate  (UEF returned, no handler)
+    record_continue_action(8001, 4001, 0)
+    r0_emit("pe_nt_raise_exception_real_record_continue_action",
+        "\"action_id\":8001,\"raise_id\":4001,\"action_kind\":0,\"target\":\"continue_execution\"")
+
+    record_continue_action(8002, 4002, 1)
+    r0_emit("pe_nt_raise_exception_real_record_continue_action",
+        "\"action_id\":8002,\"raise_id\":4002,\"action_kind\":1,\"target\":\"continue_search\"")
+
+    record_continue_action(8003, 4002, 2)
+    r0_emit("pe_nt_raise_exception_real_record_continue_action",
+        "\"action_id\":8003,\"raise_id\":4002,\"action_kind\":2,\"target\":\"execute_handler\"")
+
+    record_continue_action(8004, 4003, 3)
+    r0_emit("pe_nt_raise_exception_real_record_continue_action",
+        "\"action_id\":8004,\"raise_id\":4003,\"action_kind\":3,\"target\":\"process_terminate\"")
+
+    // 8. row count 검증 — 3 raise / 4 unwind / 3 search / 1 uhf / 4 action
+    let rc = raise_count()
+    if rc != 3 {
+        panic("pe_nt_raise_exception_real FAIL [raise_count] expected=3 got=" + to_string(rc))
+    }
+    let uc = unwind_count()
+    if uc != 4 {
+        panic("pe_nt_raise_exception_real FAIL [unwind_count] expected=4 got=" + to_string(uc))
+    }
+    let hc = handler_search_count()
+    if hc != 3 {
+        panic("pe_nt_raise_exception_real FAIL [handler_search_count] expected=3 got=" + to_string(hc))
+    }
+    let fc = unhandled_filter_count()
+    if fc != 1 {
+        panic("pe_nt_raise_exception_real FAIL [unhandled_filter_count] expected=1 got=" + to_string(fc))
+    }
+    let ac = continue_action_count()
+    if ac != 4 {
+        panic("pe_nt_raise_exception_real FAIL [continue_action_count] expected=4 got=" + to_string(ac))
+    }
+
+    // 9. pnre_stats() = [3, 4, 3, 1, 4]
+    let s = pnre_stats()
+    if len(s) != 5 {
+        panic("pe_nt_raise_exception_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_nt_raise_exception_real FAIL [stats raise_count] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_nt_raise_exception_real FAIL [stats unwind_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_nt_raise_exception_real FAIL [stats handler_search_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_nt_raise_exception_real FAIL [stats unhandled_filter_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_nt_raise_exception_real FAIL [stats continue_action_count] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 10. emit 5 종 stats line — 분리하여 r0_emit ≥ 14 보장 (15 record + 5 stats = 20)
+    r0_emit("pe_nt_raise_exception_real_stats_raise",
+        "\"raise_count\":" + to_string(s[0]))
+    r0_emit("pe_nt_raise_exception_real_stats_unwind",
+        "\"unwind_count\":" + to_string(s[1]))
+    r0_emit("pe_nt_raise_exception_real_stats_handler_search",
+        "\"handler_search_count\":" + to_string(s[2]))
+    r0_emit("pe_nt_raise_exception_real_stats_uhf",
+        "\"unhandled_filter_count\":" + to_string(s[3]))
+    r0_emit("pe_nt_raise_exception_real_stats_continue_action",
+        "\"continue_action_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 14 (15 record + 5 stats = 20)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_nt_raise_exception_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → 5 stats 모두 0
+    cleanup_pnre()
+    let s2 = pnre_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_nt_raise_exception_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_nt_raise_exception_real self_test PASS (raise=" + to_string(s[0])
+        + ", unwind=" + to_string(s[1]) + ", search=" + to_string(s[2])
+        + ", uhf=" + to_string(s[3]) + ", action=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnre_stats()
+            println("raise_count\t" + to_string(s[0]))
+            println("unwind_count\t" + to_string(s[1]))
+            println("handler_search_count\t" + to_string(s[2]))
+            println("unhandled_filter_count\t" + to_string(s[3]))
+            println("continue_action_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                println(fn_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_nt_raise_exception_real.hexa fn-kind-name <fn_kind>")
+            return
+        }
+        if sub == "unwind-kind-name" {
+            if len(a) >= 4 {
+                println(unwind_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_nt_raise_exception_real.hexa unwind-kind-name <kind>")
+            return
+        }
+        if sub == "action-kind-name" {
+            if len(a) >= 4 {
+                println(action_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_nt_raise_exception_real.hexa action-kind-name <action_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnre()
+            println("cleaned: " + pnre_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnre_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_nt_raise_exception_real.hexa { self-test | stats | fn-kind-name <n> | unwind-kind-name <n> | action-kind-name <n> | cleanup | dir }")
+}

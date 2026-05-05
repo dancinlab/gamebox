@@ -1,0 +1,829 @@
+// lib/loader/dx_d3d12_stage1.hexa — Phase 5b — DirectX 12 + DXR stage1 (D4 필수)
+//
+// own 1 enforcement: Wine / CrossOver / dxvk / vkd3d / community 코드 0 줄.
+//   참조 only — Microsoft 공식 D3D12 / DXGI / DXR API spec:
+//     - Device:       https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12device
+//     - CommandQueue: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12commandqueue
+//     - CommandList:  https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12graphicscommandlist
+//     - PSO:          https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12pipelinestate
+//     - Resource:     https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createcommittedresource
+//     - DescHeap:     https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12descriptorheap
+//     - DXR:          https://learn.microsoft.com/en-us/windows/win32/direct3d12/direct3d-12-raytracing
+//     - SwapChain3:   https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nn-dxgi1_4-idxgiswapchain3
+//   참조 only — Apple D3DMetal redist & Metal raytracing (macOS 14+) developer.apple.com.
+//   Wine / DXVK / VKD3D source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5
+//     (실제: d3d12_create_device + d3d12_resource_create × N + d3d12_dxr_dispatch + d3d12_present)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("dx_d3d12_stage1 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 5b stage1 — handle simulation):
+//   skeleton mapping (dx_d3d12.hexa) 와 달리 *실제 D3DMetal / Metal Raytracing 호출* 은 후속 Phase.
+//   여기서는 *synthetic handle table* 으로 D3D12 + DXR 동작만 검증.
+//   D4 게임이 D3D12/DXR 호출 → 우리 simulator → reasonable handle 반환.
+//
+// handle table 구조:
+//   device12_table.tsv     — "device_id\ttype\tversion"
+//   queue_table.tsv        — "queue_id\ttype\tpriority"
+//   cmd_list_table.tsv     — "cmdlist_id\ttype\tstate"          (state = "open"/"closed"/"executed")
+//   pipeline12_table.tsv   — "pipeline_id\tvs_hash\tps_hash\tcs_hash\tblend\traster\trt"  (rt = 0/1)
+//   heap_table.tsv         — "heap_id\tsize\ttype\tgpu_va"
+//   descriptor_table.tsv   — "desc_id\ttype\tcount"
+//   accel_struct_table.tsv — "as_id\tgeom_count\tinstance_count\ttype"   (DXR 전용)
+//   파일 위치: ~/.airgenome/gamebox/persist/d3d12_handles/
+//
+// handle id 범위:
+//   device      = 1xxx   (1000+)
+//   queue       = 2xxx   (2000+)
+//   cmd_list    = 3xxx   (3000+)
+//   pipeline    = 4xxx   (4000+)   graphics + compute + raytracing 공유
+//   resource    = 5xxx   (5000+)
+//   desc_heap   = 6xxx   (6000+)
+//   accel_struct= 7xxx   (7000+)   DXR 전용
+//   handle 0 / -1 은 invalid.
+//
+// command list state machine:
+//   create → "open"
+//   close  → "closed"
+//   execute → "executed"   (close 된 list 만 execute 가능)
+
+use "../perf/r0_common"
+
+// ─── handle table 디렉토리 ───
+fn handle_dir() -> str {
+    return GAMEBOX_HOME + "/persist/d3d12_handles"
+}
+
+fn device_table_path() -> str {
+    return handle_dir() + "/device12_table.tsv"
+}
+
+fn queue_table_path() -> str {
+    return handle_dir() + "/queue_table.tsv"
+}
+
+fn cmd_list_table_path() -> str {
+    return handle_dir() + "/cmd_list_table.tsv"
+}
+
+fn pipeline_table_path() -> str {
+    return handle_dir() + "/pipeline12_table.tsv"
+}
+
+fn heap_table_path() -> str {
+    return handle_dir() + "/heap_table.tsv"
+}
+
+fn descriptor_table_path() -> str {
+    return handle_dir() + "/descriptor_table.tsv"
+}
+
+fn accel_struct_table_path() -> str {
+    return handle_dir() + "/accel_struct_table.tsv"
+}
+
+fn back_buffer_state_path() -> str {
+    return handle_dir() + "/back_buffer_idx.txt"
+}
+
+fn ensure_handle_dir() -> void {
+    let _ = exec("mkdir -p '" + handle_dir() + "'")
+}
+
+fn cleanup() -> void {
+    ensure_handle_dir()
+    let _ = exec("rm -f '" + device_table_path() + "' '" + queue_table_path()
+        + "' '" + cmd_list_table_path() + "' '" + pipeline_table_path()
+        + "' '" + heap_table_path() + "' '" + descriptor_table_path()
+        + "' '" + accel_struct_table_path() + "' '" + back_buffer_state_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_row(path: str, row: str) -> void {
+    ensure_handle_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── 다음 handle id (table 의 max + 1; empty → base) ───
+fn next_id_for(path: str, base: int) -> int {
+    let t = read_table(path)
+    if t == "" {
+        return base
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut max_h = base - 1
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                let h = to_int(parts[0])
+                if h > max_h {
+                    max_h = h
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_h + 1
+}
+
+fn count_rows(path: str) -> int {
+    let t = read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── lookup: row id 가 table 에 존재하는지 ───
+fn id_exists(path: str, hnd: int) -> bool {
+    let t = read_table(path)
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                if parts[0] == key {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── cmd_list state lookup ───
+fn cmd_list_state(hnd: int) -> str {
+    let t = read_table(cmd_list_table_path())
+    if t == "" {
+        return ""
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                if parts[0] == key {
+                    return parts[2]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── cmd_list state mutate (rewrite table with new state for hnd) ───
+fn cmd_list_set_state(hnd: int, new_state: str) -> bool {
+    let t = read_table(cmd_list_table_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    let mut out = ""
+    let mut found = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                if parts[0] == key {
+                    out = out + parts[0] + "\t" + parts[1] + "\t" + new_state + "\n"
+                    found = true
+                } else {
+                    out = out + line + "\n"
+                }
+            } else {
+                out = out + line + "\n"
+            }
+        }
+        i = i + 1
+    }
+    if !found {
+        return false
+    }
+    write_file(cmd_list_table_path(), out)
+    return true
+}
+
+// ─── D3D12CreateDevice ───
+//   type    = 1 (HARDWARE) — D3D_FEATURE_LEVEL_12_0+ minimum
+//   version = 0xc000 == 12_0
+//   handle  = 1xxx
+fn d3d12_create_device() -> int {
+    let h = next_id_for(device_table_path(), 1000)
+    let row = to_string(h) + "\t1\t" + to_string(0xc000) + "\n"
+    append_row(device_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device::CreateCommandQueue ───
+//   type = D3D12_COMMAND_LIST_TYPE
+//     0 DIRECT, 1 BUNDLE, 2 COMPUTE, 3 COPY
+//   priority = 0 (NORMAL) default
+//   handle = 2xxx
+fn create_command_queue(qtype: int) -> int {
+    if qtype < 0 {
+        return -1
+    }
+    let h = next_id_for(queue_table_path(), 2000)
+    let row = to_string(h) + "\t" + to_string(qtype) + "\t0\n"
+    append_row(queue_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device::CreateCommandList ───
+//   type = D3D12_COMMAND_LIST_TYPE (위와 동일)
+//   state initial = "open"
+//   handle = 3xxx
+fn create_command_list(ltype: int) -> int {
+    if ltype < 0 {
+        return -1
+    }
+    let h = next_id_for(cmd_list_table_path(), 3000)
+    let row = to_string(h) + "\t" + to_string(ltype) + "\topen\n"
+    append_row(cmd_list_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device::CreateGraphicsPipelineState ───
+//   vs_hash, ps_hash 의 graphics PSO.
+//   cs_hash = 0, rt = 0 (raytracing flag off).
+//   blend = 0 OFF, raster = 0 SOLID.
+//   handle = 4xxx
+fn create_graphics_pipeline_state(vs: int, ps: int) -> int {
+    let h = next_id_for(pipeline_table_path(), 4000)
+    let row = to_string(h) + "\t" + to_string(vs) + "\t" + to_string(ps)
+        + "\t0\t0\t0\t0\n"
+    append_row(pipeline_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device::CreateComputePipelineState ───
+//   cs_hash 의 compute PSO. vs/ps = 0, rt = 0.
+//   handle = 4xxx (graphics 와 id 공간 공유 — pipeline_table 의 max + 1)
+fn create_compute_pipeline_state(cs: int) -> int {
+    let h = next_id_for(pipeline_table_path(), 4000)
+    let row = to_string(h) + "\t0\t0\t" + to_string(cs) + "\t0\t0\t0\n"
+    append_row(pipeline_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device5::CreateStateObject (raytracing PSO) ───
+//   raygen + closesthit shader 의 raytracing PSO. rt = 1.
+//   handle = 4xxx (모든 pipeline 동일 id 공간)
+fn create_raytracing_pipeline_state(rgs: int, chs: int) -> int {
+    let h = next_id_for(pipeline_table_path(), 4000)
+    // vs_hash 컬럼에 rgs 저장, ps_hash 컬럼에 chs 저장 (raytracing flag = 1 로 식별)
+    let row = to_string(h) + "\t" + to_string(rgs) + "\t" + to_string(chs)
+        + "\t0\t0\t0\t1\n"
+    append_row(pipeline_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device::CreateCommittedResource ───
+//   size > 0 필수.
+//   type = D3D12_HEAP_TYPE
+//     0 DEFAULT, 1 UPLOAD, 2 READBACK, 3 CUSTOM
+//   gpu_va = synthetic 0xGGGGxxxx (handle id 의 hex 표현)
+//   handle = 5xxx
+fn create_committed_resource(size: int, htype: int) -> int {
+    if size <= 0 {
+        return -1
+    }
+    let h = next_id_for(heap_table_path(), 5000)
+    // gpu_va = 0x10000000 + h (synthetic but stable per session)
+    let gpu_va = 0x10000000 + h
+    let row = to_string(h) + "\t" + to_string(size) + "\t" + to_string(htype)
+        + "\t" + to_string(gpu_va) + "\n"
+    append_row(heap_table_path(), row)
+    return h
+}
+
+// ─── ID3D12Device::CreateDescriptorHeap ───
+//   type = D3D12_DESCRIPTOR_HEAP_TYPE
+//     0 CBV_SRV_UAV, 1 SAMPLER, 2 RTV, 3 DSV
+//   count > 0 필수.
+//   handle = 6xxx
+fn create_descriptor_heap(dtype: int, count: int) -> int {
+    if count <= 0 {
+        return -1
+    }
+    if dtype < 0 {
+        return -1
+    }
+    let h = next_id_for(descriptor_table_path(), 6000)
+    let row = to_string(h) + "\t" + to_string(dtype) + "\t" + to_string(count) + "\n"
+    append_row(descriptor_table_path(), row)
+    return h
+}
+
+// ─── DXR: ID3D12Device5::BuildRaytracingAccelerationStructure (synthetic build) ───
+//   geom_count > 0 → BLAS (bottom-level), instance_count = 0, type = 0.
+//   geom_count = 0 → TLAS (top-level) 케이스는 별도 호출 필요 (현재 stage1 은 BLAS only).
+//   handle = 7xxx
+fn create_acceleration_structure(geom_count: int) -> int {
+    if geom_count <= 0 {
+        return -1
+    }
+    let h = next_id_for(accel_struct_table_path(), 7000)
+    // type=0 BLAS, instance_count=0 (BLAS 는 instance 없음)
+    let row = to_string(h) + "\t" + to_string(geom_count) + "\t0\t0\n"
+    append_row(accel_struct_table_path(), row)
+    return h
+}
+
+// ─── DXR: ID3D12GraphicsCommandList4::DispatchRays ───
+//   width/height/depth 모두 > 0 필수 (RaytracingDispatchDimensions).
+//   적어도 하나의 raytracing PSO + AS 가 존재해야 dispatch 가능.
+fn dispatch_rays(width: int, height: int, depth: int) -> bool {
+    if width <= 0 {
+        return false
+    }
+    if height <= 0 {
+        return false
+    }
+    if depth <= 0 {
+        return false
+    }
+    // raytracing PSO (rt=1) 가 적어도 하나 존재하는지 확인
+    let t = read_table(pipeline_table_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut has_rt_pso = false
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 7 {
+                if parts[6] == "1" {
+                    has_rt_pso = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    if !has_rt_pso {
+        return false
+    }
+    // 적어도 하나의 acceleration structure 가 존재
+    if count_rows(accel_struct_table_path()) <= 0 {
+        return false
+    }
+    return true
+}
+
+// ─── ID3D12GraphicsCommandList::DrawIndexedInstanced ───
+//   pipeline 이 graphics (rt=0, cs_hash=0) 이고 index_count > 0 → success.
+fn draw_indexed_instanced(pipeline: int, index_count: int, instance_count: int) -> bool {
+    if index_count <= 0 {
+        return false
+    }
+    if instance_count <= 0 {
+        return false
+    }
+    if !id_exists(pipeline_table_path(), pipeline) {
+        return false
+    }
+    return true
+}
+
+// ─── ID3D12GraphicsCommandList::Close ───
+//   "open" 상태의 cmd_list → "closed" 로 transition.
+fn close_command_list(cmdlist: int) -> bool {
+    let s = cmd_list_state(cmdlist)
+    if s != "open" {
+        return false
+    }
+    return cmd_list_set_state(cmdlist, "closed")
+}
+
+// ─── ID3D12CommandQueue::ExecuteCommandLists ───
+//   queue 가 존재하고 cmd_list 가 "closed" 상태 → "executed" 로 transition.
+fn execute_command_list(queue: int, cmdlist: int) -> bool {
+    if !id_exists(queue_table_path(), queue) {
+        return false
+    }
+    let s = cmd_list_state(cmdlist)
+    if s != "closed" {
+        return false
+    }
+    return cmd_list_set_state(cmdlist, "executed")
+}
+
+// ─── IDXGISwapChain3::Present ───
+//   queue 가 존재 → success. back-buffer index 를 toggle (0↔1).
+fn present(queue: int) -> bool {
+    if !id_exists(queue_table_path(), queue) {
+        return false
+    }
+    // back-buffer index toggle (double buffering)
+    let cur_s = exec("test -f '" + back_buffer_state_path() + "' && cat '"
+        + back_buffer_state_path() + "' || echo 0").trim()
+    let cur = to_int(cur_s)
+    let mut nxt = 0
+    if cur == 0 {
+        nxt = 1
+    } else {
+        nxt = 0
+    }
+    ensure_handle_dir()
+    write_file(back_buffer_state_path(), to_string(nxt))
+    return true
+}
+
+// ─── IDXGISwapChain3::GetCurrentBackBufferIndex ───
+//   present 호출 후 toggle 된 0 or 1 반환.
+fn current_back_buffer_index() -> int {
+    let exists = exec("test -f '" + back_buffer_state_path()
+        + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return 0
+    }
+    return to_int(exec("cat '" + back_buffer_state_path() + "' 2>/dev/null").trim())
+}
+
+// ─── handle_counts: [devices, queues, lists, pipelines, resources, heaps, accel_structs] ───
+fn handle_counts() -> array {
+    let mut out = []
+    out.push(count_rows(device_table_path()))
+    out.push(count_rows(queue_table_path()))
+    out.push(count_rows(cmd_list_table_path()))
+    out.push(count_rows(pipeline_table_path()))
+    out.push(count_rows(heap_table_path()))
+    out.push(count_rows(descriptor_table_path()))
+    out.push(count_rows(accel_struct_table_path()))
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "d3d12s1-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup()
+
+    // 2. dev = d3d12_create_device > 0, range >= 1000
+    let dev = d3d12_create_device()
+    if dev <= 0 {
+        panic("dx_d3d12_stage1 FAIL [d3d12_create_device] expected=>0 got=" + to_string(dev))
+    }
+    if dev < 1000 {
+        panic("dx_d3d12_stage1 FAIL [device id range] expected=>=1000 got=" + to_string(dev))
+    }
+
+    // emit 1: d3d12_create_device
+    r0_emit("d3d12_create_device",
+        "\"device\":" + to_string(dev) + ",\"type\":1,\"version\":\"12_0\"")
+
+    // 3. queue = create_command_queue(0) > 0   (DIRECT)
+    let queue = create_command_queue(0)
+    if queue <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_command_queue] expected=>0 got=" + to_string(queue))
+    }
+    if queue < 2000 {
+        panic("dx_d3d12_stage1 FAIL [queue id range] expected=>=2000 got=" + to_string(queue))
+    }
+
+    // 4. cmdlist = create_command_list(0) > 0
+    let cmdlist = create_command_list(0)
+    if cmdlist <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_command_list] expected=>0 got=" + to_string(cmdlist))
+    }
+    if cmdlist < 3000 {
+        panic("dx_d3d12_stage1 FAIL [cmdlist id range] expected=>=3000 got=" + to_string(cmdlist))
+    }
+    let s_init = cmd_list_state(cmdlist)
+    if s_init != "open" {
+        panic("dx_d3d12_stage1 FAIL [cmdlist init state] expected=open got=" + s_init)
+    }
+
+    // 5. pipeline_g = create_graphics_pipeline_state(0xABCD, 0x1234) > 0
+    let pipeline_g = create_graphics_pipeline_state(0xABCD, 0x1234)
+    if pipeline_g <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_graphics_pipeline_state] expected=>0 got=" + to_string(pipeline_g))
+    }
+    if pipeline_g < 4000 {
+        panic("dx_d3d12_stage1 FAIL [graphics pipeline id range] expected=>=4000 got=" + to_string(pipeline_g))
+    }
+
+    // emit 2: d3d12_resource_create (graphics PSO)
+    r0_emit("d3d12_resource_create",
+        "\"kind\":\"pipeline_graphics\",\"handle\":" + to_string(pipeline_g)
+        + ",\"vs\":\"0xABCD\",\"ps\":\"0x1234\"")
+
+    // 6. pipeline_c = create_compute_pipeline_state(0x5678) > 0
+    let pipeline_c = create_compute_pipeline_state(0x5678)
+    if pipeline_c <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_compute_pipeline_state] expected=>0 got=" + to_string(pipeline_c))
+    }
+    if pipeline_c <= pipeline_g {
+        panic("dx_d3d12_stage1 FAIL [compute pipeline id ordering] expected=>"
+            + to_string(pipeline_g) + " got=" + to_string(pipeline_c))
+    }
+
+    // emit 3: d3d12_resource_create (compute PSO)
+    r0_emit("d3d12_resource_create",
+        "\"kind\":\"pipeline_compute\",\"handle\":" + to_string(pipeline_c)
+        + ",\"cs\":\"0x5678\"")
+
+    // 7. pipeline_r = create_raytracing_pipeline_state(0xDEAD, 0xBEEF) > 0   (DXR)
+    let pipeline_r = create_raytracing_pipeline_state(0xDEAD, 0xBEEF)
+    if pipeline_r <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_raytracing_pipeline_state] expected=>0 got=" + to_string(pipeline_r))
+    }
+    if pipeline_r <= pipeline_c {
+        panic("dx_d3d12_stage1 FAIL [rt pipeline id ordering] expected=>"
+            + to_string(pipeline_c) + " got=" + to_string(pipeline_r))
+    }
+
+    // emit 4: d3d12_resource_create (DXR PSO)
+    r0_emit("d3d12_resource_create",
+        "\"kind\":\"pipeline_raytracing\",\"handle\":" + to_string(pipeline_r)
+        + ",\"rgs\":\"0xDEAD\",\"chs\":\"0xBEEF\"")
+
+    // 8. resource = create_committed_resource(8192, 1) > 0   (UPLOAD heap)
+    let resource = create_committed_resource(8192, 1)
+    if resource <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_committed_resource] expected=>0 got=" + to_string(resource))
+    }
+    if resource < 5000 {
+        panic("dx_d3d12_stage1 FAIL [resource id range] expected=>=5000 got=" + to_string(resource))
+    }
+
+    // emit 5: d3d12_resource_create (resource)
+    r0_emit("d3d12_resource_create",
+        "\"kind\":\"committed_resource\",\"handle\":" + to_string(resource)
+        + ",\"size\":8192,\"heap_type\":1")
+
+    // 8b. create_committed_resource(0, ...) → -1
+    let bad_res = create_committed_resource(0, 1)
+    if bad_res != -1 {
+        panic("dx_d3d12_stage1 FAIL [committed_resource bad size] expected=-1 got=" + to_string(bad_res))
+    }
+
+    // 9. desc_heap = create_descriptor_heap(0, 16) > 0
+    let desc_heap = create_descriptor_heap(0, 16)
+    if desc_heap <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_descriptor_heap] expected=>0 got=" + to_string(desc_heap))
+    }
+    if desc_heap < 6000 {
+        panic("dx_d3d12_stage1 FAIL [desc_heap id range] expected=>=6000 got=" + to_string(desc_heap))
+    }
+
+    // 9b. create_descriptor_heap(_, 0) → -1
+    let bad_heap = create_descriptor_heap(0, 0)
+    if bad_heap != -1 {
+        panic("dx_d3d12_stage1 FAIL [desc_heap bad count] expected=-1 got=" + to_string(bad_heap))
+    }
+
+    // 10. accel_struct = create_acceleration_structure(100) > 0   (DXR BLAS)
+    let accel_struct = create_acceleration_structure(100)
+    if accel_struct <= 0 {
+        panic("dx_d3d12_stage1 FAIL [create_acceleration_structure] expected=>0 got=" + to_string(accel_struct))
+    }
+    if accel_struct < 7000 {
+        panic("dx_d3d12_stage1 FAIL [accel_struct id range] expected=>=7000 got=" + to_string(accel_struct))
+    }
+
+    // 10b. create_acceleration_structure(0) → -1
+    let bad_as = create_acceleration_structure(0)
+    if bad_as != -1 {
+        panic("dx_d3d12_stage1 FAIL [accel_struct bad geom_count] expected=-1 got=" + to_string(bad_as))
+    }
+
+    // emit 6: d3d12_resource_create (acceleration structure)
+    r0_emit("d3d12_resource_create",
+        "\"kind\":\"acceleration_structure\",\"handle\":" + to_string(accel_struct)
+        + ",\"geom_count\":100,\"as_type\":\"BLAS\"")
+
+    // 11. draw_indexed_instanced(pipeline_g, 36, 1) → true
+    let dr = draw_indexed_instanced(pipeline_g, 36, 1)
+    if !dr {
+        panic("dx_d3d12_stage1 FAIL [draw_indexed_instanced] expected=true got=false")
+    }
+
+    // 11b. draw with bad pipeline → false
+    let dr_bad = draw_indexed_instanced(99999, 36, 1)
+    if dr_bad {
+        panic("dx_d3d12_stage1 FAIL [draw bad pipeline] expected=false got=true")
+    }
+
+    // 11c. draw with index_count = 0 → false
+    let dr_zero = draw_indexed_instanced(pipeline_g, 0, 1)
+    if dr_zero {
+        panic("dx_d3d12_stage1 FAIL [draw zero indices] expected=false got=true")
+    }
+
+    // 12. dispatch_rays(1920, 1080, 1) → true   (DXR)
+    let drr = dispatch_rays(1920, 1080, 1)
+    if !drr {
+        panic("dx_d3d12_stage1 FAIL [dispatch_rays] expected=true got=false")
+    }
+
+    // 12b. dispatch_rays with width=0 → false
+    let drr_bad = dispatch_rays(0, 1080, 1)
+    if drr_bad {
+        panic("dx_d3d12_stage1 FAIL [dispatch_rays bad width] expected=false got=true")
+    }
+
+    // emit 7: d3d12_dxr_dispatch
+    r0_emit("d3d12_dxr_dispatch",
+        "\"pso\":" + to_string(pipeline_r)
+        + ",\"as\":" + to_string(accel_struct)
+        + ",\"width\":1920,\"height\":1080,\"depth\":1,\"result\":\"S_OK\"")
+
+    // 13. close_command_list(cmdlist) → true
+    let cl = close_command_list(cmdlist)
+    if !cl {
+        panic("dx_d3d12_stage1 FAIL [close_command_list] expected=true got=false")
+    }
+    let s_closed = cmd_list_state(cmdlist)
+    if s_closed != "closed" {
+        panic("dx_d3d12_stage1 FAIL [cmdlist state after close] expected=closed got=" + s_closed)
+    }
+
+    // 13b. close 두번째 호출 → false (이미 closed)
+    let cl2 = close_command_list(cmdlist)
+    if cl2 {
+        panic("dx_d3d12_stage1 FAIL [double close] expected=false got=true")
+    }
+
+    // 14. execute_command_list(queue, cmdlist) → true
+    let ex = execute_command_list(queue, cmdlist)
+    if !ex {
+        panic("dx_d3d12_stage1 FAIL [execute_command_list] expected=true got=false")
+    }
+    let s_exec = cmd_list_state(cmdlist)
+    if s_exec != "executed" {
+        panic("dx_d3d12_stage1 FAIL [cmdlist state after execute] expected=executed got=" + s_exec)
+    }
+
+    // 14b. execute with bad queue → false
+    let ex_bad = execute_command_list(99999, cmdlist)
+    if ex_bad {
+        panic("dx_d3d12_stage1 FAIL [execute bad queue] expected=false got=true")
+    }
+
+    // 15. present(queue) → true
+    let pr = present(queue)
+    if !pr {
+        panic("dx_d3d12_stage1 FAIL [present] expected=true got=false")
+    }
+
+    // 15b. present with bad queue → false
+    let pr_bad = present(99999)
+    if pr_bad {
+        panic("dx_d3d12_stage1 FAIL [present bad queue] expected=false got=true")
+    }
+
+    // emit 8: d3d12_present
+    r0_emit("d3d12_present",
+        "\"queue\":" + to_string(queue) + ",\"sync_interval\":1,\"result\":\"S_OK\"")
+
+    // 16. current_back_buffer_index() → 0 or 1 (cycle); 첫 present 후 1
+    let bbi = current_back_buffer_index()
+    if bbi != 0 {
+        if bbi != 1 {
+            panic("dx_d3d12_stage1 FAIL [back_buffer_index] expected=0|1 got=" + to_string(bbi))
+        }
+    }
+    // 두번째 present → 다시 toggle
+    let pr2 = present(queue)
+    if !pr2 {
+        panic("dx_d3d12_stage1 FAIL [present 2nd] expected=true got=false")
+    }
+    let bbi2 = current_back_buffer_index()
+    if bbi2 == bbi {
+        panic("dx_d3d12_stage1 FAIL [back_buffer cycle] expected=toggle got=same("
+            + to_string(bbi2) + ")")
+    }
+
+    // 17. handle_counts → [1, 1, 1, 3, 1, 1, 1]
+    let counts = handle_counts()
+    if len(counts) != 7 {
+        panic("dx_d3d12_stage1 FAIL [counts len] expected=7 got=" + to_string(len(counts)))
+    }
+    if counts[0] != 1 {
+        panic("dx_d3d12_stage1 FAIL [counts devices] expected=1 got=" + to_string(counts[0]))
+    }
+    if counts[1] != 1 {
+        panic("dx_d3d12_stage1 FAIL [counts queues] expected=1 got=" + to_string(counts[1]))
+    }
+    if counts[2] != 1 {
+        panic("dx_d3d12_stage1 FAIL [counts lists] expected=1 got=" + to_string(counts[2]))
+    }
+    if counts[3] != 3 {
+        panic("dx_d3d12_stage1 FAIL [counts pipelines] expected=3 got=" + to_string(counts[3]))
+    }
+    if counts[4] != 1 {
+        panic("dx_d3d12_stage1 FAIL [counts resources] expected=1 got=" + to_string(counts[4]))
+    }
+    if counts[5] != 1 {
+        panic("dx_d3d12_stage1 FAIL [counts heaps] expected=1 got=" + to_string(counts[5]))
+    }
+    if counts[6] != 1 {
+        panic("dx_d3d12_stage1 FAIL [counts accel_structs] expected=1 got=" + to_string(counts[6]))
+    }
+
+    // 18. r0_emit count 검증 (≥ 5; 실제 8)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("dx_d3d12_stage1 FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 19. cleanup
+    cleanup()
+
+    // 19b. cleanup 후 counts 모두 0
+    let counts_after = handle_counts()
+    let i = 0
+    while i < len(counts_after) {
+        if counts_after[i] != 0 {
+            panic("dx_d3d12_stage1 FAIL [cleanup counts[" + to_string(i)
+                + "]] expected=0 got=" + to_string(counts_after[i]))
+        }
+        i = i + 1
+    }
+
+    // 20. PASS
+    println("  ✅ dx_d3d12_stage1 self_test PASS (device + 3 pipelines + DXR + present, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "counts" {
+            let c = handle_counts()
+            println("devices\t" + to_string(c[0]))
+            println("queues\t" + to_string(c[1]))
+            println("lists\t" + to_string(c[2]))
+            println("pipelines\t" + to_string(c[3]))
+            println("resources\t" + to_string(c[4]))
+            println("heaps\t" + to_string(c[5]))
+            println("accel_structs\t" + to_string(c[6]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup()
+            println("cleaned: " + handle_dir())
+            return
+        }
+        if sub == "dir" {
+            println(handle_dir())
+            return
+        }
+    }
+    println("usage: hexa run dx_d3d12_stage1.hexa { self-test | counts | cleanup | dir }")
+}

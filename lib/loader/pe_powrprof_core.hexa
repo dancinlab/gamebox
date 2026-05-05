@@ -1,0 +1,429 @@
+// lib/loader/pe_powrprof_core.hexa — POWRPROF.dll power management surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine powrprof source 인용 0.
+//       powrprof.dll 직접 binding 0. macOS IOPMrootDomain / IOPMAssertion / pmset /
+//       CGEventSourceCounterForEventType / NSWorkspace willSleep/didWake notification 직접
+//       binding 0. NOTE: POWRPROF 측 D2R/D4 idle suspend → resume 시 frame timing recover
+//       + Battle.net Agent power-state notification baseline; GetSystemPowerStatus/
+//       PowerEnumerate/PowerRegisterSuspendResumeNotification 측 SYSTEM_POWER_STATUS
+//       round-trip baseline (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BD1 — POWRPROF power state/schemes/notifications surface 10 fn skeleton-tier.
+// cycle 47 262/435 (~60.23%) → cycle 48 ~272/435 (~62.53%) (+10 fn, BD bundled part 1/4).
+//
+// 대상 fn (10 fn — 3 group, fn_kind 0..9):
+//   POWER_STATE   (4): GetSystemPowerStatus(0) / SetSystemPowerState(1) / SetSuspendState(2) /
+//                      PowerEnumerate(3)
+//   SCHEMES       (3): PowerGetActiveScheme(4) / PowerSetActiveScheme(5) /
+//                      PowerWriteACValueIndex(6)
+//   NOTIFICATIONS (3): PowerRegisterSuspendResumeNotification(7) /
+//                      PowerUnregisterSuspendResumeNotification(8) /
+//                      RegisterPowerSettingNotification(9)
+//
+// synthetic struct families:
+//   SYSTEM_POWER_STATUS 12B: ACLineStatus 1 (1 = AC online) + BatteryFlag 0x08 charging +
+//     BatteryLifePercent 0x42 (66) + Reserved1 0x80 + BatteryLifeTime 0xFFFFFFFF unknown +
+//     BatteryFullLifeTime 0xFFFFFFFF unknown.
+//   POWER_POLICY GUID 16B LE [GUID_TYPICAL_POWER_SAVINGS 381b4222 / GUID_HIGH_PERFORMANCE
+//     8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c / GUID_MIN_POWER_SAVINGS a1841308 ].
+//   HPOWERNOTIFY 0x9C010100 register handle (opaque).
+//   POWERBROADCAST_SETTING 12B: PowerSetting GUID + DataLength 4 + Data 0x00000001.
+//   DEVICE_NOTIFY_CALLBACK_ROUTINE 8B fn-pointer synth + Context 8B.
+//
+// persist schema (TSV — 4 table):
+//   syscall_invoke / power_state_event / scheme_event / notify_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ppp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_powrprof_core"
+}
+
+fn ppp_syscall_invoke_path() -> str {
+    return ppp_dir() + "/syscall_invoke.tsv"
+}
+
+fn ppp_power_state_event_path() -> str {
+    return ppp_dir() + "/power_state_event.tsv"
+}
+
+fn ppp_scheme_event_path() -> str {
+    return ppp_dir() + "/scheme_event.tsv"
+}
+
+fn ppp_notify_event_path() -> str {
+    return ppp_dir() + "/notify_event.tsv"
+}
+
+fn ppp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ppp_dir() + "'")
+}
+
+fn cleanup_ppp() -> void {
+    ppp_ensure_dir()
+    let _ = exec("rm -f '" + ppp_syscall_invoke_path() + "' '" + ppp_power_state_event_path()
+        + "' '" + ppp_scheme_event_path() + "' '" + ppp_notify_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ppp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ppp_append_row(path: str, row: str) -> void {
+    ppp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn ppp_count_rows(path: str, min_cols: int) -> int {
+    let t = ppp_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (10 fn coverage, fn_kind 0..9) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "GetSystemPowerStatus" }
+    if k == 1 { return "SetSystemPowerState" }
+    if k == 2 { return "SetSuspendState" }
+    if k == 3 { return "PowerEnumerate" }
+    if k == 4 { return "PowerGetActiveScheme" }
+    if k == 5 { return "PowerSetActiveScheme" }
+    if k == 6 { return "PowerWriteACValueIndex" }
+    if k == 7 { return "PowerRegisterSuspendResumeNotification" }
+    if k == 8 { return "PowerUnregisterSuspendResumeNotification" }
+    if k == 9 { return "RegisterPowerSettingNotification" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (3 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "power_state"
+        }
+    }
+    if k >= 4 {
+        if k <= 6 {
+            return "schemes"
+        }
+    }
+    if k >= 7 {
+        if k <= 9 {
+            return "notifications"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: POWRPROF fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_powrprof_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_powrprof_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 9 {
+        panic("pe_powrprof_core FAIL [record_syscall_invoke] expected=fn_kind<=9 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_powrprof_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_powrprof_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    ppp_append_row(ppp_syscall_invoke_path(), row)
+}
+
+// ─── record_power_state_event: GetSystemPowerStatus/SetSystemPowerState/SetSuspendState/PowerEnumerate row ───
+fn record_power_state_event(evt_id: int, p_kind: str, status_synth: str, ac_line: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_powrprof_core FAIL [record_power_state_event] evt_id<=0") }
+    if p_kind == "" { panic("pe_powrprof_core FAIL [record_power_state_event] p_kind=empty") }
+    if status_synth == "" { panic("pe_powrprof_core FAIL [record_power_state_event] status_synth=empty") }
+    if ac_line == "" { panic("pe_powrprof_core FAIL [record_power_state_event] ac_line=empty") }
+    if status == "" { panic("pe_powrprof_core FAIL [record_power_state_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + p_kind + "\t" + status_synth + "\t" + ac_line + "\t" + status + "\n"
+    ppp_append_row(ppp_power_state_event_path(), row)
+}
+
+// ─── record_scheme_event: PowerGetActiveScheme/PowerSetActiveScheme/PowerWriteACValueIndex row ───
+fn record_scheme_event(evt_id: int, s_kind: str, scheme_guid: str, value_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_powrprof_core FAIL [record_scheme_event] evt_id<=0") }
+    if s_kind == "" { panic("pe_powrprof_core FAIL [record_scheme_event] s_kind=empty") }
+    if scheme_guid == "" { panic("pe_powrprof_core FAIL [record_scheme_event] scheme_guid=empty") }
+    if value_synth == "" { panic("pe_powrprof_core FAIL [record_scheme_event] value_synth=empty") }
+    if status == "" { panic("pe_powrprof_core FAIL [record_scheme_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + s_kind + "\t" + scheme_guid + "\t" + value_synth + "\t" + status + "\n"
+    ppp_append_row(ppp_scheme_event_path(), row)
+}
+
+// ─── record_notify_event: PowerRegisterSuspendResumeNotification/Unregister/RegisterPowerSettingNotification row ───
+fn record_notify_event(evt_id: int, n_kind: str, hnotify_hex: str, callback_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_powrprof_core FAIL [record_notify_event] evt_id<=0") }
+    if n_kind == "" { panic("pe_powrprof_core FAIL [record_notify_event] n_kind=empty") }
+    if hnotify_hex == "" { panic("pe_powrprof_core FAIL [record_notify_event] hnotify_hex=empty") }
+    if callback_synth == "" { panic("pe_powrprof_core FAIL [record_notify_event] callback_synth=empty") }
+    if status == "" { panic("pe_powrprof_core FAIL [record_notify_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + n_kind + "\t" + hnotify_hex + "\t" + callback_synth + "\t" + status + "\n"
+    ppp_append_row(ppp_notify_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return ppp_count_rows(ppp_syscall_invoke_path(), 4)
+}
+
+fn power_state_event_count() -> int {
+    return ppp_count_rows(ppp_power_state_event_path(), 5)
+}
+
+fn scheme_event_count() -> int {
+    return ppp_count_rows(ppp_scheme_event_path(), 5)
+}
+
+fn notify_event_count() -> int {
+    return ppp_count_rows(ppp_notify_event_path(), 5)
+}
+
+fn ppp_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(power_state_event_count())
+    out.push(scheme_event_count())
+    out.push(notify_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "ppp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_ppp()
+
+    // ─── 1. syscall_invoke × 10 (one per fn, 3 group coverage) ───
+    //   POWER_STATE group (4)
+    record_syscall_invoke(1, 0, "GetSystemPowerStatus", "PARTIAL")
+    println("__POWRPROF__ PARTIAL GetSystemPowerStatus")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"GetSystemPowerStatus\",\"fn_group\":\"power_state\",\"status\":\"PARTIAL\",\"out_synth\":\"SYSTEM_POWER_STATUS_12B_AC_1_BattFlag_0x08_charging_BattLife_0x42_66pct\",\"struct_bytes\":12,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(2, 1, "SetSystemPowerState", "PARTIAL")
+    println("__POWRPROF__ PARTIAL SetSystemPowerState")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"SetSystemPowerState\",\"fn_group\":\"power_state\",\"status\":\"PARTIAL\",\"fSuspend\":\"TRUE_1\",\"fForce\":\"FALSE_0\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(3, 2, "SetSuspendState", "PARTIAL")
+    println("__POWRPROF__ PARTIAL SetSuspendState")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"SetSuspendState\",\"fn_group\":\"power_state\",\"status\":\"PARTIAL\",\"bHibernate\":\"FALSE_0\",\"bForce\":\"FALSE_0\",\"bWakeupEventsDisabled\":\"FALSE_0\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(4, 3, "PowerEnumerate", "PARTIAL")
+    println("__POWRPROF__ PARTIAL PowerEnumerate")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"PowerEnumerate\",\"fn_group\":\"power_state\",\"status\":\"PARTIAL\",\"AccessFlags\":\"ACCESS_SCHEME_0x10\",\"Index\":0,\"BufferSize_in_out\":16,\"out_guid_synth\":\"GUID_TYPICAL_POWER_SAVINGS_381b4222_LE\",\"return_dword\":\"ERROR_SUCCESS_0\"")
+
+    //   SCHEMES group (3)
+    record_syscall_invoke(5, 4, "PowerGetActiveScheme", "PARTIAL")
+    println("__POWRPROF__ PARTIAL PowerGetActiveScheme")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"PowerGetActiveScheme\",\"fn_group\":\"schemes\",\"status\":\"PARTIAL\",\"UserRootPowerKey\":0,\"out_guid_synth\":\"GUID_HIGH_PERFORMANCE_8c5e7fda_LE\",\"struct_bytes\":16,\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(6, 5, "PowerSetActiveScheme", "PARTIAL")
+    println("__POWRPROF__ PARTIAL PowerSetActiveScheme")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"PowerSetActiveScheme\",\"fn_group\":\"schemes\",\"status\":\"PARTIAL\",\"UserRootPowerKey\":0,\"SchemeGuid\":\"GUID_HIGH_PERFORMANCE_8c5e7fda_LE\",\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(7, 6, "PowerWriteACValueIndex", "PARTIAL")
+    println("__POWRPROF__ PARTIAL PowerWriteACValueIndex")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"PowerWriteACValueIndex\",\"fn_group\":\"schemes\",\"status\":\"PARTIAL\",\"RootPowerKey\":0,\"SchemeGuid\":\"GUID_HIGH_PERFORMANCE_8c5e7fda_LE\",\"SubGroupOfPowerSettingsGuid\":\"GUID_VIDEO_SUBGROUP_7516b95f_LE\",\"PowerSettingGuid\":\"GUID_VIDEO_TIMEOUT_3c0bc021_LE\",\"AcValueIndex\":600,\"return_dword\":\"ERROR_SUCCESS_0\"")
+
+    //   NOTIFICATIONS group (3)
+    record_syscall_invoke(8, 7, "PowerRegisterSuspendResumeNotification", "PARTIAL")
+    println("__POWRPROF__ PARTIAL PowerRegisterSuspendResumeNotification")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"PowerRegisterSuspendResumeNotification\",\"fn_group\":\"notifications\",\"status\":\"PARTIAL\",\"Flags\":\"DEVICE_NOTIFY_CALLBACK_2\",\"Recipient_synth\":\"DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS_8B_callback_0x9C020000\",\"out_RegistrationHandle\":\"0x9C010100\",\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(9, 8, "PowerUnregisterSuspendResumeNotification", "PARTIAL")
+    println("__POWRPROF__ PARTIAL PowerUnregisterSuspendResumeNotification")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"PowerUnregisterSuspendResumeNotification\",\"fn_group\":\"notifications\",\"status\":\"PARTIAL\",\"RegistrationHandle\":\"0x9C010100\",\"return_dword\":\"ERROR_SUCCESS_0\"")
+    record_syscall_invoke(10, 9, "RegisterPowerSettingNotification", "PARTIAL")
+    println("__POWRPROF__ PARTIAL RegisterPowerSettingNotification")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"RegisterPowerSettingNotification\",\"fn_group\":\"notifications\",\"status\":\"PARTIAL\",\"hRecipient\":\"0x9C020100_HWND\",\"PowerSettingGuid\":\"GUID_ACDC_POWER_SOURCE_5d3e9a59_LE\",\"Flags\":\"DEVICE_NOTIFY_WINDOW_HANDLE_0\",\"out_HPOWERNOTIFY\":\"0x9C010200\",\"return_handle\":\"0x9C010200\"")
+
+    // ─── 2. power_state_event × 4 (status/set_state/suspend/enumerate) ───
+    record_power_state_event(1, "status_ac_charging_d2r_idle", "SYSTEM_POWER_STATUS_12B_AC_1_BattFlag_0x08", "AC_1_charging_BattLife_0x42_66pct", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"power_state_event\",\"evt_id\":1,\"p_kind\":\"status_ac_charging_d2r_idle\",\"status_synth\":\"SYSTEM_POWER_STATUS_12B_AC_1_BattFlag_0x08\",\"struct_bytes\":12,\"ACLineStatus\":1,\"BatteryFlag\":\"0x08\",\"BatteryLifePercent\":66,\"status\":\"PARTIAL\"")
+    record_power_state_event(2, "set_state_suspend_request", "PowerSystemSleeping3_S3", "AC_1_charging", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"power_state_event\",\"evt_id\":2,\"p_kind\":\"set_state_suspend_request\",\"status_synth\":\"PowerSystemSleeping3_S3\",\"fSuspend\":true,\"fForce\":false,\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+    record_power_state_event(3, "suspend_state_battery_normal", "SetSuspendState_no_hibernate_no_force", "battery_normal_BattLife_0x32_50pct", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"power_state_event\",\"evt_id\":3,\"p_kind\":\"suspend_state_battery_normal\",\"status_synth\":\"SetSuspendState_no_hibernate_no_force\",\"bHibernate\":false,\"bForce\":false,\"battle_net_resume_pending\":true,\"status\":\"PARTIAL\"")
+    record_power_state_event(4, "enumerate_scheme_index_0", "GUID_TYPICAL_POWER_SAVINGS_381b4222_LE", "AccessFlags_ACCESS_SCHEME_0x10", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"power_state_event\",\"evt_id\":4,\"p_kind\":\"enumerate_scheme_index_0\",\"status_synth\":\"GUID_TYPICAL_POWER_SAVINGS_381b4222_LE\",\"struct_bytes\":16,\"AccessFlags\":\"ACCESS_SCHEME_0x10\",\"Index\":0,\"status\":\"PARTIAL\"")
+
+    // ─── 3. scheme_event × 3 (get_active/set_active/write_ac_value) ───
+    record_scheme_event(1, "get_active_high_performance", "GUID_HIGH_PERFORMANCE_8c5e7fda_LE", "active_scheme_inherit", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"scheme_event\",\"evt_id\":1,\"s_kind\":\"get_active_high_performance\",\"scheme_guid\":\"GUID_HIGH_PERFORMANCE_8c5e7fda_LE\",\"struct_bytes\":16,\"value_synth\":\"active_scheme_inherit\",\"d2r_d4_high_perf_baseline\":true,\"status\":\"PARTIAL\"")
+    record_scheme_event(2, "set_active_high_performance", "GUID_HIGH_PERFORMANCE_8c5e7fda_LE", "set_active_apply", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"scheme_event\",\"evt_id\":2,\"s_kind\":\"set_active_high_performance\",\"scheme_guid\":\"GUID_HIGH_PERFORMANCE_8c5e7fda_LE\",\"value_synth\":\"set_active_apply\",\"return_dword\":\"ERROR_SUCCESS_0\",\"status\":\"PARTIAL\"")
+    record_scheme_event(3, "write_ac_video_timeout_600s", "GUID_VIDEO_TIMEOUT_3c0bc021_LE", "AcValueIndex_600s", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"scheme_event\",\"evt_id\":3,\"s_kind\":\"write_ac_video_timeout_600s\",\"scheme_guid\":\"GUID_VIDEO_TIMEOUT_3c0bc021_LE\",\"value_synth\":\"AcValueIndex_600s\",\"AcValueIndex\":600,\"status\":\"PARTIAL\"")
+
+    // ─── 4. notify_event × 3 (register_suspend/unregister_suspend/register_setting) ───
+    record_notify_event(1, "register_suspend_resume_callback", "0x9C010100", "DEVICE_NOTIFY_CALLBACK_8B_fn_0x9C020000", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"notify_event\",\"evt_id\":1,\"n_kind\":\"register_suspend_resume_callback\",\"hnotify_hex\":\"0x9C010100\",\"callback_synth\":\"DEVICE_NOTIFY_CALLBACK_8B_fn_0x9C020000\",\"Flags\":\"DEVICE_NOTIFY_CALLBACK_2\",\"battle_net_agent_baseline\":true,\"status\":\"PARTIAL\"")
+    record_notify_event(2, "unregister_suspend_resume", "0x9C010100", "release_handle", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"notify_event\",\"evt_id\":2,\"n_kind\":\"unregister_suspend_resume\",\"hnotify_hex\":\"0x9C010100\",\"callback_synth\":\"release_handle\",\"return_dword\":\"ERROR_SUCCESS_0\",\"status\":\"PARTIAL\"")
+    record_notify_event(3, "register_setting_acdc_source", "0x9C010200", "POWERBROADCAST_SETTING_12B_acdc_source", "PARTIAL")
+    r0_emit("pe_powrprof_core_record", "\"kind\":\"notify_event\",\"evt_id\":3,\"n_kind\":\"register_setting_acdc_source\",\"hnotify_hex\":\"0x9C010200\",\"callback_synth\":\"POWERBROADCAST_SETTING_12B_acdc_source\",\"struct_bytes\":12,\"PowerSettingGuid\":\"GUID_ACDC_POWER_SOURCE_5d3e9a59_LE\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 10 {
+        panic("pe_powrprof_core FAIL [syscall_invoke_count] expected=10 got=" + to_string(si))
+    }
+    let pe = power_state_event_count()
+    if pe != 4 {
+        panic("pe_powrprof_core FAIL [power_state_event_count] expected=4 got=" + to_string(pe))
+    }
+    let se = scheme_event_count()
+    if se != 3 {
+        panic("pe_powrprof_core FAIL [scheme_event_count] expected=3 got=" + to_string(se))
+    }
+    let ne = notify_event_count()
+    if ne != 3 {
+        panic("pe_powrprof_core FAIL [notify_event_count] expected=3 got=" + to_string(ne))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "GetSystemPowerStatus" { panic("pe_powrprof_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "SetSuspendState" { panic("pe_powrprof_core FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "PowerGetActiveScheme" { panic("pe_powrprof_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(7) != "PowerRegisterSuspendResumeNotification" { panic("pe_powrprof_core FAIL [fn_kind_name(7)]") }
+    if fn_kind_name(9) != "RegisterPowerSettingNotification" { panic("pe_powrprof_core FAIL [fn_kind_name(9)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_powrprof_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "power_state" { panic("pe_powrprof_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "schemes" { panic("pe_powrprof_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(7) != "notifications" { panic("pe_powrprof_core FAIL [fn_group_name(7)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_powrprof_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = ppp_stats()
+    if len(s) != 4 { panic("pe_powrprof_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 10 { panic("pe_powrprof_core FAIL [stats syscall_invoke_count] expected=10 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_powrprof_core FAIL [stats power_state_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 3 { panic("pe_powrprof_core FAIL [stats scheme_event_count] expected=3 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_powrprof_core FAIL [stats notify_event_count] expected=3 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_powrprof_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"power_state_event_count\":" + to_string(s[1])
+        + ",\"scheme_event_count\":" + to_string(s[2])
+        + ",\"notify_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_powrprof_core_summary",
+        "\"target\":\"POWRPROF.dll\",\"fn_total\":10,\"fn_emit_partial\":10,\"groups\":[\"power_state\",\"schemes\",\"notifications\"],\"system_power_status_synth_bytes\":12,\"power_policy_guid_synth_bytes\":16,\"powerbroadcast_setting_synth_bytes\":12,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_powrprof_core_kpi",
+        "\"power_state_emits\":4,\"scheme_emits\":3,\"notify_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"d2r_d4_idle_resume_baseline\":true,\"battlenet_agent_power_notification_baseline\":true,\"iopmrootdomain_iopmassertion_pmset_binding\":false,\"nsworkspace_willsleep_didwake_binding\":false")
+
+    // ─── cycle 47 → 48 POWRPROF coverage progression evidence emit ───
+    r0_emit("pe_powrprof_core_coverage_progression",
+        "\"surface\":\"POWRPROF_full_435_fn\",\"cycle_47_count\":262,\"cycle_48_count\":272,\"delta\":10,\"cycle_47_percent\":60.23,\"cycle_48_percent\":62.53,\"cycle_48_module\":\"pe_powrprof_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bd1_cycle_increment\":10,\"track_bd_bundled_part_1_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_powrprof_core_round_trip_matrix",
+        "\"surface\":\"POWRPROF_core_10_fn\",\"fn_partial\":10,\"fn_groups\":3,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real GetSystemPowerStatus + SetSuspendState + PowerRegisterSuspendResumeNotification = IOPMrootDomain + IOPMAssertion + pmset + NSWorkspace willSleep/didWake notification bridge pending separate cycle (long-horizon power management pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BD1 expansion emit (cycle 48, POWRPROF +10 fn) ───
+    r0_emit("pe_powrprof_core_bd1_expansion",
+        "\"track\":\"BD1\",\"cycle\":48,\"surface\":\"POWRPROF_new\",\"new_fn\":10,\"groups\":[\"power_state\",\"schemes\",\"notifications\"],\"power_state_count\":4,\"schemes_count\":3,\"notifications_count\":3,\"emit_format\":\"__POWRPROF__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_1_evidence_augment\":true,\"track_bd_bundled_part_1_of_4\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_powrprof_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_ppp()
+    let s2 = ppp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_powrprof_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_powrprof_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", power_state_event=" + to_string(s[1])
+        + ", scheme_event=" + to_string(s[2]) + ", notify_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ppp_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("power_state_event_count\t" + to_string(s[1]))
+            println("scheme_event_count\t" + to_string(s[2]))
+            println("notify_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_powrprof_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_powrprof_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ppp()
+            println("cleaned: " + ppp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ppp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_powrprof_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

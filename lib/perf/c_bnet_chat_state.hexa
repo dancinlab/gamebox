@@ -1,0 +1,214 @@
+// lib/perf/c_bnet_chat_state.hexa — CN-117 skeleton manjeom 15/15
+//
+// Battle.net 친구 + 채팅 connection state — XMPP-like presence.
+// 4 presence: online / away / dnd / offline.
+//
+// 무기: presence map (TSV, name → presence) + bulk transition.
+// 효과: launcher 가 친구 list 의 presence snapshot 을 빠르게 조회 + bulk offline.
+
+use "./r0_common"
+
+let BCS_DIR = GAMEBOX_HOME + "/persist/bnet_chat_state"
+let FRIENDS_TSV = BCS_DIR + "/friends.tsv"
+
+fn bcs_dir() -> str { return BCS_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + BCS_DIR + "'")
+}
+
+fn presence_states() -> array {
+    return ["online", "away", "dnd", "offline"]
+}
+
+fn is_valid_presence(p: str) -> bool {
+    if p == "online" { return true }
+    if p == "away" { return true }
+    if p == "dnd" { return true }
+    if p == "offline" { return true }
+    return false
+}
+
+// ─── friend 등록 / 갱신 (name → presence, ts) ───
+fn record_friend(name: str, presence: str, ts: int) -> void {
+    if name == "" { return }
+    if !is_valid_presence(presence) { return }
+    ensure_dir()
+    // 동일 name 중복 제거
+    let exists = exec("test -f '" + FRIENDS_TSV + "' && echo ok").trim()
+    if exists == "ok" {
+        let _ = exec("awk -F'\\t' -v n='" + name + "' '$1!=n' '" + FRIENDS_TSV + "' > '" + FRIENDS_TSV + ".tmp' && mv '" + FRIENDS_TSV + ".tmp' '" + FRIENDS_TSV + "'")
+    }
+    let line = name + "\t" + presence + "\t" + to_string(ts)
+    let tmp = FRIENDS_TSV + ".add"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + FRIENDS_TSV + "' && rm -f '" + tmp + "'")
+    r0_emit("bnet_chat_friend", "\"name\":\"" + name + "\",\"presence\":\"" + presence + "\"")
+}
+
+fn friend_count() -> int {
+    let exists = exec("test -f '" + FRIENDS_TSV + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("wc -l < '" + FRIENDS_TSV + "' | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn online_count() -> int {
+    let exists = exec("test -f '" + FRIENDS_TSV + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$2==\"online\"' '" + FRIENDS_TSV + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn friend_presence(name: str) -> str {
+    let exists = exec("test -f '" + FRIENDS_TSV + "' && echo ok").trim()
+    if exists != "ok" { return "" }
+    let r = exec("awk -F'\\t' -v n='" + name + "' '$1==n {print $2; exit}' '" + FRIENDS_TSV + "'").trim()
+    return r
+}
+
+// ─── 모든 friend 를 offline 으로 (logout / network drop) ───
+fn bulk_set_offline() -> void {
+    let exists = exec("test -f '" + FRIENDS_TSV + "' && echo ok").trim()
+    if exists != "ok" { return }
+    let ts = exec("date +%s").trim()
+    let _ = exec("awk -F'\\t' -v t='" + ts + "' 'BEGIN{OFS=\"\\t\"} {print $1, \"offline\", t}' '" + FRIENDS_TSV + "' > '" + FRIENDS_TSV + ".tmp' && mv '" + FRIENDS_TSV + ".tmp' '" + FRIENDS_TSV + "'")
+    r0_emit("bnet_chat_bulk_offline", "\"ts\":" + ts)
+}
+
+fn cleanup_bcs() -> void {
+    let _ = exec("rm -rf '" + BCS_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "bcs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_bcs()
+
+    let p = presence_states()
+    if len(p) != 4 { panic("c_bnet_chat_state FAIL [presence] expected=4 got=" + to_string(len(p))) }
+    if p[0] != "online" { panic("c_bnet_chat_state FAIL [p0]") }
+    if p[3] != "offline" { panic("c_bnet_chat_state FAIL [p3]") }
+
+    if !is_valid_presence("dnd") { panic("c_bnet_chat_state FAIL [valid dnd]") }
+    if is_valid_presence("invisible") { panic("c_bnet_chat_state FAIL [invalid]") }
+
+    // 5 friend: 3 online / 1 away / 1 dnd
+    let now = to_int(exec("date +%s").trim())
+    record_friend("alice", "online", now)
+    record_friend("bob", "online", now)
+    record_friend("carol", "online", now)
+    record_friend("dave", "away", now)
+    record_friend("eve", "dnd", now)
+
+    let fc = friend_count()
+    if fc != 5 { panic("c_bnet_chat_state FAIL [friend_count] expected=5 got=" + to_string(fc)) }
+
+    let oc = online_count()
+    if oc != 3 { panic("c_bnet_chat_state FAIL [online_count] expected=3 got=" + to_string(oc)) }
+
+    let pa = friend_presence("alice")
+    if pa != "online" { panic("c_bnet_chat_state FAIL [presence alice] got=" + pa) }
+    let pe = friend_presence("eve")
+    if pe != "dnd" { panic("c_bnet_chat_state FAIL [presence eve] got=" + pe) }
+    let pmiss = friend_presence("ghost")
+    if pmiss != "" { panic("c_bnet_chat_state FAIL [presence miss]") }
+
+    // dedup: alice 갱신 → away
+    record_friend("alice", "away", now + 10)
+    let pa2 = friend_presence("alice")
+    if pa2 != "away" { panic("c_bnet_chat_state FAIL [update alice] got=" + pa2) }
+    let fc2 = friend_count()
+    if fc2 != 5 { panic("c_bnet_chat_state FAIL [dedup count] expected=5 got=" + to_string(fc2)) }
+    let oc2 = online_count()
+    if oc2 != 2 { panic("c_bnet_chat_state FAIL [online after update] expected=2 got=" + to_string(oc2)) }
+
+    // invalid presence 무시
+    record_friend("frank", "invisible", now)
+    let fc3 = friend_count()
+    if fc3 != 5 { panic("c_bnet_chat_state FAIL [invalid ignored] expected=5 got=" + to_string(fc3)) }
+
+    // bulk offline
+    bulk_set_offline()
+    let fc4 = friend_count()
+    if fc4 != 5 { panic("c_bnet_chat_state FAIL [bulk count] expected=5 got=" + to_string(fc4)) }
+    let oc3 = online_count()
+    if oc3 != 0 { panic("c_bnet_chat_state FAIL [bulk online] expected=0 got=" + to_string(oc3)) }
+    let pa3 = friend_presence("alice")
+    if pa3 != "offline" { panic("c_bnet_chat_state FAIL [bulk alice] got=" + pa3) }
+    let pe2 = friend_presence("eve")
+    if pe2 != "offline" { panic("c_bnet_chat_state FAIL [bulk eve] got=" + pe2) }
+
+    r0_emit("bnet_chat_summary", "\"friends\":" + to_string(fc4) + ",\"online\":" + to_string(oc3))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 6 { panic("c_bnet_chat_state FAIL [emit count] expected>=6 got=" + to_string(cnt)) }
+
+    // ─── synthetic chat presence state machine round-trip (Track-N cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track-N mission: battlenet cond.3 (OAuth 2-leg + chat/login state track live)
+    // 측 evidence augment. cond.3 측 status `partial` 영구 유지 — 실 XMPP-like presence
+    // server endpoint + 실 chat protocol round-trip 측 production smoke gate transitive
+    // (network-dependent, blk.1 + Track-K Win32 syscall perfection long-horizon 정합).
+    //
+    // synthetic chat presence state machine: ONLINE → AWAY → DND → OFFLINE 4 transition.
+    // hexa-native loop only — 실 XMPP / Battle.net chat server 0, TCP/UDP 0,
+    // socket() 0, OAuth credential 0. payload = chat_session_id + presence_kind +
+    // msg_count_simulated. round-trip emit = `__BNET_CHAT__ PARTIAL <state>` per row.
+    //
+    // own1: Wine 0 / chat protocol bypass 0 / Warden detection 측 hook 0.
+    // own2: PARTIAL emit explicit (NOT PASS — production smoke deferred).
+    let chat_session_id = "csid-synth-" + exec("date +%s").trim()
+
+    println("__BNET_CHAT__ PARTIAL ONLINE")
+    r0_emit("c_bnet_chat_state_synthetic_state",
+        "\"stage\":\"presence_state_machine\",\"chat_session_id\":\"" + chat_session_id + "\",\"presence_kind\":\"ONLINE\",\"msg_count_simulated\":0,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"permanent_until_real_network — blk.1 transitive\"")
+
+    println("__BNET_CHAT__ PARTIAL AWAY")
+    r0_emit("c_bnet_chat_state_synthetic_state",
+        "\"stage\":\"presence_state_machine\",\"chat_session_id\":\"" + chat_session_id + "\",\"presence_kind\":\"AWAY\",\"msg_count_simulated\":3,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__BNET_CHAT__ PARTIAL DND")
+    r0_emit("c_bnet_chat_state_synthetic_state",
+        "\"stage\":\"presence_state_machine\",\"chat_session_id\":\"" + chat_session_id + "\",\"presence_kind\":\"DND\",\"msg_count_simulated\":7,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__BNET_CHAT__ PARTIAL OFFLINE")
+    r0_emit("c_bnet_chat_state_synthetic_state",
+        "\"stage\":\"presence_state_machine\",\"chat_session_id\":\"" + chat_session_id + "\",\"presence_kind\":\"OFFLINE\",\"msg_count_simulated\":10,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    r0_emit("c_bnet_chat_state_synthetic_round_trip_matrix",
+        "\"states_total\":4,\"states_partial\":4,\"states_pass\":0,\"chat_session_id\":\"" + chat_session_id + "\",\"transport_kind\":\"synthetic_inline\",\"network\":\"none\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"track\":\"N1\",\"lockin_iso\":\"2026-05-03\"")
+
+    cleanup_bcs()
+
+    println("  ✅ c_bnet_chat_state self_test PASS (5 friends, 3→0 online after bulk, +4 synthetic state PARTIAL transitions, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "record" && len(a) >= 5 {
+            let ts = to_int(exec("date +%s").trim())
+            record_friend(a[3], a[4], ts)
+            println("recorded")
+            return
+        }
+        if sub == "presence" && len(a) >= 4 {
+            let r = friend_presence(a[3])
+            if r == "" { println("not_found") } else { println(r) }
+            return
+        }
+        if sub == "stats" {
+            println("friends=" + to_string(friend_count()) + " online=" + to_string(online_count()))
+            return
+        }
+        if sub == "bulk-offline" { bulk_set_offline(); println("bulk offline"); return }
+        if sub == "cleanup" { cleanup_bcs(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_bnet_chat_state.hexa { self-test | record <name> <presence> | presence <name> | stats | bulk-offline | cleanup }")
+}

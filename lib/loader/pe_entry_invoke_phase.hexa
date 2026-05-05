@@ -1,0 +1,489 @@
+// lib/loader/pe_entry_invoke_phase.hexa — phase 12. PE entry_rva 호출 invoke phase tracker.
+//
+// PE Entry Invoke Phase (own1: PE/COFF + Apple sigaction(2) + ucontext_t 공개 정보):
+//   1 = stack_setup           (i386 cdecl/stdcall — HINSTANCE/HINSTANCE/cmdline/cmdshow 4 args 또는
+//                              cdecl 1-2 args 정렬, ESP 16-byte 정렬 + 가짜 return addr push)
+//   2 = arg_marshall          (HINSTANCE handle 값 marshalling, lpCmdLine ANSI/UNICODE 포인터,
+//                              nCmdShow int 정렬 — call frame on stack 작성)
+//   3 = jump_to_entry         (entry_rva 위치로 control transfer — 첫 호출은 Win32 API call →
+//                              미해소 IAT slot 시 SIGSEGV trap 가능)
+//   4 = signal_trap_setup     (Apple sigaction(SIGSEGV/SIGFPE/SIGILL/SIGTRAP) + sa_sigaction +
+//                              SA_SIGINFO|SA_ONSTACK + sigaltstack)
+//   5 = trap_recover          (signal handler 가 ucontext_t (mc->__es.__faultvaddr/__rip) 로
+//                              IAT entry 식별 후 helper IPC kind=5 dlsym 으로 patch + retry)
+//   6 = tls_callback_fire     (entry_rva 호출 직전 TLS callback chain — IMAGE_DIRECTORY_ENTRY_TLS,
+//                              DLL_PROCESS_ATTACH 로 firing)
+//
+// trap_signal:
+//   0  = none                 (정상 invoke — trap 없음)
+//   11 = SIGSEGV              (미해소 IAT slot 접근 / NULL deref / 잘못된 page protection)
+//   8  = SIGFPE               (entry 코드 division by zero / x87 FPU exception)
+//   4  = SIGILL               (illegal instruction — x86_64 vs i386 mismatch / VEX prefix 등)
+//   5  = SIGTRAP              (debug breakpoint / int 3 — anti-debug 또는 lazy bind)
+//
+// own1 enforcement: Wine / CrossOver / Whisky / GPTK / community wrapper 코드 0 줄.
+//   본 module 은 Apple sigaction + ucontext_t + PE entry_rva 호출 phase tracker — 실 PE 실행 X.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — invokes.tsv):
+//   invoke_id<int> \t phase_kind<int> \t elevated<int> \t trap_signal<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn peip_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_entry_invoke_phase"
+}
+
+fn peip_invokes_path() -> str {
+    return peip_dir() + "/invokes.tsv"
+}
+
+fn peip_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + peip_dir() + "'")
+}
+
+fn cleanup_peip() -> void {
+    peip_ensure_dir()
+    let _ = exec("rm -f '" + peip_invokes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn peip_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn peip_append_row(path: str, row: str) -> void {
+    peip_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_invoke: entry invoke 1 건 기록 ───
+fn record_invoke(invoke_id: int, phase_kind: int, elevated: int, trap_signal: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_entry_invoke_phase FAIL [record_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_entry_invoke_phase FAIL [record_invoke] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 6 {
+        panic("pe_entry_invoke_phase FAIL [record_invoke] expected=phase_kind<=6 got=" + to_string(phase_kind))
+    }
+    if elevated < 0 {
+        panic("pe_entry_invoke_phase FAIL [record_invoke] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_entry_invoke_phase FAIL [record_invoke] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    // trap_signal: 0 / 4 / 5 / 8 / 11
+    if trap_signal != 0 {
+        if trap_signal != 4 {
+            if trap_signal != 5 {
+                if trap_signal != 8 {
+                    if trap_signal != 11 {
+                        panic("pe_entry_invoke_phase FAIL [record_invoke] expected=trap_signal in {0,4,5,8,11} got=" + to_string(trap_signal))
+                    }
+                }
+            }
+        }
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(elevated) + "\t" + to_string(trap_signal) + "\n"
+    peip_append_row(peip_invokes_path(), row)
+}
+
+// ─── invoke_count: total invoke 수 ───
+fn invoke_count() -> int {
+    let t = peip_read_table(peip_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 invoke 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = peip_read_table(peip_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_trap_signal: 특정 trap_signal 의 invoke 수 ───
+fn count_by_trap_signal(trap_signal: int) -> int {
+    let t = peip_read_table(peip_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == trap_signal {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── elevated_count: elevated=1 인 invoke 수 ───
+fn elevated_count() -> int {
+    let t = peip_read_table(peip_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── trap_count: invoke_count - count_by_trap_signal(0) (= trap_signal != 0 인 row) ───
+fn trap_count() -> int {
+    return invoke_count() - count_by_trap_signal(0)
+}
+
+// ─── invoke_trap_signal: 특정 invoke_id 의 trap_signal (없으면 0) ───
+fn invoke_trap_signal(invoke_id: int) -> int {
+    let t = peip_read_table(peip_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == invoke_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── peip_stats: [invoke_count, elevated_count, trap_count, count_phase_kind(3), count_phase_kind(5)] ───
+fn peip_stats() -> array {
+    let mut out = []
+    out.push(invoke_count())
+    out.push(elevated_count())
+    out.push(trap_count())
+    out.push(count_by_phase_kind(3))
+    out.push(count_by_phase_kind(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "peip-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_peip()
+
+    // 2. record 6 invokes — phase_kind 1,2,3,4,5,6 각 1건 (= 6 phase_kinds), trap_signal != 0 ≥ 2 건
+    //   id 120001: phase 1 stack_setup          elev=1 trap=0   (정상 스택 정렬, elevated UAC)
+    //   id 120002: phase 2 arg_marshall         elev=0 trap=0   (정상 marshall)
+    //   id 120003: phase 3 jump_to_entry        elev=0 trap=11  (SIGSEGV — 미해소 IAT slot)
+    //   id 120004: phase 4 signal_trap_setup    elev=0 trap=0   (sigaction 등록 정상)
+    //   id 120005: phase 5 trap_recover         elev=0 trap=5   (SIGTRAP — lazy bind / int 3 retry)
+    //   id 120006: phase 6 tls_callback_fire    elev=0 trap=0   (TLS callback 정상 firing)
+    //   sums: invokes=6, elevated=1, trap=2 (120003,120005), phase(3)=1, phase(5)=1
+    record_invoke(120001, 1, 1, 0)
+    r0_emit("pe_entry_invoke_phase_record",
+        "\"invoke_id\":120001,\"phase_kind\":1,\"elevated\":1,\"trap_signal\":0,\"target\":\"stack_setup\"")
+
+    record_invoke(120002, 2, 0, 0)
+    r0_emit("pe_entry_invoke_phase_record",
+        "\"invoke_id\":120002,\"phase_kind\":2,\"elevated\":0,\"trap_signal\":0,\"target\":\"arg_marshall\"")
+
+    record_invoke(120003, 3, 0, 11)
+    r0_emit("pe_entry_invoke_phase_record",
+        "\"invoke_id\":120003,\"phase_kind\":3,\"elevated\":0,\"trap_signal\":11,\"target\":\"jump_to_entry\"")
+
+    record_invoke(120004, 4, 0, 0)
+    r0_emit("pe_entry_invoke_phase_record",
+        "\"invoke_id\":120004,\"phase_kind\":4,\"elevated\":0,\"trap_signal\":0,\"target\":\"signal_trap_setup\"")
+
+    record_invoke(120005, 5, 0, 5)
+    r0_emit("pe_entry_invoke_phase_record",
+        "\"invoke_id\":120005,\"phase_kind\":5,\"elevated\":0,\"trap_signal\":5,\"target\":\"trap_recover\"")
+
+    record_invoke(120006, 6, 0, 0)
+    r0_emit("pe_entry_invoke_phase_record",
+        "\"invoke_id\":120006,\"phase_kind\":6,\"elevated\":0,\"trap_signal\":0,\"target\":\"tls_callback_fire\"")
+
+    // 3. invoke_count = 6
+    let c = invoke_count()
+    if c != 6 {
+        panic("pe_entry_invoke_phase FAIL [invoke_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..6 각 1건, 99 = 0 (≥4 phase_kinds 보장)
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_entry_invoke_phase FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+    // distinct phase_kinds 카운트 — ≥4 검증
+    let mut distinct_pk = 0
+    if p1 > 0 { distinct_pk = distinct_pk + 1 }
+    if p2 > 0 { distinct_pk = distinct_pk + 1 }
+    if p3 > 0 { distinct_pk = distinct_pk + 1 }
+    if p4 > 0 { distinct_pk = distinct_pk + 1 }
+    if p5 > 0 { distinct_pk = distinct_pk + 1 }
+    if p6 > 0 { distinct_pk = distinct_pk + 1 }
+    if distinct_pk < 4 {
+        panic("pe_entry_invoke_phase FAIL [distinct_phase_kinds] expected=>=4 got=" + to_string(distinct_pk))
+    }
+
+    // 5. count_by_trap_signal sanity — 0=4, 11=1, 5=1, 8=0, 4=0
+    let ts0 = count_by_trap_signal(0)
+    if ts0 != 4 {
+        panic("pe_entry_invoke_phase FAIL [count_by_trap_signal(0)] expected=4 got=" + to_string(ts0))
+    }
+    let ts11 = count_by_trap_signal(11)
+    if ts11 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_trap_signal(11)] expected=1 got=" + to_string(ts11))
+    }
+    let ts5 = count_by_trap_signal(5)
+    if ts5 != 1 {
+        panic("pe_entry_invoke_phase FAIL [count_by_trap_signal(5)] expected=1 got=" + to_string(ts5))
+    }
+    let ts8 = count_by_trap_signal(8)
+    if ts8 != 0 {
+        panic("pe_entry_invoke_phase FAIL [count_by_trap_signal(8)] expected=0 got=" + to_string(ts8))
+    }
+    let ts4 = count_by_trap_signal(4)
+    if ts4 != 0 {
+        panic("pe_entry_invoke_phase FAIL [count_by_trap_signal(4)] expected=0 got=" + to_string(ts4))
+    }
+
+    // 6. elevated_count = 1 (120001)
+    let ec = elevated_count()
+    if ec != 1 {
+        panic("pe_entry_invoke_phase FAIL [elevated_count] expected=1 got=" + to_string(ec))
+    }
+
+    // 7. trap_count = invoke_count - count_by_trap_signal(0) = 6 - 4 = 2 (≥2 보장)
+    let tc = trap_count()
+    if tc != 2 {
+        panic("pe_entry_invoke_phase FAIL [trap_count] expected=2 got=" + to_string(tc))
+    }
+    if tc < 2 {
+        panic("pe_entry_invoke_phase FAIL [trap_count>=2] expected=>=2 got=" + to_string(tc))
+    }
+
+    // 8. invoke_trap_signal sanity
+    let s3 = invoke_trap_signal(120003)
+    if s3 != 11 {
+        panic("pe_entry_invoke_phase FAIL [invoke_trap_signal(120003)] expected=11 got=" + to_string(s3))
+    }
+    let s5 = invoke_trap_signal(120005)
+    if s5 != 5 {
+        panic("pe_entry_invoke_phase FAIL [invoke_trap_signal(120005)] expected=5 got=" + to_string(s5))
+    }
+    let s1 = invoke_trap_signal(120001)
+    if s1 != 0 {
+        panic("pe_entry_invoke_phase FAIL [invoke_trap_signal(120001)] expected=0 got=" + to_string(s1))
+    }
+    let s_miss = invoke_trap_signal(9999)
+    if s_miss != 0 {
+        panic("pe_entry_invoke_phase FAIL [invoke_trap_signal(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 9. peip_stats() = [6, 1, 2, 1, 1]
+    let s = peip_stats()
+    if len(s) != 5 {
+        panic("pe_entry_invoke_phase FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_entry_invoke_phase FAIL [stats invoke_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_entry_invoke_phase FAIL [stats elevated_count] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_entry_invoke_phase FAIL [stats trap_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_entry_invoke_phase FAIL [stats count_phase(3)] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_entry_invoke_phase FAIL [stats count_phase(5)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_entry_invoke_phase_stats",
+        "\"invoke_count\":" + to_string(s[0])
+        + ",\"elevated_count\":" + to_string(s[1])
+        + ",\"trap_count\":" + to_string(s[2])
+        + ",\"count_jump_to_entry\":" + to_string(s[3])
+        + ",\"count_trap_recover\":" + to_string(s[4]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_entry_invoke_phase FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_peip()
+    let s2 = peip_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_entry_invoke_phase FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_entry_invoke_phase self_test PASS (invokes=" + to_string(s[0])
+        + ", elevated=" + to_string(s[1]) + ", trap=" + to_string(s[2])
+        + ", jump_to_entry=" + to_string(s[3]) + ", trap_recover=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = peip_stats()
+            println("invoke_count\t" + to_string(s[0]))
+            println("elevated_count\t" + to_string(s[1]))
+            println("trap_count\t" + to_string(s[2]))
+            println("count_jump_to_entry\t" + to_string(s[3]))
+            println("count_trap_recover\t" + to_string(s[4]))
+            return
+        }
+        if sub == "trap" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("invoke_trap_signal\t" + to_string(invoke_trap_signal(iid)))
+                return
+            }
+            println("usage: hexa run pe_entry_invoke_phase.hexa trap <invoke_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_entry_invoke_phase.hexa count <phase_kind>")
+            return
+        }
+        if sub == "signal" {
+            if len(a) >= 4 {
+                let ts = to_int(a[3])
+                println("count_by_trap_signal\t" + to_string(count_by_trap_signal(ts)))
+                return
+            }
+            println("usage: hexa run pe_entry_invoke_phase.hexa signal <trap_signal>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_peip()
+            println("cleaned: " + peip_dir())
+            return
+        }
+        if sub == "dir" {
+            println(peip_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_entry_invoke_phase.hexa { self-test | stats | trap <invoke_id> | count <phase_kind> | signal <trap_signal> | cleanup | dir }")
+}

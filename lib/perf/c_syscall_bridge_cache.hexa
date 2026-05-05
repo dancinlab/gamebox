@@ -1,0 +1,470 @@
+// lib/perf/c_syscall_bridge_cache.hexa — CN-4 C-SYSCALL-BRIDGE-CACHE (D-list 15/15)
+//
+// 무엇:
+//   Win32 API 호출은 매번 syscall bridge 변환 (Win32 ABI → POSIX/macOS syscall)
+//   비용을 지불. own1-driven hexa-native Win32 shim (Phase 3a kernel32 실시) 위에서
+//   result_cache 무기로 amortize: <win32_func>:<arg_pattern> → resolved macOS
+//   syscall mapping (signature + notes).
+//
+//   첫 호출 = default_mapping(table) lookup → cache_insert (miss).
+//   이후 호출 = cache_lookup → 즉시 mapping 반환 (hit).
+//
+// schema (cache JSONL row):
+//   key / macos_syscall / signature / notes / hit_count / last_used_ts /
+//   inserted_ts
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X.
+// args() = [hexa, file, ...userargs]. a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. Win32→macOS 변환 path
+// 는 own1-native (lib/loader/win32_*.hexa, syscall_bridge.hexa) 만. 본 모듈은
+// cache 만 — built-in default_mapping table 은 Microsoft + Apple 공식 docs
+// 기반 (learn.microsoft.com + developer.apple.com).
+//
+// own 2 mandate: r0_emit ≥ 2 (cache_hit / cache_miss / cache_insert /
+// syscall_bridge_summary), fn self_test() + main() dispatch, headless
+// (no GUI/dialog), panic 형식
+// "c_syscall_bridge_cache FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/syscall_bridge/cache.jsonl
+//
+// 한 key 당 한 줄. insert 는 append. lookup 은 grep + 마지막 매치.
+
+fn bridge_dir() -> str {
+    return GAMEBOX_HOME + "/persist/syscall_bridge"
+}
+
+fn bridge_cache_path() -> str {
+    return bridge_dir() + "/cache.jsonl"
+}
+
+fn bridge_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + bridge_dir() + "'")
+}
+
+// ─── key 합성 ───
+//   "<win32_func>:<arg_pattern>"  예: "CreateFileW:read_only"
+fn bridge_key(win32_func: str, arg_pattern: str) -> str {
+    return win32_func + ":" + arg_pattern
+}
+
+// ─── default_mapping ───
+//   built-in 10 핵심 Win32 → macOS syscall mapping table.
+//   return: "macos_syscall|signature|notes" — pipe 구분.
+//   "" → unknown (caller 가 stub mapping 으로 insert).
+//
+//   참조: learn.microsoft.com/win32 + developer.apple.com (Apple 공식 only).
+//   own 1 — Wine / CrossOver source 단 1 줄도 참조 X.
+fn default_mapping(win32_func: str, arg_pattern: str) -> str {
+    if win32_func == "CreateFileW" {
+        if arg_pattern == "read_only" {
+            return "open|open(path, O_RDONLY)|POSIX open with O_RDONLY"
+        }
+        if arg_pattern == "read_write" {
+            return "open|open(path, O_RDWR)|POSIX open with O_RDWR"
+        }
+    }
+    if win32_func == "ReadFile" {
+        if arg_pattern == "sync" {
+            return "read|read(fd, buf, count)|POSIX synchronous read"
+        }
+    }
+    if win32_func == "WriteFile" {
+        if arg_pattern == "sync" {
+            return "write|write(fd, buf, count)|POSIX synchronous write"
+        }
+    }
+    if win32_func == "CloseHandle" {
+        if arg_pattern == "any" {
+            return "close|close(fd)|POSIX close (HANDLE → fd)"
+        }
+    }
+    if win32_func == "VirtualAlloc" {
+        if arg_pattern == "rwx" {
+            return "mmap|mmap(addr, size, PROT_READ|WRITE|EXEC, MAP_ANON)|anon RWX mmap"
+        }
+    }
+    if win32_func == "HeapAlloc" {
+        if arg_pattern == "any" {
+            return "malloc|malloc(size)|libc malloc passthrough"
+        }
+    }
+    if win32_func == "GetTickCount" {
+        if arg_pattern == "any" {
+            return "mach_absolute_time|mach_absolute_time() / 1e6|Mach time → ms"
+        }
+    }
+    if win32_func == "Sleep" {
+        if arg_pattern == "any" {
+            return "usleep|usleep(ms * 1000)|POSIX usleep (ms → us)"
+        }
+    }
+    return ""
+}
+
+// ─── lookup ───
+//   index 마지막 일치 line 반환 ("" = miss). emit 은 caller (resolve_or_cache)
+//   에서 — lookup 자체는 stats 부산물 (no emit).
+fn cache_lookup(key: str) -> str {
+    bridge_ensure_dir()
+    let idx = bridge_cache_path()
+    let exists = exec("test -f '" + idx + "' && echo ok").trim()
+    if exists != "ok" {
+        return ""
+    }
+    let needle = "\"key\":\"" + key + "\""
+    let cmd = "grep -F '" + needle + "' '" + idx + "' 2>/dev/null | tail -1"
+    let line = exec(cmd).trim()
+    return line
+}
+
+// ─── insert ───
+//   mapping = "macos_syscall|signature|notes"  (default_mapping 출력 형식).
+//   "" mapping 은 stub (unknown) — macos="unknown", signature="", notes="".
+fn cache_insert(key: str, mapping: str) -> void {
+    bridge_ensure_dir()
+    let idx = bridge_cache_path()
+    let ts = exec("date +%s").trim()
+
+    // mapping 분해 — pipe 구분.
+    let macos = "unknown"
+    let signature = ""
+    let notes = ""
+    if mapping != "" {
+        // awk -F'|' 로 3 필드 분리.
+        let m = exec("printf '%s' '" + mapping + "' | awk -F'|' '{print $1}'").trim()
+        let s = exec("printf '%s' '" + mapping + "' | awk -F'|' '{print $2}'").trim()
+        let n = exec("printf '%s' '" + mapping + "' | awk -F'|' '{print $3}'").trim()
+        if m != "" { macos = m }
+        signature = s
+        notes = n
+    }
+
+    let line = "{\"key\":\"" + key + "\""
+        + ",\"macos_syscall\":\"" + macos + "\""
+        + ",\"signature\":\"" + signature + "\""
+        + ",\"notes\":\"" + notes + "\""
+        + ",\"hit_count\":0"
+        + ",\"last_used_ts\":" + ts
+        + ",\"inserted_ts\":" + ts
+        + "}"
+    r0_append_line(idx, line)
+    r0_emit("syscall_cache_insert", "\"key\":\"" + key + "\",\"macos\":\"" + macos + "\"")
+}
+
+// ─── increment hit_count ───
+//   in-place 갱신은 비싸므로 (rewrite) JSONL append-only 패턴 — 새 row 추가.
+//   tail -1 lookup 이 최신 hit_count 를 본다. last_used_ts 도 갱신.
+fn cache_bump_hit(key: str, prev_line: str) -> void {
+    bridge_ensure_dir()
+    let idx = bridge_cache_path()
+    let ts = exec("date +%s").trim()
+
+    // prev_line 에서 macos / signature / notes / hit_count 추출.
+    let macos = extract_str_field(prev_line, "macos_syscall")
+    let signature = extract_str_field(prev_line, "signature")
+    let notes = extract_str_field(prev_line, "notes")
+    let prev_hits = extract_int_field(prev_line, "hit_count")
+    let new_hits = prev_hits + 1
+
+    let prev_inserted = extract_int_field(prev_line, "inserted_ts")
+    let line = "{\"key\":\"" + key + "\""
+        + ",\"macos_syscall\":\"" + macos + "\""
+        + ",\"signature\":\"" + signature + "\""
+        + ",\"notes\":\"" + notes + "\""
+        + ",\"hit_count\":" + to_string(new_hits)
+        + ",\"last_used_ts\":" + ts
+        + ",\"inserted_ts\":" + to_string(prev_inserted)
+        + "}"
+    r0_append_line(idx, line)
+}
+
+// ─── extract int field ───
+fn extract_int_field(line: str, field: str) -> int {
+    if line == "" { return 0 }
+    let cmd = "echo '" + line + "' | sed -E 's/.*\"" + field + "\":([0-9]+).*/\\1/'"
+    let v = exec(cmd).trim()
+    if v == "" { return 0 }
+    if v == line { return 0 }
+    return to_int(v)
+}
+
+// ─── extract str field ───
+fn extract_str_field(line: str, field: str) -> str {
+    if line == "" { return "" }
+    let cmd = "echo '" + line + "' | sed -E 's/.*\"" + field + "\":\"([^\"]*)\".*/\\1/'"
+    let v = exec(cmd).trim()
+    if v == line { return "" }
+    return v
+}
+
+// ─── resolve_or_cache ───
+//   key 가 cache 에 있으면 cached mapping line 반환 + emit "syscall_cache_hit"
+//   + bump hit_count.
+//   miss 면 default_mapping 호출 + insert + emit "syscall_cache_miss".
+fn resolve_or_cache(win32_func: str, arg_pattern: str) -> str {
+    let key = bridge_key(win32_func, arg_pattern)
+    let line = cache_lookup(key)
+    if line != "" {
+        let macos = extract_str_field(line, "macos_syscall")
+        r0_emit("syscall_cache_hit", "\"key\":\"" + key + "\",\"macos\":\"" + macos + "\"")
+        cache_bump_hit(key, line)
+        return line
+    }
+    // miss
+    r0_emit("syscall_cache_miss", "\"key\":\"" + key + "\"")
+    let mapping = default_mapping(win32_func, arg_pattern)
+    cache_insert(key, mapping)
+    return cache_lookup(key)
+}
+
+// ─── stats ───
+//   [hits, misses, total_keys] — hits/misses 는 session r0 jsonl grep,
+//   total_keys 는 unique key count (sort -u + wc -l).
+fn cache_stats() -> array {
+    let sid = r0_session_get()
+    let f = r0_session_path(sid)
+    let exists = exec("test -f '" + f + "' && echo ok").trim()
+    let hits = 0
+    let misses = 0
+    if exists == "ok" {
+        let h = exec("grep -c '\"event\":\"syscall_cache_hit\"' '" + f + "' 2>/dev/null").trim()
+        let m = exec("grep -c '\"event\":\"syscall_cache_miss\"' '" + f + "' 2>/dev/null").trim()
+        if h != "" { hits = to_int(h) }
+        if m != "" { misses = to_int(m) }
+    }
+    let idx = bridge_cache_path()
+    let total = 0
+    let idx_exists = exec("test -f '" + idx + "' && echo ok").trim()
+    if idx_exists == "ok" {
+        // unique key count — append-only 라 한 key 가 여러 row 가질 수 있음.
+        let c = exec("grep -oE '\"key\":\"[^\"]+\"' '" + idx + "' 2>/dev/null | sort -u | wc -l | tr -d ' '").trim()
+        if c != "" { total = to_int(c) }
+    }
+    return [hits, misses, total]
+}
+
+// ─── top_hits ───
+//   hit_count 기준 상위 n 개 win32_func 반환 (key 별 latest row 의 hit_count).
+//   각 unique key 의 가장 최근 row (tail) 만 채택 → sort -k hit_count desc → top n.
+//
+//   stage1 제약: dict literal X — array of "key" 문자열 반환.
+//
+//   구현: awk 단일 pass — append-only 라 마지막 row 가 최신 hit_count.
+//   awk 'BEGIN{} {key=...; hits=...; last_hits[key]=hits} END {for (k in last_hits) print last_hits[k]"|"k}'
+fn top_hits(n: int) -> array {
+    bridge_ensure_dir()
+    let idx = bridge_cache_path()
+    let exists = exec("test -f '" + idx + "' && echo ok").trim()
+    let result = []
+    if exists != "ok" { return result }
+
+    // awk: 각 line 에서 key, hit_count 추출 → 같은 key 의 마지막 hit_count 가
+    // 최종 (last write wins). END 에서 "<hits>|<key>" emit → sort -nr → top n.
+    let cmd = "awk '"
+        + "{ "
+        + "match($0, /\"key\":\"[^\"]+\"/); k=substr($0, RSTART+7, RLENGTH-8); "
+        + "match($0, /\"hit_count\":[0-9]+/); h=substr($0, RSTART+12, RLENGTH-12)+0; "
+        + "last[k]=h "
+        + "} "
+        + "END { for (k in last) print last[k] \"|\" k }"
+        + "' '" + idx + "' 2>/dev/null | sort -t'|' -k1,1 -nr | head -" + to_string(n) + " | awk -F'|' '{print $2}'"
+    let raw = exec(cmd).trim()
+    if raw == "" { return result }
+
+    // 결과를 줄 단위로 array element 로 — 한 줄씩 awk NR==i 로 추출.
+    let count_cmd = "printf '%s\\n' '" + raw + "' | wc -l | tr -d ' '"
+    let count_s = exec(count_cmd).trim()
+    let count = 0
+    if count_s != "" { count = to_int(count_s) }
+
+    let i = 1
+    while i <= count {
+        let pick_cmd = "printf '%s\\n' '" + raw + "' | awk 'NR==" + to_string(i) + "{print}'"
+        let v = exec(pick_cmd).trim()
+        if v != "" {
+            result.push(v)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "syscallbridge-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cache reset.
+    let idx = bridge_cache_path()
+    let _rm = exec("rm -f '" + idx + "'")
+
+    // 2. resolve_or_cache (CreateFileW, read_only) → miss → insert open(O_RDONLY).
+    let r1 = resolve_or_cache("CreateFileW", "read_only")
+    if r1 == "" {
+        panic("c_syscall_bridge_cache FAIL [r1 lookup] expected=non-empty got=empty")
+    }
+    let r1_macos = extract_str_field(r1, "macos_syscall")
+    if r1_macos != "open" {
+        panic("c_syscall_bridge_cache FAIL [r1 macos] expected=open got=" + r1_macos)
+    }
+    let r1_sig = extract_str_field(r1, "signature")
+    if r1_sig != "open(path, O_RDONLY)" {
+        panic("c_syscall_bridge_cache FAIL [r1 sig] expected=open(path, O_RDONLY) got=" + r1_sig)
+    }
+
+    // 3. resolve_or_cache (CreateFileW, read_only) → hit → 동일 mapping.
+    let r1b = resolve_or_cache("CreateFileW", "read_only")
+    if r1b == "" {
+        panic("c_syscall_bridge_cache FAIL [r1b hit] expected=non-empty got=empty")
+    }
+    let r1b_macos = extract_str_field(r1b, "macos_syscall")
+    if r1b_macos != "open" {
+        panic("c_syscall_bridge_cache FAIL [r1b macos] expected=open got=" + r1b_macos)
+    }
+
+    // 4. resolve_or_cache (ReadFile, sync) → miss → insert read.
+    let r2 = resolve_or_cache("ReadFile", "sync")
+    let r2_macos = extract_str_field(r2, "macos_syscall")
+    if r2_macos != "read" {
+        panic("c_syscall_bridge_cache FAIL [r2 macos] expected=read got=" + r2_macos)
+    }
+
+    // 5. resolve_or_cache (CloseHandle, any) → miss → insert close.
+    let r3 = resolve_or_cache("CloseHandle", "any")
+    let r3_macos = extract_str_field(r3, "macos_syscall")
+    if r3_macos != "close" {
+        panic("c_syscall_bridge_cache FAIL [r3 macos] expected=close got=" + r3_macos)
+    }
+
+    // 6. resolve_or_cache (UnknownFunc, test) → miss + default empty → insert
+    //    {macos: "unknown", signature: ""}.
+    let r4 = resolve_or_cache("UnknownFunc", "test")
+    let r4_macos = extract_str_field(r4, "macos_syscall")
+    if r4_macos != "unknown" {
+        panic("c_syscall_bridge_cache FAIL [r4 macos] expected=unknown got=" + r4_macos)
+    }
+    let r4_sig = extract_str_field(r4, "signature")
+    if r4_sig != "" {
+        panic("c_syscall_bridge_cache FAIL [r4 sig] expected=empty got=" + r4_sig)
+    }
+
+    // 7. cache_stats → [hits=1, misses=4, total_keys=4].
+    let stats = cache_stats()
+    let hits = stats[0]
+    let misses = stats[1]
+    let total = stats[2]
+    if hits != 1 {
+        panic("c_syscall_bridge_cache FAIL [hits count] expected=1 got=" + to_string(hits))
+    }
+    if misses != 4 {
+        panic("c_syscall_bridge_cache FAIL [misses count] expected=4 got=" + to_string(misses))
+    }
+    if total != 4 {
+        panic("c_syscall_bridge_cache FAIL [total_keys] expected=4 got=" + to_string(total))
+    }
+
+    // 8. top_hits(3) → CreateFileW (가장 hit 많음) 가 첫번째.
+    let top = top_hits(3)
+    if len(top) < 1 {
+        panic("c_syscall_bridge_cache FAIL [top_hits length] expected>=1 got=" + to_string(len(top)))
+    }
+    let top_func = top[0]
+    // top_func 형식: "<win32_func>:<arg_pattern>" — CreateFileW 로 시작해야.
+    let starts_with_create = top_func.contains("CreateFileW")
+    if starts_with_create == false {
+        panic("c_syscall_bridge_cache FAIL [top_func] expected=CreateFileW:* got=" + top_func)
+    }
+
+    // 9. emit syscall_bridge_summary {hits, misses, top_func}.
+    r0_emit("syscall_bridge_summary",
+        "\"hits\":" + to_string(hits)
+        + ",\"misses\":" + to_string(misses)
+        + ",\"total_keys\":" + to_string(total)
+        + ",\"top_func\":\"" + top_func + "\"")
+
+    // 10. emit count 검증 — 4 miss + 1 hit + 4 insert + 1 summary = 10. 최소 5.
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 5 {
+        panic("c_syscall_bridge_cache FAIL [emit count] expected>=5 got=" + to_string(evt_cnt))
+    }
+
+    // cleanup index (테스트 누적 방지).
+    let _idx_rm = exec("rm -f '" + idx + "'")
+
+    println("  ✅ c_syscall_bridge_cache self_test PASS (4 inserts, 1 hit, top=" + top_func + ", emits=" + to_string(evt_cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "resolve" {
+            if len(a) >= 5 {
+                let line = resolve_or_cache(a[3], a[4])
+                if line == "" {
+                    println("miss")
+                } else {
+                    println(line)
+                }
+                return
+            }
+        }
+        if sub == "lookup" {
+            if len(a) >= 5 {
+                let line = cache_lookup(bridge_key(a[3], a[4]))
+                if line == "" {
+                    println("miss")
+                } else {
+                    println(line)
+                }
+                return
+            }
+        }
+        if sub == "default" {
+            if len(a) >= 5 {
+                let m = default_mapping(a[3], a[4])
+                if m == "" {
+                    println("(unknown)")
+                } else {
+                    println(m)
+                }
+                return
+            }
+        }
+        if sub == "stats" {
+            let s = cache_stats()
+            println("hits=" + to_string(s[0]) + " misses=" + to_string(s[1]) + " total_keys=" + to_string(s[2]))
+            return
+        }
+        if sub == "top" {
+            let n = 5
+            if len(a) >= 4 {
+                n = to_int(a[3])
+            }
+            let t = top_hits(n)
+            let i = 0
+            while i < len(t) {
+                println(to_string(i + 1) + ". " + t[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "cache-dir" {
+            println(bridge_dir())
+            return
+        }
+        if sub == "cache-path" {
+            println(bridge_cache_path())
+            return
+        }
+    }
+    println("usage: hexa run c_syscall_bridge_cache.hexa { self-test | resolve <fn> <pat> | lookup <fn> <pat> | default <fn> <pat> | stats | top [n] | cache-dir | cache-path }")
+}

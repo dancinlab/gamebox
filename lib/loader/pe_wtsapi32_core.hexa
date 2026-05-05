@@ -1,0 +1,428 @@
+// lib/loader/pe_wtsapi32_core.hexa — WTSAPI32.dll terminal services surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine wtsapi32 source 인용 0.
+//       wtsapi32.dll 직접 binding 0. macOS loginwindow / SCDynamicStore /
+//       SystemConfiguration.framework / CGSession / SessionGetInfoTransitionState /
+//       AppKit NSWorkspace sessionDidBecomeActive 직접 binding 0. NOTE: WTSAPI32 측 D2R/D4
+//       single-session check + Battle.net Agent fast-user-switching detect + console
+//       session id baseline; WTSEnumerateSessions/WTSQuerySessionInformation/
+//       WTSRegisterSessionNotification 측 WTS_SESSION_INFO/WTS_INFO_CLASS round-trip
+//       baseline (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BD3 — WTSAPI32 sessions/connections/notifications surface 10 fn skeleton-tier.
+// cycle 49 282/435 (~64.83%) → cycle 50 ~292/435 (~67.13%) (+10 fn, BD bundled part 3/4).
+//
+// 대상 fn (10 fn — 3 group, fn_kind 0..9):
+//   SESSIONS      (4): WTSEnumerateSessions(0) / WTSQuerySessionInformation(1) /
+//                      WTSDisconnectSession(2) / WTSLogoffSession(3)
+//   CONNECTIONS   (3): WTSOpenServer(4) / WTSCloseServer(5) /
+//                      WTSGetActiveConsoleSessionId(6)
+//   NOTIFICATIONS (3): WTSRegisterSessionNotification(7) /
+//                      WTSUnRegisterSessionNotification(8) / WTSWaitSystemEvent(9)
+//
+// synthetic struct families:
+//   WTS_SESSION_INFO 24B per record: SessionId DWORD 1 (console) + pWinStationName ptr
+//     "Console" + State WTSActive 0.
+//   WTS_INFO_CLASS enum: WTSUserName=5 / WTSWinStationName=6 / WTSDomainName=7 / WTSConnectState=8 /
+//     WTSClientName=10 / WTSSessionId=4.
+//   HSERVER 0x9E010000 server handle (opaque) / WTS_CURRENT_SERVER_HANDLE 0 = local.
+//   HWND notify_window 0x9E020100 (NOTIFY_FOR_THIS_SESSION 0 / NOTIFY_FOR_ALL_SESSIONS 1).
+//   wait_event_mask DWORD: WTS_EVENT_LOGON 0x20 / WTS_EVENT_LOGOFF 0x40 / WTS_EVENT_CONNECT 0x08.
+//
+// persist schema (TSV — 4 table):
+//   syscall_invoke / session_event / connection_event / notification_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wtsapi32_core"
+}
+
+fn pwt_syscall_invoke_path() -> str {
+    return pwt_dir() + "/syscall_invoke.tsv"
+}
+
+fn pwt_session_event_path() -> str {
+    return pwt_dir() + "/session_event.tsv"
+}
+
+fn pwt_connection_event_path() -> str {
+    return pwt_dir() + "/connection_event.tsv"
+}
+
+fn pwt_notification_event_path() -> str {
+    return pwt_dir() + "/notification_event.tsv"
+}
+
+fn pwt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwt_dir() + "'")
+}
+
+fn cleanup_pwt() -> void {
+    pwt_ensure_dir()
+    let _ = exec("rm -f '" + pwt_syscall_invoke_path() + "' '" + pwt_session_event_path()
+        + "' '" + pwt_connection_event_path() + "' '" + pwt_notification_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwt_append_row(path: str, row: str) -> void {
+    pwt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwt_count_rows(path: str, min_cols: int) -> int {
+    let t = pwt_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (10 fn coverage, fn_kind 0..9) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "WTSEnumerateSessions" }
+    if k == 1 { return "WTSQuerySessionInformation" }
+    if k == 2 { return "WTSDisconnectSession" }
+    if k == 3 { return "WTSLogoffSession" }
+    if k == 4 { return "WTSOpenServer" }
+    if k == 5 { return "WTSCloseServer" }
+    if k == 6 { return "WTSGetActiveConsoleSessionId" }
+    if k == 7 { return "WTSRegisterSessionNotification" }
+    if k == 8 { return "WTSUnRegisterSessionNotification" }
+    if k == 9 { return "WTSWaitSystemEvent" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (3 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 3 {
+            return "sessions"
+        }
+    }
+    if k >= 4 {
+        if k <= 6 {
+            return "connections"
+        }
+    }
+    if k >= 7 {
+        if k <= 9 {
+            return "notifications"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: WTSAPI32 fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_wtsapi32_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_wtsapi32_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 9 {
+        panic("pe_wtsapi32_core FAIL [record_syscall_invoke] expected=fn_kind<=9 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_wtsapi32_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_wtsapi32_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pwt_append_row(pwt_syscall_invoke_path(), row)
+}
+
+// ─── record_session_event: enumerate/query/disconnect/logoff session row ───
+fn record_session_event(evt_id: int, s_kind: str, session_id: str, session_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wtsapi32_core FAIL [record_session_event] evt_id<=0") }
+    if s_kind == "" { panic("pe_wtsapi32_core FAIL [record_session_event] s_kind=empty") }
+    if session_id == "" { panic("pe_wtsapi32_core FAIL [record_session_event] session_id=empty") }
+    if session_synth == "" { panic("pe_wtsapi32_core FAIL [record_session_event] session_synth=empty") }
+    if status == "" { panic("pe_wtsapi32_core FAIL [record_session_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + s_kind + "\t" + session_id + "\t" + session_synth + "\t" + status + "\n"
+    pwt_append_row(pwt_session_event_path(), row)
+}
+
+// ─── record_connection_event: open_server/close_server/active_console_id row ───
+fn record_connection_event(evt_id: int, c_kind: str, hserver_hex: str, server_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wtsapi32_core FAIL [record_connection_event] evt_id<=0") }
+    if c_kind == "" { panic("pe_wtsapi32_core FAIL [record_connection_event] c_kind=empty") }
+    if hserver_hex == "" { panic("pe_wtsapi32_core FAIL [record_connection_event] hserver_hex=empty") }
+    if server_synth == "" { panic("pe_wtsapi32_core FAIL [record_connection_event] server_synth=empty") }
+    if status == "" { panic("pe_wtsapi32_core FAIL [record_connection_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + c_kind + "\t" + hserver_hex + "\t" + server_synth + "\t" + status + "\n"
+    pwt_append_row(pwt_connection_event_path(), row)
+}
+
+// ─── record_notification_event: register_notify/unregister/wait_system_event row ───
+fn record_notification_event(evt_id: int, n_kind: str, hwnd_hex: str, event_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wtsapi32_core FAIL [record_notification_event] evt_id<=0") }
+    if n_kind == "" { panic("pe_wtsapi32_core FAIL [record_notification_event] n_kind=empty") }
+    if hwnd_hex == "" { panic("pe_wtsapi32_core FAIL [record_notification_event] hwnd_hex=empty") }
+    if event_synth == "" { panic("pe_wtsapi32_core FAIL [record_notification_event] event_synth=empty") }
+    if status == "" { panic("pe_wtsapi32_core FAIL [record_notification_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + n_kind + "\t" + hwnd_hex + "\t" + event_synth + "\t" + status + "\n"
+    pwt_append_row(pwt_notification_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pwt_count_rows(pwt_syscall_invoke_path(), 4)
+}
+
+fn session_event_count() -> int {
+    return pwt_count_rows(pwt_session_event_path(), 5)
+}
+
+fn connection_event_count() -> int {
+    return pwt_count_rows(pwt_connection_event_path(), 5)
+}
+
+fn notification_event_count() -> int {
+    return pwt_count_rows(pwt_notification_event_path(), 5)
+}
+
+fn pwt_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(session_event_count())
+    out.push(connection_event_count())
+    out.push(notification_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwt()
+
+    // ─── 1. syscall_invoke × 10 (one per fn, 3 group coverage) ───
+    //   SESSIONS group (4)
+    record_syscall_invoke(1, 0, "WTSEnumerateSessions", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSEnumerateSessions")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"WTSEnumerateSessions\",\"fn_group\":\"sessions\",\"status\":\"PARTIAL\",\"hServer\":\"WTS_CURRENT_SERVER_HANDLE_0\",\"Reserved\":0,\"Version\":1,\"out_ppSessionInfo\":\"WTS_SESSION_INFO_array_24B_console_session_1_active\",\"out_pCount\":1,\"struct_bytes\":24,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(2, 1, "WTSQuerySessionInformation", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSQuerySessionInformation")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"WTSQuerySessionInformation\",\"fn_group\":\"sessions\",\"status\":\"PARTIAL\",\"hServer\":\"WTS_CURRENT_SERVER_HANDLE_0\",\"SessionId\":1,\"WTSInfoClass\":\"WTSUserName_5\",\"out_ppBuffer\":\"BattleNetUser_LPWSTR_NUL_terminated\",\"out_pBytesReturned\":28,\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(3, 2, "WTSDisconnectSession", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSDisconnectSession")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"WTSDisconnectSession\",\"fn_group\":\"sessions\",\"status\":\"PARTIAL\",\"hServer\":\"WTS_CURRENT_SERVER_HANDLE_0\",\"SessionId\":1,\"bWait\":\"TRUE_1\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(4, 3, "WTSLogoffSession", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSLogoffSession")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"WTSLogoffSession\",\"fn_group\":\"sessions\",\"status\":\"PARTIAL\",\"hServer\":\"WTS_CURRENT_SERVER_HANDLE_0\",\"SessionId\":2,\"bWait\":\"FALSE_0\",\"return_bool\":\"TRUE_1\"")
+
+    //   CONNECTIONS group (3)
+    record_syscall_invoke(5, 4, "WTSOpenServer", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSOpenServer")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"WTSOpenServer\",\"fn_group\":\"connections\",\"status\":\"PARTIAL\",\"pServerName_LPWSTR\":\"DESKTOP-D2R\",\"out_HSERVER\":\"0x9E010000\",\"return_handle\":\"0x9E010000\"")
+    record_syscall_invoke(6, 5, "WTSCloseServer", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSCloseServer")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"WTSCloseServer\",\"fn_group\":\"connections\",\"status\":\"PARTIAL\",\"hServer\":\"0x9E010000\",\"return_void\":true")
+    record_syscall_invoke(7, 6, "WTSGetActiveConsoleSessionId", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSGetActiveConsoleSessionId")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"WTSGetActiveConsoleSessionId\",\"fn_group\":\"connections\",\"status\":\"PARTIAL\",\"return_dword\":1,\"console_session_id\":1,\"d2r_d4_single_session_baseline\":true")
+
+    //   NOTIFICATIONS group (3)
+    record_syscall_invoke(8, 7, "WTSRegisterSessionNotification", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSRegisterSessionNotification")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"WTSRegisterSessionNotification\",\"fn_group\":\"notifications\",\"status\":\"PARTIAL\",\"hWnd\":\"0x9E020100\",\"dwFlags\":\"NOTIFY_FOR_THIS_SESSION_0\",\"return_bool\":\"TRUE_1\",\"battle_net_agent_fast_user_switching_baseline\":true")
+    record_syscall_invoke(9, 8, "WTSUnRegisterSessionNotification", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSUnRegisterSessionNotification")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"WTSUnRegisterSessionNotification\",\"fn_group\":\"notifications\",\"status\":\"PARTIAL\",\"hWnd\":\"0x9E020100\",\"return_bool\":\"TRUE_1\"")
+    record_syscall_invoke(10, 9, "WTSWaitSystemEvent", "PARTIAL")
+    println("__WTSAPI32__ PARTIAL WTSWaitSystemEvent")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"WTSWaitSystemEvent\",\"fn_group\":\"notifications\",\"status\":\"PARTIAL\",\"hServer\":\"WTS_CURRENT_SERVER_HANDLE_0\",\"EventMask\":\"WTS_EVENT_LOGON_0x20_LOGOFF_0x40_CONNECT_0x08_combined_0x68\",\"out_pEventFlags\":\"WTS_EVENT_LOGON_0x20\",\"return_bool\":\"TRUE_1\"")
+
+    // ─── 2. session_event × 4 (enumerate/query_user/disconnect/logoff) ───
+    record_session_event(1, "enumerate_console_session_active", "1", "WTS_SESSION_INFO_24B_Console_WTSActive_0", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"session_event\",\"evt_id\":1,\"s_kind\":\"enumerate_console_session_active\",\"session_id\":\"1\",\"session_synth\":\"WTS_SESSION_INFO_24B_Console_WTSActive_0\",\"struct_bytes\":24,\"State\":\"WTSActive_0\",\"d2r_d4_single_session_baseline\":true,\"status\":\"PARTIAL\"")
+    record_session_event(2, "query_user_battle_net_user", "1", "WTSUserName_BattleNetUser_LPWSTR_28B", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"session_event\",\"evt_id\":2,\"s_kind\":\"query_user_battle_net_user\",\"session_id\":\"1\",\"session_synth\":\"WTSUserName_BattleNetUser_LPWSTR_28B\",\"WTSInfoClass\":\"WTSUserName_5\",\"BytesReturned\":28,\"status\":\"PARTIAL\"")
+    record_session_event(3, "disconnect_console_no_wait", "1", "disconnect_no_logoff_session_preserved", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"session_event\",\"evt_id\":3,\"s_kind\":\"disconnect_console_no_wait\",\"session_id\":\"1\",\"session_synth\":\"disconnect_no_logoff_session_preserved\",\"bWait\":true,\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+    record_session_event(4, "logoff_secondary_session", "2", "logoff_terminate_session_2", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"session_event\",\"evt_id\":4,\"s_kind\":\"logoff_secondary_session\",\"session_id\":\"2\",\"session_synth\":\"logoff_terminate_session_2\",\"bWait\":false,\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+
+    // ─── 3. connection_event × 3 (open_local/close/active_console_id) ───
+    record_connection_event(1, "open_server_local", "0x9E010000", "DESKTOP-D2R_HSERVER", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"connection_event\",\"evt_id\":1,\"c_kind\":\"open_server_local\",\"hserver_hex\":\"0x9E010000\",\"server_synth\":\"DESKTOP-D2R_HSERVER\",\"return_handle\":\"0x9E010000\",\"status\":\"PARTIAL\"")
+    record_connection_event(2, "close_server_release", "0x9E010000", "release_handle_no_session_pending", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"connection_event\",\"evt_id\":2,\"c_kind\":\"close_server_release\",\"hserver_hex\":\"0x9E010000\",\"server_synth\":\"release_handle_no_session_pending\",\"return_void\":true,\"status\":\"PARTIAL\"")
+    record_connection_event(3, "active_console_session_id_query", "0x00000000", "WTS_CURRENT_SERVER_HANDLE_local_session_1", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"connection_event\",\"evt_id\":3,\"c_kind\":\"active_console_session_id_query\",\"hserver_hex\":\"0x00000000\",\"server_synth\":\"WTS_CURRENT_SERVER_HANDLE_local_session_1\",\"return_dword\":1,\"battle_net_console_check_baseline\":true,\"status\":\"PARTIAL\"")
+
+    // ─── 4. notification_event × 3 (register/unregister/wait_event_logon) ───
+    record_notification_event(1, "register_this_session_notify", "0x9E020100", "NOTIFY_FOR_THIS_SESSION_0", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"notification_event\",\"evt_id\":1,\"n_kind\":\"register_this_session_notify\",\"hwnd_hex\":\"0x9E020100\",\"event_synth\":\"NOTIFY_FOR_THIS_SESSION_0\",\"dwFlags\":0,\"battle_net_agent_fast_user_switching_baseline\":true,\"status\":\"PARTIAL\"")
+    record_notification_event(2, "unregister_release_window", "0x9E020100", "release_notification_handle", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"notification_event\",\"evt_id\":2,\"n_kind\":\"unregister_release_window\",\"hwnd_hex\":\"0x9E020100\",\"event_synth\":\"release_notification_handle\",\"return_bool\":\"TRUE_1\",\"status\":\"PARTIAL\"")
+    record_notification_event(3, "wait_event_logon_logoff_connect", "0x00000000", "WTS_EVENT_LOGON_0x20_received", "PARTIAL")
+    r0_emit("pe_wtsapi32_core_record", "\"kind\":\"notification_event\",\"evt_id\":3,\"n_kind\":\"wait_event_logon_logoff_connect\",\"hwnd_hex\":\"0x00000000\",\"event_synth\":\"WTS_EVENT_LOGON_0x20_received\",\"EventMask\":\"0x68_LOGON_LOGOFF_CONNECT\",\"out_EventFlags\":\"0x20_LOGON\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 10 {
+        panic("pe_wtsapi32_core FAIL [syscall_invoke_count] expected=10 got=" + to_string(si))
+    }
+    let se = session_event_count()
+    if se != 4 {
+        panic("pe_wtsapi32_core FAIL [session_event_count] expected=4 got=" + to_string(se))
+    }
+    let ce = connection_event_count()
+    if ce != 3 {
+        panic("pe_wtsapi32_core FAIL [connection_event_count] expected=3 got=" + to_string(ce))
+    }
+    let ne = notification_event_count()
+    if ne != 3 {
+        panic("pe_wtsapi32_core FAIL [notification_event_count] expected=3 got=" + to_string(ne))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "WTSEnumerateSessions" { panic("pe_wtsapi32_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(2) != "WTSDisconnectSession" { panic("pe_wtsapi32_core FAIL [fn_kind_name(2)]") }
+    if fn_kind_name(4) != "WTSOpenServer" { panic("pe_wtsapi32_core FAIL [fn_kind_name(4)]") }
+    if fn_kind_name(7) != "WTSRegisterSessionNotification" { panic("pe_wtsapi32_core FAIL [fn_kind_name(7)]") }
+    if fn_kind_name(9) != "WTSWaitSystemEvent" { panic("pe_wtsapi32_core FAIL [fn_kind_name(9)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_wtsapi32_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "sessions" { panic("pe_wtsapi32_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(4) != "connections" { panic("pe_wtsapi32_core FAIL [fn_group_name(4)]") }
+    if fn_group_name(7) != "notifications" { panic("pe_wtsapi32_core FAIL [fn_group_name(7)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_wtsapi32_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pwt_stats()
+    if len(s) != 4 { panic("pe_wtsapi32_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 10 { panic("pe_wtsapi32_core FAIL [stats syscall_invoke_count] expected=10 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_wtsapi32_core FAIL [stats session_event_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 3 { panic("pe_wtsapi32_core FAIL [stats connection_event_count] expected=3 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_wtsapi32_core FAIL [stats notification_event_count] expected=3 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_wtsapi32_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"session_event_count\":" + to_string(s[1])
+        + ",\"connection_event_count\":" + to_string(s[2])
+        + ",\"notification_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_wtsapi32_core_summary",
+        "\"target\":\"WTSAPI32.dll\",\"fn_total\":10,\"fn_emit_partial\":10,\"groups\":[\"sessions\",\"connections\",\"notifications\"],\"wts_session_info_synth_bytes\":24,\"hserver_synth\":\"0x9E010000\",\"hwnd_notify_synth\":\"0x9E020100\",\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_wtsapi32_core_kpi",
+        "\"sessions_emits\":4,\"connections_emits\":3,\"notifications_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"d2r_d4_single_session_baseline\":true,\"battlenet_agent_fast_user_switching_baseline\":true,\"loginwindow_scdynamicstore_systemconfig_binding\":false,\"cgsession_nsworkspace_session_did_become_active_binding\":false")
+
+    // ─── cycle 49 → 50 WTSAPI32 coverage progression evidence emit ───
+    r0_emit("pe_wtsapi32_core_coverage_progression",
+        "\"surface\":\"WTSAPI32_full_435_fn\",\"cycle_49_count\":282,\"cycle_50_count\":292,\"delta\":10,\"cycle_49_percent\":64.83,\"cycle_50_percent\":67.13,\"cycle_50_module\":\"pe_wtsapi32_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bd3_cycle_increment\":10,\"track_bd_bundled_part_3_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_wtsapi32_core_round_trip_matrix",
+        "\"surface\":\"WTSAPI32_core_10_fn\",\"fn_partial\":10,\"fn_groups\":3,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real WTSEnumerateSessions + WTSQuerySessionInformation + WTSRegisterSessionNotification = loginwindow + SCDynamicStore + SystemConfiguration.framework + CGSession + NSWorkspace sessionDidBecomeActive bridge pending separate cycle (long-horizon terminal services pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BD3 expansion emit (cycle 50, WTSAPI32 +10 fn) ───
+    r0_emit("pe_wtsapi32_core_bd3_expansion",
+        "\"track\":\"BD3\",\"cycle\":50,\"surface\":\"WTSAPI32_new\",\"new_fn\":10,\"groups\":[\"sessions\",\"connections\",\"notifications\"],\"sessions_count\":4,\"connections_count\":3,\"notifications_count\":3,\"emit_format\":\"__WTSAPI32__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_1_evidence_augment\":true,\"track_bd_bundled_part_3_of_4\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_wtsapi32_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwt()
+    let s2 = pwt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wtsapi32_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wtsapi32_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", session_event=" + to_string(s[1])
+        + ", connection_event=" + to_string(s[2]) + ", notification_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwt_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("session_event_count\t" + to_string(s[1]))
+            println("connection_event_count\t" + to_string(s[2]))
+            println("notification_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_wtsapi32_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_wtsapi32_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwt()
+            println("cleaned: " + pwt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wtsapi32_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

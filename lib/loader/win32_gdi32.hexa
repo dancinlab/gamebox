@@ -1,0 +1,393 @@
+// lib/loader/win32_gdi32.hexa — Phase 4b — gdi32 mapping skeleton
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft 공식 gdi32 API spec:
+//     - DC:     https://learn.microsoft.com/en-us/windows/win32/api/wingdi/
+//     - Object: https://learn.microsoft.com/en-us/windows/win32/api/wingdi/
+//     - Draw:   https://learn.microsoft.com/en-us/windows/win32/api/wingdi/
+//   Cocoa / CoreGraphics / CoreText equivalent 은 developer.apple.com 만 참조.
+//   Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 1 (실제 ≥ 2: gdi32_lookup + gdi32_stats)
+//   - fn self_test() + main() dispatch
+//   - headless (GUI 없이 in-memory CGBitmapContext — 화면 안 그림)
+//   - panic("win32_gdi32 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 4b — skeleton):
+//   ~24 핵심 gdi32 paint 함수의 *mapping table* + headless blit fallback.
+//   각 entry = (Win32 함수명, 대응되는 CoreGraphics/CoreText 호출, 카테고리, status).
+//   실제 CGContext alloc / CGImage decode / CTLine binding 은 Phase 4b 후속.
+//
+// status 값:
+//   "skeleton" — mapping 만 (Phase 4b 현재 모든 entry)
+//   "stub"     — default value 만 반환 (호출 시 NULL 또는 0)
+//   "impl"     — 실제 CoreGraphics / CoreText 호출 수행
+//
+// 24 함수 카테고리 (실제 분포):
+//   DC      5  (CreateDC, DeleteDC, GetDC, ReleaseDC, CreateCompatibleDC)
+//   Object  8  (CreatePen, CreateBrush, SelectObject, DeleteObject,
+//                CreateFont, CreateBitmap, GetObject, StretchBlt)
+//   Draw   11  (BitBlt, MoveToEx, LineTo, Rectangle, Ellipse,
+//                FillRect, FrameRect, TextOutW, ExtTextOutW,
+//                SetTextColor, SetBkColor)
+//   ──────────
+//   total  24  / 3 categories
+
+use "../perf/r0_common"
+
+// ─── 24 함수 mapping table (TSV — name\tcocoa_equiv\tcategory\tstatus) ───
+//
+// 한 줄 = "<Win32 name>\t<CoreGraphics/CoreText equivalent>\t<category>\t<status>"
+// 줄 구분자 = "\n". 첫 줄도 의미 entry (header 없음 — 데이터 24 줄).
+fn gdi32_table() -> str {
+    let t = ""
+    // DC (5)
+    t = t + "CreateDC\tCGContext_create\tDC\tskeleton\n"
+    t = t + "DeleteDC\tCGContext_release\tDC\tskeleton\n"
+    t = t + "GetDC\tCGGraphicsContext\tDC\tskeleton\n"
+    t = t + "ReleaseDC\tCGContext_restore\tDC\tskeleton\n"
+    t = t + "CreateCompatibleDC\tCGContext_compat\tDC\tskeleton\n"
+    // Object (8)
+    t = t + "CreatePen\tCGContext_setStroke\tObject\tskeleton\n"
+    t = t + "CreateBrush\tCGContext_setFillColor\tObject\tskeleton\n"
+    t = t + "SelectObject\tCGContext_save\tObject\tskeleton\n"
+    t = t + "DeleteObject\tCGContext_release\tObject\tskeleton\n"
+    t = t + "CreateFont\tCTFontCreate\tObject\tskeleton\n"
+    t = t + "CreateBitmap\tCGImage_create\tObject\tskeleton\n"
+    t = t + "GetObject\tCGImage_info\tObject\tskeleton\n"
+    t = t + "StretchBlt\tCGContext_drawImage\tObject\tskeleton\n"
+    // Draw (11)
+    t = t + "BitBlt\tCGContext_drawImage\tDraw\tskeleton\n"
+    t = t + "MoveToEx\tCGContext_moveTo\tDraw\tskeleton\n"
+    t = t + "LineTo\tCGContext_addLineTo\tDraw\tskeleton\n"
+    t = t + "Rectangle\tCGContext_addRect\tDraw\tskeleton\n"
+    t = t + "Ellipse\tCGContext_addEllipse\tDraw\tskeleton\n"
+    t = t + "FillRect\tCGContext_fillRect\tDraw\tskeleton\n"
+    t = t + "FrameRect\tCGContext_strokeRect\tDraw\tskeleton\n"
+    t = t + "TextOutW\tCTLineDraw\tDraw\tskeleton\n"
+    t = t + "ExtTextOutW\tCTLineDrawAtPoint\tDraw\tskeleton\n"
+    t = t + "SetTextColor\tCGContext_setFillColor\tDraw\tskeleton\n"
+    t = t + "SetBkColor\tCGContext_setFillColor\tDraw\tskeleton\n"
+    return t
+}
+
+// ─── table line count (entry 수 = 24) ───
+fn gdi32_table_size() -> int {
+    let t = gdi32_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let count = 0
+    while i < n {
+        if lines[i] != "" {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── lookup: Win32 함수명 → "<cocoa>\t<category>\t<status>" 또는 "" ───
+fn lookup_mapping(name: str) -> str {
+    let t = gdi32_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == name {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── status only ───
+fn function_status(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[2]
+    }
+    return ""
+}
+
+// ─── category only ───
+fn function_category(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[1]
+    }
+    return ""
+}
+
+// ─── CoreGraphics / CoreText equivalent only ───
+fn function_cocoa_equiv(name: str) -> str {
+    let m = lookup_mapping(name)
+    if m == "" {
+        return ""
+    }
+    let p = m.split("\t")
+    if len(p) >= 3 {
+        return p[0]
+    }
+    return ""
+}
+
+// ─── category 통계 ───
+//
+//   반환: array of [category_name, total_count, impl_count]
+//   (hexa stage1 dict 부재 → array of array).
+//   impl_count = status == "impl" 인 entry 수 (Phase 4b 현재 모두 0).
+fn gdi32_stats() -> array {
+    let mut cats = []
+    cats.push(["DC", 0, 0])
+    cats.push(["Object", 0, 0])
+    cats.push(["Draw", 0, 0])
+
+    let t = gdi32_table()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let cat = parts[2]
+                let st = parts[3]
+                let j = 0
+                while j < len(cats) {
+                    if cats[j][0] == cat {
+                        cats[j][1] = cats[j][1] + 1
+                        if st == "impl" {
+                            cats[j][2] = cats[j][2] + 1
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cats
+}
+
+// ─── 전체 impl_count 합 (스카라) ───
+fn gdi32_impl_count() -> int {
+    let stats = gdi32_stats()
+    let n = len(stats)
+    let i = 0
+    let total = 0
+    while i < n {
+        total = total + stats[i][2]
+        i = i + 1
+    }
+    return total
+}
+
+// ─── headless blit fallback ───
+//
+// own 2 (c) headless mandate: GUI 안 띄움. in-memory CGBitmapContext placeholder.
+// 실제 CGContextDrawImage 호출은 Phase 4b 후속 (with --gui flag 또는 PNG dump).
+// 반환값 1 = success (gdi32 BitBlt 성공 시 BOOL TRUE).
+//   참조: https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-bitblt
+fn headless_blit(dst_w: int, dst_h: int, op: str) -> int {
+    println("[BitBlt headless] dst=" + to_string(dst_w) + "x" + to_string(dst_h)
+        + " op=\"" + op + "\" backend=CGBitmapContext(in-memory)")
+    return 1
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "g32test-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. table_size ≥ 18 (실제 24)
+    let sz = gdi32_table_size()
+    if sz < 18 {
+        panic("win32_gdi32 FAIL [table_size] expected=>=18 got=" + to_string(sz))
+    }
+    if sz != 24 {
+        panic("win32_gdi32 FAIL [table_size_exact] expected=24 got=" + to_string(sz))
+    }
+
+    // 2. lookup_mapping("BitBlt") = "CGContext_drawImage\tDraw\tskeleton"
+    let m_bitblt = lookup_mapping("BitBlt")
+    let exp_bitblt = "CGContext_drawImage\tDraw\tskeleton"
+    if m_bitblt != exp_bitblt {
+        panic("win32_gdi32 FAIL [lookup BitBlt] expected=" + exp_bitblt + " got=" + m_bitblt)
+    }
+
+    // 3. lookup_mapping("CreateDC") = "CGContext_create\tDC\tskeleton"
+    let m_createdc = lookup_mapping("CreateDC")
+    let exp_createdc = "CGContext_create\tDC\tskeleton"
+    if m_createdc != exp_createdc {
+        panic("win32_gdi32 FAIL [lookup CreateDC] expected=" + exp_createdc + " got=" + m_createdc)
+    }
+
+    // 3b. lookup_mapping("CreateFont") = "CTFontCreate\tObject\tskeleton"
+    let m_font = lookup_mapping("CreateFont")
+    let exp_font = "CTFontCreate\tObject\tskeleton"
+    if m_font != exp_font {
+        panic("win32_gdi32 FAIL [lookup CreateFont] expected=" + exp_font + " got=" + m_font)
+    }
+
+    // 4. function_status("BitBlt") = "skeleton"
+    let st = function_status("BitBlt")
+    if st != "skeleton" {
+        panic("win32_gdi32 FAIL [function_status BitBlt] expected=skeleton got=" + st)
+    }
+
+    // 4b. unknown name → empty
+    let m_unknown = lookup_mapping("NoSuchFunction")
+    if m_unknown != "" {
+        panic("win32_gdi32 FAIL [lookup unknown] expected=empty got=" + m_unknown)
+    }
+
+    // 5. r0_emit "gdi32_lookup" {name, cocoa}
+    let cocoa_bitblt = function_cocoa_equiv("BitBlt")
+    r0_emit("gdi32_lookup",
+        "\"name\":\"BitBlt\",\"cocoa\":\"" + cocoa_bitblt + "\"")
+
+    // 6. gdi32_stats() ≥ 3 categories with expected counts
+    let stats = gdi32_stats()
+    let cat_n = len(stats)
+    if cat_n < 3 {
+        panic("win32_gdi32 FAIL [stats categories] expected=>=3 got=" + to_string(cat_n))
+    }
+    // 카테고리별 정확한 count 검증
+    let i = 0
+    let sum_total = 0
+    let sum_impl = 0
+    while i < cat_n {
+        let cn = stats[i][0]
+        let ct = stats[i][1]
+        let ci = stats[i][2]
+        sum_total = sum_total + ct
+        sum_impl = sum_impl + ci
+        if cn == "DC" {
+            if ct != 5 {
+                panic("win32_gdi32 FAIL [stats DC count] expected=5 got=" + to_string(ct))
+            }
+        }
+        if cn == "Object" {
+            if ct != 8 {
+                panic("win32_gdi32 FAIL [stats Object count] expected=8 got=" + to_string(ct))
+            }
+        }
+        if cn == "Draw" {
+            if ct != 11 {
+                panic("win32_gdi32 FAIL [stats Draw count] expected=11 got=" + to_string(ct))
+            }
+        }
+        i = i + 1
+    }
+    if sum_total != 24 {
+        panic("win32_gdi32 FAIL [stats total sum] expected=24 got=" + to_string(sum_total))
+    }
+    if sum_impl != 0 {
+        panic("win32_gdi32 FAIL [stats impl sum] expected=0 got=" + to_string(sum_impl))
+    }
+
+    // 7. headless_blit(640, 480, "SRCCOPY") = 1 (in-memory CGBitmapContext, GUI 안 띄움)
+    let bb = headless_blit(640, 480, "SRCCOPY")
+    if bb != 1 {
+        panic("win32_gdi32 FAIL [headless_blit] expected=1 got=" + to_string(bb))
+    }
+
+    // 8. r0_emit "gdi32_stats" {table_size, categories}
+    r0_emit("gdi32_stats",
+        "\"table_size\":" + to_string(sz)
+        + ",\"categories\":" + to_string(cat_n)
+        + ",\"impl_count\":" + to_string(sum_impl))
+
+    // R0 emit count 검증 — 정확히 2 events (gdi32_lookup + gdi32_stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n != 2 {
+        panic("win32_gdi32 FAIL [r0 emit count] expected=2 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ win32_gdi32 self_test PASS (24 functions, 3 categories, headless blit=CGBitmapContext, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "table" {
+            print(gdi32_table())
+            return
+        }
+        if sub == "lookup" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let m = lookup_mapping(name)
+                if m == "" {
+                    println("(not found)")
+                } else {
+                    println(m)
+                }
+                return
+            }
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let s = function_status(name)
+                if s == "" {
+                    println("(not found)")
+                } else {
+                    println(s)
+                }
+                return
+            }
+        }
+        if sub == "stats" {
+            let stats = gdi32_stats()
+            let n = len(stats)
+            let i = 0
+            while i < n {
+                println(stats[i][0]
+                    + "\t" + to_string(stats[i][1])
+                    + "\t" + to_string(stats[i][2]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "size" {
+            println(to_string(gdi32_table_size()))
+            return
+        }
+        if sub == "blit" {
+            let w = 640
+            let h = 480
+            let op = "SRCCOPY"
+            if len(a) >= 4 { w = to_int(a[3]) }
+            if len(a) >= 5 { h = to_int(a[4]) }
+            if len(a) >= 6 { op = a[5] }
+            let rc = headless_blit(w, h, op)
+            println("rc=" + to_string(rc))
+            return
+        }
+    }
+    println("usage: hexa run win32_gdi32.hexa { self-test | table | lookup <name> | status <name> | stats | size | blit [w] [h] [op] }")
+}

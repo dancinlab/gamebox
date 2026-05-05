@@ -1,0 +1,371 @@
+// lib/loader/pe_stub_address_table.hexa — stage3 stub address table skeleton
+//
+// Win32 stub function 별 native ARM64 code address. IAT pointer fixup 시
+// PE 의 IAT slot 에 이 주소 박힘. 실 address 는 stage4 dyld_image_address
+// 결과 — 본 파일은 lookup table instrumentation.
+//
+// own 1 enforcement: Wine / CrossOver / ReactOS / community stub table 0 줄.
+//   참조 only — Microsoft 공식 PE IAT spec:
+//     - PE Format (Import Address Table):
+//         https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-address-table
+//     - GetProcAddress:
+//         https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5
+//     (실제: psat_record × 4 + psat_stats)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_stub_address_table FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 1 — IAT pointer fixup 준비):
+//   stage3 = 합성 address (split 32+32 bits) 로 lookup table 검증.
+//   stage4 = 실제 macOS dlsym/dyld_image_address 결과로 채움.
+//
+// dll_id 정의 (관례):
+//   1 = KERNEL32
+//   2 = USER32
+//   3 = GDI32
+//   ... (추가는 stage4 이후 확정)
+//
+// 64bit address split 이유:
+//   hexa int 정확성 보장 위해 low 32 bits + high 32 bits 분할 저장.
+//   실 address = address_high << 32 | address_low.
+//
+// schema (stub_addr.tsv):
+//   stub_id<int> | dll_id<int> | address_low<int> | address_high<int>
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 ───
+fn psat_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_stub_address_table"
+}
+
+fn stub_addr_path() -> str {
+    return psat_dir() + "/stub_addr.tsv"
+}
+
+fn ensure_psat_dir() -> void {
+    let _ = exec("mkdir -p '" + psat_dir() + "'")
+}
+
+fn cleanup_psat() -> void {
+    ensure_psat_dir()
+    let _ = exec("rm -f '" + stub_addr_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_psat_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_psat_row(path: str, row: str) -> void {
+    ensure_psat_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_stub ───
+//   address_low  = lower 32 bits  (e.g. 0x12340000)
+//   address_high = upper 32 bits  (e.g. 0x100)
+//   실 address   = (address_high << 32) | address_low
+fn record_stub(stub_id: int, dll_id: int, address_low: int, address_high: int) -> void {
+    let row = to_string(stub_id) + "\t" + to_string(dll_id)
+        + "\t" + to_string(address_low) + "\t" + to_string(address_high) + "\n"
+    append_psat_row(stub_addr_path(), row)
+}
+
+// ─── stub_count: 전체 row 수 ───
+fn stub_count() -> int {
+    let t = read_psat_table(stub_addr_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total_dlls: distinct dll_id 수 ───
+fn total_dlls() -> int {
+    let t = read_psat_table(stub_addr_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = ""
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let key = "|" + parts[1] + "|"
+                if !seen.contains(key) {
+                    seen = seen + key
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── count_by_dll: 특정 dll_id 의 row 수 ───
+fn count_by_dll(dll_id: int) -> int {
+    let t = read_psat_table(stub_addr_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let d = to_int(parts[1])
+                if d == dll_id {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── stub_address_low: 특정 stub_id 의 address_low (없으면 0) ───
+fn stub_address_low(stub_id: int) -> int {
+    let t = read_psat_table(stub_addr_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let s = to_int(parts[0])
+                if s == stub_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psat_stats: [stub_count, count_by_dll(1), count_by_dll(2), count_by_dll(3)] ───
+fn psat_stats() -> array {
+    let mut out = []
+    out.push(stub_count())
+    out.push(count_by_dll(1))
+    out.push(count_by_dll(2))
+    out.push(count_by_dll(3))
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "psat-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psat()
+
+    // 1b. cleanup 후 stub_count == 0
+    let c0 = stub_count()
+    if c0 != 0 {
+        panic("pe_stub_address_table FAIL [cleanup stub_count] expected=0 got=" + to_string(c0))
+    }
+
+    // 2. record 4 stubs across 3 DLLs
+    record_stub(83001, 1, 0x12340000, 0x100)   // KERNEL32 stub @ 0x100_12340000
+    r0_emit("psat_record",
+        "\"stub_id\":83001,\"dll_id\":1,\"addr_low\":\"0x12340000\",\"addr_high\":\"0x100\"")
+
+    record_stub(83002, 1, 0x12345000, 0x100)   // KERNEL32 stub @ 0x100_12345000
+    r0_emit("psat_record",
+        "\"stub_id\":83002,\"dll_id\":1,\"addr_low\":\"0x12345000\",\"addr_high\":\"0x100\"")
+
+    record_stub(83003, 2, 0x22340000, 0x100)   // USER32 stub @ 0x100_22340000
+    r0_emit("psat_record",
+        "\"stub_id\":83003,\"dll_id\":2,\"addr_low\":\"0x22340000\",\"addr_high\":\"0x100\"")
+
+    record_stub(83004, 3, 0x32340000, 0x100)   // GDI32 stub @ 0x100_32340000
+    r0_emit("psat_record",
+        "\"stub_id\":83004,\"dll_id\":3,\"addr_low\":\"0x32340000\",\"addr_high\":\"0x100\"")
+
+    // 3. stub_count == 4
+    let c = stub_count()
+    if c != 4 {
+        panic("pe_stub_address_table FAIL [stub_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_dlls == 3
+    let td = total_dlls()
+    if td != 3 {
+        panic("pe_stub_address_table FAIL [total_dlls] expected=3 got=" + to_string(td))
+    }
+
+    // 5. count_by_dll(1) == 2
+    let n1 = count_by_dll(1)
+    if n1 != 2 {
+        panic("pe_stub_address_table FAIL [count_by_dll 1] expected=2 got=" + to_string(n1))
+    }
+
+    // 6. count_by_dll(2) == 1
+    let n2 = count_by_dll(2)
+    if n2 != 1 {
+        panic("pe_stub_address_table FAIL [count_by_dll 2] expected=1 got=" + to_string(n2))
+    }
+
+    // 7. count_by_dll(3) == 1
+    let n3 = count_by_dll(3)
+    if n3 != 1 {
+        panic("pe_stub_address_table FAIL [count_by_dll 3] expected=1 got=" + to_string(n3))
+    }
+
+    // 8. count_by_dll(99) == 0
+    let n99 = count_by_dll(99)
+    if n99 != 0 {
+        panic("pe_stub_address_table FAIL [count_by_dll 99] expected=0 got=" + to_string(n99))
+    }
+
+    // 9. stub_address_low(83001) == 0x12340000 (= 305397760)
+    let a1 = stub_address_low(83001)
+    if a1 != 0x12340000 {
+        panic("pe_stub_address_table FAIL [addr_low 83001] expected=305397760 got=" + to_string(a1))
+    }
+
+    // 10. stub_address_low(83003) == 0x22340000 (= 573833216)
+    let a3 = stub_address_low(83003)
+    if a3 != 0x22340000 {
+        panic("pe_stub_address_table FAIL [addr_low 83003] expected=573833216 got=" + to_string(a3))
+    }
+
+    // 11. stub_address_low(9999) == 0 (missing)
+    let am = stub_address_low(9999)
+    if am != 0 {
+        panic("pe_stub_address_table FAIL [addr_low 9999] expected=0 got=" + to_string(am))
+    }
+
+    // 12. psat_stats() == [4, 2, 1, 1]
+    let s = psat_stats()
+    if len(s) != 4 {
+        panic("pe_stub_address_table FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_stub_address_table FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_stub_address_table FAIL [stats[1]] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_stub_address_table FAIL [stats[2]] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_stub_address_table FAIL [stats[3]] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 13. emit psat_stats (final aggregator)
+    r0_emit("psat_stats",
+        "\"stub_count\":" + to_string(s[0])
+        + ",\"dll1\":" + to_string(s[1])
+        + ",\"dll2\":" + to_string(s[2])
+        + ",\"dll3\":" + to_string(s[3]))
+
+    // 14. r0_emit count 검증 (≥ 5; 실제 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_stub_address_table FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 15. cleanup → 모든 stat 0
+    cleanup_psat()
+    let s2 = psat_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_stub_address_table FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    // 16. PASS
+    println("  ✅ pe_stub_address_table self_test PASS (4 stubs, 3 DLLs, addr_low(83001)="
+        + to_string(a1) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psat_stats()
+            println("stub_count\t" + to_string(s[0]))
+            println("count_by_dll(1)\t" + to_string(s[1]))
+            println("count_by_dll(2)\t" + to_string(s[2]))
+            println("count_by_dll(3)\t" + to_string(s[3]))
+            println("total_dlls\t" + to_string(total_dlls()))
+            return
+        }
+        if sub == "addr" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println(to_string(stub_address_low(sid)))
+                return
+            }
+            println("usage: hexa run pe_stub_address_table.hexa addr <stub_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let dll_id = to_int(a[3])
+                println(to_string(count_by_dll(dll_id)))
+                return
+            }
+            println("usage: hexa run pe_stub_address_table.hexa count <dll_id>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psat()
+            println("cleaned: " + psat_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psat_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_stub_address_table.hexa { self-test | stats | addr <stub_id> | count <dll_id> | cleanup | dir }")
+}

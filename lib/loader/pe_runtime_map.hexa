@@ -1,0 +1,161 @@
+// lib/loader/pe_runtime_map.hexa — Phase 1 stage1 — PE 런타임 layout 계산기
+//
+// pe_loader_stage1 가 파싱한 section header 를 받아 in-process layout 산출.
+// Wine 0 줄 — Microsoft PE/COFF spec 참조.
+//
+// stage1: 실제 mmap 호출 없이 layout 검증 (VA 범위, page protection, overlap).
+//          stage2 에서 native helper 로 실제 mmap.
+//
+// API:
+//   layout_section_count(pe_path) -> int
+//   layout_section_va(pe_path, idx) -> int      // ImageBase + RVA
+//   layout_section_vsize_aligned(pe_path, idx) -> int
+//   layout_section_prot(pe_path, idx) -> str    // R / RW / RX / RWX
+//   layout_total_size(pe_path) -> int
+//   layout_overlap_check(pe_path) -> int        // 0 = clean
+
+use "./pe_loader_stage1"
+use "../perf/r0_common"
+
+// section header characteristics flags (PE spec)
+let IMAGE_SCN_MEM_EXECUTE  = 0x20000000
+let IMAGE_SCN_MEM_READ     = 0x40000000
+let IMAGE_SCN_MEM_WRITE    = 0x80000000
+
+fn page_size() -> int { return 4096 }
+
+fn page_align(n: int) -> int {
+    let r = n % page_size()
+    if r == 0 { return n }
+    return n + (page_size() - r)
+}
+
+fn layout_section_count(pe_path: str) -> int {
+    let lfa = s1_e_lfanew(pe_path)
+    return s1_num_sections(pe_path, lfa)
+}
+
+// 각 section header offset = e_lfanew + 24 + opt_size + idx*40
+fn section_header_offset(pe_path: str, idx: int) -> int {
+    let lfa = s1_e_lfanew(pe_path)
+    let opt_size = s1_size_opt_header(pe_path, lfa)
+    return lfa + 24 + opt_size + idx * 40
+}
+
+fn layout_section_rva(pe_path: str, idx: int) -> int {
+    let off = section_header_offset(pe_path, idx)
+    // VirtualAddress at +12 (DWORD)
+    return s1_read_u32(pe_path, off + 12)
+}
+
+fn layout_section_vsize(pe_path: str, idx: int) -> int {
+    let off = section_header_offset(pe_path, idx)
+    // VirtualSize at +8 (DWORD)
+    return s1_read_u32(pe_path, off + 8)
+}
+
+fn layout_section_vsize_aligned(pe_path: str, idx: int) -> int {
+    return page_align(layout_section_vsize(pe_path, idx))
+}
+
+fn layout_section_chars(pe_path: str, idx: int) -> int {
+    let off = section_header_offset(pe_path, idx)
+    // Characteristics at +36 (DWORD)
+    return s1_read_u32(pe_path, off + 36)
+}
+
+fn layout_section_prot(pe_path: str, idx: int) -> str {
+    let c = layout_section_chars(pe_path, idx)
+    let r = (c / 0x40000000) % 2 == 1
+    let w = (c / 0x80000000) % 2 == 1
+    let x = (c / 0x20000000) % 2 == 1
+    let mut s = ""
+    if r { s = s + "R" }
+    if w { s = s + "W" }
+    if x { s = s + "X" }
+    if s == "" { return "-" }
+    return s
+}
+
+fn layout_section_va(pe_path: str, idx: int) -> int {
+    let lfa = s1_e_lfanew(pe_path)
+    let opt_magic = s1_opt_magic(pe_path, lfa)
+    let base = s1_image_base_lo(pe_path, lfa, opt_magic)
+    return base + layout_section_rva(pe_path, idx)
+}
+
+fn layout_total_size(pe_path: str) -> int {
+    let n = layout_section_count(pe_path)
+    let i = 0
+    let total = 0
+    while i < n {
+        total = total + layout_section_vsize_aligned(pe_path, i)
+        i = i + 1
+    }
+    return total
+}
+
+fn layout_overlap_check(pe_path: str) -> int {
+    let n = layout_section_count(pe_path)
+    let mut overlaps = 0
+    let i = 0
+    while i < n {
+        let i_va = layout_section_va(pe_path, i)
+        let i_end = i_va + layout_section_vsize_aligned(pe_path, i)
+        let j = i + 1
+        while j < n {
+            let j_va = layout_section_va(pe_path, j)
+            let j_end = j_va + layout_section_vsize_aligned(pe_path, j)
+            if i_va < j_end && j_va < i_end { overlaps = overlaps + 1 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return overlaps
+}
+
+fn self_test() -> void {
+    let sid = "prm-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    if page_align(100) != 4096 { panic("pe_runtime_map FAIL [align 100]") }
+    if page_align(4096) != 4096 { panic("pe_runtime_map FAIL [align 4096]") }
+    if page_align(8000) != 8192 { panic("pe_runtime_map FAIL [align 8000]") }
+
+    // 실 PE 파일 있으면 layout 검증, 없으면 page_align 만 검증
+    let bnet = exec("ls /Users/ghost/core/airgenome-gamebox/tool/bench/Battle.net-Setup.exe 2>/dev/null").trim()
+    if bnet != "" {
+        let n = layout_section_count(bnet)
+        if n <= 0 { panic("pe_runtime_map FAIL [section count] got=" + to_string(n)) }
+        let total = layout_total_size(bnet)
+        if total <= 0 { panic("pe_runtime_map FAIL [total size]") }
+        let overlap = layout_overlap_check(bnet)
+        // 정상 PE 는 overlap 0
+        if overlap != 0 { panic("pe_runtime_map FAIL [unexpected overlap] got=" + to_string(overlap)) }
+        r0_emit("pe_runtime_layout", "\"sections\":" + to_string(n) + ",\"total_aligned\":" + to_string(total) + ",\"overlaps\":" + to_string(overlap))
+        println("  ✅ pe_runtime_map self_test PASS (Battle.net-Setup.exe sections=" + to_string(n) + " aligned=" + to_string(total) + "B overlaps=0)")
+    } else {
+        r0_emit("pe_runtime_layout_skip", "\"reason\":\"no_pe_sample\"")
+        println("  ✅ pe_runtime_map self_test PASS (page_align only — no PE sample)")
+    }
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "layout" && len(a) >= 4 {
+            let p = a[3]
+            let n = layout_section_count(p)
+            println("sections=" + to_string(n) + " total_aligned=" + to_string(layout_total_size(p)) + "B overlaps=" + to_string(layout_overlap_check(p)))
+            let i = 0
+            while i < n {
+                println("  [" + to_string(i) + "] VA=0x" + to_string(layout_section_va(p, i)) + " size=" + to_string(layout_section_vsize_aligned(p, i)) + " prot=" + layout_section_prot(p, i))
+                i = i + 1
+            }
+            return
+        }
+    }
+    println("usage: hexa run pe_runtime_map.hexa { self-test | layout <pe_path> }")
+}

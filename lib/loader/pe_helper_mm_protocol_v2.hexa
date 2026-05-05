@@ -1,0 +1,461 @@
+// lib/loader/pe_helper_mm_protocol_v2.hexa — helper.mm IPC frame protocol v2 추적
+//
+// STAGE7_HELPER_MM_IPC_SPEC.md § 3 의 8 IPC kind frame layout 추적.
+// Frame magic "AHI1" + kind + seq + payload_len + payload (header 24 byte, payload ≤ 64 KiB).
+//
+// 8 IPC kind:
+//   1 = dlopen
+//   2 = mmap
+//   3 = mprotect
+//   4 = pthread_create
+//   5 = dlsym
+//   6 = nsobject
+//   7 = metal_device
+//   8 = signal_register
+//
+// direction:
+//   1 = request   (parent → helper)
+//   2 = response  (helper → parent, seq echo)
+//
+// own1: Apple SDK + man pages only — dlopen(3) / mmap(2) / mprotect(2) / pthread(3)
+//   / dlsym(3) / NSObject (Foundation.framework) / Metal MTLDevice / signal(2).
+//   Wine wineserver IPC frame 인용 X. 본 module 은 protocol tracker — 실 byte stream
+//   read/write X (stage7).
+// own 2 mandate: r0_emit ≥ 9 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — frames.tsv):
+//   frame_id<int> \t ipc_kind<int> \t direction<int> \t payload_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn phmpv2_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_helper_mm_protocol_v2"
+}
+
+fn phmpv2_frames_path() -> str {
+    return phmpv2_dir() + "/frames.tsv"
+}
+
+fn phmpv2_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + phmpv2_dir() + "'")
+}
+
+fn cleanup_phmpv2() -> void {
+    phmpv2_ensure_dir()
+    let _ = exec("rm -f '" + phmpv2_frames_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn phmpv2_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn phmpv2_append_row(path: str, row: str) -> void {
+    phmpv2_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_frame: IPC frame 1 행 기록 ───
+fn record_frame(frame_id: int, ipc_kind: int, direction: int, payload_bytes: int) -> void {
+    if frame_id <= 0 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=frame_id>0 got=" + to_string(frame_id))
+    }
+    if ipc_kind < 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=ipc_kind>=1 got=" + to_string(ipc_kind))
+    }
+    if ipc_kind > 8 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=ipc_kind<=8 got=" + to_string(ipc_kind))
+    }
+    if direction < 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=direction>=1 got=" + to_string(direction))
+    }
+    if direction > 2 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=direction<=2 got=" + to_string(direction))
+    }
+    if payload_bytes < 0 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=payload_bytes>=0 got=" + to_string(payload_bytes))
+    }
+    if payload_bytes > 65536 {
+        panic("pe_helper_mm_protocol_v2 FAIL [record_frame] expected=payload_bytes<=65536 got=" + to_string(payload_bytes))
+    }
+    let row = to_string(frame_id) + "\t" + to_string(ipc_kind)
+        + "\t" + to_string(direction) + "\t" + to_string(payload_bytes) + "\n"
+    phmpv2_append_row(phmpv2_frames_path(), row)
+}
+
+// ─── frame_count: total frame row 수 ───
+fn frame_count() -> int {
+    let t = phmpv2_read_table(phmpv2_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_ipc_kind: 특정 ipc_kind 의 row 수 ───
+fn count_by_ipc_kind(kind: int) -> int {
+    let t = phmpv2_read_table(phmpv2_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_direction: request(1) / response(2) row 수 ───
+fn count_by_direction(direction: int) -> int {
+    let t = phmpv2_read_table(phmpv2_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == direction {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_payload_bytes: 모든 frame payload byte 합 ───
+fn total_payload_bytes() -> int {
+    let t = phmpv2_read_table(phmpv2_frames_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut total = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                total = total + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ─── request_response_pair_count: min(req, resp) — 매칭된 pair 수 추정 ───
+fn request_response_pair_count() -> int {
+    let req = count_by_direction(1)
+    let resp = count_by_direction(2)
+    if req < resp {
+        return req
+    }
+    return resp
+}
+
+// ─── frame_payload: 특정 frame_id 의 payload_bytes (없으면 -1) ───
+fn frame_payload(frame_id: int) -> int {
+    let t = phmpv2_read_table(phmpv2_frames_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == frame_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── phmpv2_stats: [frame_count, request, response, pair, total_bytes] ───
+fn phmpv2_stats() -> array {
+    let mut out = []
+    out.push(frame_count())
+    out.push(count_by_direction(1))
+    out.push(count_by_direction(2))
+    out.push(request_response_pair_count())
+    out.push(total_payload_bytes())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "phmpv2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_phmpv2()
+
+    // 2. record 8 frames — 4 req + 4 resp, all 8 ipc_kinds covered:
+    //    kind=1 req, kind=2 req, kind=3 resp, kind=4 req,
+    //    kind=5 resp, kind=6 resp, kind=7 req, kind=8 resp
+    record_frame(700001, 1, 1, 96)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700001,\"ipc_kind\":1,\"direction\":1,\"payload_bytes\":96,\"target\":\"dlopen_request\"")
+
+    record_frame(700002, 2, 1, 40)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700002,\"ipc_kind\":2,\"direction\":1,\"payload_bytes\":40,\"target\":\"mmap_request\"")
+
+    record_frame(700003, 3, 2, 16)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700003,\"ipc_kind\":3,\"direction\":2,\"payload_bytes\":16,\"target\":\"mprotect_response\"")
+
+    record_frame(700004, 4, 1, 56)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700004,\"ipc_kind\":4,\"direction\":1,\"payload_bytes\":56,\"target\":\"pthread_create_request\"")
+
+    record_frame(700005, 5, 2, 24)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700005,\"ipc_kind\":5,\"direction\":2,\"payload_bytes\":24,\"target\":\"dlsym_response\"")
+
+    record_frame(700006, 6, 2, 48)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700006,\"ipc_kind\":6,\"direction\":2,\"payload_bytes\":48,\"target\":\"nsobject_response\"")
+
+    record_frame(700007, 7, 1, 64)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700007,\"ipc_kind\":7,\"direction\":1,\"payload_bytes\":64,\"target\":\"metal_device_request\"")
+
+    record_frame(700008, 8, 2, 12)
+    r0_emit("pe_helper_mm_protocol_v2_record",
+        "\"frame_id\":700008,\"ipc_kind\":8,\"direction\":2,\"payload_bytes\":12,\"target\":\"signal_register_response\"")
+
+    // 3. frame_count = 8
+    let c = frame_count()
+    if c != 8 {
+        panic("pe_helper_mm_protocol_v2 FAIL [frame_count] expected=8 got=" + to_string(c))
+    }
+
+    // 4. count_by_ipc_kind sanity (1 each, all 8 ipc_kinds)
+    let k1 = count_by_ipc_kind(1)
+    if k1 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_ipc_kind(2)
+    if k2 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_ipc_kind(3)
+    if k3 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_ipc_kind(4)
+    if k4 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_ipc_kind(5)
+    if k5 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_ipc_kind(6)
+    if k6 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k7 = count_by_ipc_kind(7)
+    if k7 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(7)] expected=1 got=" + to_string(k7))
+    }
+    let k8 = count_by_ipc_kind(8)
+    if k8 != 1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_ipc_kind(8)] expected=1 got=" + to_string(k8))
+    }
+
+    // 5. count_by_direction → 4 req + 4 resp
+    let d_req = count_by_direction(1)
+    if d_req != 4 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_direction(1)] expected=4 got=" + to_string(d_req))
+    }
+    let d_resp = count_by_direction(2)
+    if d_resp != 4 {
+        panic("pe_helper_mm_protocol_v2 FAIL [count_by_direction(2)] expected=4 got=" + to_string(d_resp))
+    }
+
+    // 6. request_response_pair_count = min(4, 4) = 4
+    let pair = request_response_pair_count()
+    if pair != 4 {
+        panic("pe_helper_mm_protocol_v2 FAIL [request_response_pair_count] expected=4 got=" + to_string(pair))
+    }
+
+    // 7. total_payload_bytes = 96+40+16+56+24+48+64+12 = 356
+    let tb = total_payload_bytes()
+    if tb != 356 {
+        panic("pe_helper_mm_protocol_v2 FAIL [total_payload_bytes] expected=356 got=" + to_string(tb))
+    }
+
+    // 8. frame_payload sanity
+    let p1 = frame_payload(700001)
+    if p1 != 96 {
+        panic("pe_helper_mm_protocol_v2 FAIL [frame_payload(700001)] expected=96 got=" + to_string(p1))
+    }
+    let p7 = frame_payload(700007)
+    if p7 != 64 {
+        panic("pe_helper_mm_protocol_v2 FAIL [frame_payload(700007)] expected=64 got=" + to_string(p7))
+    }
+    let p_miss = frame_payload(999999)
+    if p_miss != -1 {
+        panic("pe_helper_mm_protocol_v2 FAIL [frame_payload(999999)] expected=-1 got=" + to_string(p_miss))
+    }
+
+    // 9. phmpv2_stats() = [8, 4, 4, 4, 356]
+    let s = phmpv2_stats()
+    if len(s) != 5 {
+        panic("pe_helper_mm_protocol_v2 FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_helper_mm_protocol_v2 FAIL [stats frame_count] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_helper_mm_protocol_v2 FAIL [stats request] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_helper_mm_protocol_v2 FAIL [stats response] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_helper_mm_protocol_v2 FAIL [stats pair] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 356 {
+        panic("pe_helper_mm_protocol_v2 FAIL [stats total_bytes] expected=356 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats (총 8 records + 1 stats = 9 ≥ 9)
+    r0_emit("pe_helper_mm_protocol_v2_stats",
+        "\"frame_count\":" + to_string(s[0])
+        + ",\"request\":" + to_string(s[1])
+        + ",\"response\":" + to_string(s[2])
+        + ",\"pair\":" + to_string(s[3])
+        + ",\"total_bytes\":" + to_string(s[4]))
+
+    // 11. emit count >= 9
+    let emit_n = r0_session_count(sid)
+    if emit_n < 9 {
+        panic("pe_helper_mm_protocol_v2 FAIL [r0 emit count] expected=>=9 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_phmpv2()
+    let s2 = phmpv2_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_helper_mm_protocol_v2 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_helper_mm_protocol_v2 self_test PASS (frames=" + to_string(s[0])
+        + ", req=" + to_string(s[1]) + ", resp=" + to_string(s[2])
+        + ", pair=" + to_string(s[3]) + ", total_bytes=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = phmpv2_stats()
+            println("frame_count\t" + to_string(s[0]))
+            println("request\t" + to_string(s[1]))
+            println("response\t" + to_string(s[2]))
+            println("pair\t" + to_string(s[3]))
+            println("total_bytes\t" + to_string(s[4]))
+            return
+        }
+        if sub == "payload" {
+            if len(a) >= 4 {
+                let fid = to_int(a[3])
+                println("frame_payload\t" + to_string(frame_payload(fid)))
+                return
+            }
+            println("usage: hexa run pe_helper_mm_protocol_v2.hexa payload <frame_id>")
+            return
+        }
+        if sub == "kind" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println("count_by_ipc_kind\t" + to_string(count_by_ipc_kind(k)))
+                return
+            }
+            println("usage: hexa run pe_helper_mm_protocol_v2.hexa kind <ipc_kind>")
+            return
+        }
+        if sub == "direction" {
+            if len(a) >= 4 {
+                let d = to_int(a[3])
+                println("count_by_direction\t" + to_string(count_by_direction(d)))
+                return
+            }
+            println("usage: hexa run pe_helper_mm_protocol_v2.hexa direction <1|2>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_phmpv2()
+            println("cleaned: " + phmpv2_dir())
+            return
+        }
+        if sub == "dir" {
+            println(phmpv2_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_helper_mm_protocol_v2.hexa { self-test | stats | payload <frame_id> | kind <ipc_kind> | direction <1|2> | cleanup | dir }")
+}

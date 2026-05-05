@@ -1,0 +1,216 @@
+// lib/perf/c_elden_dx12_first_frame.hexa — CN-160 skeleton manjeom 15/15
+//
+// Elden Ring (+ SotE DLC) DX12 first frame trace — D4 stage2 100% 재사용 path.
+// Elden Ring / Nightreign 의 FromSoftware 자체 엔진은 DX12 only (DX11 fallback
+// 없음). offline mode (`start_game_in_offline_mode.exe`, EAC 비활성) 또는 DIY
+// hexa loader 직접 PE load 시 DX12 device init + PSO 컴파일 + first draw 측정.
+// D4 DX12 stage2 인프라 직접 재사용 가능.
+//
+// 무기: frame × dx12_init × pso_warm × first_draw 4-key 로그.
+// 효과: Elden Ring offline cold-launch latency 분해, D4 DX12 path 와 비교
+//       baseline.
+
+use "./r0_common"
+
+let EDFF_DIR = GAMEBOX_HOME + "/persist/elden_dx12_first_frame"
+let FRAME_LOG = EDFF_DIR + "/frames.tsv"
+
+fn edff_dir() -> str { return EDFF_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + EDFF_DIR + "'")
+}
+
+// ─── frame 등록 ───
+//   frame_id     (cold/warm/hot 구분 가능한 launch 식별자),
+//   dx12_init_us (DX12 device + swapchain init 시간 us),
+//   pso_warm_us  (PSO 컴파일/캐시 warm 시간 us),
+//   first_draw_us(첫 draw call 완료까지 시간 us).
+fn record_frame(frame_id: int, dx12_init_us: int, pso_warm_us: int, first_draw_us: int) -> void {
+    ensure_dir()
+    let line = to_string(frame_id) + "\t" + to_string(dx12_init_us) + "\t" + to_string(pso_warm_us) + "\t" + to_string(first_draw_us)
+    let tmp = FRAME_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + FRAME_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("elden_dx12_first_frame_record", "\"frame\":" + to_string(frame_id) + ",\"dx12_init_us\":" + to_string(dx12_init_us) + ",\"pso_warm_us\":" + to_string(pso_warm_us) + ",\"first_draw_us\":" + to_string(first_draw_us))
+}
+
+// ─── frame_count — 등록된 frame 행 수 ───
+fn frame_count() -> int {
+    let exists = exec("test -f '" + FRAME_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + FRAME_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_dx12_init_us — 모든 frame dx12_init_us 합 ───
+fn total_dx12_init_us() -> int {
+    let exists = exec("test -f '" + FRAME_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + FRAME_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_pso_warm_us — 모든 frame pso_warm_us 합 ───
+fn total_pso_warm_us() -> int {
+    let exists = exec("test -f '" + FRAME_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + FRAME_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_first_draw_us — 모든 frame first_draw_us 합 ───
+fn total_first_draw_us() -> int {
+    let exists = exec("test -f '" + FRAME_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + FRAME_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_first_draw_us — total_first_draw_us / frame_count ───
+//   frame 0 이면 0 반환 (divide-by-zero guard).
+fn avg_first_draw_us() -> int {
+    let fc = frame_count()
+    if fc == 0 { return 0 }
+    return total_first_draw_us() / fc
+}
+
+// ─── frame_total_us — 특정 frame_id 의 dx12_init+pso_warm+first_draw 합 ───
+//   frame_id 미등록이면 0.
+fn frame_total_us(frame_id: int) -> int {
+    let exists = exec("test -f '" + FRAME_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v f=" + to_string(frame_id) + " '$1==f {s+=$2+$3+$4} END{print s+0}' '" + FRAME_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── edff_stats — [frame_count, total_dx12_init_us, total_pso_warm_us, total_first_draw_us] ───
+fn edff_stats() -> array {
+    return [frame_count(), total_dx12_init_us(), total_pso_warm_us(), total_first_draw_us()]
+}
+
+fn cleanup_edff() -> void {
+    let _ = exec("rm -rf '" + EDFF_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "edff-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_edff()
+
+    // 합성 frame 3 종:
+    //   frame_id=14001 (cold, offline mode 첫 launch)  : 320000 / 480000 / 120000
+    //   frame_id=14002 (warm, PSO cache hit)           : 120000 / 160000 /  44000
+    //   frame_id=14003 (hot, 동일 area Realm of Shadow):  48000 /  64000 /  16000
+    record_frame(14001, 320000, 480000, 120000)
+    record_frame(14002, 120000, 160000, 44000)
+    record_frame(14003, 48000, 64000, 16000)
+
+    // frame_count = 3
+    let fc = frame_count()
+    if fc != 3 { panic("c_elden_dx12_first_frame FAIL [frame_count] expected=3 got=" + to_string(fc)) }
+
+    // total_dx12_init_us = 320000+120000+48000 = 488000
+    let tdi = total_dx12_init_us()
+    if tdi != 488000 { panic("c_elden_dx12_first_frame FAIL [total_dx12_init_us] expected=488000 got=" + to_string(tdi)) }
+
+    // total_pso_warm_us = 480000+160000+64000 = 704000
+    let tpw = total_pso_warm_us()
+    if tpw != 704000 { panic("c_elden_dx12_first_frame FAIL [total_pso_warm_us] expected=704000 got=" + to_string(tpw)) }
+
+    // total_first_draw_us = 120000+44000+16000 = 180000
+    let tfd = total_first_draw_us()
+    if tfd != 180000 { panic("c_elden_dx12_first_frame FAIL [total_first_draw_us] expected=180000 got=" + to_string(tfd)) }
+
+    // avg_first_draw_us = 180000 / 3 = 60000
+    let avg = avg_first_draw_us()
+    if avg != 60000 { panic("c_elden_dx12_first_frame FAIL [avg_first_draw_us] expected=60000 got=" + to_string(avg)) }
+
+    // frame_total_us:
+    //   14001 = 320000+480000+120000 = 920000
+    //   14002 = 120000+160000+44000  = 324000
+    //   14003 =  48000+ 64000+16000  = 128000
+    //   9999 (미등록) = 0
+    let f1 = frame_total_us(14001)
+    if f1 != 920000 { panic("c_elden_dx12_first_frame FAIL [frame_total 14001] expected=920000 got=" + to_string(f1)) }
+    let f2 = frame_total_us(14002)
+    if f2 != 324000 { panic("c_elden_dx12_first_frame FAIL [frame_total 14002] expected=324000 got=" + to_string(f2)) }
+    let f3 = frame_total_us(14003)
+    if f3 != 128000 { panic("c_elden_dx12_first_frame FAIL [frame_total 14003] expected=128000 got=" + to_string(f3)) }
+    let f4 = frame_total_us(9999)
+    if f4 != 0 { panic("c_elden_dx12_first_frame FAIL [frame_total unknown] expected=0 got=" + to_string(f4)) }
+
+    let stats = edff_stats()
+    if stats[0] != 3 { panic("c_elden_dx12_first_frame FAIL [stats frames] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 488000 { panic("c_elden_dx12_first_frame FAIL [stats dx12_init] expected=488000 got=" + to_string(stats[1])) }
+    if stats[2] != 704000 { panic("c_elden_dx12_first_frame FAIL [stats pso_warm] expected=704000 got=" + to_string(stats[2])) }
+    if stats[3] != 180000 { panic("c_elden_dx12_first_frame FAIL [stats first_draw] expected=180000 got=" + to_string(stats[3])) }
+
+    r0_emit("elden_dx12_first_frame_summary", "\"frames\":" + to_string(stats[0]) + ",\"dx12_init_us\":" + to_string(stats[1]) + ",\"pso_warm_us\":" + to_string(stats[2]) + ",\"first_draw_us\":" + to_string(stats[3]) + ",\"avg_first_draw_us\":" + to_string(avg))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_elden_dx12_first_frame FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic Elden Ring retired_intentional posture annotation (Track AS) ───
+    //
+    // Track AS mission: extend Track C (Elden Ring blk.1 retired_intentional adoption
+    // 2026-05-03) posture annotation across 5-6 c_elden_*.hexa modules — mirror
+    // Track V (D4 7) / Track AJ (D4 6) / Track AL (D4 6) pattern but for Elden Ring
+    // EAC anti-tamper class. .roadmap.elden_ring blk.1 status_enum_adopted =
+    // retired_intentional (block-acknowledged = PASS-equivalent posture, own1 Wine 0
+    // + own2 honest emit, no AC bypass code, no anti-tamper bypass). 본 module 측
+    // DX12 first-frame 4-key trace (frame × dx12_init × pso_warm × first_draw) =
+    // synthetic launch trace — Elden Ring live session X (EAC kernel driver Apple
+    // Silicon load 불가 → game process auto offline, but production binary smoke X).
+    // 본 cycle 측 module self_test() honest annotation row 추가 only — cond.2 status
+    // `partial` 영구 유지 (retired_intentional posture per blk.1 영구 lock).
+    // pattern reference:
+    //     lib/perf/c_d4_dxr_first_frame_trace.hexa (Track AL predecessor, schema mirror)
+    //
+    // synthetic posture row column header:
+    //     domain                "dx12_first_frame"
+    //     posture               "retired_intentional"  (NOT pass / NOT partial / NOT fail)
+    //     production_smoke      "no_attempt"           (no live game state acquire)
+    //     drm_bypass            "0"                    (own1 Wine 0 / no evasion)
+    //     ac_bypass             "0"                    (own1 honest acknowledgment)
+    //     anti_tamper_bypass    "0"                    (Elden Ring EAC anti-tamper boundary)
+    //     blocker_ref           "elden_ring.blk.1"     (eac_anti_tamper)
+    //     adoption_iso          "2026-05-03"           (Track C 4-game retired_intentional)
+    r0_emit("c_elden_dx12_first_frame_retired_intentional",
+        "\"stage\":\"elden_ring_engine_synthetic\",\"domain\":\"dx12_first_frame\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"ac_bypass\":0,\"anti_tamper_bypass\":0,\"blocker_ref\":\"elden_ring.blk.1\",\"blocker_class\":\"eac_anti_tamper\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"elden_ring.cond.2\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\"")
+    println("__ELDEN_DX12_FIRST_FRAME__ RETIRED_INTENTIONAL elden_ring_engine_synthetic")
+
+    cleanup_edff()
+
+    println("  ✅ c_elden_dx12_first_frame self_test PASS (3 frames, dx12_init=488000 us, pso_warm=704000 us, first_draw=180000 us, avg=60000 us, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = edff_stats()
+            println("frames=" + to_string(s[0]) + " dx12_init_us=" + to_string(s[1]) + " pso_warm_us=" + to_string(s[2]) + " first_draw_us=" + to_string(s[3]))
+            return
+        }
+        if sub == "total" {
+            if len(a) >= 4 {
+                let fid = to_int(a[3])
+                let us = frame_total_us(fid)
+                println(to_string(us))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_edff(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_elden_dx12_first_frame.hexa { self-test | stats | total <frame_id> | cleanup }")
+}

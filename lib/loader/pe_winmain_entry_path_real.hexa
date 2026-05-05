@@ -1,0 +1,500 @@
+// lib/loader/pe_winmain_entry_path_real.hexa — WinMain entry path tracker
+//
+// own 1: Wine / CrossOver / Whisky / Box86 / community 0 줄. Apple SDK 직접 호출 X.
+//        Microsoft Win32 API doc 의 contract reference only — telemetry instrumentation.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   CRT init 통과 후 WinMain 진입 → first window message loop 까지의 sequence.
+//
+// WinMain typical sequence (Battle.net Setup-style installer):
+//   1. WinMain(hInstance, hPrevInstance, lpCmdLine, nShowCmd) entry
+//   2. WNDCLASSEX 초기화 + RegisterClassExA → atom return
+//   3. CreateWindowExA(class_name, "Battle.net Setup", style, x, y, w, h,
+//                      parent, menu, hInst, lParam)
+//   4. ShowWindow(hwnd, nShowCmd)
+//   5. UpdateWindow(hwnd)
+//   6. message loop:
+//        while (GetMessageA(&msg, NULL, 0, 0)) {
+//            TranslateMessage(&msg);
+//            DispatchMessageA(&msg);
+//        }
+//   7. return msg.wParam (after WM_QUIT)
+//
+// Win32 API reference (MSDN — 구현 X, 본 hexa 는 milestone telemetry 만 기록):
+//   - WinMain                  : application entry after CRT init
+//   - WNDCLASSEXA / RegisterClassExA (USER32) : window class registration → atom
+//   - CreateWindowExA          (USER32) : HWND 생성 (WM_NCCREATE / WM_CREATE 발생)
+//   - ShowWindow / UpdateWindow(USER32) : visibility + WM_PAINT
+//   - GetMessageA              (USER32) : message pump (returns 0 on WM_QUIT)
+//   - TranslateMessage / DispatchMessageA (USER32) : WndProc dispatch
+//   - WM_NCCREATE  (0x0081)
+//   - WM_CREATE    (0x0001)
+//   - WM_PAINT     (0x000F)
+//   - WM_LBUTTONDOWN (0x0201)
+//   - WM_DESTROY   (0x0002)
+//   - WM_QUIT      (0x0012)
+//
+// persist schema (TSV — 5 separate tables):
+//   winmain_entry.tsv :
+//     entry_id<int> \t hinstance_hex<str> \t cmdline_va_hex<str> \t n_show_cmd<int> \t ts_ns<int>
+//   class_register.tsv:
+//     register_id<int> \t class_name<str> \t atom<int> \t wndproc_va_hex<str> \t style_hex<str>
+//   window_create.tsv :
+//     create_id<int> \t hwnd_hex<str> \t class_name<str> \t title<str> \t x<int> \t y<int> \t w<int> \t h<int>
+//   message_loop.tsv  :
+//     iter_id<int> \t hwnd_hex<str> \t message_code_hex<str> \t returned_quit<int>
+//   winmain_exit.tsv  :
+//     exit_id<int> \t exit_code<int> \t total_iters<int> \t ts_ns<int>
+//
+// 식별자 주의: type/mod/resume/handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: entry_id / hinstance_hex / cmdline_va_hex / n_show_cmd /
+// register_id / class_name / atom / wndproc_va_hex / style_hex /
+// create_id / hwnd_hex / iter_id / message_code_hex / returned_quit /
+// exit_id / exit_code / total_iters.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwep_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_winmain_entry_path_real"
+}
+
+fn pwep_winmain_entry_path() -> str {
+    return pwep_dir() + "/winmain_entry.tsv"
+}
+
+fn pwep_class_register_path() -> str {
+    return pwep_dir() + "/class_register.tsv"
+}
+
+fn pwep_window_create_path() -> str {
+    return pwep_dir() + "/window_create.tsv"
+}
+
+fn pwep_message_loop_path() -> str {
+    return pwep_dir() + "/message_loop.tsv"
+}
+
+fn pwep_winmain_exit_path() -> str {
+    return pwep_dir() + "/winmain_exit.tsv"
+}
+
+fn pwep_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwep_dir() + "'")
+}
+
+fn cleanup_pwep() -> void {
+    pwep_ensure_dir()
+    let _ = exec("rm -f '" + pwep_winmain_entry_path() + "' '" + pwep_class_register_path()
+        + "' '" + pwep_window_create_path() + "' '" + pwep_message_loop_path()
+        + "' '" + pwep_winmain_exit_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwep_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwep_append_row(path: str, row: str) -> void {
+    pwep_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwep_count_rows(path: str, min_cols: int) -> int {
+    let t = pwep_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── hwnd_to_int — convert "0x10001" → 65537 ───
+fn hwnd_to_int(hex: str) -> int {
+    if hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [hwnd_to_int] expected=hex!=empty got=empty")
+    }
+    let s = hex
+    let n = len(s)
+    let mut i = 0
+    if n >= 2 {
+        if s[0] == "0" {
+            if s[1] == "x" || s[1] == "X" {
+                i = 2
+            }
+        }
+    }
+    if i >= n {
+        panic("pe_winmain_entry_path_real FAIL [hwnd_to_int] expected=digits_after_prefix got=" + hex)
+    }
+    let mut acc = 0
+    while i < n {
+        let c = s[i]
+        let mut d = -1
+        if c == "0" { d = 0 }
+        if c == "1" { d = 1 }
+        if c == "2" { d = 2 }
+        if c == "3" { d = 3 }
+        if c == "4" { d = 4 }
+        if c == "5" { d = 5 }
+        if c == "6" { d = 6 }
+        if c == "7" { d = 7 }
+        if c == "8" { d = 8 }
+        if c == "9" { d = 9 }
+        if c == "a" || c == "A" { d = 10 }
+        if c == "b" || c == "B" { d = 11 }
+        if c == "c" || c == "C" { d = 12 }
+        if c == "d" || c == "D" { d = 13 }
+        if c == "e" || c == "E" { d = 14 }
+        if c == "f" || c == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_winmain_entry_path_real FAIL [hwnd_to_int] expected=hexdigit got=" + c)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── record_winmain_entry: WinMain entry milestone ───
+fn record_winmain_entry(entry_id: int, hinstance_hex: str, cmdline_va_hex: str, n_show_cmd: int, ts_ns: int) -> void {
+    if entry_id <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_entry] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    if hinstance_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_entry] expected=hinstance_hex!=empty got=empty")
+    }
+    if cmdline_va_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_entry] expected=cmdline_va_hex!=empty got=empty")
+    }
+    if n_show_cmd < 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_entry] expected=n_show_cmd>=0 got=" + to_string(n_show_cmd))
+    }
+    if ts_ns < 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_entry] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    let row = to_string(entry_id) + "\t" + hinstance_hex + "\t" + cmdline_va_hex
+        + "\t" + to_string(n_show_cmd) + "\t" + to_string(ts_ns) + "\n"
+    pwep_append_row(pwep_winmain_entry_path(), row)
+}
+
+// ─── record_class_register: RegisterClassExA milestone ───
+fn record_class_register(register_id: int, class_name: str, atom: int, wndproc_va_hex: str, style_hex: str) -> void {
+    if register_id <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_class_register] expected=register_id>0 got=" + to_string(register_id))
+    }
+    if class_name == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_class_register] expected=class_name!=empty got=empty")
+    }
+    if atom <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_class_register] expected=atom>0 got=" + to_string(atom))
+    }
+    if wndproc_va_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_class_register] expected=wndproc_va_hex!=empty got=empty")
+    }
+    if style_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_class_register] expected=style_hex!=empty got=empty")
+    }
+    let row = to_string(register_id) + "\t" + class_name + "\t" + to_string(atom)
+        + "\t" + wndproc_va_hex + "\t" + style_hex + "\n"
+    pwep_append_row(pwep_class_register_path(), row)
+}
+
+// ─── record_window_create: CreateWindowExA milestone ───
+fn record_window_create(create_id: int, hwnd_hex: str, class_name: str, title: str, x: int, y: int, w: int, h: int) -> void {
+    if create_id <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_window_create] expected=create_id>0 got=" + to_string(create_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_window_create] expected=hwnd_hex!=empty got=empty")
+    }
+    if class_name == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_window_create] expected=class_name!=empty got=empty")
+    }
+    if title == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_window_create] expected=title!=empty got=empty")
+    }
+    if w <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_window_create] expected=w>0 got=" + to_string(w))
+    }
+    if h <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_window_create] expected=h>0 got=" + to_string(h))
+    }
+    let row = to_string(create_id) + "\t" + hwnd_hex + "\t" + class_name + "\t" + title
+        + "\t" + to_string(x) + "\t" + to_string(y) + "\t" + to_string(w) + "\t" + to_string(h) + "\n"
+    pwep_append_row(pwep_window_create_path(), row)
+}
+
+// ─── record_message_loop_iter: GetMessage/Translate/Dispatch one iteration ───
+// returned_quit: 0=normal iteration, 1=GetMessage returned 0 (WM_QUIT)
+fn record_message_loop_iter(iter_id: int, hwnd_hex: str, message_code_hex: str, returned_quit: int) -> void {
+    if iter_id <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_message_loop_iter] expected=iter_id>0 got=" + to_string(iter_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_message_loop_iter] expected=hwnd_hex!=empty got=empty")
+    }
+    if message_code_hex == "" {
+        panic("pe_winmain_entry_path_real FAIL [record_message_loop_iter] expected=message_code_hex!=empty got=empty")
+    }
+    if returned_quit < 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_message_loop_iter] expected=returned_quit>=0 got=" + to_string(returned_quit))
+    }
+    if returned_quit > 1 {
+        panic("pe_winmain_entry_path_real FAIL [record_message_loop_iter] expected=returned_quit<=1 got=" + to_string(returned_quit))
+    }
+    let row = to_string(iter_id) + "\t" + hwnd_hex + "\t" + message_code_hex
+        + "\t" + to_string(returned_quit) + "\n"
+    pwep_append_row(pwep_message_loop_path(), row)
+}
+
+// ─── record_winmain_exit: WinMain return to CRT ───
+fn record_winmain_exit(exit_id: int, exit_code: int, total_iters: int, ts_ns: int) -> void {
+    if exit_id <= 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_exit] expected=exit_id>0 got=" + to_string(exit_id))
+    }
+    if exit_code < 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_exit] expected=exit_code>=0 got=" + to_string(exit_code))
+    }
+    if total_iters < 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_exit] expected=total_iters>=0 got=" + to_string(total_iters))
+    }
+    if ts_ns < 0 {
+        panic("pe_winmain_entry_path_real FAIL [record_winmain_exit] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    let row = to_string(exit_id) + "\t" + to_string(exit_code) + "\t"
+        + to_string(total_iters) + "\t" + to_string(ts_ns) + "\n"
+    pwep_append_row(pwep_winmain_exit_path(), row)
+}
+
+// ─── statistics ───
+fn winmain_entry_count() -> int {
+    return pwep_count_rows(pwep_winmain_entry_path(), 5)
+}
+
+fn class_register_count() -> int {
+    return pwep_count_rows(pwep_class_register_path(), 5)
+}
+
+fn window_create_count() -> int {
+    return pwep_count_rows(pwep_window_create_path(), 8)
+}
+
+fn message_loop_iter_count() -> int {
+    return pwep_count_rows(pwep_message_loop_path(), 4)
+}
+
+fn winmain_exit_count() -> int {
+    return pwep_count_rows(pwep_winmain_exit_path(), 4)
+}
+
+fn pwep_stats() -> array {
+    let mut out = []
+    out.push(winmain_entry_count())
+    out.push(class_register_count())
+    out.push(window_create_count())
+    out.push(message_loop_iter_count())
+    out.push(winmain_exit_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwep-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwep()
+
+    // ─── 1. winmain_entry × 1 ───
+    record_winmain_entry(1, "0x10000000", "0x80000800", 10, 1000)
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"winmain_entry\",\"entry_id\":1,\"hinstance\":\"0x10000000\",\"cmdline_va\":\"0x80000800\",\"n_show_cmd\":10,\"ts_ns\":1000")
+
+    // ─── 2. class_register × 2 ───
+    record_class_register(1, "BattleNetMainClass", 1, "0x00401000", "0x00000003")
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"class_register\",\"register_id\":1,\"class_name\":\"BattleNetMainClass\",\"atom\":1,\"wndproc_va\":\"0x00401000\",\"style_hex\":\"0x00000003\"")
+
+    record_class_register(2, "BattleNetDlgClass", 2, "0x00401200", "0x00000008")
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"class_register\",\"register_id\":2,\"class_name\":\"BattleNetDlgClass\",\"atom\":2,\"wndproc_va\":\"0x00401200\",\"style_hex\":\"0x00000008\"")
+
+    // ─── 3. window_create × 1 ───
+    record_window_create(1, "0x10001", "BattleNetMainClass", "Battle.net Setup", 0, 0, 800, 600)
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"window_create\",\"create_id\":1,\"hwnd\":\"0x10001\",\"class_name\":\"BattleNetMainClass\",\"title\":\"Battle.net Setup\",\"x\":0,\"y\":0,\"w\":800,\"h\":600")
+
+    // ─── 4. message_loop_iter × 6 ───
+    record_message_loop_iter(1, "0x10001", "0x0081", 0)  // WM_NCCREATE
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"message_loop_iter\",\"iter_id\":1,\"hwnd\":\"0x10001\",\"message_code\":\"0x0081\",\"wm\":\"WM_NCCREATE\",\"returned_quit\":0")
+
+    record_message_loop_iter(2, "0x10001", "0x0001", 0)  // WM_CREATE
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"message_loop_iter\",\"iter_id\":2,\"hwnd\":\"0x10001\",\"message_code\":\"0x0001\",\"wm\":\"WM_CREATE\",\"returned_quit\":0")
+
+    record_message_loop_iter(3, "0x10001", "0x000F", 0)  // WM_PAINT
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"message_loop_iter\",\"iter_id\":3,\"hwnd\":\"0x10001\",\"message_code\":\"0x000F\",\"wm\":\"WM_PAINT\",\"returned_quit\":0")
+
+    record_message_loop_iter(4, "0x10001", "0x0201", 0)  // WM_LBUTTONDOWN — user click
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"message_loop_iter\",\"iter_id\":4,\"hwnd\":\"0x10001\",\"message_code\":\"0x0201\",\"wm\":\"WM_LBUTTONDOWN\",\"returned_quit\":0")
+
+    record_message_loop_iter(5, "0x10001", "0x0002", 0)  // WM_DESTROY
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"message_loop_iter\",\"iter_id\":5,\"hwnd\":\"0x10001\",\"message_code\":\"0x0002\",\"wm\":\"WM_DESTROY\",\"returned_quit\":0")
+
+    record_message_loop_iter(6, "0x10001", "0x0012", 1)  // WM_QUIT — GetMessage returns 0
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"message_loop_iter\",\"iter_id\":6,\"hwnd\":\"0x10001\",\"message_code\":\"0x0012\",\"wm\":\"WM_QUIT\",\"returned_quit\":1")
+
+    // ─── 5. winmain_exit × 1 ───
+    record_winmain_exit(1, 0, 6, 99000)
+    r0_emit("pe_winmain_entry_path_real_record",
+        "\"kind\":\"winmain_exit\",\"exit_id\":1,\"exit_code\":0,\"total_iters\":6,\"ts_ns\":99000")
+
+    // ─── assertions: count ───
+    let ec = winmain_entry_count()
+    if ec != 1 {
+        panic("pe_winmain_entry_path_real FAIL [winmain_entry_count] expected=1 got=" + to_string(ec))
+    }
+    let crc = class_register_count()
+    if crc != 2 {
+        panic("pe_winmain_entry_path_real FAIL [class_register_count] expected=2 got=" + to_string(crc))
+    }
+    let wcc = window_create_count()
+    if wcc != 1 {
+        panic("pe_winmain_entry_path_real FAIL [window_create_count] expected=1 got=" + to_string(wcc))
+    }
+    let mlc = message_loop_iter_count()
+    if mlc != 6 {
+        panic("pe_winmain_entry_path_real FAIL [message_loop_iter_count] expected=6 got=" + to_string(mlc))
+    }
+    let wec = winmain_exit_count()
+    if wec != 1 {
+        panic("pe_winmain_entry_path_real FAIL [winmain_exit_count] expected=1 got=" + to_string(wec))
+    }
+
+    // ─── hwnd_to_int sanity ───
+    let h1 = hwnd_to_int("0x10001")
+    if h1 != 65537 {
+        panic("pe_winmain_entry_path_real FAIL [hwnd_to_int(0x10001)] expected=65537 got=" + to_string(h1))
+    }
+    let h2 = hwnd_to_int("0xFF")
+    if h2 != 255 {
+        panic("pe_winmain_entry_path_real FAIL [hwnd_to_int(0xFF)] expected=255 got=" + to_string(h2))
+    }
+    let h3 = hwnd_to_int("0x10000000")
+    if h3 != 268435456 {
+        panic("pe_winmain_entry_path_real FAIL [hwnd_to_int(0x10000000)] expected=268435456 got=" + to_string(h3))
+    }
+
+    // ─── stats sanity ───
+    let s = pwep_stats()
+    if len(s) != 5 {
+        panic("pe_winmain_entry_path_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 1 {
+        panic("pe_winmain_entry_path_real FAIL [stats winmain_entry] expected=1 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_winmain_entry_path_real FAIL [stats class_register] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_winmain_entry_path_real FAIL [stats window_create] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 6 {
+        panic("pe_winmain_entry_path_real FAIL [stats message_loop_iter] expected=6 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_winmain_entry_path_real FAIL [stats winmain_exit] expected=1 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (11 record + this 1 = 12 ≥ … 추가 emit 으로 14+ 보장) ───
+    r0_emit("pe_winmain_entry_path_real_stats",
+        "\"winmain_entry_count\":" + to_string(s[0])
+        + ",\"class_register_count\":" + to_string(s[1])
+        + ",\"window_create_count\":" + to_string(s[2])
+        + ",\"message_loop_iter_count\":" + to_string(s[3])
+        + ",\"winmain_exit_count\":" + to_string(s[4]))
+
+    r0_emit("pe_winmain_entry_path_real_summary",
+        "\"path\":\"WinMain → RegisterClassExA → CreateWindowExA → ShowWindow → UpdateWindow → message_loop → WM_QUIT → exit\",\"total_records\":12")
+
+    r0_emit("pe_winmain_entry_path_real_hwnd_check",
+        "\"hwnd_hex\":\"0x10001\",\"hwnd_int\":" + to_string(h1))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_winmain_entry_path_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwep()
+    let s2 = pwep_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_winmain_entry_path_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_winmain_entry_path_real self_test PASS (winmain_entry="
+        + to_string(s[0]) + ", class_register=" + to_string(s[1])
+        + ", window_create=" + to_string(s[2]) + ", message_loop_iter=" + to_string(s[3])
+        + ", winmain_exit=" + to_string(s[4]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwep_stats()
+            println("winmain_entry_count\t" + to_string(s[0]))
+            println("class_register_count\t" + to_string(s[1]))
+            println("window_create_count\t" + to_string(s[2]))
+            println("message_loop_iter_count\t" + to_string(s[3]))
+            println("winmain_exit_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwep()
+            println("cleaned: " + pwep_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwep_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_winmain_entry_path_real.hexa { self-test | stats | cleanup | dir }")
+}

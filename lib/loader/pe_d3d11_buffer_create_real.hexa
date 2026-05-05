@@ -1,0 +1,475 @@
+// lib/loader/pe_d3d11_buffer_create_real.hexa — D3D11 CreateBuffer → MTLBuffer routing tracker
+//
+// ID3D11Device::CreateBuffer 호출의 D3D11_BUFFER_DESC 매핑 추적기.
+// 본 module 은 buffer descriptor record/aggregate 만 — 실 ID3D11Device::CreateBuffer
+// / MTLDevice newBufferWithLength 호출은 stage2 native helper(D3DMetal binary 위임)
+// 에서 처리.
+//
+// D3D11 CreateBuffer → Metal MTLBuffer:
+//   D3D11_BUFFER_DESC.ByteWidth → MTLDevice newBufferWithLength
+//   D3D11_USAGE_DEFAULT       → MTLResourceStorageModePrivate (GPU only)
+//   D3D11_USAGE_IMMUTABLE     → MTLResourceStorageModeShared (initial data only)
+//   D3D11_USAGE_DYNAMIC       → MTLResourceStorageModeShared + frequent CPU write
+//   D3D11_USAGE_STAGING       → MTLResourceStorageModeManaged (CPU↔GPU sync via didModifyRange)
+//   BindFlags VERTEX/INDEX/CONSTANT → no Metal flag, used for binding type only
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11Device. MoltenVK/DXVK 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// bind_flags bitmask (D3D11_BIND_FLAG):
+//   1   = VERTEX_BUFFER
+//   2   = INDEX_BUFFER
+//   4   = CONSTANT_BUFFER
+//   8   = SHADER_RESOURCE
+//   16  = STREAM_OUTPUT
+//   32  = RENDER_TARGET
+//   64  = DEPTH_STENCIL
+//   128 = UNORDERED_ACCESS
+//
+// usage_kind code (D3D11_USAGE):
+//   1 = default   (GPU read/write)
+//   2 = immutable (initial data only)
+//   3 = dynamic   (frequent CPU write)
+//   4 = staging   (CPU↔GPU transfer)
+//
+// persist schema (TSV — buffers.tsv):
+//   buffer_id<int> \t bind_flags<int> \t usage_kind<int> \t size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdbc_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_buffer_create_real"
+}
+
+fn pdbc_buffers_path() -> str {
+    return pdbc_dir() + "/buffers.tsv"
+}
+
+fn pdbc_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdbc_dir() + "'")
+}
+
+fn cleanup_pdbc() -> void {
+    pdbc_ensure_dir()
+    let _ = exec("rm -f '" + pdbc_buffers_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdbc_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdbc_append_row(path: str, row: str) -> void {
+    pdbc_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_buffer: buffer descriptor 1 건 기록 ───
+fn record_buffer(buffer_id: int, bind_flags: int, usage_kind: int, size_bytes: int) -> void {
+    if buffer_id <= 0 {
+        panic("pe_d3d11_buffer_create_real FAIL [record_buffer] expected=buffer_id>0 got=" + to_string(buffer_id))
+    }
+    if bind_flags < 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [record_buffer] expected=bind_flags>=1 got=" + to_string(bind_flags))
+    }
+    if usage_kind < 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [record_buffer] expected=usage_kind>=1 got=" + to_string(usage_kind))
+    }
+    if usage_kind > 4 {
+        panic("pe_d3d11_buffer_create_real FAIL [record_buffer] expected=usage_kind<=4 got=" + to_string(usage_kind))
+    }
+    if size_bytes <= 0 {
+        panic("pe_d3d11_buffer_create_real FAIL [record_buffer] expected=size_bytes>0 got=" + to_string(size_bytes))
+    }
+    let row = to_string(buffer_id) + "\t" + to_string(bind_flags)
+        + "\t" + to_string(usage_kind) + "\t" + to_string(size_bytes) + "\n"
+    pdbc_append_row(pdbc_buffers_path(), row)
+}
+
+// ─── buffer_count: total buffer 수 ───
+fn buffer_count() -> int {
+    let t = pdbc_read_table(pdbc_buffers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_bytes: 모든 buffer size_bytes 합 ───
+fn total_size_bytes() -> int {
+    let t = pdbc_read_table(pdbc_buffers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_usage_kind: 특정 usage_kind 의 buffer 수 ───
+fn count_by_usage_kind(usage_kind: int) -> int {
+    let t = pdbc_read_table(pdbc_buffers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == usage_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_bind_bit: bind_flags 와 bit_mask AND 결과 != 0 인 buffer 수 ───
+fn count_by_bind_bit(bit_mask: int) -> int {
+    let t = pdbc_read_table(pdbc_buffers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let bf = to_int(parts[1])
+                // bitwise AND via decomposition: (bf AND bit_mask) != 0
+                // bit_mask 는 single-bit 또는 multi-bit. bf 의 어떤 bit 든
+                // bit_mask 의 set bit 와 겹치면 match.
+                let mut m = bit_mask
+                let mut b = bf
+                let mut bit = 1
+                let mut hit = 0
+                while bit <= m {
+                    if bit > b {
+                        bit = bit * 2
+                    } else {
+                        let m_has = (m / bit) - ((m / (bit * 2)) * 2)
+                        let b_has = (b / bit) - ((b / (bit * 2)) * 2)
+                        if m_has == 1 {
+                            if b_has == 1 {
+                                hit = 1
+                            }
+                        }
+                        bit = bit * 2
+                    }
+                }
+                if hit == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── vertex_buffer_count: VERTEX_BUFFER (bit=1) buffer 수 ───
+fn vertex_buffer_count() -> int {
+    return count_by_bind_bit(1)
+}
+
+// ─── buffer_size: 특정 buffer_id 의 size_bytes (없으면 0) ───
+fn buffer_size(buffer_id: int) -> int {
+    let t = pdbc_read_table(pdbc_buffers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == buffer_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdbc_stats: [buffer_count, total_size_bytes, count_by_usage_kind(1), vertex_buffer_count] ───
+fn pdbc_stats() -> array {
+    let mut out = []
+    out.push(buffer_count())
+    out.push(total_size_bytes())
+    out.push(count_by_usage_kind(1))
+    out.push(vertex_buffer_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdbc-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdbc()
+
+    // 2. record 6 buffers — ≥3 usage_kinds, varying bind_flags
+    //    b1: vertex (bind=1, usage=2 immutable, 4096)
+    record_buffer(310001, 1, 2, 4096)
+    r0_emit("pe_d3d11_buffer_create_real_record",
+        "\"buffer_id\":310001,\"bind_flags\":1,\"usage_kind\":2,\"size_bytes\":4096,\"target\":\"newBufferWithLength\"")
+
+    //    b2: index (bind=2, usage=2 immutable, 2048)
+    record_buffer(310002, 2, 2, 2048)
+    r0_emit("pe_d3d11_buffer_create_real_record",
+        "\"buffer_id\":310002,\"bind_flags\":2,\"usage_kind\":2,\"size_bytes\":2048,\"target\":\"newBufferWithLength\"")
+
+    //    b3: constant (bind=4, usage=3 dynamic, 256)
+    record_buffer(310003, 4, 3, 256)
+    r0_emit("pe_d3d11_buffer_create_real_record",
+        "\"buffer_id\":310003,\"bind_flags\":4,\"usage_kind\":3,\"size_bytes\":256,\"target\":\"newBufferWithLength\"")
+
+    //    b4: vertex+shader_resource (bind=1|8=9, usage=1 default, 8192)
+    record_buffer(310004, 9, 1, 8192)
+    r0_emit("pe_d3d11_buffer_create_real_record",
+        "\"buffer_id\":310004,\"bind_flags\":9,\"usage_kind\":1,\"size_bytes\":8192,\"target\":\"newBufferWithLength\"")
+
+    //    b5: unordered_access (bind=128, usage=1 default, 16384)
+    record_buffer(310005, 128, 1, 16384)
+    r0_emit("pe_d3d11_buffer_create_real_record",
+        "\"buffer_id\":310005,\"bind_flags\":128,\"usage_kind\":1,\"size_bytes\":16384,\"target\":\"newBufferWithLength\"")
+
+    //    b6: staging (bind=1, usage=4 staging, 1024)
+    record_buffer(310006, 1, 4, 1024)
+    r0_emit("pe_d3d11_buffer_create_real_record",
+        "\"buffer_id\":310006,\"bind_flags\":1,\"usage_kind\":4,\"size_bytes\":1024,\"target\":\"newBufferWithLength\"")
+
+    // 3. buffer_count = 6
+    let c = buffer_count()
+    if c != 6 {
+        panic("pe_d3d11_buffer_create_real FAIL [buffer_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_size_bytes = 4096+2048+256+8192+16384+1024 = 32000
+    let tb = total_size_bytes()
+    if tb != 32000 {
+        panic("pe_d3d11_buffer_create_real FAIL [total_size_bytes] expected=32000 got=" + to_string(tb))
+    }
+
+    // 5. count_by_usage_kind sanity
+    //    usage=1 default → b4, b5 = 2
+    let u1 = count_by_usage_kind(1)
+    if u1 != 2 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_usage_kind(1)] expected=2 got=" + to_string(u1))
+    }
+    //    usage=2 immutable → b1, b2 = 2
+    let u2 = count_by_usage_kind(2)
+    if u2 != 2 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_usage_kind(2)] expected=2 got=" + to_string(u2))
+    }
+    //    usage=3 dynamic → b3 = 1
+    let u3 = count_by_usage_kind(3)
+    if u3 != 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_usage_kind(3)] expected=1 got=" + to_string(u3))
+    }
+    //    usage=4 staging → b6 = 1
+    let u4 = count_by_usage_kind(4)
+    if u4 != 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_usage_kind(4)] expected=1 got=" + to_string(u4))
+    }
+
+    // 6. count_by_bind_bit sanity
+    //    VERTEX (bit=1) → b1, b4 (bf=9 has bit1), b6 = 3
+    let vb = vertex_buffer_count()
+    if vb != 3 {
+        panic("pe_d3d11_buffer_create_real FAIL [vertex_buffer_count] expected=3 got=" + to_string(vb))
+    }
+    //    INDEX (bit=2) → b2 = 1
+    let ib = count_by_bind_bit(2)
+    if ib != 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_bind_bit(2)] expected=1 got=" + to_string(ib))
+    }
+    //    CONSTANT (bit=4) → b3 = 1
+    let cb = count_by_bind_bit(4)
+    if cb != 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_bind_bit(4)] expected=1 got=" + to_string(cb))
+    }
+    //    SHADER_RESOURCE (bit=8) → b4 (bf=9 has bit8) = 1
+    let sb = count_by_bind_bit(8)
+    if sb != 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_bind_bit(8)] expected=1 got=" + to_string(sb))
+    }
+    //    UNORDERED (bit=128) → b5 = 1
+    let ub = count_by_bind_bit(128)
+    if ub != 1 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_bind_bit(128)] expected=1 got=" + to_string(ub))
+    }
+    //    DEPTH_STENCIL (bit=64) → none = 0
+    let zb = count_by_bind_bit(64)
+    if zb != 0 {
+        panic("pe_d3d11_buffer_create_real FAIL [count_by_bind_bit(64)] expected=0 got=" + to_string(zb))
+    }
+
+    // 7. buffer_size sanity
+    let s4 = buffer_size(310004)
+    if s4 != 8192 {
+        panic("pe_d3d11_buffer_create_real FAIL [buffer_size(310004)] expected=8192 got=" + to_string(s4))
+    }
+    let s5 = buffer_size(310005)
+    if s5 != 16384 {
+        panic("pe_d3d11_buffer_create_real FAIL [buffer_size(310005)] expected=16384 got=" + to_string(s5))
+    }
+    let s_miss = buffer_size(99999)
+    if s_miss != 0 {
+        panic("pe_d3d11_buffer_create_real FAIL [buffer_size(99999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pdbc_stats() = [6, 32000, 2, 3]
+    let s = pdbc_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_buffer_create_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d11_buffer_create_real FAIL [stats buffer_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 32000 {
+        panic("pe_d3d11_buffer_create_real FAIL [stats total_size_bytes] expected=32000 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_d3d11_buffer_create_real FAIL [stats usage_default] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_d3d11_buffer_create_real FAIL [stats vertex_buffer_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_d3d11_buffer_create_real_stats",
+        "\"buffer_count\":" + to_string(s[0])
+        + ",\"total_size_bytes\":" + to_string(s[1])
+        + ",\"usage_default\":" + to_string(s[2])
+        + ",\"vertex_buffers\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d11_buffer_create_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pdbc()
+    let s2 = pdbc_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_buffer_create_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_buffer_create_real self_test PASS (buffers=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", default=" + to_string(s[2])
+        + ", vertex=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdbc_stats()
+            println("buffer_count\t" + to_string(s[0]))
+            println("total_size_bytes\t" + to_string(s[1]))
+            println("usage_default\t" + to_string(s[2]))
+            println("vertex_buffer_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                println("buffer_size\t" + to_string(buffer_size(bid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_buffer_create_real.hexa size <buffer_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "usage" {
+                    println("count_by_usage_kind\t" + to_string(count_by_usage_kind(val)))
+                    return
+                }
+                if kind == "bind" {
+                    println("count_by_bind_bit\t" + to_string(count_by_bind_bit(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_buffer_create_real.hexa count { usage <usage_kind> | bind <bit> }")
+                return
+            }
+            println("usage: hexa run pe_d3d11_buffer_create_real.hexa count { usage <usage_kind> | bind <bit> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdbc()
+            println("cleaned: " + pdbc_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdbc_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_buffer_create_real.hexa { self-test | stats | size <buffer_id> | count usage <usage_kind> | count bind <bit> | cleanup | dir }")
+}

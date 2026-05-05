@@ -1,0 +1,418 @@
+// lib/loader/pe_runtime_check_helper.hexa — MSVC /GS + /RTC + CFG runtime check helper 추적
+//
+// MSVC runtime check helper (R6 Tier 5):
+//   __security_check_cookie (MSVC /GS) — function epilogue 에서 stack canary check
+//     prolog: rsp 기반 cookie 저장 (__security_cookie XOR 와 frame ptr)
+//     epilog: stored cookie XOR rsp == __security_cookie 검증
+//     실패 시 __report_gsfailure → __fastfail(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE)
+//   _RTC_* (Debug build only):
+//     _RTC_CheckEsp — function call 후 stack pointer 보존 검증 (calling convention)
+//     _RTC_CheckStackVars — local variable canary (over/underrun)
+//     _RTC_UninitUse — uninitialized local read 감지 (0xCCCCCCCC pattern)
+//   __guard_check_icall_fptr (CFG, ms /guard:cf) — indirect call target 검증
+//   __guard_dispatch_icall — indirect call protection (LdrSystemDllInitBlock 의 valid target bitmap)
+//   __guard_xfg_dispatch_icall_fptr (XFG, /guard:xfg) — type-based CFG 확장
+//   ACG (Arbitrary Code Guard) — dynamic code generation 차단 (PROCESS_MITIGATION_DYNAMIC_CODE_POLICY)
+// own1: MSVC ABI spec + MS /guard CFG only. Wine 인용 X
+//
+// check_kind code:
+//   1 = security_cookie
+//   2 = rtc_check_esp
+//   3 = rtc_check_stack_vars
+//   4 = rtc_uninitialized_use
+//   5 = cfg_guard_check
+//   6 = arbitrary_code_guard
+//
+// persist schema (TSV — checks.tsv):
+//   check_id<int> \t check_kind<int> \t caller_rva<int> \t violated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn prch_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_runtime_check_helper"
+}
+
+fn prch_checks_path() -> str {
+    return prch_dir() + "/checks.tsv"
+}
+
+fn prch_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + prch_dir() + "'")
+}
+
+fn cleanup_prch() -> void {
+    prch_ensure_dir()
+    let _ = exec("rm -f '" + prch_checks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prch_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prch_append_row(path: str, row: str) -> void {
+    prch_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_check: runtime check 1 건 기록 ───
+fn record_check(check_id: int, check_kind: int, caller_rva: int, violated: int) -> void {
+    if check_id <= 0 {
+        panic("pe_runtime_check_helper FAIL [record_check] expected=check_id>0 got=" + to_string(check_id))
+    }
+    if check_kind < 1 {
+        panic("pe_runtime_check_helper FAIL [record_check] expected=check_kind>=1 got=" + to_string(check_kind))
+    }
+    if check_kind > 6 {
+        panic("pe_runtime_check_helper FAIL [record_check] expected=check_kind<=6 got=" + to_string(check_kind))
+    }
+    if caller_rva < 0 {
+        panic("pe_runtime_check_helper FAIL [record_check] expected=caller_rva>=0 got=" + to_string(caller_rva))
+    }
+    if violated < 0 {
+        panic("pe_runtime_check_helper FAIL [record_check] expected=violated>=0 got=" + to_string(violated))
+    }
+    if violated > 1 {
+        panic("pe_runtime_check_helper FAIL [record_check] expected=violated<=1 got=" + to_string(violated))
+    }
+    let row = to_string(check_id) + "\t" + to_string(check_kind)
+        + "\t" + to_string(caller_rva) + "\t" + to_string(violated) + "\n"
+    prch_append_row(prch_checks_path(), row)
+}
+
+// ─── check_count: total check row 수 ───
+fn check_count() -> int {
+    let t = prch_read_table(prch_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_check_kind: 특정 check_kind 의 row 수 ───
+fn count_by_check_kind(kind: int) -> int {
+    let t = prch_read_table(prch_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── violated_count: violated=1 인 check 수 ───
+fn violated_count() -> int {
+    let t = prch_read_table(prch_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── security_check_count: check_kind == 1 (security_cookie) row 수 ───
+fn security_check_count() -> int {
+    return count_by_check_kind(1)
+}
+
+// ─── cfg_count: check_kind == 5 (cfg_guard_check) row 수 ───
+fn cfg_count() -> int {
+    return count_by_check_kind(5)
+}
+
+// ─── check_caller_rva: 특정 check_id 의 caller_rva (없으면 0) ───
+fn check_caller_rva(check_id: int) -> int {
+    let t = prch_read_table(prch_checks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == check_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── prch_stats: [check_count, violated_count, security_check_count, cfg_count] ───
+fn prch_stats() -> array {
+    let mut out = []
+    out.push(check_count())
+    out.push(violated_count())
+    out.push(security_check_count())
+    out.push(cfg_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "prch-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prch()
+
+    // 2. record 6 checks covering ≥4 check_kinds with ≥2 violated
+    //    kinds: 1 (security_cookie), 2 (rtc_check_esp), 3 (rtc_check_stack_vars),
+    //           4 (rtc_uninitialized_use), 5 (cfg_guard_check), 6 (arbitrary_code_guard)
+    record_check(190001, 1, 4096, 0)
+    r0_emit("pe_runtime_check_helper_record",
+        "\"check_id\":190001,\"check_kind\":1,\"caller_rva\":4096,\"violated\":0,\"target\":\"security_cookie\"")
+
+    record_check(190002, 1, 8192, 1)
+    r0_emit("pe_runtime_check_helper_record",
+        "\"check_id\":190002,\"check_kind\":1,\"caller_rva\":8192,\"violated\":1,\"target\":\"security_cookie\"")
+
+    record_check(190003, 2, 12288, 0)
+    r0_emit("pe_runtime_check_helper_record",
+        "\"check_id\":190003,\"check_kind\":2,\"caller_rva\":12288,\"violated\":0,\"target\":\"rtc_check_esp\"")
+
+    record_check(190004, 3, 16384, 0)
+    r0_emit("pe_runtime_check_helper_record",
+        "\"check_id\":190004,\"check_kind\":3,\"caller_rva\":16384,\"violated\":0,\"target\":\"rtc_check_stack_vars\"")
+
+    record_check(190005, 5, 20480, 1)
+    r0_emit("pe_runtime_check_helper_record",
+        "\"check_id\":190005,\"check_kind\":5,\"caller_rva\":20480,\"violated\":1,\"target\":\"cfg_guard_check\"")
+
+    record_check(190006, 5, 24576, 0)
+    r0_emit("pe_runtime_check_helper_record",
+        "\"check_id\":190006,\"check_kind\":5,\"caller_rva\":24576,\"violated\":0,\"target\":\"cfg_guard_check\"")
+
+    // 3. check_count = 6
+    let c = check_count()
+    if c != 6 {
+        panic("pe_runtime_check_helper FAIL [check_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_check_kind sanity
+    //    kind 1 = 2 (190001, 190002), kind 2 = 1, kind 3 = 1, kind 5 = 2 (190005, 190006)
+    //    kind 4 = 0, kind 6 = 0, kind 99 = 0
+    let k1 = count_by_check_kind(1)
+    if k1 != 2 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_check_kind(2)
+    if k2 != 1 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_check_kind(3)
+    if k3 != 1 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_check_kind(4)
+    if k4 != 0 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k5 = count_by_check_kind(5)
+    if k5 != 2 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(5)] expected=2 got=" + to_string(k5))
+    }
+    let k6 = count_by_check_kind(6)
+    if k6 != 0 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(6)] expected=0 got=" + to_string(k6))
+    }
+    let k99 = count_by_check_kind(99)
+    if k99 != 0 {
+        panic("pe_runtime_check_helper FAIL [count_by_check_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // ≥4 distinct check_kinds present (1, 2, 3, 5)
+    let mut distinct = 0
+    if k1 > 0 { distinct = distinct + 1 }
+    if k2 > 0 { distinct = distinct + 1 }
+    if k3 > 0 { distinct = distinct + 1 }
+    if k4 > 0 { distinct = distinct + 1 }
+    if k5 > 0 { distinct = distinct + 1 }
+    if k6 > 0 { distinct = distinct + 1 }
+    if distinct < 4 {
+        panic("pe_runtime_check_helper FAIL [distinct check_kinds] expected=>=4 got=" + to_string(distinct))
+    }
+
+    // 5. violated_count = 2 (190002, 190005)
+    let v = violated_count()
+    if v != 2 {
+        panic("pe_runtime_check_helper FAIL [violated_count] expected=2 got=" + to_string(v))
+    }
+
+    // 6. security_check_count = 2
+    let sc = security_check_count()
+    if sc != 2 {
+        panic("pe_runtime_check_helper FAIL [security_check_count] expected=2 got=" + to_string(sc))
+    }
+
+    // 7. cfg_count = 2
+    let cf = cfg_count()
+    if cf != 2 {
+        panic("pe_runtime_check_helper FAIL [cfg_count] expected=2 got=" + to_string(cf))
+    }
+
+    // 8. check_caller_rva sanity
+    let r1 = check_caller_rva(190001)
+    if r1 != 4096 {
+        panic("pe_runtime_check_helper FAIL [check_caller_rva(190001)] expected=4096 got=" + to_string(r1))
+    }
+    let r5 = check_caller_rva(190005)
+    if r5 != 20480 {
+        panic("pe_runtime_check_helper FAIL [check_caller_rva(190005)] expected=20480 got=" + to_string(r5))
+    }
+    let r_miss = check_caller_rva(9999)
+    if r_miss != 0 {
+        panic("pe_runtime_check_helper FAIL [check_caller_rva(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 9. prch_stats() = [6, 2, 2, 2]
+    let s = prch_stats()
+    if len(s) != 4 {
+        panic("pe_runtime_check_helper FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_runtime_check_helper FAIL [stats check_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_runtime_check_helper FAIL [stats violated_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_runtime_check_helper FAIL [stats security_check_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_runtime_check_helper FAIL [stats cfg_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_runtime_check_helper_stats",
+        "\"check_count\":" + to_string(s[0])
+        + ",\"violated_count\":" + to_string(s[1])
+        + ",\"security_check_count\":" + to_string(s[2])
+        + ",\"cfg_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_runtime_check_helper FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_prch()
+    let s2 = prch_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_runtime_check_helper FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_runtime_check_helper self_test PASS (checks=" + to_string(s[0])
+        + ", violated=" + to_string(s[1]) + ", security=" + to_string(s[2])
+        + ", cfg=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prch_stats()
+            println("check_count\t" + to_string(s[0]))
+            println("violated_count\t" + to_string(s[1]))
+            println("security_check_count\t" + to_string(s[2]))
+            println("cfg_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "rva" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("check_caller_rva\t" + to_string(check_caller_rva(cid)))
+                return
+            }
+            println("usage: hexa run pe_runtime_check_helper.hexa rva <check_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_check_kind\t" + to_string(count_by_check_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_runtime_check_helper.hexa count <check_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_prch()
+            println("cleaned: " + prch_dir())
+            return
+        }
+        if sub == "dir" {
+            println(prch_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_runtime_check_helper.hexa { self-test | stats | rva <check_id> | count <check_kind> | cleanup | dir }")
+}

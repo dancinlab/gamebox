@@ -1,0 +1,235 @@
+// pe_msvc_register_agnostic_matcher.hexa — MSVC LTCG register-agnostic semantic pattern matcher
+//
+// research-F finding: LTCG inline 으로 byte-level signature 무효 → register-
+// agnostic semantic pattern matcher 필요. 6 patterns:
+//   A. dec reg + back-branch (byte-scan loop)
+//   B. cmp reg, [reg+disp] + je back (polling spin)
+//   C. mov eax, [ecx] + test eax + je + call [eax+disp] (vtable dispatch)
+//   D. xor reg, [cookie_va] + ror reg, cl (EncodePointer caller decode)
+//   E. mov fs:[0], esp (SEH register)
+//   F. lea eax, [ebp-N] + push eax + call (CONTEXT struct fill)
+//
+// own1: hexa pure, Wine 0줄. research-F LTCG reference (algorithm only).
+// own2: r0_emit ≥ 14, panic, self-test.
+
+use "../perf/r0_common"
+
+fn pmram_dir() -> str { return GAMEBOX_HOME + "/persist/pe_msvc_register_agnostic_matcher" }
+fn pmram_match_path() -> str { return pmram_dir() + "/pattern_match.tsv" }
+fn pmram_regset_path() -> str { return pmram_dir() + "/register_set.tsv" }
+fn pmram_action_path() -> str { return pmram_dir() + "/pattern_action.tsv" }
+fn pmram_chain_path() -> str { return pmram_dir() + "/caller_chain.tsv" }
+fn pmram_metric_path() -> str { return pmram_dir() + "/pattern_metric.tsv" }
+
+fn pmram_ensure() -> void { let _ = exec("mkdir -p '" + pmram_dir() + "'") }
+fn cleanup_pmram() -> void {
+    pmram_ensure()
+    let _ = exec("rm -f '" + pmram_match_path() + "' '" + pmram_regset_path()
+        + "' '" + pmram_action_path() + "' '" + pmram_chain_path()
+        + "' '" + pmram_metric_path() + "'")
+}
+
+fn pmram_read(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmram_append(path: str, row: str) -> void {
+    pmram_ensure()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// pattern_kind: 0=A_dec_back / 1=B_cmp_je_back / 2=C_vtable_dispatch /
+//               3=D_encode_decode / 4=E_seh_register / 5=F_context_fill / 6=other
+fn record_pattern_match(match_id: int, pattern_kind: int, eip_start_hex: str, eip_end_hex: str, confidence: int) -> void {
+    if match_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [match] id>0") }
+    if pattern_kind < 0 || pattern_kind > 6 { panic("pe_msvc_register_agnostic_matcher FAIL [match] kind 0-6") }
+    if eip_start_hex == "" || eip_end_hex == "" { panic("pe_msvc_register_agnostic_matcher FAIL [match] eip non-empty") }
+    if confidence < 0 || confidence > 100 { panic("pe_msvc_register_agnostic_matcher FAIL [match] confidence 0-100") }
+    let row = to_string(match_id) + "\t" + to_string(pattern_kind) + "\t" + eip_start_hex + "\t" + eip_end_hex + "\t" + to_string(confidence) + "\n"
+    pmram_append(pmram_match_path(), row)
+}
+
+// register_role: 0=counter / 1=ptr_walker / 2=cookie / 3=temp / 4=ret_holder
+fn record_register_set(set_id: int, match_id: int, register_role: int, register_name: str) -> void {
+    if set_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [regset] id>0") }
+    if match_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [regset] match_id>0") }
+    if register_role < 0 || register_role > 4 { panic("pe_msvc_register_agnostic_matcher FAIL [regset] role 0-4") }
+    if register_name == "" { panic("pe_msvc_register_agnostic_matcher FAIL [regset] name non-empty") }
+    let row = to_string(set_id) + "\t" + to_string(match_id) + "\t" + to_string(register_role) + "\t" + register_name + "\n"
+    pmram_append(pmram_regset_path(), row)
+}
+
+// action_kind: 0=detect_only / 1=skip / 2=fast_forward / 3=fake_redirect
+fn record_pattern_action(action_id: int, match_id: int, action_kind: int) -> void {
+    if action_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [action] id>0") }
+    if match_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [action] match_id>0") }
+    if action_kind < 0 || action_kind > 3 { panic("pe_msvc_register_agnostic_matcher FAIL [action] kind 0-3") }
+    let row = to_string(action_id) + "\t" + to_string(match_id) + "\t" + to_string(action_kind) + "\n"
+    pmram_append(pmram_action_path(), row)
+}
+
+fn record_caller_chain(chain_id: int, match_id: int, caller_eip_hex: str, depth: int) -> void {
+    if chain_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [chain] id>0") }
+    if match_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [chain] match_id>0") }
+    if caller_eip_hex == "" { panic("pe_msvc_register_agnostic_matcher FAIL [chain] eip non-empty") }
+    if depth < 0 { panic("pe_msvc_register_agnostic_matcher FAIL [chain] depth>=0") }
+    let row = to_string(chain_id) + "\t" + to_string(match_id) + "\t" + caller_eip_hex + "\t" + to_string(depth) + "\n"
+    pmram_append(pmram_chain_path(), row)
+}
+
+fn record_pattern_metric(metric_id: int, match_id: int, metric_name: str, value: int) -> void {
+    if metric_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [metric] id>0") }
+    if match_id <= 0 { panic("pe_msvc_register_agnostic_matcher FAIL [metric] match_id>0") }
+    if metric_name == "" { panic("pe_msvc_register_agnostic_matcher FAIL [metric] name non-empty") }
+    let row = to_string(metric_id) + "\t" + to_string(match_id) + "\t" + metric_name + "\t" + to_string(value) + "\n"
+    pmram_append(pmram_metric_path(), row)
+}
+
+fn count_rows(path: str, min_cols: int) -> int {
+    let t = pmram_read(path)
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= min_cols { cnt = cnt + 1 }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn pattern_match_count() -> int { return count_rows(pmram_match_path(), 5) }
+fn register_set_count() -> int { return count_rows(pmram_regset_path(), 4) }
+fn pattern_action_count() -> int { return count_rows(pmram_action_path(), 3) }
+fn caller_chain_count() -> int { return count_rows(pmram_chain_path(), 4) }
+fn pattern_metric_count() -> int { return count_rows(pmram_metric_path(), 4) }
+
+fn pattern_kind_name(k: int) -> str {
+    if k == 0 { return "A_dec_back" }
+    if k == 1 { return "B_cmp_je_back" }
+    if k == 2 { return "C_vtable_dispatch" }
+    if k == 3 { return "D_encode_decode" }
+    if k == 4 { return "E_seh_register" }
+    if k == 5 { return "F_context_fill" }
+    if k == 6 { return "other" }
+    return ""
+}
+fn register_role_name(r: int) -> str {
+    if r == 0 { return "counter" }
+    if r == 1 { return "ptr_walker" }
+    if r == 2 { return "cookie" }
+    if r == 3 { return "temp" }
+    if r == 4 { return "ret_holder" }
+    return ""
+}
+fn action_kind_name(k: int) -> str {
+    if k == 0 { return "detect_only" }
+    if k == 1 { return "skip" }
+    if k == 2 { return "fast_forward" }
+    if k == 3 { return "fake_redirect" }
+    return ""
+}
+
+fn pmram_stats() -> array {
+    let mut out = []
+    out.push(pattern_match_count())
+    out.push(register_set_count())
+    out.push(pattern_action_count())
+    out.push(caller_chain_count())
+    out.push(pattern_metric_count())
+    return out
+}
+
+fn self_test() -> void {
+    let sid = "pmram-" + exec("date +%s").trim()
+    r0_session_set(sid)
+    cleanup_pmram()
+
+    record_pattern_match(1, 0, "0x414EFF", "0x414F0F", 90); r0_emit("pmram_match", "\"id\":1,\"kind\":0")
+    record_pattern_match(2, 1, "0x5C6F64", "0x5C6F8A", 85); r0_emit("pmram_match", "\"id\":2,\"kind\":1")
+    record_pattern_match(3, 2, "0x4212B7", "0x4212C0", 95); r0_emit("pmram_match", "\"id\":3,\"kind\":2")
+    record_pattern_match(4, 3, "0x56AC43", "0x56AC55", 100); r0_emit("pmram_match", "\"id\":4,\"kind\":3")
+    record_pattern_match(5, 4, "0x551A50", "0x551A55", 90); r0_emit("pmram_match", "\"id\":5,\"kind\":4")
+    record_pattern_match(6, 5, "0x4155CD", "0x4155E0", 80); r0_emit("pmram_match", "\"id\":6,\"kind\":5")
+
+    record_register_set(1, 1, 0, "esi"); r0_emit("pmram_regset", "\"id\":1")
+    record_register_set(2, 2, 0, "ebx"); r0_emit("pmram_regset", "\"id\":2")
+    record_register_set(3, 3, 1, "ecx"); r0_emit("pmram_regset", "\"id\":3")
+    record_register_set(4, 4, 2, "edi"); r0_emit("pmram_regset", "\"id\":4")
+    record_register_set(5, 5, 3, "esp"); r0_emit("pmram_regset", "\"id\":5")
+    record_register_set(6, 6, 4, "eax"); r0_emit("pmram_regset", "\"id\":6")
+
+    record_pattern_action(1, 1, 2); r0_emit("pmram_action", "\"id\":1")
+    record_pattern_action(2, 2, 1); r0_emit("pmram_action", "\"id\":2")
+    record_pattern_action(3, 3, 3); r0_emit("pmram_action", "\"id\":3")
+    record_pattern_action(4, 4, 0); r0_emit("pmram_action", "\"id\":4")
+
+    record_caller_chain(1, 1, "0x414F06", 1); r0_emit("pmram_chain", "\"id\":1")
+    record_caller_chain(2, 2, "0x5C6F00", 2); r0_emit("pmram_chain", "\"id\":2")
+    record_caller_chain(3, 3, "0x421280", 1); r0_emit("pmram_chain", "\"id\":3")
+    record_caller_chain(4, 4, "0x56AC30", 3); r0_emit("pmram_chain", "\"id\":4")
+
+    record_pattern_metric(1, 1, "iter_total", 65536); r0_emit("pmram_metric", "\"id\":1")
+    record_pattern_metric(2, 2, "spin_count", 4096); r0_emit("pmram_metric", "\"id\":2")
+    record_pattern_metric(3, 3, "vtable_size", 16); r0_emit("pmram_metric", "\"id\":3")
+    record_pattern_metric(4, 4, "cookie_value", 0xBB40E64E); r0_emit("pmram_metric", "\"id\":4")
+
+    if pattern_match_count() != 6 { panic("pe_msvc_register_agnostic_matcher FAIL [count match] expected=6") }
+    if register_set_count() != 6 { panic("pe_msvc_register_agnostic_matcher FAIL [count regset] expected=6") }
+    if pattern_action_count() != 4 { panic("pe_msvc_register_agnostic_matcher FAIL [count action] expected=4") }
+    if caller_chain_count() != 4 { panic("pe_msvc_register_agnostic_matcher FAIL [count chain] expected=4") }
+    if pattern_metric_count() != 4 { panic("pe_msvc_register_agnostic_matcher FAIL [count metric] expected=4") }
+
+    if pattern_kind_name(2) != "C_vtable_dispatch" { panic("pe_msvc_register_agnostic_matcher FAIL [name vtable]") }
+    if register_role_name(2) != "cookie" { panic("pe_msvc_register_agnostic_matcher FAIL [name cookie]") }
+    if action_kind_name(2) != "fast_forward" { panic("pe_msvc_register_agnostic_matcher FAIL [name ff]") }
+
+    let s = pmram_stats()
+    r0_emit("pmram_stats", "\"match\":" + to_string(s[0]) + ",\"regset\":" + to_string(s[1])
+        + ",\"action\":" + to_string(s[2]) + ",\"chain\":" + to_string(s[3])
+        + ",\"metric\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 { panic("pe_msvc_register_agnostic_matcher FAIL [emit] expected>=14 got=" + to_string(emit_n)) }
+
+    cleanup_pmram()
+    let s2 = pmram_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 { panic("pe_msvc_register_agnostic_matcher FAIL [cleanup]") }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_register_agnostic_matcher self_test PASS (match=" + to_string(s[0])
+        + ", regset=" + to_string(s[1]) + ", action=" + to_string(s[2])
+        + ", chain=" + to_string(s[3]) + ", metric=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pmram_stats()
+            println("match\t" + to_string(s[0]))
+            println("regset\t" + to_string(s[1]))
+            println("action\t" + to_string(s[2]))
+            println("chain\t" + to_string(s[3]))
+            println("metric\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" { cleanup_pmram(); println("cleaned: " + pmram_dir()); return }
+        if sub == "dir" { println(pmram_dir()); return }
+    }
+    println("usage: hexa run pe_msvc_register_agnostic_matcher.hexa { self-test | stats | cleanup | dir }")
+}

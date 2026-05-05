@@ -1,0 +1,635 @@
+// lib/loader/pe_msvc_byte_scan_loop_real.hexa
+// — MSVC CRT byte-scan inner loop (memcpy / memcmp / strlen / memset / hash)
+//   대규모 iter 추적기 + counter 진척 + fast-forward 결과
+//
+// MSVC static CRT 의 inner loop (REP MOVS / REP CMPS / REP SCAS / REP STOS /
+// inline FNV/CRC hash) 는 large iteration (수만 ~ 수백만 byte) 을 도는데,
+// hexa interpreter 가 그 모든 step 을 실제로 simulate 하면 cold launch 가
+// 영원히 끝나지 않는다. 본 hexa 는 각 byte-scan loop 의 EIP range + total_iter
+// + counter register 진척 을 5 종 record 로 추적하고, fast-forward action
+// (cap_clamp / zero_set / skip) 으로 large iter 를 단축시킨 결과 까지 기록한다.
+//
+//   1. scan_loop          : EIP range + total_iter + counter_register
+//   2. counter_progress   : snapshot_iter + counter register 의 실제 값
+//   3. fast_forward       : action_kind (cap_clamp / zero_set / skip) +
+//                           before_count → after_count 변화
+//   4. loop_kind          : memcpy / memcmp / strlen / memset / hash / other
+//   5. completion         : completed_normally + fast_forwarded flag
+//
+// own 1 enforcement: Wine ntdll/string.c 0 줄. Wine msvcrt/string.c 0 줄.
+//                    MSDN CRT memcpy/memcmp/strlen/memset doc + Microsoft VC
+//                    runtime header 만 참조. hexa pure (native bridge 호출 0).
+//                    타사 Wine/CrossOver/GPTK/Whisky 추천/언급 X.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   scan_loops.tsv         : loop_id<int>      \t eip_range_start_hex<str>
+//                            \t eip_range_end_hex<str> \t total_iter<int>
+//                            \t counter_register<int>
+//   counter_progress.tsv   : progress_id<int>  \t loop_id<int>
+//                            \t snapshot_iter<int> \t register_value<int>
+//   fast_forward.tsv       : ff_id<int>        \t loop_id<int>
+//                            \t action_kind<int>
+//                            \t before_count<int> \t after_count<int>
+//   loop_kinds.tsv         : kind_id<int>      \t loop_id<int> \t kind<int>
+//   completions.tsv        : comp_id<int>      \t loop_id<int>
+//                            \t completed_normally<int> \t fast_forwarded<int>
+//
+// counter_register code (scan_loop):
+//   0 = eax  1 = ecx  2 = edx  3 = ebx  4 = esp  5 = ebp  6 = esi  7 = edi
+//
+// action_kind code (fast_forward):
+//   0 = cap_clamp    (counter > cap → cap 으로 clamp 후 진행)
+//   1 = zero_set     (counter = 0 강제 후 단일 step 으로 loop 탈출)
+//   2 = skip         (loop 전체를 1 step 으로 건너뜀 — EIP 를 loop end 로 점프)
+//
+// kind code (loop_kind):
+//   0 = memcpy   1 = memcmp   2 = strlen   3 = memset   4 = hash   5 = other
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → kind / k / counter_register /
+//                   action_kind / register_value.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmbsl_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_byte_scan_loop_real"
+}
+
+fn pmbsl_scan_loops_path() -> str {
+    return pmbsl_dir() + "/scan_loops.tsv"
+}
+
+fn pmbsl_counter_progress_path() -> str {
+    return pmbsl_dir() + "/counter_progress.tsv"
+}
+
+fn pmbsl_fast_forward_path() -> str {
+    return pmbsl_dir() + "/fast_forward.tsv"
+}
+
+fn pmbsl_loop_kinds_path() -> str {
+    return pmbsl_dir() + "/loop_kinds.tsv"
+}
+
+fn pmbsl_completions_path() -> str {
+    return pmbsl_dir() + "/completions.tsv"
+}
+
+fn pmbsl_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmbsl_dir() + "'")
+}
+
+fn cleanup_pmbsl() -> void {
+    pmbsl_ensure_dir()
+    let _ = exec("rm -f '" + pmbsl_scan_loops_path()
+        + "' '" + pmbsl_counter_progress_path()
+        + "' '" + pmbsl_fast_forward_path()
+        + "' '" + pmbsl_loop_kinds_path()
+        + "' '" + pmbsl_completions_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmbsl_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmbsl_append_row(path: str, row: str) -> void {
+    pmbsl_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_scan_loop ───
+//   counter_register: 0=eax 1=ecx 2=edx 3=ebx 4=esp 5=ebp 6=esi 7=edi
+fn record_scan_loop(loop_id: int, eip_range_start_hex: str, eip_range_end_hex: str, total_iter: int, counter_register: int) -> void {
+    if loop_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_scan_loop] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if eip_range_start_hex == "" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_scan_loop] expected=eip_range_start_hex!=empty got=empty")
+    }
+    if eip_range_end_hex == "" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_scan_loop] expected=eip_range_end_hex!=empty got=empty")
+    }
+    if total_iter < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_scan_loop] expected=total_iter>=0 got=" + to_string(total_iter))
+    }
+    if counter_register < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_scan_loop] expected=counter_register>=0 got=" + to_string(counter_register))
+    }
+    if counter_register > 7 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_scan_loop] expected=counter_register<=7 got=" + to_string(counter_register))
+    }
+    let row = to_string(loop_id) + "\t" + eip_range_start_hex + "\t" + eip_range_end_hex
+        + "\t" + to_string(total_iter) + "\t" + to_string(counter_register) + "\n"
+    pmbsl_append_row(pmbsl_scan_loops_path(), row)
+}
+
+// ─── record_counter_progress ───
+fn record_counter_progress(progress_id: int, loop_id: int, snapshot_iter: int, register_value: int) -> void {
+    if progress_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_counter_progress] expected=progress_id>0 got=" + to_string(progress_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_counter_progress] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if snapshot_iter < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_counter_progress] expected=snapshot_iter>=0 got=" + to_string(snapshot_iter))
+    }
+    if register_value < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_counter_progress] expected=register_value>=0 got=" + to_string(register_value))
+    }
+    let row = to_string(progress_id) + "\t" + to_string(loop_id) + "\t" + to_string(snapshot_iter)
+        + "\t" + to_string(register_value) + "\n"
+    pmbsl_append_row(pmbsl_counter_progress_path(), row)
+}
+
+// ─── record_fast_forward ───
+//   action_kind: 0=cap_clamp 1=zero_set 2=skip
+fn record_fast_forward(ff_id: int, loop_id: int, action_kind: int, before_count: int, after_count: int) -> void {
+    if ff_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=ff_id>0 got=" + to_string(ff_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if action_kind < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=action_kind>=0 got=" + to_string(action_kind))
+    }
+    if action_kind > 2 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=action_kind<=2 got=" + to_string(action_kind))
+    }
+    if before_count < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=before_count>=0 got=" + to_string(before_count))
+    }
+    if after_count < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=after_count>=0 got=" + to_string(after_count))
+    }
+    if after_count > before_count {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_fast_forward] expected=after_count<=before_count got_before=" + to_string(before_count) + " got_after=" + to_string(after_count))
+    }
+    let row = to_string(ff_id) + "\t" + to_string(loop_id) + "\t" + to_string(action_kind)
+        + "\t" + to_string(before_count) + "\t" + to_string(after_count) + "\n"
+    pmbsl_append_row(pmbsl_fast_forward_path(), row)
+}
+
+// ─── record_loop_kind ───
+//   kind: 0=memcpy 1=memcmp 2=strlen 3=memset 4=hash 5=other
+fn record_loop_kind(kind_id: int, loop_id: int, kind: int) -> void {
+    if kind_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_loop_kind] expected=kind_id>0 got=" + to_string(kind_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_loop_kind] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if kind < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_loop_kind] expected=kind>=0 got=" + to_string(kind))
+    }
+    if kind > 5 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_loop_kind] expected=kind<=5 got=" + to_string(kind))
+    }
+    let row = to_string(kind_id) + "\t" + to_string(loop_id) + "\t" + to_string(kind) + "\n"
+    pmbsl_append_row(pmbsl_loop_kinds_path(), row)
+}
+
+// ─── record_completion ───
+fn record_completion(comp_id: int, loop_id: int, completed_normally: int, fast_forwarded: int) -> void {
+    if comp_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_completion] expected=comp_id>0 got=" + to_string(comp_id))
+    }
+    if loop_id <= 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_completion] expected=loop_id>0 got=" + to_string(loop_id))
+    }
+    if completed_normally < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_completion] expected=completed_normally>=0 got=" + to_string(completed_normally))
+    }
+    if completed_normally > 1 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_completion] expected=completed_normally<=1 got=" + to_string(completed_normally))
+    }
+    if fast_forwarded < 0 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_completion] expected=fast_forwarded>=0 got=" + to_string(fast_forwarded))
+    }
+    if fast_forwarded > 1 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [record_completion] expected=fast_forwarded<=1 got=" + to_string(fast_forwarded))
+    }
+    let row = to_string(comp_id) + "\t" + to_string(loop_id) + "\t" + to_string(completed_normally)
+        + "\t" + to_string(fast_forwarded) + "\n"
+    pmbsl_append_row(pmbsl_completions_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmbsl_count_rows(path: str, min_fields: int) -> int {
+    let t = pmbsl_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn scan_loop_count() -> int {
+    return pmbsl_count_rows(pmbsl_scan_loops_path(), 5)
+}
+
+fn counter_progress_count() -> int {
+    return pmbsl_count_rows(pmbsl_counter_progress_path(), 4)
+}
+
+fn fast_forward_count() -> int {
+    return pmbsl_count_rows(pmbsl_fast_forward_path(), 5)
+}
+
+fn loop_kind_count() -> int {
+    return pmbsl_count_rows(pmbsl_loop_kinds_path(), 3)
+}
+
+fn completion_count() -> int {
+    return pmbsl_count_rows(pmbsl_completions_path(), 4)
+}
+
+// ─── helper: counter_register name (0..7) ───
+fn counter_reg_name(k: int) -> str {
+    if k == 0 {
+        return "eax"
+    }
+    if k == 1 {
+        return "ecx"
+    }
+    if k == 2 {
+        return "edx"
+    }
+    if k == 3 {
+        return "ebx"
+    }
+    if k == 4 {
+        return "esp"
+    }
+    if k == 5 {
+        return "ebp"
+    }
+    if k == 6 {
+        return "esi"
+    }
+    if k == 7 {
+        return "edi"
+    }
+    panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name] expected=0..7 got=" + to_string(k))
+}
+
+// ─── helper: loop_kind name (0..5) ───
+fn loop_kind_name(k: int) -> str {
+    if k == 0 {
+        return "memcpy"
+    }
+    if k == 1 {
+        return "memcmp"
+    }
+    if k == 2 {
+        return "strlen"
+    }
+    if k == 3 {
+        return "memset"
+    }
+    if k == 4 {
+        return "hash"
+    }
+    if k == 5 {
+        return "other"
+    }
+    panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name] expected=0..5 got=" + to_string(k))
+}
+
+// ─── helper: fast_forward action_kind name (0..2) ───
+fn ff_action_name(k: int) -> str {
+    if k == 0 {
+        return "cap_clamp"
+    }
+    if k == 1 {
+        return "zero_set"
+    }
+    if k == 2 {
+        return "skip"
+    }
+    panic("pe_msvc_byte_scan_loop_real FAIL [ff_action_name] expected=0..2 got=" + to_string(k))
+}
+
+// ─── pmbsl_stats: [scan_loop, counter_progress, fast_forward, loop_kind, completion] ───
+fn pmbsl_stats() -> array {
+    let mut out = []
+    out.push(scan_loop_count())
+    out.push(counter_progress_count())
+    out.push(fast_forward_count())
+    out.push(loop_kind_count())
+    out.push(completion_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmbsl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmbsl()
+
+    // 2. record_scan_loop x4 — memcpy / strlen / memset / hash with ESI/EDI/ECX/EDX counter
+    //    loop 1: memcpy REP MOVSB at 0x4A1200, total=131072 byte, counter=ESI(6)
+    //    loop 2: strlen byte-walk at 0x4A1380, total=4096 byte, counter=EDX(2)
+    //    loop 3: memset REP STOSB at 0x4A1500, total=262144 byte, counter=ECX(1)
+    //    loop 4: FNV hash inline at 0x4A1680, total=8192 byte, counter=ESI(6)
+    record_scan_loop(1, "0x004A1200", "0x004A121C", 131072, 6)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_scan_loop",
+        "\"loop_id\":1,\"eip_range_start_hex\":\"0x004A1200\""
+        + ",\"eip_range_end_hex\":\"0x004A121C\",\"total_iter\":131072,\"counter_register\":6"
+        + ",\"counter_reg_name\":\"" + counter_reg_name(6) + "\""
+        + ",\"target\":\"crt_memcpy_rep_movsb\"")
+
+    record_scan_loop(2, "0x004A1380", "0x004A1394", 4096, 2)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_scan_loop",
+        "\"loop_id\":2,\"eip_range_start_hex\":\"0x004A1380\""
+        + ",\"eip_range_end_hex\":\"0x004A1394\",\"total_iter\":4096,\"counter_register\":2"
+        + ",\"counter_reg_name\":\"" + counter_reg_name(2) + "\""
+        + ",\"target\":\"crt_strlen_byte_walk\"")
+
+    record_scan_loop(3, "0x004A1500", "0x004A1518", 262144, 1)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_scan_loop",
+        "\"loop_id\":3,\"eip_range_start_hex\":\"0x004A1500\""
+        + ",\"eip_range_end_hex\":\"0x004A1518\",\"total_iter\":262144,\"counter_register\":1"
+        + ",\"counter_reg_name\":\"" + counter_reg_name(1) + "\""
+        + ",\"target\":\"crt_memset_rep_stosb\"")
+
+    record_scan_loop(4, "0x004A1680", "0x004A16A4", 8192, 6)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_scan_loop",
+        "\"loop_id\":4,\"eip_range_start_hex\":\"0x004A1680\""
+        + ",\"eip_range_end_hex\":\"0x004A16A4\",\"total_iter\":8192,\"counter_register\":6"
+        + ",\"counter_reg_name\":\"" + counter_reg_name(6) + "\""
+        + ",\"target\":\"crt_fnv_hash_inline\"")
+
+    // 3. record_counter_progress x4 — snapshot at iter 32K / 1K / 64K / 4K
+    record_counter_progress(1, 1, 32768, 98304)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_counter_progress",
+        "\"progress_id\":1,\"loop_id\":1,\"snapshot_iter\":32768,\"register_value\":98304")
+
+    record_counter_progress(2, 2, 1024, 3072)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_counter_progress",
+        "\"progress_id\":2,\"loop_id\":2,\"snapshot_iter\":1024,\"register_value\":3072")
+
+    record_counter_progress(3, 3, 65536, 196608)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_counter_progress",
+        "\"progress_id\":3,\"loop_id\":3,\"snapshot_iter\":65536,\"register_value\":196608")
+
+    record_counter_progress(4, 4, 4096, 4096)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_counter_progress",
+        "\"progress_id\":4,\"loop_id\":4,\"snapshot_iter\":4096,\"register_value\":4096")
+
+    // 4. record_fast_forward x4 — cap_clamp / zero_set / skip + extra cap_clamp on hash
+    //    ff 1: loop 1 cap_clamp — before=131072 → after=4096 (cap)
+    //    ff 2: loop 2 zero_set — before=4096 → after=0
+    //    ff 3: loop 3 skip — before=262144 → after=0 (전체 단축)
+    //    ff 4: loop 4 cap_clamp — before=8192 → after=2048
+    record_fast_forward(1, 1, 0, 131072, 4096)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_fast_forward",
+        "\"ff_id\":1,\"loop_id\":1,\"action_kind\":0,\"before_count\":131072,\"after_count\":4096"
+        + ",\"action\":\"" + ff_action_name(0) + "\"")
+
+    record_fast_forward(2, 2, 1, 4096, 0)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_fast_forward",
+        "\"ff_id\":2,\"loop_id\":2,\"action_kind\":1,\"before_count\":4096,\"after_count\":0"
+        + ",\"action\":\"" + ff_action_name(1) + "\"")
+
+    record_fast_forward(3, 3, 2, 262144, 0)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_fast_forward",
+        "\"ff_id\":3,\"loop_id\":3,\"action_kind\":2,\"before_count\":262144,\"after_count\":0"
+        + ",\"action\":\"" + ff_action_name(2) + "\"")
+
+    record_fast_forward(4, 4, 0, 8192, 2048)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_fast_forward",
+        "\"ff_id\":4,\"loop_id\":4,\"action_kind\":0,\"before_count\":8192,\"after_count\":2048"
+        + ",\"action\":\"" + ff_action_name(0) + "\"")
+
+    // 5. record_loop_kind x4 — memcpy / strlen / memset / hash mapped to loop 1..4
+    record_loop_kind(1, 1, 0)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_loop_kind",
+        "\"kind_id\":1,\"loop_id\":1,\"kind\":0,\"name\":\"" + loop_kind_name(0) + "\"")
+
+    record_loop_kind(2, 2, 2)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_loop_kind",
+        "\"kind_id\":2,\"loop_id\":2,\"kind\":2,\"name\":\"" + loop_kind_name(2) + "\"")
+
+    record_loop_kind(3, 3, 3)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_loop_kind",
+        "\"kind_id\":3,\"loop_id\":3,\"kind\":3,\"name\":\"" + loop_kind_name(3) + "\"")
+
+    record_loop_kind(4, 4, 4)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_loop_kind",
+        "\"kind_id\":4,\"loop_id\":4,\"kind\":4,\"name\":\"" + loop_kind_name(4) + "\"")
+
+    // 6. record_completion x4 — 3 fast_forwarded + 1 completed_normally
+    //    comp 1: loop 1 completed_normally=0, fast_forwarded=1 (cap_clamp 으로 단축)
+    //    comp 2: loop 2 completed_normally=0, fast_forwarded=1 (zero_set 탈출)
+    //    comp 3: loop 3 completed_normally=0, fast_forwarded=1 (skip 점프)
+    //    comp 4: loop 4 completed_normally=1, fast_forwarded=0 (정상 완주 — cap 후에도 finish)
+    record_completion(1, 1, 0, 1)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_completion",
+        "\"comp_id\":1,\"loop_id\":1,\"completed_normally\":0,\"fast_forwarded\":1")
+
+    record_completion(2, 2, 0, 1)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_completion",
+        "\"comp_id\":2,\"loop_id\":2,\"completed_normally\":0,\"fast_forwarded\":1")
+
+    record_completion(3, 3, 0, 1)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_completion",
+        "\"comp_id\":3,\"loop_id\":3,\"completed_normally\":0,\"fast_forwarded\":1")
+
+    record_completion(4, 4, 1, 0)
+    r0_emit("pe_msvc_byte_scan_loop_real_record_completion",
+        "\"comp_id\":4,\"loop_id\":4,\"completed_normally\":1,\"fast_forwarded\":0")
+
+    // 7. assertion: scan_loop == 4
+    let sl = scan_loop_count()
+    if sl != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [scan_loop_count] expected=4 got=" + to_string(sl))
+    }
+
+    // 8. assertion: counter_progress == 4
+    let cp = counter_progress_count()
+    if cp != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_progress_count] expected=4 got=" + to_string(cp))
+    }
+
+    // 9. assertion: fast_forward == 4
+    let ff = fast_forward_count()
+    if ff != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [fast_forward_count] expected=4 got=" + to_string(ff))
+    }
+
+    // 10. assertion: loop_kind == 4
+    let lk = loop_kind_count()
+    if lk != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_count] expected=4 got=" + to_string(lk))
+    }
+
+    // 11. assertion: completion == 4
+    let cn = completion_count()
+    if cn != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [completion_count] expected=4 got=" + to_string(cn))
+    }
+
+    // 12. counter_reg_name sanity (0..7)
+    if counter_reg_name(0) != "eax" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(0)] expected=eax got=" + counter_reg_name(0))
+    }
+    if counter_reg_name(1) != "ecx" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(1)] expected=ecx got=" + counter_reg_name(1))
+    }
+    if counter_reg_name(2) != "edx" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(2)] expected=edx got=" + counter_reg_name(2))
+    }
+    if counter_reg_name(3) != "ebx" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(3)] expected=ebx got=" + counter_reg_name(3))
+    }
+    if counter_reg_name(4) != "esp" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(4)] expected=esp got=" + counter_reg_name(4))
+    }
+    if counter_reg_name(5) != "ebp" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(5)] expected=ebp got=" + counter_reg_name(5))
+    }
+    if counter_reg_name(6) != "esi" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(6)] expected=esi got=" + counter_reg_name(6))
+    }
+    if counter_reg_name(7) != "edi" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [counter_reg_name(7)] expected=edi got=" + counter_reg_name(7))
+    }
+
+    // 13. loop_kind_name sanity (0..5)
+    if loop_kind_name(0) != "memcpy" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name(0)] expected=memcpy got=" + loop_kind_name(0))
+    }
+    if loop_kind_name(1) != "memcmp" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name(1)] expected=memcmp got=" + loop_kind_name(1))
+    }
+    if loop_kind_name(2) != "strlen" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name(2)] expected=strlen got=" + loop_kind_name(2))
+    }
+    if loop_kind_name(3) != "memset" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name(3)] expected=memset got=" + loop_kind_name(3))
+    }
+    if loop_kind_name(4) != "hash" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name(4)] expected=hash got=" + loop_kind_name(4))
+    }
+    if loop_kind_name(5) != "other" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [loop_kind_name(5)] expected=other got=" + loop_kind_name(5))
+    }
+
+    // 14. ff_action_name sanity (0..2)
+    if ff_action_name(0) != "cap_clamp" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [ff_action_name(0)] expected=cap_clamp got=" + ff_action_name(0))
+    }
+    if ff_action_name(1) != "zero_set" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [ff_action_name(1)] expected=zero_set got=" + ff_action_name(1))
+    }
+    if ff_action_name(2) != "skip" {
+        panic("pe_msvc_byte_scan_loop_real FAIL [ff_action_name(2)] expected=skip got=" + ff_action_name(2))
+    }
+
+    // 15. pmbsl_stats() == [4, 4, 4, 4, 4]
+    let s = pmbsl_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [stats scan_loop] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [stats counter_progress] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [stats fast_forward] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [stats loop_kind] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [stats completion] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 16. emit stats summary
+    r0_emit("pe_msvc_byte_scan_loop_real_stats",
+        "\"scan_loop\":" + to_string(s[0])
+        + ",\"counter_progress\":" + to_string(s[1])
+        + ",\"fast_forward\":" + to_string(s[2])
+        + ",\"loop_kind\":" + to_string(s[3])
+        + ",\"completion\":" + to_string(s[4]))
+
+    // 17. emit count >= 14 — 4 scan_loop + 4 counter_progress + 4 fast_forward + 4 loop_kind + 4 completion + 1 stats = 21
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_byte_scan_loop_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 18. cleanup → stats 모두 0
+    cleanup_pmbsl()
+    let s2 = pmbsl_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_byte_scan_loop_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_byte_scan_loop_real self_test PASS (scan_loop=" + to_string(s[0])
+        + ", counter_progress=" + to_string(s[1]) + ", fast_forward=" + to_string(s[2])
+        + ", loop_kind=" + to_string(s[3]) + ", completion=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmbsl_stats()
+            println("scan_loop_count\t" + to_string(s[0]))
+            println("counter_progress_count\t" + to_string(s[1]))
+            println("fast_forward_count\t" + to_string(s[2]))
+            println("loop_kind_count\t" + to_string(s[3]))
+            println("completion_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmbsl()
+            println("cleaned: " + pmbsl_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmbsl_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_byte_scan_loop_real.hexa { self-test | stats | cleanup | dir }")
+}

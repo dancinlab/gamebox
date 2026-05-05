@@ -1,0 +1,398 @@
+// lib/loader/pe_pipe_anonymous.hexa — Win32 CreatePipe anonymous in-process pipe tracker
+//
+// Win32 CreatePipe(hReadPipe, hWritePipe, lpSecurityAttributes, nSize) →
+// POSIX pipe(2) bridge. read/write 핸들 + 누적 byte 수 + inheritable flag 추적.
+// Anonymous pipe = 같은 프로세스 / 자식 프로세스 한정 unidirectional byte stream.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 pipe op tracker — 실 pipe(2) / read(2) / write(2) 호출 X (cycle 74+).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = create  (pipe 생성)
+//   2 = read    (read end 에서 byte 소비)
+//   3 = write   (write end 에 byte 주입)
+//   4 = close   (read or write 핸들 close)
+//
+// inheritable flag:
+//   0 = SECURITY_ATTRIBUTES.bInheritHandle = FALSE
+//   1 = SECURITY_ATTRIBUTES.bInheritHandle = TRUE  (자식 프로세스 상속)
+//
+// persist schema (TSV — ops.tsv):
+//   pipe_id<int> \t op_kind<int> \t bytes_transferred<int> \t inheritable<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ppa_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_pipe_anonymous"
+}
+
+fn ppa_ops_path() -> str {
+    return ppa_dir() + "/ops.tsv"
+}
+
+fn ppa_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ppa_dir() + "'")
+}
+
+fn cleanup_ppa() -> void {
+    ppa_ensure_dir()
+    let _ = exec("rm -f '" + ppa_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ppa_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ppa_append_row(path: str, row: str) -> void {
+    ppa_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: pipe op 1 건 기록 ───
+fn record_op(pipe_id: int, op_kind: int, bytes_transferred: int, inheritable: int) -> void {
+    if pipe_id <= 0 {
+        panic("pe_pipe_anonymous FAIL [record_op] expected=pipe_id>0 got=" + to_string(pipe_id))
+    }
+    if op_kind < 1 {
+        panic("pe_pipe_anonymous FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_pipe_anonymous FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if bytes_transferred < 0 {
+        panic("pe_pipe_anonymous FAIL [record_op] expected=bytes_transferred>=0 got=" + to_string(bytes_transferred))
+    }
+    if inheritable < 0 {
+        panic("pe_pipe_anonymous FAIL [record_op] expected=inheritable>=0 got=" + to_string(inheritable))
+    }
+    if inheritable > 1 {
+        panic("pe_pipe_anonymous FAIL [record_op] expected=inheritable<=1 got=" + to_string(inheritable))
+    }
+    let row = to_string(pipe_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(bytes_transferred) + "\t" + to_string(inheritable) + "\n"
+    ppa_append_row(ppa_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = ppa_read_table(ppa_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes: 모든 op bytes_transferred 합 ───
+fn total_bytes() -> int {
+    let t = ppa_read_table(ppa_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = ppa_read_table(ppa_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── inheritable_count: inheritable=1 인 op 수 ───
+fn inheritable_count() -> int {
+    let t = ppa_read_table(ppa_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pipe_bytes: 특정 pipe_id 의 bytes_transferred 합 ───
+fn pipe_bytes(pipe_id: int) -> int {
+    let t = ppa_read_table(ppa_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == pipe_id {
+                    sum = sum + to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── ppa_stats: [op_count, total_bytes, inheritable_count, count_by_op_kind(3)] ───
+fn ppa_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_bytes())
+    out.push(inheritable_count())
+    out.push(count_by_op_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ppa-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ppa()
+
+    // 2. record 6 pipe ops across ≥3 op_kinds, ≥2 inheritable
+    //    pipe 7001 (inheritable=1): create / write 512 / read 512 / close
+    //    pipe 7002 (inheritable=0): create / write 256
+    record_op(7001, 1, 0, 1)
+    r0_emit("pe_pipe_anonymous_record",
+        "\"pipe_id\":7001,\"op_kind\":1,\"bytes_transferred\":0,\"inheritable\":1,\"target\":\"create\"")
+
+    record_op(7001, 3, 512, 1)
+    r0_emit("pe_pipe_anonymous_record",
+        "\"pipe_id\":7001,\"op_kind\":3,\"bytes_transferred\":512,\"inheritable\":1,\"target\":\"write\"")
+
+    record_op(7001, 2, 512, 1)
+    r0_emit("pe_pipe_anonymous_record",
+        "\"pipe_id\":7001,\"op_kind\":2,\"bytes_transferred\":512,\"inheritable\":1,\"target\":\"read\"")
+
+    record_op(7001, 4, 0, 1)
+    r0_emit("pe_pipe_anonymous_record",
+        "\"pipe_id\":7001,\"op_kind\":4,\"bytes_transferred\":0,\"inheritable\":1,\"target\":\"close\"")
+
+    record_op(7002, 1, 0, 0)
+    r0_emit("pe_pipe_anonymous_record",
+        "\"pipe_id\":7002,\"op_kind\":1,\"bytes_transferred\":0,\"inheritable\":0,\"target\":\"create\"")
+
+    record_op(7002, 3, 256, 0)
+    r0_emit("pe_pipe_anonymous_record",
+        "\"pipe_id\":7002,\"op_kind\":3,\"bytes_transferred\":256,\"inheritable\":0,\"target\":\"write\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_pipe_anonymous FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_bytes = 1280  (512 + 512 + 256)
+    let tb = total_bytes()
+    if tb != 1280 {
+        panic("pe_pipe_anonymous FAIL [total_bytes] expected=1280 got=" + to_string(tb))
+    }
+
+    // 5. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_pipe_anonymous FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_pipe_anonymous FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 2 {
+        panic("pe_pipe_anonymous FAIL [count_by_op_kind(3)] expected=2 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_pipe_anonymous FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_pipe_anonymous FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. inheritable_count = 4  (pipe 7001 의 4 op)
+    let ic = inheritable_count()
+    if ic != 4 {
+        panic("pe_pipe_anonymous FAIL [inheritable_count] expected=4 got=" + to_string(ic))
+    }
+
+    // 7. pipe_bytes sanity
+    let p7001 = pipe_bytes(7001)
+    if p7001 != 1024 {
+        panic("pe_pipe_anonymous FAIL [pipe_bytes(7001)] expected=1024 got=" + to_string(p7001))
+    }
+    let p7002 = pipe_bytes(7002)
+    if p7002 != 256 {
+        panic("pe_pipe_anonymous FAIL [pipe_bytes(7002)] expected=256 got=" + to_string(p7002))
+    }
+    let p_miss = pipe_bytes(9999)
+    if p_miss != 0 {
+        panic("pe_pipe_anonymous FAIL [pipe_bytes(9999)] expected=0 got=" + to_string(p_miss))
+    }
+
+    // 8. ppa_stats() = [6, 1280, 4, 2]
+    let s = ppa_stats()
+    if len(s) != 4 {
+        panic("pe_pipe_anonymous FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_pipe_anonymous FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 1280 {
+        panic("pe_pipe_anonymous FAIL [stats total_bytes] expected=1280 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_pipe_anonymous FAIL [stats inheritable_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_pipe_anonymous FAIL [stats count_kind(3)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_pipe_anonymous_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_bytes\":" + to_string(s[1])
+        + ",\"inheritable_count\":" + to_string(s[2])
+        + ",\"kind_write\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_pipe_anonymous FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_ppa()
+    let s2 = ppa_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_pipe_anonymous FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_pipe_anonymous self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", inheritable=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ppa_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_bytes\t" + to_string(s[1]))
+            println("inheritable_count\t" + to_string(s[2]))
+            println("count_kind_write\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("pipe_bytes\t" + to_string(pipe_bytes(pid)))
+                return
+            }
+            println("usage: hexa run pe_pipe_anonymous.hexa bytes <pipe_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_pipe_anonymous.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ppa()
+            println("cleaned: " + ppa_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ppa_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_pipe_anonymous.hexa { self-test | stats | bytes <pipe_id> | count <op_kind> | cleanup | dir }")
+}

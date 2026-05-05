@@ -1,0 +1,231 @@
+// lib/perf/c_anticheat_detection_track.hexa — CN-123 skeleton manjeom 15/15
+//
+// Phase 1 anti-cheat detection — PE 안에서 BattlEye / EAC / VAC / 자체(Tencent) 검출.
+// DLL 의존 + 이름 패턴 매칭으로 anti-cheat presence + kernel-level blocker 식별.
+//
+// 무기: signature table + DLL pattern match + kernel-level counter.
+// 효과: closure path B Phase 1 의 PE load 전 "안전 적재 가능" 판정 (kernel-level 0 일 때만 true).
+
+use "./r0_common"
+
+let CADT_DIR = GAMEBOX_HOME + "/persist/anticheat_detection"
+let DETECT_LOG = CADT_DIR + "/detections.tsv"
+
+fn cadt_dir() -> str { return CADT_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CADT_DIR + "'")
+}
+
+// ─── anti-cheat signatures: [name, dll_pattern, kernel_level("1"|"0")] ───
+fn anticheat_signatures() -> array {
+    return [
+        ["BattlEye",       "BEService.dll",                       "1"],
+        ["EasyAntiCheat",  "EasyAntiCheat.dll",                   "1"],
+        ["VAC",            "vac3.dll|vac.dll",                    "0"],
+        ["VAC_Live",       "csgo_*.dll|Trusted Mode",             "1"],
+        ["Custom_Tencent", "ACE-BASE.exe",                        "1"]
+    ]
+}
+
+// ─── DLL 매칭 — pattern 안 '|' 구분자 + '*' wildcard 단순 처리 ───
+fn pattern_match(dll_seen: str, pattern: str) -> bool {
+    if dll_seen == "" { return false }
+    if pattern == "" { return false }
+    let parts = pattern.split("|")
+    let i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if p != "" {
+            if p.contains("*") {
+                // wildcard: split by '*' and check all fragments appear in order
+                let frags = p.split("*")
+                let pos = 0
+                let ok = true
+                let j = 0
+                while j < len(frags) {
+                    let f = frags[j]
+                    if f != "" {
+                        let idx = dll_seen.index_of(f)
+                        if idx < 0 { ok = false; j = len(frags) } else { pos = idx + len(f) }
+                    }
+                    j = j + 1
+                }
+                if ok { return true }
+            } else {
+                if dll_seen.contains(p) { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── 식별: dll_seen 이 어떤 anti-cheat 에 매치되는지 → name (없으면 "") ───
+fn identify_anticheat(dll_seen: str) -> str {
+    let sigs = anticheat_signatures()
+    let i = 0
+    while i < len(sigs) {
+        let s = sigs[i]
+        if pattern_match(dll_seen, s[1]) { return s[0] }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── kernel_level lookup (signature name → bool) ───
+fn is_kernel_level(ac_name: str) -> bool {
+    let sigs = anticheat_signatures()
+    let i = 0
+    while i < len(sigs) {
+        let s = sigs[i]
+        if s[0] == ac_name {
+            if s[2] == "1" { return true }
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── detection 기록 ───
+fn record_detection(pe_name: str, dll_seen: str) -> void {
+    ensure_dir()
+    let ac = identify_anticheat(dll_seen)
+    let kl = "0"
+    if ac != "" {
+        if is_kernel_level(ac) { kl = "1" }
+    }
+    let line = pe_name + "\t" + dll_seen + "\t" + ac + "\t" + kl
+    let tmp = DETECT_LOG + ".add"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + DETECT_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("anticheat_detect", "\"pe\":\"" + pe_name + "\",\"dll\":\"" + dll_seen + "\",\"ac\":\"" + ac + "\",\"kernel\":" + kl)
+}
+
+fn detection_count() -> int {
+    let exists = exec("test -f '" + DETECT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    // anti-cheat 식별된 것만 (3 컬럼이 비어있지 않은 것)
+    let r = exec("awk -F'\\t' '$3!=\"\"{c++} END{print c+0}' '" + DETECT_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn kernel_level_blockers() -> int {
+    let exists = exec("test -f '" + DETECT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$4==\"1\"{c++} END{print c+0}' '" + DETECT_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── safe_to_load: pe_name 의 detections 안에 kernel-level 가 0 일 때만 true ───
+fn safe_to_load(pe_name: str) -> bool {
+    let exists = exec("test -f '" + DETECT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return true }
+    let r = exec("awk -F'\\t' -v p='" + pe_name + "' '$1==p && $4==\"1\"{c++} END{print c+0}' '" + DETECT_LOG + "'").trim()
+    if r == "" { return true }
+    return to_int(r) == 0
+}
+
+fn cleanup_cadt() -> void {
+    let _ = exec("rm -rf '" + CADT_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cadt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cadt()
+
+    // signature table — 5 entries
+    let sigs = anticheat_signatures()
+    if len(sigs) != 5 { panic("c_anticheat_detection_track FAIL [sigs] expected=5 got=" + to_string(len(sigs))) }
+
+    // identify: BattlEye
+    let id_be = identify_anticheat("BEService.dll")
+    if id_be != "BattlEye" { panic("c_anticheat_detection_track FAIL [identify BattlEye] got=" + id_be) }
+
+    // identify: EAC
+    let id_eac = identify_anticheat("EasyAntiCheat.dll")
+    if id_eac != "EasyAntiCheat" { panic("c_anticheat_detection_track FAIL [identify EAC] got=" + id_eac) }
+
+    // identify: VAC user-level
+    let id_vac = identify_anticheat("vac3.dll")
+    if id_vac != "VAC" { panic("c_anticheat_detection_track FAIL [identify VAC] got=" + id_vac) }
+
+    // identify: VAC_Live wildcard
+    let id_vacl = identify_anticheat("csgo_client.dll")
+    if id_vacl != "VAC_Live" { panic("c_anticheat_detection_track FAIL [identify VAC_Live] got=" + id_vacl) }
+
+    // identify: Custom_Tencent
+    let id_tc = identify_anticheat("ACE-BASE.exe")
+    if id_tc != "Custom_Tencent" { panic("c_anticheat_detection_track FAIL [identify Tencent] got=" + id_tc) }
+
+    // identify: 깨끗한 DLL
+    let id_clean = identify_anticheat("kernel32.dll")
+    if id_clean != "" { panic("c_anticheat_detection_track FAIL [identify clean] got=" + id_clean) }
+
+    // kernel-level flags
+    if !is_kernel_level("BattlEye") { panic("c_anticheat_detection_track FAIL [BattlEye not kernel]") }
+    if !is_kernel_level("EasyAntiCheat") { panic("c_anticheat_detection_track FAIL [EAC not kernel]") }
+    if is_kernel_level("VAC") { panic("c_anticheat_detection_track FAIL [VAC kernel?]") }
+    if !is_kernel_level("VAC_Live") { panic("c_anticheat_detection_track FAIL [VAC_Live not kernel]") }
+    if !is_kernel_level("Custom_Tencent") { panic("c_anticheat_detection_track FAIL [Tencent not kernel]") }
+
+    // 4 PE 등록 — BattlEye / EAC / VAC user-level / 깨끗
+    record_detection("PUBG.exe",   "BEService.dll")          // BattlEye → kernel
+    record_detection("Fortnite.exe", "EasyAntiCheat.dll")    // EAC → kernel
+    record_detection("CSGO_old.exe", "vac3.dll")             // VAC → user-level
+    record_detection("Solitaire.exe", "kernel32.dll")        // 깨끗 (no anti-cheat)
+
+    let dcnt = detection_count()
+    if dcnt != 3 { panic("c_anticheat_detection_track FAIL [detection_count] expected=3 got=" + to_string(dcnt)) }
+
+    let klb = kernel_level_blockers()
+    if klb != 2 { panic("c_anticheat_detection_track FAIL [kernel blockers] expected=2 got=" + to_string(klb)) }
+
+    // safe_to_load 검증
+    if safe_to_load("PUBG.exe") { panic("c_anticheat_detection_track FAIL [PUBG safe?]") }
+    if safe_to_load("Fortnite.exe") { panic("c_anticheat_detection_track FAIL [Fortnite safe?]") }
+    if !safe_to_load("CSGO_old.exe") { panic("c_anticheat_detection_track FAIL [CSGO not safe?] (VAC user-level)") }
+    if !safe_to_load("Solitaire.exe") { panic("c_anticheat_detection_track FAIL [Solitaire not safe?]") }
+
+    r0_emit("anticheat_summary", "\"detections\":" + to_string(dcnt) + ",\"kernel_blockers\":" + to_string(klb))
+
+    let emit_cnt = r0_session_count(sid)
+    if emit_cnt < 4 { panic("c_anticheat_detection_track FAIL [emit] got=" + to_string(emit_cnt)) }
+
+    cleanup_cadt()
+
+    println("  ✅ c_anticheat_detection_track self_test PASS (5 sigs, 4 PE, " + to_string(dcnt) + " detected, " + to_string(klb) + " kernel-level blockers, emits=" + to_string(emit_cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "record" && len(a) >= 5 {
+            record_detection(a[3], a[4])
+            println("recorded")
+            return
+        }
+        if sub == "identify" && len(a) >= 4 {
+            let r = identify_anticheat(a[3])
+            if r == "" { println("(no anti-cheat detected)") } else { println(r + " (kernel=" + to_string(is_kernel_level(r)) + ")") }
+            return
+        }
+        if sub == "safe" && len(a) >= 4 {
+            if safe_to_load(a[3]) { println("safe") } else { println("BLOCKED (kernel-level anti-cheat present)") }
+            return
+        }
+        if sub == "stats" {
+            println("detections=" + to_string(detection_count()) + " kernel_blockers=" + to_string(kernel_level_blockers()))
+            return
+        }
+        if sub == "cleanup" { cleanup_cadt(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_anticheat_detection_track.hexa { self-test | record <pe> <dll> | identify <dll> | safe <pe> | stats | cleanup }")
+}

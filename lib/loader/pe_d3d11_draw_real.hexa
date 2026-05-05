@@ -1,0 +1,436 @@
+// lib/loader/pe_d3d11_draw_real.hexa — D3D11 Draw* → MTLRenderCommandEncoder routing tracker
+//
+// ID3D11DeviceContext::Draw / DrawIndexed / DrawInstanced / DrawIndexedInstanced /
+// DrawAuto / DrawInstancedIndirect / DrawIndexedInstancedIndirect 호출의
+// MTLRenderCommandEncoder drawPrimitives* 매핑 추적기.
+// 본 module 은 draw call descriptor record/aggregate 만 — 실 ID3D11DeviceContext::Draw
+// / MTLRenderCommandEncoder drawPrimitives 호출은 stage2 native helper(D3DMetal binary
+// 위임) 에서 처리.
+//
+// D3D11 Draw* → Metal:
+//   ID3D11DeviceContext::Draw(VertexCount, StartVertex)
+//     → MTLRenderCommandEncoder drawPrimitives:vertexStart:vertexCount:
+//   DrawIndexed(IndexCount, StartIndex, BaseVertex)
+//     → drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:
+//   DrawInstanced(VPI, IC, SV, SI)
+//     → drawPrimitives:...:instanceCount:baseInstance:
+//   DrawAuto                    → tess output stream draw (geometry shader)
+//   DrawInstancedIndirect       → drawPrimitives:indirectBuffer:indirectBufferOffset:
+//   D2R/D4/CS2/모든 게임의 hot path
+// own1: D3DMetal 위임 + MSDN ID3D11DeviceContext only
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// draw_kind code:
+//   1 = Draw
+//   2 = DrawIndexed
+//   3 = DrawInstanced
+//   4 = DrawIndexedInstanced
+//   5 = DrawAuto
+//   6 = DrawInstancedIndirect
+//   7 = DrawIndexedInstancedIndirect
+//
+// persist schema (TSV — draws.tsv):
+//   draw_id<int> \t draw_kind<int> \t vertex_count<int> \t instance_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdd11_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_draw_real"
+}
+
+fn pdd11_draws_path() -> str {
+    return pdd11_dir() + "/draws.tsv"
+}
+
+fn pdd11_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdd11_dir() + "'")
+}
+
+fn cleanup_pdd11() -> void {
+    pdd11_ensure_dir()
+    let _ = exec("rm -f '" + pdd11_draws_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdd11_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdd11_append_row(path: str, row: str) -> void {
+    pdd11_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_draw: draw call descriptor 1 건 기록 ───
+fn record_draw(draw_id: int, draw_kind: int, vertex_count: int, instance_count: int) -> void {
+    if draw_id <= 0 {
+        panic("pe_d3d11_draw_real FAIL [record_draw] expected=draw_id>0 got=" + to_string(draw_id))
+    }
+    if draw_kind < 1 {
+        panic("pe_d3d11_draw_real FAIL [record_draw] expected=draw_kind>=1 got=" + to_string(draw_kind))
+    }
+    if draw_kind > 7 {
+        panic("pe_d3d11_draw_real FAIL [record_draw] expected=draw_kind<=7 got=" + to_string(draw_kind))
+    }
+    if vertex_count < 0 {
+        panic("pe_d3d11_draw_real FAIL [record_draw] expected=vertex_count>=0 got=" + to_string(vertex_count))
+    }
+    if instance_count < 0 {
+        panic("pe_d3d11_draw_real FAIL [record_draw] expected=instance_count>=0 got=" + to_string(instance_count))
+    }
+    let row = to_string(draw_id) + "\t" + to_string(draw_kind)
+        + "\t" + to_string(vertex_count) + "\t" + to_string(instance_count) + "\n"
+    pdd11_append_row(pdd11_draws_path(), row)
+}
+
+// ─── draw_count: total draw call 수 ───
+fn draw_count() -> int {
+    let t = pdd11_read_table(pdd11_draws_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_vertex_count: 모든 draw 의 vertex_count 합 ───
+fn total_vertex_count() -> int {
+    let t = pdd11_read_table(pdd11_draws_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_instance_count: 모든 draw 의 instance_count 합 ───
+fn total_instance_count() -> int {
+    let t = pdd11_read_table(pdd11_draws_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_draw_kind: 특정 draw_kind 의 draw 수 ───
+fn count_by_draw_kind(kind: int) -> int {
+    let t = pdd11_read_table(pdd11_draws_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── instanced_count: kind 3 + 4 + 6 + 7 (instanced family) ───
+fn instanced_count() -> int {
+    return count_by_draw_kind(3) + count_by_draw_kind(4)
+        + count_by_draw_kind(6) + count_by_draw_kind(7)
+}
+
+// ─── draw_vertex_count: 특정 draw_id 의 vertex_count (없으면 0) ───
+fn draw_vertex_count(draw_id: int) -> int {
+    let t = pdd11_read_table(pdd11_draws_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == draw_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdd11_stats: [draw_count, total_vertex_count, total_instance_count, instanced_count] ───
+fn pdd11_stats() -> array {
+    let mut out = []
+    out.push(draw_count())
+    out.push(total_vertex_count())
+    out.push(total_instance_count())
+    out.push(instanced_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdd11-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdd11()
+
+    // 2. record 6 draws — ≥4 draw_kinds, varying vertex/instance counts
+    //    d1: Draw (kind=1, vc=36, ic=0)
+    record_draw(420001, 1, 36, 0)
+    r0_emit("pe_d3d11_draw_real_record",
+        "\"draw_id\":420001,\"draw_kind\":1,\"vertex_count\":36,\"instance_count\":0,\"target\":\"drawPrimitives\"")
+
+    //    d2: DrawIndexed (kind=2, vc=1024, ic=0)
+    record_draw(420002, 2, 1024, 0)
+    r0_emit("pe_d3d11_draw_real_record",
+        "\"draw_id\":420002,\"draw_kind\":2,\"vertex_count\":1024,\"instance_count\":0,\"target\":\"drawIndexedPrimitives\"")
+
+    //    d3: DrawInstanced (kind=3, vc=128, ic=64)
+    record_draw(420003, 3, 128, 64)
+    r0_emit("pe_d3d11_draw_real_record",
+        "\"draw_id\":420003,\"draw_kind\":3,\"vertex_count\":128,\"instance_count\":64,\"target\":\"drawPrimitives_instanceCount\"")
+
+    //    d4: DrawIndexedInstanced (kind=4, vc=2048, ic=32)
+    record_draw(420004, 4, 2048, 32)
+    r0_emit("pe_d3d11_draw_real_record",
+        "\"draw_id\":420004,\"draw_kind\":4,\"vertex_count\":2048,\"instance_count\":32,\"target\":\"drawIndexedPrimitives_instanceCount\"")
+
+    //    d5: DrawIndexed (kind=2, vc=512, ic=0)
+    record_draw(420005, 2, 512, 0)
+    r0_emit("pe_d3d11_draw_real_record",
+        "\"draw_id\":420005,\"draw_kind\":2,\"vertex_count\":512,\"instance_count\":0,\"target\":\"drawIndexedPrimitives\"")
+
+    //    d6: DrawInstancedIndirect (kind=6, vc=0, ic=16)
+    record_draw(420006, 6, 0, 16)
+    r0_emit("pe_d3d11_draw_real_record",
+        "\"draw_id\":420006,\"draw_kind\":6,\"vertex_count\":0,\"instance_count\":16,\"target\":\"drawPrimitives_indirectBuffer\"")
+
+    // 3. draw_count = 6
+    let c = draw_count()
+    if c != 6 {
+        panic("pe_d3d11_draw_real FAIL [draw_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_vertex_count = 36+1024+128+2048+512+0 = 3748
+    let tv = total_vertex_count()
+    if tv != 3748 {
+        panic("pe_d3d11_draw_real FAIL [total_vertex_count] expected=3748 got=" + to_string(tv))
+    }
+
+    // 5. total_instance_count = 0+0+64+32+0+16 = 112
+    let ti = total_instance_count()
+    if ti != 112 {
+        panic("pe_d3d11_draw_real FAIL [total_instance_count] expected=112 got=" + to_string(ti))
+    }
+
+    // 6. count_by_draw_kind sanity
+    //    kind=1 Draw → d1 = 1
+    let k1 = count_by_draw_kind(1)
+    if k1 != 1 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    //    kind=2 DrawIndexed → d2, d5 = 2
+    let k2 = count_by_draw_kind(2)
+    if k2 != 2 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    //    kind=3 DrawInstanced → d3 = 1
+    let k3 = count_by_draw_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    //    kind=4 DrawIndexedInstanced → d4 = 1
+    let k4 = count_by_draw_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    //    kind=5 DrawAuto → none = 0
+    let k5 = count_by_draw_kind(5)
+    if k5 != 0 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(5)] expected=0 got=" + to_string(k5))
+    }
+    //    kind=6 DrawInstancedIndirect → d6 = 1
+    let k6 = count_by_draw_kind(6)
+    if k6 != 1 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    //    kind=7 DrawIndexedInstancedIndirect → none = 0
+    let k7 = count_by_draw_kind(7)
+    if k7 != 0 {
+        panic("pe_d3d11_draw_real FAIL [count_by_draw_kind(7)] expected=0 got=" + to_string(k7))
+    }
+
+    // 7. instanced_count = k3+k4+k6+k7 = 1+1+1+0 = 3
+    let ic = instanced_count()
+    if ic != 3 {
+        panic("pe_d3d11_draw_real FAIL [instanced_count] expected=3 got=" + to_string(ic))
+    }
+
+    // 8. draw_vertex_count sanity
+    let v2 = draw_vertex_count(420002)
+    if v2 != 1024 {
+        panic("pe_d3d11_draw_real FAIL [draw_vertex_count(420002)] expected=1024 got=" + to_string(v2))
+    }
+    let v4 = draw_vertex_count(420004)
+    if v4 != 2048 {
+        panic("pe_d3d11_draw_real FAIL [draw_vertex_count(420004)] expected=2048 got=" + to_string(v4))
+    }
+    let v_miss = draw_vertex_count(99999)
+    if v_miss != 0 {
+        panic("pe_d3d11_draw_real FAIL [draw_vertex_count(99999)] expected=0 got=" + to_string(v_miss))
+    }
+
+    // 9. pdd11_stats() = [6, 3748, 112, 3]
+    let s = pdd11_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_draw_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d11_draw_real FAIL [stats draw_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3748 {
+        panic("pe_d3d11_draw_real FAIL [stats total_vertex_count] expected=3748 got=" + to_string(s[1]))
+    }
+    if s[2] != 112 {
+        panic("pe_d3d11_draw_real FAIL [stats total_instance_count] expected=112 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_d3d11_draw_real FAIL [stats instanced_count] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d11_draw_real_stats",
+        "\"draw_count\":" + to_string(s[0])
+        + ",\"total_vertex_count\":" + to_string(s[1])
+        + ",\"total_instance_count\":" + to_string(s[2])
+        + ",\"instanced_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d11_draw_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdd11()
+    let s2 = pdd11_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_draw_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_draw_real self_test PASS (draws=" + to_string(s[0])
+        + ", vertices=" + to_string(s[1]) + ", instances=" + to_string(s[2])
+        + ", instanced=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdd11_stats()
+            println("draw_count\t" + to_string(s[0]))
+            println("total_vertex_count\t" + to_string(s[1]))
+            println("total_instance_count\t" + to_string(s[2]))
+            println("instanced_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "vertices" {
+            if len(a) >= 4 {
+                let did = to_int(a[3])
+                println("draw_vertex_count\t" + to_string(draw_vertex_count(did)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_draw_real.hexa vertices <draw_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_draw_kind\t" + to_string(count_by_draw_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_draw_real.hexa count <draw_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdd11()
+            println("cleaned: " + pdd11_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdd11_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_draw_real.hexa { self-test | stats | vertices <draw_id> | count <draw_kind> | cleanup | dir }")
+}

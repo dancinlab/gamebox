@@ -1,0 +1,577 @@
+// lib/loader/pe_battlenet_setup_static_crt_path.hexa — Battle.net Setup static CRT linkage path tracker
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / community wrapper 0 줄.
+//        Microsoft Win32 / MSVC CRT public PE 관찰만 — 본 module 은
+//        static CRT inline path milestone telemetry 만 기록.
+// own 2: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   Battle.net Setup.exe 가 IAT 에 MSVCR*.dll 0 줄로 link 된 채
+//   binary 내부에 inline 된 static CRT (security_cookie / _initterm /
+//   __scrt_common_main_seh / GetCommandLineA inline) 를 walk 해 WinMain 으로
+//   진입하는 path 의 단계별 milestone.
+//
+// static CRT typical sequence (instructions_executed → percent_to_user32):
+//   pe_validate                — Setup.exe PE header / signature 확인
+//   entry_point                — IMAGE_OPTIONAL_HEADER.AddressOfEntryPoint
+//   text_section_start         — .text section RVA start
+//   crt_inline_start           — static CRT prologue 진입
+//   security_cookie_init       — __security_init_cookie inline (~50 byte)
+//   initterm_walk_start        — _initterm(_e) array walk 시작
+//   initterm_walk_complete     — initterm CTOR/DTOR table walk 완료
+//   scrt_common_main_seh       — __scrt_common_main_seh 진입 (SEH frame 설치)
+//   get_cmdline_inline         — GetCommandLineA inline (PEB->ProcessParameters)
+//   winmain_entry              — WinMain 진입 — first user code
+//   windows_api_first_call     — kernel32/user32 첫 import call
+//   register_class_first       — RegisterClassW (USER32 첫 GUI api)
+//   create_window_first        — CreateWindowExW (Battle.net Setup window)
+//
+// persist schema (TSV — 5 separate tables):
+//   static_milestone.tsv:
+//     milestone_id<int> \t milestone_name<str> \t eip_va_hex<str> \t ts_ns<int>
+//   iat_dependency.tsv:
+//     dep_id<int> \t dll_name<str> \t fn_count<int> \t classification<int>
+//   inline_function_size.tsv:
+//     size_id<int> \t milestone_id<int> \t byte_count<int>
+//   text_range.tsv:
+//     range_id<int> \t section_name<str> \t va_start_hex<str> \t va_end_hex<str>
+//   progress_milestone.tsv:
+//     progress_id<int> \t milestone_id<int> \t instructions_executed<int> \t percent_to_user32<int>
+//
+// classification reference:
+//   0=core_kernel32 1=user32 2=msvcr_static_inline_only 3=optional
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: milestone_id / milestone_name / eip_va_hex / ts_ns /
+// dep_id / dll_name / fn_count / classification /
+// size_id / byte_count / range_id / section_name / va_start_hex / va_end_hex /
+// progress_id / instructions_executed / percent_to_user32.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pbsscp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_battlenet_setup_static_crt_path"
+}
+
+fn pbsscp_static_milestone_path() -> str {
+    return pbsscp_dir() + "/static_milestone.tsv"
+}
+
+fn pbsscp_iat_dependency_path() -> str {
+    return pbsscp_dir() + "/iat_dependency.tsv"
+}
+
+fn pbsscp_inline_function_size_path() -> str {
+    return pbsscp_dir() + "/inline_function_size.tsv"
+}
+
+fn pbsscp_text_range_path() -> str {
+    return pbsscp_dir() + "/text_range.tsv"
+}
+
+fn pbsscp_progress_milestone_path() -> str {
+    return pbsscp_dir() + "/progress_milestone.tsv"
+}
+
+fn pbsscp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pbsscp_dir() + "'")
+}
+
+fn cleanup_pbsscp() -> void {
+    pbsscp_ensure_dir()
+    let _ = exec("rm -f '" + pbsscp_static_milestone_path()
+        + "' '" + pbsscp_iat_dependency_path()
+        + "' '" + pbsscp_inline_function_size_path()
+        + "' '" + pbsscp_text_range_path()
+        + "' '" + pbsscp_progress_milestone_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pbsscp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbsscp_append_row(path: str, row: str) -> void {
+    pbsscp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pbsscp_count_rows(path: str, min_cols: int) -> int {
+    let t = pbsscp_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_static_milestone: static CRT path EIP milestone (시간 순) ───
+fn record_static_milestone(milestone_id: int, milestone_name: str, eip_va_hex: str, ts_ns: int) -> void {
+    if milestone_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_static_milestone] expected=milestone_id>0 got=" + to_string(milestone_id))
+    }
+    if milestone_name == "" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_static_milestone] expected=milestone_name!=empty got=empty")
+    }
+    if eip_va_hex == "" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_static_milestone] expected=eip_va_hex!=empty got=empty")
+    }
+    if ts_ns < 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_static_milestone] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    let row = to_string(milestone_id) + "\t" + milestone_name + "\t"
+        + eip_va_hex + "\t" + to_string(ts_ns) + "\n"
+    pbsscp_append_row(pbsscp_static_milestone_path(), row)
+}
+
+// ─── record_iat_dependency: IAT dependency + classification ───
+fn record_iat_dependency(dep_id: int, dll_name: str, fn_count: int, classification: int) -> void {
+    if dep_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_iat_dependency] expected=dep_id>0 got=" + to_string(dep_id))
+    }
+    if dll_name == "" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_iat_dependency] expected=dll_name!=empty got=empty")
+    }
+    if fn_count < 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_iat_dependency] expected=fn_count>=0 got=" + to_string(fn_count))
+    }
+    if classification < 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_iat_dependency] expected=classification>=0 got=" + to_string(classification))
+    }
+    if classification > 3 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_iat_dependency] expected=classification<=3 got=" + to_string(classification))
+    }
+    let row = to_string(dep_id) + "\t" + dll_name + "\t"
+        + to_string(fn_count) + "\t" + to_string(classification) + "\n"
+    pbsscp_append_row(pbsscp_iat_dependency_path(), row)
+}
+
+// ─── record_inline_function_size: inline CRT function byte size ───
+fn record_inline_function_size(size_id: int, milestone_id: int, byte_count: int) -> void {
+    if size_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_inline_function_size] expected=size_id>0 got=" + to_string(size_id))
+    }
+    if milestone_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_inline_function_size] expected=milestone_id>0 got=" + to_string(milestone_id))
+    }
+    if byte_count <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_inline_function_size] expected=byte_count>0 got=" + to_string(byte_count))
+    }
+    let row = to_string(size_id) + "\t" + to_string(milestone_id) + "\t"
+        + to_string(byte_count) + "\n"
+    pbsscp_append_row(pbsscp_inline_function_size_path(), row)
+}
+
+// ─── record_text_range: PE section VA range (.text / .rdata) ───
+fn record_text_range(range_id: int, section_name: str, va_start_hex: str, va_end_hex: str) -> void {
+    if range_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_text_range] expected=range_id>0 got=" + to_string(range_id))
+    }
+    if section_name == "" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_text_range] expected=section_name!=empty got=empty")
+    }
+    if va_start_hex == "" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_text_range] expected=va_start_hex!=empty got=empty")
+    }
+    if va_end_hex == "" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_text_range] expected=va_end_hex!=empty got=empty")
+    }
+    let row = to_string(range_id) + "\t" + section_name + "\t"
+        + va_start_hex + "\t" + va_end_hex + "\n"
+    pbsscp_append_row(pbsscp_text_range_path(), row)
+}
+
+// ─── record_progress_milestone: instructions_executed → percent_to_user32 ───
+fn record_progress_milestone(progress_id: int, milestone_id: int, instructions_executed: int, percent_to_user32: int) -> void {
+    if progress_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_progress_milestone] expected=progress_id>0 got=" + to_string(progress_id))
+    }
+    if milestone_id <= 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_progress_milestone] expected=milestone_id>0 got=" + to_string(milestone_id))
+    }
+    if instructions_executed < 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_progress_milestone] expected=instructions_executed>=0 got=" + to_string(instructions_executed))
+    }
+    if percent_to_user32 < 0 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_progress_milestone] expected=percent_to_user32>=0 got=" + to_string(percent_to_user32))
+    }
+    if percent_to_user32 > 100 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [record_progress_milestone] expected=percent_to_user32<=100 got=" + to_string(percent_to_user32))
+    }
+    let row = to_string(progress_id) + "\t" + to_string(milestone_id) + "\t"
+        + to_string(instructions_executed) + "\t" + to_string(percent_to_user32) + "\n"
+    pbsscp_append_row(pbsscp_progress_milestone_path(), row)
+}
+
+// ─── statistics ───
+fn static_milestone_count() -> int {
+    return pbsscp_count_rows(pbsscp_static_milestone_path(), 4)
+}
+
+fn iat_dependency_count() -> int {
+    return pbsscp_count_rows(pbsscp_iat_dependency_path(), 4)
+}
+
+fn inline_function_size_count() -> int {
+    return pbsscp_count_rows(pbsscp_inline_function_size_path(), 3)
+}
+
+fn text_range_count() -> int {
+    return pbsscp_count_rows(pbsscp_text_range_path(), 4)
+}
+
+fn progress_milestone_count() -> int {
+    return pbsscp_count_rows(pbsscp_progress_milestone_path(), 4)
+}
+
+// ─── classification_name: int code → 사람-읽기 string ───
+fn classification_name(classification: int) -> str {
+    if classification == 0 {
+        return "core_kernel32"
+    }
+    if classification == 1 {
+        return "user32"
+    }
+    if classification == 2 {
+        return "msvcr_static_inline_only"
+    }
+    if classification == 3 {
+        return "optional"
+    }
+    return "unknown"
+}
+
+// ─── has_milestone: 특정 milestone_name 존재 여부 ───
+fn has_milestone(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let t = pbsscp_read_table(pbsscp_static_milestone_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[1] == name {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn pbsscp_stats() -> array {
+    let mut out = []
+    out.push(static_milestone_count())
+    out.push(iat_dependency_count())
+    out.push(inline_function_size_count())
+    out.push(text_range_count())
+    out.push(progress_milestone_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 12 ───
+fn self_test() -> void {
+    let sid = "pbsscp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pbsscp()
+
+    // ─── 1. static_milestone × 8 (시간 순 — pe_validate ~ winmain_entry) ───
+    record_static_milestone(1, "pe_validate", "0x00400000", 1000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":1,\"milestone_name\":\"pe_validate\",\"eip_va_hex\":\"0x00400000\",\"ts_ns\":1000")
+
+    record_static_milestone(2, "entry_point", "0x00401000", 2000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":2,\"milestone_name\":\"entry_point\",\"eip_va_hex\":\"0x00401000\",\"ts_ns\":2000")
+
+    record_static_milestone(3, "text_section_start", "0x00401000", 2100)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":3,\"milestone_name\":\"text_section_start\",\"eip_va_hex\":\"0x00401000\",\"ts_ns\":2100")
+
+    record_static_milestone(4, "crt_inline_start", "0x00401050", 3000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":4,\"milestone_name\":\"crt_inline_start\",\"eip_va_hex\":\"0x00401050\",\"ts_ns\":3000")
+
+    record_static_milestone(5, "security_cookie_init", "0x00401080", 4000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":5,\"milestone_name\":\"security_cookie_init\",\"eip_va_hex\":\"0x00401080\",\"ts_ns\":4000")
+
+    record_static_milestone(6, "initterm_walk_start", "0x004010c0", 5000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":6,\"milestone_name\":\"initterm_walk_start\",\"eip_va_hex\":\"0x004010c0\",\"ts_ns\":5000")
+
+    record_static_milestone(7, "scrt_common_main_seh", "0x00401200", 6000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":7,\"milestone_name\":\"scrt_common_main_seh\",\"eip_va_hex\":\"0x00401200\",\"ts_ns\":6000")
+
+    record_static_milestone(8, "winmain_entry", "0x00402000", 7000)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"static_milestone\",\"milestone_id\":8,\"milestone_name\":\"winmain_entry\",\"eip_va_hex\":\"0x00402000\",\"ts_ns\":7000")
+
+    // ─── 2. iat_dependency × 4 (KERNEL32 core / USER32 / NTDLL optional / MSVCR static-inline-only) ───
+    record_iat_dependency(1, "KERNEL32.dll", 12, 0)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"iat_dependency\",\"dep_id\":1,\"dll_name\":\"KERNEL32.dll\",\"fn_count\":12,\"classification\":0,\"name\":\"core_kernel32\"")
+
+    record_iat_dependency(2, "USER32.dll", 6, 1)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"iat_dependency\",\"dep_id\":2,\"dll_name\":\"USER32.dll\",\"fn_count\":6,\"classification\":1,\"name\":\"user32\"")
+
+    record_iat_dependency(3, "ntdll.dll", 2, 3)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"iat_dependency\",\"dep_id\":3,\"dll_name\":\"ntdll.dll\",\"fn_count\":2,\"classification\":3,\"name\":\"optional\"")
+
+    // MSVCR* — IAT 0 줄 (static inline only). fn_count=0 으로 명시.
+    record_iat_dependency(4, "MSVCR_static_inline", 0, 2)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"iat_dependency\",\"dep_id\":4,\"dll_name\":\"MSVCR_static_inline\",\"fn_count\":0,\"classification\":2,\"name\":\"msvcr_static_inline_only\"")
+
+    // ─── 3. inline_function_size × 4 (security_cookie 50 / initterm 200 / scrt_common 800 / get_cmdline 100) ───
+    record_inline_function_size(1, 5, 50)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"inline_function_size\",\"size_id\":1,\"milestone_id\":5,\"byte_count\":50,\"name\":\"security_cookie\"")
+
+    record_inline_function_size(2, 6, 200)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"inline_function_size\",\"size_id\":2,\"milestone_id\":6,\"byte_count\":200,\"name\":\"initterm\"")
+
+    record_inline_function_size(3, 7, 800)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"inline_function_size\",\"size_id\":3,\"milestone_id\":7,\"byte_count\":800,\"name\":\"scrt_common_main_seh\"")
+
+    record_inline_function_size(4, 8, 100)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"inline_function_size\",\"size_id\":4,\"milestone_id\":8,\"byte_count\":100,\"name\":\"get_cmdline_inline\"")
+
+    // ─── 4. text_range × 2 (.text + .rdata) ───
+    record_text_range(1, ".text", "0x00401000", "0x00420000")
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"text_range\",\"range_id\":1,\"section_name\":\".text\",\"va_start_hex\":\"0x00401000\",\"va_end_hex\":\"0x00420000\"")
+
+    record_text_range(2, ".rdata", "0x00420000", "0x00425000")
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"text_range\",\"range_id\":2,\"section_name\":\".rdata\",\"va_start_hex\":\"0x00420000\",\"va_end_hex\":\"0x00425000\"")
+
+    // ─── 5. progress_milestone × 4 (10000/15000/17000/20000 inst, 50%/65%/70%/80%) ───
+    record_progress_milestone(1, 5, 10000, 50)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"progress_milestone\",\"progress_id\":1,\"milestone_id\":5,\"instructions_executed\":10000,\"percent_to_user32\":50")
+
+    record_progress_milestone(2, 6, 15000, 65)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"progress_milestone\",\"progress_id\":2,\"milestone_id\":6,\"instructions_executed\":15000,\"percent_to_user32\":65")
+
+    record_progress_milestone(3, 7, 17000, 70)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"progress_milestone\",\"progress_id\":3,\"milestone_id\":7,\"instructions_executed\":17000,\"percent_to_user32\":70")
+
+    record_progress_milestone(4, 8, 20000, 80)
+    r0_emit("pe_battlenet_setup_static_crt_path_record",
+        "\"kind\":\"progress_milestone\",\"progress_id\":4,\"milestone_id\":8,\"instructions_executed\":20000,\"percent_to_user32\":80")
+
+    // ─── assertions: count ───
+    let smc = static_milestone_count()
+    if smc != 8 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [static_milestone_count] expected=8 got=" + to_string(smc))
+    }
+    let iac = iat_dependency_count()
+    if iac != 4 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [iat_dependency_count] expected=4 got=" + to_string(iac))
+    }
+    let ifc = inline_function_size_count()
+    if ifc != 4 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [inline_function_size_count] expected=4 got=" + to_string(ifc))
+    }
+    let trc = text_range_count()
+    if trc != 2 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [text_range_count] expected=2 got=" + to_string(trc))
+    }
+    let pmc = progress_milestone_count()
+    if pmc != 4 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [progress_milestone_count] expected=4 got=" + to_string(pmc))
+    }
+
+    // ─── classification_name sanity ───
+    let cn0 = classification_name(0)
+    if cn0 != "core_kernel32" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [classification_name(0)] expected=core_kernel32 got=" + cn0)
+    }
+    let cn1 = classification_name(1)
+    if cn1 != "user32" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [classification_name(1)] expected=user32 got=" + cn1)
+    }
+    let cn2 = classification_name(2)
+    if cn2 != "msvcr_static_inline_only" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [classification_name(2)] expected=msvcr_static_inline_only got=" + cn2)
+    }
+    let cn3 = classification_name(3)
+    if cn3 != "optional" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [classification_name(3)] expected=optional got=" + cn3)
+    }
+    let cn99 = classification_name(99)
+    if cn99 != "unknown" {
+        panic("pe_battlenet_setup_static_crt_path FAIL [classification_name(99)] expected=unknown got=" + cn99)
+    }
+
+    // ─── has_milestone sanity ───
+    let hm_first = has_milestone("pe_validate")
+    if !hm_first {
+        panic("pe_battlenet_setup_static_crt_path FAIL [has_milestone(pe_validate)] expected=true got=false")
+    }
+    let hm_cookie = has_milestone("security_cookie_init")
+    if !hm_cookie {
+        panic("pe_battlenet_setup_static_crt_path FAIL [has_milestone(security_cookie_init)] expected=true got=false")
+    }
+    let hm_last = has_milestone("winmain_entry")
+    if !hm_last {
+        panic("pe_battlenet_setup_static_crt_path FAIL [has_milestone(winmain_entry)] expected=true got=false")
+    }
+    let hm_miss = has_milestone("nonexistent_milestone")
+    if hm_miss {
+        panic("pe_battlenet_setup_static_crt_path FAIL [has_milestone(nonexistent)] expected=false got=true")
+    }
+    let hm_empty = has_milestone("")
+    if hm_empty {
+        panic("pe_battlenet_setup_static_crt_path FAIL [has_milestone(empty)] expected=false got=true")
+    }
+
+    // ─── stats sanity ───
+    let s = pbsscp_stats()
+    if len(s) != 5 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [stats static_milestone_count] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [stats iat_dependency_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [stats inline_function_size_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [stats text_range_count] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [stats progress_milestone_count] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── stats / summary / kpi r0_emit (22 record + summary/stats/kpi = 25 ≥ 12) ───
+    r0_emit("pe_battlenet_setup_static_crt_path_stats",
+        "\"static_milestone_count\":" + to_string(s[0])
+        + ",\"iat_dependency_count\":" + to_string(s[1])
+        + ",\"inline_function_size_count\":" + to_string(s[2])
+        + ",\"text_range_count\":" + to_string(s[3])
+        + ",\"progress_milestone_count\":" + to_string(s[4]))
+
+    r0_emit("pe_battlenet_setup_static_crt_path_summary",
+        "\"path\":\"pe_validate -> entry_point -> text_section_start -> crt_inline_start -> security_cookie_init -> initterm_walk_start -> scrt_common_main_seh -> winmain_entry\",\"total_records\":22,\"iat_msvcr_fn_count\":0")
+
+    r0_emit("pe_battlenet_setup_static_crt_path_kpi",
+        "\"inline_total_bytes\":1150,\"instructions_to_winmain\":20000,\"final_percent_to_user32\":80,\"static_link_only\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_battlenet_setup_static_crt_path FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pbsscp()
+    let s2 = pbsscp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_battlenet_setup_static_crt_path FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battlenet_setup_static_crt_path self_test PASS (static_milestone="
+        + to_string(s[0]) + ", iat_dependency=" + to_string(s[1])
+        + ", inline_function_size=" + to_string(s[2]) + ", text_range=" + to_string(s[3])
+        + ", progress_milestone=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pbsscp_stats()
+            println("static_milestone_count\t" + to_string(s[0]))
+            println("iat_dependency_count\t" + to_string(s[1]))
+            println("inline_function_size_count\t" + to_string(s[2]))
+            println("text_range_count\t" + to_string(s[3]))
+            println("progress_milestone_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "has-milestone" {
+            if len(a) >= 4 {
+                let name = a[3]
+                if has_milestone(name) {
+                    println("has_milestone\ttrue")
+                } else {
+                    println("has_milestone\tfalse")
+                }
+                return
+            }
+            println("usage: hexa run pe_battlenet_setup_static_crt_path.hexa has-milestone <milestone_name>")
+            return
+        }
+        if sub == "classification-name" {
+            if len(a) >= 4 {
+                let code = to_int(a[3])
+                println(classification_name(code))
+                return
+            }
+            println("usage: hexa run pe_battlenet_setup_static_crt_path.hexa classification-name <0..3>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pbsscp()
+            println("cleaned: " + pbsscp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pbsscp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_battlenet_setup_static_crt_path.hexa { self-test | stats | has-milestone <name> | classification-name <0..3> | cleanup | dir }")
+}

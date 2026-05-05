@@ -1,0 +1,395 @@
+// lib/loader/pe_kuser_shared_data.hexa — cycle 69 KUSER_SHARED_DATA read access skeleton
+//
+// Windows kernel maps KUSER_SHARED_DATA at fixed user-mode VA 0x7FFE0000 — read-only
+// page exposing tick count / system time / QPC / process feature bits / NT version.
+// GetTickCount, QueryPerformanceCounter, RtlGetVersion 등 hot path 가 syscall 없이
+// 바로 read. PE loader 가 process init 시 page 매핑을 보장해야 함.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 read access tracker — 실 page mapping (mmap fixed addr) 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// field_kind code:
+//   1 = tick_count       (offset 0x0320, 4 bytes — TickCountQuad low)
+//   2 = system_time      (offset 0x0014, 8 bytes — SystemTime KSYSTEM_TIME)
+//   3 = qpc              (offset 0x03B8, 8 bytes — QueryPerformanceCounter base)
+//   4 = process_features (offset 0x02D4, 4 bytes — SharedDataFlags bits)
+//   5 = nt_version       (offset 0x026C, 4 bytes — NtMajor/Minor/Build packed)
+//
+// persist schema (TSV — reads.tsv):
+//   read_id<int> \t field_kind<int> \t offset<int> \t bytes_read<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pksd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_kuser_shared_data"
+}
+
+fn pksd_reads_path() -> str {
+    return pksd_dir() + "/reads.tsv"
+}
+
+fn pksd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pksd_dir() + "'")
+}
+
+fn cleanup_pksd() -> void {
+    pksd_ensure_dir()
+    let _ = exec("rm -f '" + pksd_reads_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pksd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pksd_append_row(path: str, row: str) -> void {
+    pksd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_read: KUSER_SHARED_DATA read 1 건 기록 ───
+fn record_read(read_id: int, field_kind: int, offset: int, bytes_read: int) -> void {
+    if read_id <= 0 {
+        panic("pe_kuser_shared_data FAIL [record_read] expected=read_id>0 got=" + to_string(read_id))
+    }
+    if field_kind < 1 {
+        panic("pe_kuser_shared_data FAIL [record_read] expected=field_kind>=1 got=" + to_string(field_kind))
+    }
+    if field_kind > 5 {
+        panic("pe_kuser_shared_data FAIL [record_read] expected=field_kind<=5 got=" + to_string(field_kind))
+    }
+    if offset < 0 {
+        panic("pe_kuser_shared_data FAIL [record_read] expected=offset>=0 got=" + to_string(offset))
+    }
+    if bytes_read <= 0 {
+        panic("pe_kuser_shared_data FAIL [record_read] expected=bytes_read>0 got=" + to_string(bytes_read))
+    }
+    let row = to_string(read_id) + "\t" + to_string(field_kind)
+        + "\t" + to_string(offset) + "\t" + to_string(bytes_read) + "\n"
+    pksd_append_row(pksd_reads_path(), row)
+}
+
+// ─── read_count: total read 수 ───
+fn read_count() -> int {
+    let t = pksd_read_table(pksd_reads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_bytes_read: 모든 read bytes_read 합 ───
+fn total_bytes_read() -> int {
+    let t = pksd_read_table(pksd_reads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_field: 특정 field_kind 의 read 수 ───
+fn count_by_field(field_kind: int) -> int {
+    let t = pksd_read_table(pksd_reads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == field_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_offset: 특정 offset 에서의 read 수 ───
+fn count_by_offset(offset: int) -> int {
+    let t = pksd_read_table(pksd_reads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == offset {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── read_bytes: 특정 read_id 의 bytes_read (없으면 0) ───
+fn read_bytes(read_id: int) -> int {
+    let t = pksd_read_table(pksd_reads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == read_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pksd_stats: [read_count, total_bytes_read, count_by_field(1), count_by_field(3)] ───
+fn pksd_stats() -> array {
+    let mut out = []
+    out.push(read_count())
+    out.push(total_bytes_read())
+    out.push(count_by_field(1))
+    out.push(count_by_field(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pksd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pksd()
+
+    // 2. record 5 reads across 4 distinct field_kinds at distinct offsets
+    record_read(690001, 1, 800, 4)
+    r0_emit("pe_kuser_shared_data_record",
+        "\"read_id\":690001,\"field_kind\":1,\"offset\":800,\"bytes_read\":4,\"target\":\"tick_count\"")
+
+    record_read(690002, 2, 20, 8)
+    r0_emit("pe_kuser_shared_data_record",
+        "\"read_id\":690002,\"field_kind\":2,\"offset\":20,\"bytes_read\":8,\"target\":\"system_time\"")
+
+    record_read(690003, 3, 952, 8)
+    r0_emit("pe_kuser_shared_data_record",
+        "\"read_id\":690003,\"field_kind\":3,\"offset\":952,\"bytes_read\":8,\"target\":\"qpc\"")
+
+    record_read(690004, 1, 800, 4)
+    r0_emit("pe_kuser_shared_data_record",
+        "\"read_id\":690004,\"field_kind\":1,\"offset\":800,\"bytes_read\":4,\"target\":\"tick_count\"")
+
+    record_read(690005, 5, 620, 4)
+    r0_emit("pe_kuser_shared_data_record",
+        "\"read_id\":690005,\"field_kind\":5,\"offset\":620,\"bytes_read\":4,\"target\":\"nt_version\"")
+
+    // 3. read_count = 5
+    let c = read_count()
+    if c != 5 {
+        panic("pe_kuser_shared_data FAIL [read_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_bytes_read = 4 + 8 + 8 + 4 + 4 = 28
+    let tb = total_bytes_read()
+    if tb != 28 {
+        panic("pe_kuser_shared_data FAIL [total_bytes_read] expected=28 got=" + to_string(tb))
+    }
+
+    // 5. count_by_field sanity
+    let f1 = count_by_field(1)
+    if f1 != 2 {
+        panic("pe_kuser_shared_data FAIL [count_by_field(1)] expected=2 got=" + to_string(f1))
+    }
+    let f2 = count_by_field(2)
+    if f2 != 1 {
+        panic("pe_kuser_shared_data FAIL [count_by_field(2)] expected=1 got=" + to_string(f2))
+    }
+    let f3 = count_by_field(3)
+    if f3 != 1 {
+        panic("pe_kuser_shared_data FAIL [count_by_field(3)] expected=1 got=" + to_string(f3))
+    }
+    let f4 = count_by_field(4)
+    if f4 != 0 {
+        panic("pe_kuser_shared_data FAIL [count_by_field(4)] expected=0 got=" + to_string(f4))
+    }
+    let f5 = count_by_field(5)
+    if f5 != 1 {
+        panic("pe_kuser_shared_data FAIL [count_by_field(5)] expected=1 got=" + to_string(f5))
+    }
+
+    // 6. count_by_offset sanity (offset 800 → 2 reads from field_kind=1)
+    let o800 = count_by_offset(800)
+    if o800 != 2 {
+        panic("pe_kuser_shared_data FAIL [count_by_offset(800)] expected=2 got=" + to_string(o800))
+    }
+    let o20 = count_by_offset(20)
+    if o20 != 1 {
+        panic("pe_kuser_shared_data FAIL [count_by_offset(20)] expected=1 got=" + to_string(o20))
+    }
+    let o_miss = count_by_offset(99999)
+    if o_miss != 0 {
+        panic("pe_kuser_shared_data FAIL [count_by_offset(99999)] expected=0 got=" + to_string(o_miss))
+    }
+
+    // 7. read_bytes sanity
+    let b2 = read_bytes(690002)
+    if b2 != 8 {
+        panic("pe_kuser_shared_data FAIL [read_bytes(690002)] expected=8 got=" + to_string(b2))
+    }
+    let b3 = read_bytes(690003)
+    if b3 != 8 {
+        panic("pe_kuser_shared_data FAIL [read_bytes(690003)] expected=8 got=" + to_string(b3))
+    }
+    let b_miss = read_bytes(9999)
+    if b_miss != 0 {
+        panic("pe_kuser_shared_data FAIL [read_bytes(9999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 8. pksd_stats() = [5, 28, 2, 1]
+    let s = pksd_stats()
+    if len(s) != 4 {
+        panic("pe_kuser_shared_data FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_kuser_shared_data FAIL [stats read_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 28 {
+        panic("pe_kuser_shared_data FAIL [stats total_bytes_read] expected=28 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_kuser_shared_data FAIL [stats count_field(1)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_kuser_shared_data FAIL [stats count_field(3)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_kuser_shared_data_stats",
+        "\"read_count\":" + to_string(s[0])
+        + ",\"total_bytes_read\":" + to_string(s[1])
+        + ",\"field_tick_count\":" + to_string(s[2])
+        + ",\"field_qpc\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_kuser_shared_data FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pksd()
+    let s2 = pksd_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_kuser_shared_data FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_kuser_shared_data self_test PASS (reads=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", tick=" + to_string(s[2])
+        + ", qpc=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pksd_stats()
+            println("read_count\t" + to_string(s[0]))
+            println("total_bytes_read\t" + to_string(s[1]))
+            println("count_field_tick_count\t" + to_string(s[2]))
+            println("count_field_qpc\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("read_bytes\t" + to_string(read_bytes(rid)))
+                return
+            }
+            println("usage: hexa run pe_kuser_shared_data.hexa bytes <read_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let fk = to_int(a[3])
+                println("count_by_field\t" + to_string(count_by_field(fk)))
+                return
+            }
+            println("usage: hexa run pe_kuser_shared_data.hexa count <field_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pksd()
+            println("cleaned: " + pksd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pksd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_kuser_shared_data.hexa { self-test | stats | bytes <read_id> | count <field_kind> | cleanup | dir }")
+}

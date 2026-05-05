@@ -1,0 +1,388 @@
+// lib/loader/pe_unicode_string.hexa — stage5 UNICODE_STRING marshalling telemetry
+//
+// NT API 의 UNICODE_STRING { Length, MaximumLength, Buffer } (UTF-16 LE) 를
+// Win32 ANSI/OEM ↔ Unicode 경로에서 marshalling 하는 호출을 추적한다.
+// RtlAnsiStringToUnicodeString / RtlUnicodeStringToAnsiString /
+// RtlUnicodeStringToOemString / identity copy 4 가지 direction 을 모두 카운트.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 marshal op tracker — 실 Rtl* / NtAllocateVirtualMemory 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// direction_kind code:
+//   1 = ansi_to_unicode    (RtlAnsiStringToUnicodeString)
+//   2 = unicode_to_ansi    (RtlUnicodeStringToAnsiString)
+//   3 = unicode_to_oem     (RtlUnicodeStringToOemString)
+//   4 = identity           (UTF-16 → UTF-16 copy)
+//
+// persist schema (TSV — marshals.tsv):
+//   marshal_id<int> \t direction_kind<int> \t length_bytes<int> \t max_length_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pus_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_unicode_string"
+}
+
+fn pus_marshals_path() -> str {
+    return pus_dir() + "/marshals.tsv"
+}
+
+fn pus_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pus_dir() + "'")
+}
+
+fn cleanup_pus() -> void {
+    pus_ensure_dir()
+    let _ = exec("rm -f '" + pus_marshals_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pus_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pus_append_row(path: str, row: str) -> void {
+    pus_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_marshal: marshal 1 건 기록 ───
+fn record_marshal(marshal_id: int, direction_kind: int, length_bytes: int, max_length_bytes: int) -> void {
+    if marshal_id <= 0 {
+        panic("pe_unicode_string FAIL [record_marshal] expected=marshal_id>0 got=" + to_string(marshal_id))
+    }
+    if direction_kind < 1 {
+        panic("pe_unicode_string FAIL [record_marshal] expected=direction_kind>=1 got=" + to_string(direction_kind))
+    }
+    if direction_kind > 4 {
+        panic("pe_unicode_string FAIL [record_marshal] expected=direction_kind<=4 got=" + to_string(direction_kind))
+    }
+    if length_bytes < 0 {
+        panic("pe_unicode_string FAIL [record_marshal] expected=length_bytes>=0 got=" + to_string(length_bytes))
+    }
+    if max_length_bytes < 0 {
+        panic("pe_unicode_string FAIL [record_marshal] expected=max_length_bytes>=0 got=" + to_string(max_length_bytes))
+    }
+    if max_length_bytes < length_bytes {
+        panic("pe_unicode_string FAIL [record_marshal] expected=max_length_bytes>=length_bytes got max="
+            + to_string(max_length_bytes) + " len=" + to_string(length_bytes))
+    }
+    let row = to_string(marshal_id) + "\t" + to_string(direction_kind)
+        + "\t" + to_string(length_bytes) + "\t" + to_string(max_length_bytes) + "\n"
+    pus_append_row(pus_marshals_path(), row)
+}
+
+// ─── marshal_count: total marshal 수 ───
+fn marshal_count() -> int {
+    let t = pus_read_table(pus_marshals_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_length_bytes: 모든 marshal length_bytes 합 ───
+fn total_length_bytes() -> int {
+    let t = pus_read_table(pus_marshals_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_max_bytes: 모든 marshal max_length_bytes 합 ───
+fn total_max_bytes() -> int {
+    let t = pus_read_table(pus_marshals_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_direction: 특정 direction_kind 의 marshal 수 ───
+fn count_by_direction(direction_kind: int) -> int {
+    let t = pus_read_table(pus_marshals_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == direction_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── marshal_length: 특정 marshal_id 의 length_bytes (없으면 0) ───
+fn marshal_length(marshal_id: int) -> int {
+    let t = pus_read_table(pus_marshals_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == marshal_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pus_stats: [marshal_count, total_length_bytes, total_max_bytes, count_by_direction(1)] ───
+fn pus_stats() -> array {
+    let mut out = []
+    out.push(marshal_count())
+    out.push(total_length_bytes())
+    out.push(total_max_bytes())
+    out.push(count_by_direction(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pus-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pus()
+
+    // 2. record 5 marshals across 3+ directions (1, 2, 3, 4)
+    //    UTF-16 LE: 각 wide char = 2 bytes, MaximumLength 는 보통 Length + 2 (NUL terminator)
+    record_marshal(220001, 1, 24, 26)   // ansi_to_unicode "C:\\Windows\\System32" 12 chars * 2
+    r0_emit("pe_unicode_string_record",
+        "\"marshal_id\":220001,\"direction_kind\":1,\"length_bytes\":24,\"max_length_bytes\":26,\"target\":\"ansi_to_unicode\"")
+
+    record_marshal(220002, 2, 16, 17)   // unicode_to_ansi "Diablo II.exe" 16 ansi bytes
+    r0_emit("pe_unicode_string_record",
+        "\"marshal_id\":220002,\"direction_kind\":2,\"length_bytes\":16,\"max_length_bytes\":17,\"target\":\"unicode_to_ansi\"")
+
+    record_marshal(220003, 3, 32, 33)   // unicode_to_oem "한글경로\\게임.exe" → CP949 32 bytes
+    r0_emit("pe_unicode_string_record",
+        "\"marshal_id\":220003,\"direction_kind\":3,\"length_bytes\":32,\"max_length_bytes\":33,\"target\":\"unicode_to_oem\"")
+
+    record_marshal(220004, 1, 40, 42)   // ansi_to_unicode 두 번째 — registry path
+    r0_emit("pe_unicode_string_record",
+        "\"marshal_id\":220004,\"direction_kind\":1,\"length_bytes\":40,\"max_length_bytes\":42,\"target\":\"ansi_to_unicode\"")
+
+    record_marshal(220005, 4, 64, 66)   // identity UTF-16 copy
+    r0_emit("pe_unicode_string_record",
+        "\"marshal_id\":220005,\"direction_kind\":4,\"length_bytes\":64,\"max_length_bytes\":66,\"target\":\"identity\"")
+
+    // 3. marshal_count = 5
+    let c = marshal_count()
+    if c != 5 {
+        panic("pe_unicode_string FAIL [marshal_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_length_bytes = 24 + 16 + 32 + 40 + 64 = 176
+    let tl = total_length_bytes()
+    if tl != 176 {
+        panic("pe_unicode_string FAIL [total_length_bytes] expected=176 got=" + to_string(tl))
+    }
+
+    // 5. total_max_bytes = 26 + 17 + 33 + 42 + 66 = 184
+    let tm = total_max_bytes()
+    if tm != 184 {
+        panic("pe_unicode_string FAIL [total_max_bytes] expected=184 got=" + to_string(tm))
+    }
+
+    // 6. count_by_direction sanity
+    let d1 = count_by_direction(1)
+    if d1 != 2 {
+        panic("pe_unicode_string FAIL [count_by_direction(1)] expected=2 got=" + to_string(d1))
+    }
+    let d2 = count_by_direction(2)
+    if d2 != 1 {
+        panic("pe_unicode_string FAIL [count_by_direction(2)] expected=1 got=" + to_string(d2))
+    }
+    let d3 = count_by_direction(3)
+    if d3 != 1 {
+        panic("pe_unicode_string FAIL [count_by_direction(3)] expected=1 got=" + to_string(d3))
+    }
+    let d4 = count_by_direction(4)
+    if d4 != 1 {
+        panic("pe_unicode_string FAIL [count_by_direction(4)] expected=1 got=" + to_string(d4))
+    }
+    let d99 = count_by_direction(99)
+    if d99 != 0 {
+        panic("pe_unicode_string FAIL [count_by_direction(99)] expected=0 got=" + to_string(d99))
+    }
+
+    // 7. marshal_length sanity
+    let l3 = marshal_length(220003)
+    if l3 != 32 {
+        panic("pe_unicode_string FAIL [marshal_length(220003)] expected=32 got=" + to_string(l3))
+    }
+    let l5 = marshal_length(220005)
+    if l5 != 64 {
+        panic("pe_unicode_string FAIL [marshal_length(220005)] expected=64 got=" + to_string(l5))
+    }
+    let l_miss = marshal_length(9999)
+    if l_miss != 0 {
+        panic("pe_unicode_string FAIL [marshal_length(9999)] expected=0 got=" + to_string(l_miss))
+    }
+
+    // 8. pus_stats() = [5, 176, 184, 2]
+    let s = pus_stats()
+    if len(s) != 4 {
+        panic("pe_unicode_string FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_unicode_string FAIL [stats marshal_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 176 {
+        panic("pe_unicode_string FAIL [stats total_length_bytes] expected=176 got=" + to_string(s[1]))
+    }
+    if s[2] != 184 {
+        panic("pe_unicode_string FAIL [stats total_max_bytes] expected=184 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_unicode_string FAIL [stats count_dir(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_unicode_string_stats",
+        "\"marshal_count\":" + to_string(s[0])
+        + ",\"total_length_bytes\":" + to_string(s[1])
+        + ",\"total_max_bytes\":" + to_string(s[2])
+        + ",\"dir_ansi_to_unicode\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_unicode_string FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pus()
+    let s2 = pus_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_unicode_string FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_unicode_string self_test PASS (marshals=" + to_string(s[0])
+        + ", length=" + to_string(s[1]) + ", max=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pus_stats()
+            println("marshal_count\t" + to_string(s[0]))
+            println("total_length_bytes\t" + to_string(s[1]))
+            println("total_max_bytes\t" + to_string(s[2]))
+            println("count_dir_ansi_to_unicode\t" + to_string(s[3]))
+            return
+        }
+        if sub == "length" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("marshal_length\t" + to_string(marshal_length(mid)))
+                return
+            }
+            println("usage: hexa run pe_unicode_string.hexa length <marshal_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let dk = to_int(a[3])
+                println("count_by_direction\t" + to_string(count_by_direction(dk)))
+                return
+            }
+            println("usage: hexa run pe_unicode_string.hexa count <direction_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pus()
+            println("cleaned: " + pus_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pus_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_unicode_string.hexa { self-test | stats | length <marshal_id> | count <direction_kind> | cleanup | dir }")
+}

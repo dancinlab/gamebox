@@ -1,0 +1,446 @@
+// lib/loader/pe_ntdll_set_information_file.hexa — NTDLL NtSetInformationFile / NtQueryInformationFile bridge
+//
+// NTDLL NtSetInformationFile / NtQueryInformationFile → POSIX bridge:
+//   NtQueryInformationFile(FileBasicInformation)    → fstat(2) (st_atime/st_mtime/st_ctime/attr)
+//   NtQueryInformationFile(FileStandardInformation) → fstat(2) (st_size/AllocationSize/NumberOfLinks)
+//   NtSetInformationFile(FileRenameInformation)     → rename(2) (target utf8 path)
+//   NtSetInformationFile(FileDispositionInformation) { DeleteFile=TRUE } → unlink at close (defer to NtClose)
+//   NtSetInformationFile(FileEndOfFileInformation)  → ftruncate(2) (set EOF)
+//   NtSetInformationFile(FileLinkInformation)       → link(2) (hard link create)
+//
+//   FileRenameInformation → rename(2). FileDispositionInformation { DeleteFile=TRUE } → unlink at close.
+//   FileEndOfFileInformation → ftruncate.
+//
+//   D2R/D4 .d2s/.d4s SaveData write 후 atomic swap path: WriteFile → SetInformationFile(Rename) → CloseHandle
+// own1: NTDLL spec + Apple POSIX. Wine 인용 X.
+//
+// own 1 enforcement: 타사 community 코드 0 줄. 본 module 은 NT API call tracker — 실 syscall X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = NtSetInformationFile
+//   2 = NtQueryInformationFile
+//
+// info_class code (FILE_INFORMATION_CLASS subset):
+//    4 = FileBasicInformation
+//    5 = FileStandardInformation
+//   10 = FileRenameInformation
+//   13 = FileDispositionInformation
+//   22 = FileEndOfFileInformation
+//   64 = FileLinkInformation
+//
+// nt_status code (decimal — stored as int):
+//   0          = STATUS_SUCCESS
+//   3221225506 = 0xC0000022 = STATUS_ACCESS_DENIED
+//   3221225524 = 0xC0000034 = STATUS_OBJECT_NAME_NOT_FOUND
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t info_class<int> \t nt_status<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnsif_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_set_information_file"
+}
+
+fn pnsif_ops_path() -> str {
+    return pnsif_dir() + "/ops.tsv"
+}
+
+fn pnsif_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnsif_dir() + "'")
+}
+
+fn cleanup_pnsif() -> void {
+    pnsif_ensure_dir()
+    let _ = exec("rm -f '" + pnsif_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnsif_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnsif_append_row(path: str, row: str) -> void {
+    pnsif_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: NT API op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, info_class: int, nt_status: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_set_information_file FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ntdll_set_information_file FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 2 {
+        panic("pe_ntdll_set_information_file FAIL [record_op] expected=op_kind<=2 got=" + to_string(op_kind))
+    }
+    if info_class < 1 {
+        panic("pe_ntdll_set_information_file FAIL [record_op] expected=info_class>=1 got=" + to_string(info_class))
+    }
+    if nt_status < 0 {
+        panic("pe_ntdll_set_information_file FAIL [record_op] expected=nt_status>=0 got=" + to_string(nt_status))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(info_class) + "\t" + to_string(nt_status) + "\n"
+    pnsif_append_row(pnsif_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pnsif_read_table(pnsif_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pnsif_read_table(pnsif_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_info_class: 특정 info_class 의 op 수 ───
+fn count_by_info_class(info: int) -> int {
+    let t = pnsif_read_table(pnsif_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == info {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: nt_status == 0 (STATUS_SUCCESS) op 수 ───
+fn success_count() -> int {
+    let t = pnsif_read_table(pnsif_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── rename_count: FileRenameInformation (info_class=10) op 수 ───
+fn rename_count() -> int {
+    return count_by_info_class(10)
+}
+
+// ─── op_nt_status: 특정 op_id 의 nt_status (없으면 -1) ───
+fn op_nt_status(op_id: int) -> int {
+    let t = pnsif_read_table(pnsif_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnsif_stats: [op_count, success_count, count_by_op_kind(1), rename_count] ───
+fn pnsif_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(success_count())
+    out.push(count_by_op_kind(1))
+    out.push(rename_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnsif-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnsif()
+
+    // 2. record 6 ops — covers both op_kinds (set/query) + ≥3 info_classes (basic/standard/rename/disposition/end_of_file)
+    //    NtQueryInformationFile FileBasicInformation SUCCESS (fstat → atime/mtime)
+    record_op(140001, 2, 4, 0)
+    r0_emit("pe_ntdll_set_information_file_record",
+        "\"op_id\":140001,\"op_kind\":2,\"info_class\":4,\"nt_status\":0,\"target\":\"NtQueryInformationFile/FileBasicInformation\"")
+
+    //    NtQueryInformationFile FileStandardInformation SUCCESS (fstat → st_size)
+    record_op(140002, 2, 5, 0)
+    r0_emit("pe_ntdll_set_information_file_record",
+        "\"op_id\":140002,\"op_kind\":2,\"info_class\":5,\"nt_status\":0,\"target\":\"NtQueryInformationFile/FileStandardInformation\"")
+
+    //    NtSetInformationFile FileRenameInformation SUCCESS (rename(2) — D2R .d2s atomic swap)
+    record_op(140003, 1, 10, 0)
+    r0_emit("pe_ntdll_set_information_file_record",
+        "\"op_id\":140003,\"op_kind\":1,\"info_class\":10,\"nt_status\":0,\"target\":\"NtSetInformationFile/FileRenameInformation\"")
+
+    //    NtSetInformationFile FileDispositionInformation { DeleteFile=TRUE } SUCCESS (unlink at close)
+    record_op(140004, 1, 13, 0)
+    r0_emit("pe_ntdll_set_information_file_record",
+        "\"op_id\":140004,\"op_kind\":1,\"info_class\":13,\"nt_status\":0,\"target\":\"NtSetInformationFile/FileDispositionInformation\"")
+
+    //    NtSetInformationFile FileEndOfFileInformation → ftruncate ACCESS_DENIED (read-only handle)
+    record_op(140005, 1, 22, 3221225506)
+    r0_emit("pe_ntdll_set_information_file_record",
+        "\"op_id\":140005,\"op_kind\":1,\"info_class\":22,\"nt_status\":3221225506,\"target\":\"NtSetInformationFile/FileEndOfFileInformation\"")
+
+    //    NtSetInformationFile FileRenameInformation → rename(2) OBJECT_NAME_NOT_FOUND (target dir missing)
+    record_op(140006, 1, 10, 3221225524)
+    r0_emit("pe_ntdll_set_information_file_record",
+        "\"op_id\":140006,\"op_kind\":1,\"info_class\":10,\"nt_status\":3221225524,\"target\":\"NtSetInformationFile/FileRenameInformation\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_ntdll_set_information_file FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (both op_kinds covered)
+    let k1 = count_by_op_kind(1)
+    if k1 != 4 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_op_kind(1)] expected=4 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. count_by_info_class sanity (≥3 info_classes covered: 4,5,10,13,22)
+    let i4 = count_by_info_class(4)
+    if i4 != 1 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_info_class(4)] expected=1 got=" + to_string(i4))
+    }
+    let i5 = count_by_info_class(5)
+    if i5 != 1 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_info_class(5)] expected=1 got=" + to_string(i5))
+    }
+    let i10 = count_by_info_class(10)
+    if i10 != 2 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_info_class(10)] expected=2 got=" + to_string(i10))
+    }
+    let i13 = count_by_info_class(13)
+    if i13 != 1 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_info_class(13)] expected=1 got=" + to_string(i13))
+    }
+    let i22 = count_by_info_class(22)
+    if i22 != 1 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_info_class(22)] expected=1 got=" + to_string(i22))
+    }
+    let i64 = count_by_info_class(64)
+    if i64 != 0 {
+        panic("pe_ntdll_set_information_file FAIL [count_by_info_class(64)] expected=0 got=" + to_string(i64))
+    }
+
+    // 6. success_count = 4 (140001, 140002, 140003, 140004)
+    let sc = success_count()
+    if sc != 4 {
+        panic("pe_ntdll_set_information_file FAIL [success_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 7. rename_count = 2 (info_class=10 — 140003 + 140006)
+    let rc = rename_count()
+    if rc != 2 {
+        panic("pe_ntdll_set_information_file FAIL [rename_count] expected=2 got=" + to_string(rc))
+    }
+
+    // 8. op_nt_status sanity
+    let st1 = op_nt_status(140001)
+    if st1 != 0 {
+        panic("pe_ntdll_set_information_file FAIL [op_nt_status(140001)] expected=0 got=" + to_string(st1))
+    }
+    let st5 = op_nt_status(140005)
+    if st5 != 3221225506 {
+        panic("pe_ntdll_set_information_file FAIL [op_nt_status(140005)] expected=3221225506 got=" + to_string(st5))
+    }
+    let st_miss = op_nt_status(9999)
+    if st_miss != -1 {
+        panic("pe_ntdll_set_information_file FAIL [op_nt_status(9999)] expected=-1 got=" + to_string(st_miss))
+    }
+
+    // 9. pnsif_stats() = [6, 4, 4, 2]
+    let s = pnsif_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_set_information_file FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_ntdll_set_information_file FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_ntdll_set_information_file FAIL [stats success_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_ntdll_set_information_file FAIL [stats op_kind(1)] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ntdll_set_information_file FAIL [stats rename_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit)
+    r0_emit("pe_ntdll_set_information_file_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"success_count\":" + to_string(s[1])
+        + ",\"op_kind_set\":" + to_string(s[2])
+        + ",\"rename_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_ntdll_set_information_file FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pnsif()
+    let s2 = pnsif_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_set_information_file FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_set_information_file self_test PASS (ops=" + to_string(s[0])
+        + ", success=" + to_string(s[1]) + ", set=" + to_string(s[2])
+        + ", rename=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnsif_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("success_count\t" + to_string(s[1]))
+            println("count_op_kind_set\t" + to_string(s[2]))
+            println("rename_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_nt_status\t" + to_string(op_nt_status(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_set_information_file.hexa status <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "kind" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+                if what == "info" {
+                    println("count_by_info_class\t" + to_string(count_by_info_class(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_set_information_file.hexa count { kind <op_kind> | info <info_class> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnsif()
+            println("cleaned: " + pnsif_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnsif_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_set_information_file.hexa { self-test | stats | status <op_id> | count kind <op_kind> | count info <info_class> | cleanup | dir }")
+}

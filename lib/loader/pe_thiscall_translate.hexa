@@ -1,0 +1,389 @@
+// lib/loader/pe_thiscall_translate.hexa — cycle68 C++ thiscall → arm64 translation telemetry
+//
+// PE x86/x64 C++ method 호출 규약 → arm64 변환 추적.
+//   - i386 MSVC thiscall: ECX = this pointer, args on stack (right→left, callee clean)
+//   - x64 MSVC: RCX = this, RDX/R8/R9 = args, shadow space 32B
+//   - i386 GCC: this on stack (cdecl-ish), caller clean
+//   → arm64 AAPCS64: X0 = this, X1..X7 = args
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 thiscall translation tracker — 실 binary translation X (stage7).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// abi_kind code:
+//   1 = msvc_x86  (ECX = this)
+//   2 = msvc_x64  (RCX = this)
+//   3 = gcc_x86   (this on stack)
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t abi_kind<int> \t param_count<int> \t virtual_call<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ptct_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_thiscall_translate"
+}
+
+fn ptct_calls_path() -> str {
+    return ptct_dir() + "/calls.tsv"
+}
+
+fn ptct_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ptct_dir() + "'")
+}
+
+fn cleanup_ptct() -> void {
+    ptct_ensure_dir()
+    let _ = exec("rm -f '" + ptct_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ptct_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ptct_append_row(path: str, row: str) -> void {
+    ptct_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: thiscall 1 건 기록 ───
+fn record_call(call_id: int, abi_kind: int, param_count: int, virtual_call: int) -> void {
+    if call_id <= 0 {
+        panic("pe_thiscall_translate FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if abi_kind < 1 {
+        panic("pe_thiscall_translate FAIL [record_call] expected=abi_kind>=1 got=" + to_string(abi_kind))
+    }
+    if abi_kind > 3 {
+        panic("pe_thiscall_translate FAIL [record_call] expected=abi_kind<=3 got=" + to_string(abi_kind))
+    }
+    if param_count < 0 {
+        panic("pe_thiscall_translate FAIL [record_call] expected=param_count>=0 got=" + to_string(param_count))
+    }
+    if virtual_call < 0 {
+        panic("pe_thiscall_translate FAIL [record_call] expected=virtual_call>=0 got=" + to_string(virtual_call))
+    }
+    if virtual_call > 1 {
+        panic("pe_thiscall_translate FAIL [record_call] expected=virtual_call<=1 got=" + to_string(virtual_call))
+    }
+    let row = to_string(call_id) + "\t" + to_string(abi_kind)
+        + "\t" + to_string(param_count) + "\t" + to_string(virtual_call) + "\n"
+    ptct_append_row(ptct_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = ptct_read_table(ptct_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── virtual_call_count: virtual_call=1 인 call 수 ───
+fn virtual_call_count() -> int {
+    let t = ptct_read_table(ptct_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_params: 모든 call param_count 합 ───
+fn total_params() -> int {
+    let t = ptct_read_table(ptct_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_abi: 특정 abi_kind 의 call 수 ───
+fn count_by_abi(abi_kind: int) -> int {
+    let t = ptct_read_table(ptct_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == abi_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── call_param_count: 특정 call_id 의 param_count (없으면 0) ───
+fn call_param_count(call_id: int) -> int {
+    let t = ptct_read_table(ptct_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ptct_stats: [call_count, total_params, virtual_call_count, count_by_abi(2)] ───
+fn ptct_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(total_params())
+    out.push(virtual_call_count())
+    out.push(count_by_abi(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ptct-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ptct()
+
+    // 2. record 5 calls — 3 abi_kinds, 2 virtual
+    record_call(680001, 1, 2, 0)
+    r0_emit("pe_thiscall_translate_record",
+        "\"call_id\":680001,\"abi_kind\":1,\"param_count\":2,\"virtual_call\":0,\"target\":\"msvc_x86_static\"")
+
+    record_call(680002, 1, 3, 1)
+    r0_emit("pe_thiscall_translate_record",
+        "\"call_id\":680002,\"abi_kind\":1,\"param_count\":3,\"virtual_call\":1,\"target\":\"msvc_x86_virtual\"")
+
+    record_call(680003, 2, 4, 1)
+    r0_emit("pe_thiscall_translate_record",
+        "\"call_id\":680003,\"abi_kind\":2,\"param_count\":4,\"virtual_call\":1,\"target\":\"msvc_x64_virtual\"")
+
+    record_call(680004, 2, 1, 0)
+    r0_emit("pe_thiscall_translate_record",
+        "\"call_id\":680004,\"abi_kind\":2,\"param_count\":1,\"virtual_call\":0,\"target\":\"msvc_x64_static\"")
+
+    record_call(680005, 3, 5, 0)
+    r0_emit("pe_thiscall_translate_record",
+        "\"call_id\":680005,\"abi_kind\":3,\"param_count\":5,\"virtual_call\":0,\"target\":\"gcc_x86_static\"")
+
+    // 3. call_count = 5
+    let c = call_count()
+    if c != 5 {
+        panic("pe_thiscall_translate FAIL [call_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_params = 15
+    let tp = total_params()
+    if tp != 15 {
+        panic("pe_thiscall_translate FAIL [total_params] expected=15 got=" + to_string(tp))
+    }
+
+    // 5. virtual_call_count = 2
+    let vc = virtual_call_count()
+    if vc != 2 {
+        panic("pe_thiscall_translate FAIL [virtual_call_count] expected=2 got=" + to_string(vc))
+    }
+
+    // 6. count_by_abi sanity
+    let a1 = count_by_abi(1)
+    if a1 != 2 {
+        panic("pe_thiscall_translate FAIL [count_by_abi(1)] expected=2 got=" + to_string(a1))
+    }
+    let a2 = count_by_abi(2)
+    if a2 != 2 {
+        panic("pe_thiscall_translate FAIL [count_by_abi(2)] expected=2 got=" + to_string(a2))
+    }
+    let a3 = count_by_abi(3)
+    if a3 != 1 {
+        panic("pe_thiscall_translate FAIL [count_by_abi(3)] expected=1 got=" + to_string(a3))
+    }
+    let a99 = count_by_abi(99)
+    if a99 != 0 {
+        panic("pe_thiscall_translate FAIL [count_by_abi(99)] expected=0 got=" + to_string(a99))
+    }
+
+    // 7. call_param_count sanity
+    let p3 = call_param_count(680003)
+    if p3 != 4 {
+        panic("pe_thiscall_translate FAIL [call_param_count(680003)] expected=4 got=" + to_string(p3))
+    }
+    let p5 = call_param_count(680005)
+    if p5 != 5 {
+        panic("pe_thiscall_translate FAIL [call_param_count(680005)] expected=5 got=" + to_string(p5))
+    }
+    let p_miss = call_param_count(9999)
+    if p_miss != 0 {
+        panic("pe_thiscall_translate FAIL [call_param_count(9999)] expected=0 got=" + to_string(p_miss))
+    }
+
+    // 8. ptct_stats() = [5, 15, 2, 2]
+    let s = ptct_stats()
+    if len(s) != 4 {
+        panic("pe_thiscall_translate FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_thiscall_translate FAIL [stats call_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 15 {
+        panic("pe_thiscall_translate FAIL [stats total_params] expected=15 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_thiscall_translate FAIL [stats virtual_call_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_thiscall_translate FAIL [stats count_abi(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_thiscall_translate_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"total_params\":" + to_string(s[1])
+        + ",\"virtual_calls\":" + to_string(s[2])
+        + ",\"abi_msvc_x64\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_thiscall_translate FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_ptct()
+    let s2 = ptct_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_thiscall_translate FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_thiscall_translate self_test PASS (calls=" + to_string(s[0])
+        + ", params=" + to_string(s[1]) + ", virtual=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ptct_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("total_params\t" + to_string(s[1]))
+            println("virtual_call_count\t" + to_string(s[2]))
+            println("count_abi_msvc_x64\t" + to_string(s[3]))
+            return
+        }
+        if sub == "params" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_param_count\t" + to_string(call_param_count(cid)))
+                return
+            }
+            println("usage: hexa run pe_thiscall_translate.hexa params <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let arg = a[3]
+                if arg == "virtual" {
+                    println("virtual_call_count\t" + to_string(virtual_call_count()))
+                    return
+                }
+                let abi = to_int(arg)
+                println("count_by_abi\t" + to_string(count_by_abi(abi)))
+                return
+            }
+            println("usage: hexa run pe_thiscall_translate.hexa count { virtual | <abi_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ptct()
+            println("cleaned: " + ptct_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ptct_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_thiscall_translate.hexa { self-test | stats | params <call_id> | count virtual | count <abi_kind> | cleanup | dir }")
+}

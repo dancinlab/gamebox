@@ -1,0 +1,555 @@
+// lib/loader/pe_msvc_funcinfo_scope_table.hexa — MSVC FuncInfo + UnwindMap + TryBlockMap walk tracker (r3 wave 17-C)
+//
+// 본 module 은 wave 17-B (catch_frame_layout_v2) 의 후속. catch frame 의 register layout
+// 정합 기반 위에서, MSVC C++ EH 의 핵심 metadata 자료구조 — FuncInfo / UnwindMapEntry /
+// TryBlockMapEntry / HandlerArrayEntry 의 walk 를 빈 cell 로 추적 (algorithm direction
+// reference only — Wine code 0 줄):
+//
+//   research-3 (Wine MSVCRT cppexcept.h — algorithm direction):
+//     FuncInfo {
+//         magicNumber                   // 0x19930520 (VC6) / 0x19930521 (VC7) / 0x19930522 (VC8)
+//         maxState                      // unwindMap entry 개수
+//         pUnwindMap (UnwindMapEntry*)  // state → unwind action
+//         nTryBlocks
+//         pTryBlockMap (TryBlockMapEntry*)
+//         ...                            // VC7+: pESTypeList / ipMapEntries / EHFlags
+//     }
+//     UnwindMapEntry { toState, action }    // toState = -1 → no further unwind
+//     TryBlockMapEntry { tryLow, tryHigh, catchHigh, nCatches, pHandlerArray }
+//     HandlerArrayEntry { adjectives, pType (TypeDescriptor*), dispOfHandler }
+//
+//   walk algorithm (state machine — direction only):
+//     1) thrown state := tryLow  (try block 진입)
+//     2) catch 후보 검사: type 비교 → match 시 catch handler 진입
+//     3) unwind: thrown state > target_state 인 동안 pUnwindMap[state].action 호출
+//        후 state := pUnwindMap[state].toState
+//     4) collided unwind: 다른 unwind 도중 또 throw → terminate 또는 chained
+//
+// own 1 enforcement: Wine/CrossOver/GPTK/Whisky/Box86/QEMU 코드 0 줄 import.
+//   research 는 Microsoft cppexcept.h spec 의 "방향" 만 참조. 코드 복제 X.
+//   본 module 은 pure tracker — 실 dispatch X.
+// own 2 mandate: panic + r0_emit ≥ 14 + self_test() + main() dispatch.
+//
+// persist schema (TSV — records.tsv):
+//   record_id<int> \t kind<str> \t a<int> \t b<int> \t c<int> \t d<int> \t e<int> \t f<int>
+//
+//   kind 별 의미:
+//     "funcinfo_parse"        — a=parse_id, b=func_va, c=magic_number, d=max_state, e=n_try_blocks
+//     "unwind_map_entry"      — a=entry_id, b=parse_id, c=slot_index, d=to_state, e=action_va
+//     "try_block_entry"       — a=try_id, b=parse_id, c=try_low, d=try_high, e=catch_high, f=n_catches
+//     "handler_array_entry"   — a=handler_id, b=try_id, c=adjectives, d=type_descriptor_va, e=disp_of_handler
+//     "state_machine_walk"    — a=walk_id, b=parse_id, c=current_state, d=target_state, e=walked_kind
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmfst_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_funcinfo_scope_table"
+}
+
+fn pmfst_records_path() -> str {
+    return pmfst_dir() + "/records.tsv"
+}
+
+fn pmfst_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmfst_dir() + "'")
+}
+
+fn cleanup_pmfst() -> void {
+    pmfst_ensure_dir()
+    let _ = exec("rm -f '" + pmfst_records_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmfst_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmfst_append_row(path: str, row: str) -> void {
+    pmfst_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int ───
+fn pmfst_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_funcinfo_scope_table FAIL [pmfst_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── magic_name: VC6 / VC7 / VC8 → 이름 ───
+//   0x19930520 = 428916512 = VC6
+//   0x19930521 = 428916513 = VC7
+//   0x19930522 = 428916514 = VC8
+fn magic_name(magic_number: int) -> str {
+    if magic_number == 428916512 { return "VC6" }
+    if magic_number == 428916513 { return "VC7" }
+    if magic_number == 428916514 { return "VC8" }
+    return "?"
+}
+
+// ─── walked_kind_name: 0..2 → walk kind 이름 ───
+//   0 = catch              (catch handler 진입)
+//   1 = unwind             (cleanup 진행)
+//   2 = collided           (collided unwind — 또 다른 throw 발생)
+fn walked_kind_name(k: int) -> str {
+    if k == 0 { return "catch" }
+    if k == 1 { return "unwind" }
+    if k == 2 { return "collided" }
+    return "?"
+}
+
+// ─── record_funcinfo_parse: FuncInfo 구조체 parse (magic / maxState / nTryBlocks) ───
+fn record_funcinfo_parse(parse_id: int, func_va_hex: str, magic_number: int, max_state: int, n_try_blocks: int) -> void {
+    if parse_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_funcinfo_parse] expected=parse_id>0 got=" + to_string(parse_id))
+    }
+    let f = pmfst_hex_to_int(func_va_hex)
+    if f <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_funcinfo_parse] expected=func_va>0 got=" + to_string(f))
+    }
+    if magic_number != 428916512 {
+        if magic_number != 428916513 {
+            if magic_number != 428916514 {
+                panic("pe_msvc_funcinfo_scope_table FAIL [record_funcinfo_parse] expected=magic_number in {VC6,VC7,VC8} got=" + to_string(magic_number))
+            }
+        }
+    }
+    if max_state < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_funcinfo_parse] expected=max_state>=0 got=" + to_string(max_state))
+    }
+    if n_try_blocks < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_funcinfo_parse] expected=n_try_blocks>=0 got=" + to_string(n_try_blocks))
+    }
+    let row = to_string(parse_id) + "\tfuncinfo_parse"
+        + "\t" + to_string(parse_id) + "\t" + to_string(f) + "\t" + to_string(magic_number)
+        + "\t" + to_string(max_state) + "\t" + to_string(n_try_blocks) + "\t0\n"
+    pmfst_append_row(pmfst_records_path(), row)
+}
+
+// ─── record_unwind_map_entry: UnwindMapEntry { toState, action } ───
+fn record_unwind_map_entry(entry_id: int, parse_id: int, slot_index: int, to_state: int, action_va_hex: str) -> void {
+    if entry_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_unwind_map_entry] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    if parse_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_unwind_map_entry] expected=parse_id>0 got=" + to_string(parse_id))
+    }
+    if slot_index < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_unwind_map_entry] expected=slot_index>=0 got=" + to_string(slot_index))
+    }
+    // to_state == -1 → no further unwind (sentinel)
+    if to_state < -1 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_unwind_map_entry] expected=to_state>=-1 got=" + to_string(to_state))
+    }
+    let a = pmfst_hex_to_int(action_va_hex)
+    if a < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_unwind_map_entry] expected=action_va>=0 got=" + to_string(a))
+    }
+    let row = to_string(entry_id) + "\tunwind_map_entry"
+        + "\t" + to_string(entry_id) + "\t" + to_string(parse_id) + "\t" + to_string(slot_index)
+        + "\t" + to_string(to_state) + "\t" + to_string(a) + "\t0\n"
+    pmfst_append_row(pmfst_records_path(), row)
+}
+
+// ─── record_try_block_entry: TryBlockMapEntry { tryLow, tryHigh, catchHigh, nCatches, ... } ───
+fn record_try_block_entry(try_id: int, parse_id: int, try_low: int, try_high: int, catch_high: int, n_catches: int) -> void {
+    if try_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_try_block_entry] expected=try_id>0 got=" + to_string(try_id))
+    }
+    if parse_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_try_block_entry] expected=parse_id>0 got=" + to_string(parse_id))
+    }
+    if try_low < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_try_block_entry] expected=try_low>=0 got=" + to_string(try_low))
+    }
+    if try_high < try_low {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_try_block_entry] expected=try_high>=try_low got=" + to_string(try_high))
+    }
+    if catch_high < try_high {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_try_block_entry] expected=catch_high>=try_high got=" + to_string(catch_high))
+    }
+    if n_catches <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_try_block_entry] expected=n_catches>0 got=" + to_string(n_catches))
+    }
+    let row = to_string(try_id) + "\ttry_block_entry"
+        + "\t" + to_string(try_id) + "\t" + to_string(parse_id) + "\t" + to_string(try_low)
+        + "\t" + to_string(try_high) + "\t" + to_string(catch_high) + "\t" + to_string(n_catches) + "\n"
+    pmfst_append_row(pmfst_records_path(), row)
+}
+
+// ─── record_handler_array_entry: HandlerArrayEntry { adjectives, pType, dispOfHandler } ───
+fn record_handler_array_entry(handler_id: int, try_id: int, adjectives: int, type_descriptor_va_hex: str, disp_of_handler: int) -> void {
+    if handler_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_handler_array_entry] expected=handler_id>0 got=" + to_string(handler_id))
+    }
+    if try_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_handler_array_entry] expected=try_id>0 got=" + to_string(try_id))
+    }
+    if adjectives < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_handler_array_entry] expected=adjectives>=0 got=" + to_string(adjectives))
+    }
+    let t = pmfst_hex_to_int(type_descriptor_va_hex)
+    if t < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_handler_array_entry] expected=type_descriptor_va>=0 got=" + to_string(t))
+    }
+    if disp_of_handler < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_handler_array_entry] expected=disp_of_handler>=0 got=" + to_string(disp_of_handler))
+    }
+    let row = to_string(handler_id) + "\thandler_array_entry"
+        + "\t" + to_string(handler_id) + "\t" + to_string(try_id) + "\t" + to_string(adjectives)
+        + "\t" + to_string(t) + "\t" + to_string(disp_of_handler) + "\t0\n"
+    pmfst_append_row(pmfst_records_path(), row)
+}
+
+// ─── record_state_machine_walk: state transition walk (catch / unwind / collided) ───
+fn record_state_machine_walk(walk_id: int, parse_id: int, current_state: int, target_state: int, walked_kind: int) -> void {
+    if walk_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_state_machine_walk] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if parse_id <= 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_state_machine_walk] expected=parse_id>0 got=" + to_string(parse_id))
+    }
+    if current_state < -1 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_state_machine_walk] expected=current_state>=-1 got=" + to_string(current_state))
+    }
+    if target_state < -1 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_state_machine_walk] expected=target_state>=-1 got=" + to_string(target_state))
+    }
+    if walked_kind < 0 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_state_machine_walk] expected=walked_kind>=0 got=" + to_string(walked_kind))
+    }
+    if walked_kind > 2 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [record_state_machine_walk] expected=walked_kind<=2 got=" + to_string(walked_kind))
+    }
+    let row = to_string(walk_id) + "\tstate_machine_walk"
+        + "\t" + to_string(walk_id) + "\t" + to_string(parse_id) + "\t" + to_string(current_state)
+        + "\t" + to_string(target_state) + "\t" + to_string(walked_kind) + "\t0\n"
+    pmfst_append_row(pmfst_records_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn pmfst_count_kind(kind_filter: str) -> int {
+    let t = pmfst_read_table(pmfst_records_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 8 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn funcinfo_parse_count() -> int {
+    return pmfst_count_kind("funcinfo_parse")
+}
+
+fn unwind_map_count() -> int {
+    return pmfst_count_kind("unwind_map_entry")
+}
+
+fn try_block_count() -> int {
+    return pmfst_count_kind("try_block_entry")
+}
+
+fn handler_array_count() -> int {
+    return pmfst_count_kind("handler_array_entry")
+}
+
+fn state_walk_count() -> int {
+    return pmfst_count_kind("state_machine_walk")
+}
+
+fn pmfst_stats() -> array {
+    let mut out = []
+    out.push(funcinfo_parse_count())
+    out.push(unwind_map_count())
+    out.push(try_block_count())
+    out.push(handler_array_count())
+    out.push(state_walk_count())
+    return out
+}
+
+// ─── self_test ≥ 18 record + assertions, r0 emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pmfst-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmfst()
+
+    // ─── 3 funcinfo_parse — 각 magic_number (VC6 / VC7 / VC8) ───
+    record_funcinfo_parse(1, "00401200", 428916512, 4, 2)  // VC6
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"funcinfo_parse\",\"parse_id\":1,\"func_va\":\"0x00401200\",\"magic\":\"0x19930520\",\"name\":\"VC6\",\"max_state\":4,\"n_try\":2")
+
+    record_funcinfo_parse(2, "00401500", 428916513, 6, 2)  // VC7
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"funcinfo_parse\",\"parse_id\":2,\"func_va\":\"0x00401500\",\"magic\":\"0x19930521\",\"name\":\"VC7\",\"max_state\":6,\"n_try\":2")
+
+    record_funcinfo_parse(3, "00401800", 428916514, 8, 1)  // VC8
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"funcinfo_parse\",\"parse_id\":3,\"func_va\":\"0x00401800\",\"magic\":\"0x19930522\",\"name\":\"VC8\",\"max_state\":8,\"n_try\":1")
+
+    // ─── 4 unwind_map_entry ───
+    record_unwind_map_entry(1, 1, 0, -1, "00000000")           // slot 0: no unwind
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"unwind_map_entry\",\"entry_id\":1,\"parse_id\":1,\"slot\":0,\"to_state\":-1,\"action\":\"0x0\"")
+
+    record_unwind_map_entry(2, 1, 1, 0, "00401300")            // slot 1 → state 0, cleanup
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"unwind_map_entry\",\"entry_id\":2,\"parse_id\":1,\"slot\":1,\"to_state\":0,\"action\":\"0x00401300\"")
+
+    record_unwind_map_entry(3, 2, 2, 1, "00401600")            // VC7 slot 2
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"unwind_map_entry\",\"entry_id\":3,\"parse_id\":2,\"slot\":2,\"to_state\":1,\"action\":\"0x00401600\"")
+
+    record_unwind_map_entry(4, 3, 3, 2, "00401900")            // VC8 slot 3
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"unwind_map_entry\",\"entry_id\":4,\"parse_id\":3,\"slot\":3,\"to_state\":2,\"action\":\"0x00401900\"")
+
+    // ─── 4 try_block_entry — try_low 0/2/4/6 ───
+    record_try_block_entry(1, 1, 0, 1, 2, 1)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"try_block_entry\",\"try_id\":1,\"parse_id\":1,\"try_low\":0,\"try_high\":1,\"catch_high\":2,\"n_catches\":1")
+
+    record_try_block_entry(2, 1, 2, 3, 4, 2)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"try_block_entry\",\"try_id\":2,\"parse_id\":1,\"try_low\":2,\"try_high\":3,\"catch_high\":4,\"n_catches\":2")
+
+    record_try_block_entry(3, 2, 4, 5, 6, 1)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"try_block_entry\",\"try_id\":3,\"parse_id\":2,\"try_low\":4,\"try_high\":5,\"catch_high\":6,\"n_catches\":1")
+
+    record_try_block_entry(4, 3, 6, 7, 8, 3)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"try_block_entry\",\"try_id\":4,\"parse_id\":3,\"try_low\":6,\"try_high\":7,\"catch_high\":8,\"n_catches\":3")
+
+    // ─── 4 handler_array_entry ───
+    record_handler_array_entry(1, 1, 0, "00410000", 32)        // catch (std::exception&)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"handler_array_entry\",\"handler_id\":1,\"try_id\":1,\"adjectives\":0,\"type_va\":\"0x00410000\",\"disp\":32")
+
+    record_handler_array_entry(2, 2, 1, "00410100", 64)        // catch (...) - reference
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"handler_array_entry\",\"handler_id\":2,\"try_id\":2,\"adjectives\":1,\"type_va\":\"0x00410100\",\"disp\":64")
+
+    record_handler_array_entry(3, 3, 8, "00410200", 96)        // catch by-pointer (adjectives=8)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"handler_array_entry\",\"handler_id\":3,\"try_id\":3,\"adjectives\":8,\"type_va\":\"0x00410200\",\"disp\":96")
+
+    record_handler_array_entry(4, 4, 64, "00410300", 128)      // ellipsis (adjectives=0x40)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"handler_array_entry\",\"handler_id\":4,\"try_id\":4,\"adjectives\":64,\"type_va\":\"0x00410300\",\"disp\":128")
+
+    // ─── 3 state_machine_walk — 각 walked_kind (catch / unwind / collided) ───
+    record_state_machine_walk(1, 1, 1, 0, 0)  // catch — try_low → state 0
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"state_machine_walk\",\"walk_id\":1,\"parse_id\":1,\"current\":1,\"target\":0,\"walked\":0,\"name\":\"catch\"")
+
+    record_state_machine_walk(2, 2, 5, -1, 1)  // unwind — state 5 → -1 (sentinel)
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"state_machine_walk\",\"walk_id\":2,\"parse_id\":2,\"current\":5,\"target\":-1,\"walked\":1,\"name\":\"unwind\"")
+
+    record_state_machine_walk(3, 3, 7, 2, 2)  // collided — 또 다른 throw 도중 unwind
+    r0_emit("pe_msvc_funcinfo_scope_table_record",
+        "\"kind\":\"state_machine_walk\",\"walk_id\":3,\"parse_id\":3,\"current\":7,\"target\":2,\"walked\":2,\"name\":\"collided\"")
+
+    // ─── assertions ───
+    let fp = funcinfo_parse_count()
+    if fp != 3 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [funcinfo_parse_count] expected=3 got=" + to_string(fp))
+    }
+    let um = unwind_map_count()
+    if um != 4 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [unwind_map_count] expected=4 got=" + to_string(um))
+    }
+    let tb = try_block_count()
+    if tb != 4 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [try_block_count] expected=4 got=" + to_string(tb))
+    }
+    let ha = handler_array_count()
+    if ha != 4 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [handler_array_count] expected=4 got=" + to_string(ha))
+    }
+    let sw = state_walk_count()
+    if sw != 3 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [state_walk_count] expected=3 got=" + to_string(sw))
+    }
+
+    // ─── magic_name lookups ───
+    let m_vc6 = magic_name(428916512)
+    if m_vc6 != "VC6" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [magic_name(VC6)] expected=VC6 got=" + m_vc6)
+    }
+    let m_vc7 = magic_name(428916513)
+    if m_vc7 != "VC7" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [magic_name(VC7)] expected=VC7 got=" + m_vc7)
+    }
+    let m_vc8 = magic_name(428916514)
+    if m_vc8 != "VC8" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [magic_name(VC8)] expected=VC8 got=" + m_vc8)
+    }
+    let m_unk = magic_name(0)
+    if m_unk != "?" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [magic_name(0)] expected=? got=" + m_unk)
+    }
+
+    // ─── walked_kind_name lookups ───
+    let w_c = walked_kind_name(0)
+    if w_c != "catch" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [walked_kind_name(0)] expected=catch got=" + w_c)
+    }
+    let w_u = walked_kind_name(1)
+    if w_u != "unwind" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [walked_kind_name(1)] expected=unwind got=" + w_u)
+    }
+    let w_co = walked_kind_name(2)
+    if w_co != "collided" {
+        panic("pe_msvc_funcinfo_scope_table FAIL [walked_kind_name(2)] expected=collided got=" + w_co)
+    }
+
+    // ─── hex parser sanity ───
+    let h_ff = pmfst_hex_to_int("00410300")
+    if h_ff != 4260608 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [pmfst_hex_to_int(00410300)] expected=4260608 got=" + to_string(h_ff))
+    }
+
+    // ─── stats sanity ───
+    let s = pmfst_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [stats funcinfo_parse] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [stats unwind_map] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [stats try_block] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [stats handler_array] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [stats state_walk] expected=3 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (record 18 + stats 1 + summary 1 = 20 ≥ 14) ───
+    r0_emit("pe_msvc_funcinfo_scope_table_stats",
+        "\"funcinfo_parse_count\":" + to_string(s[0])
+        + ",\"unwind_map_count\":" + to_string(s[1])
+        + ",\"try_block_count\":" + to_string(s[2])
+        + ",\"handler_array_count\":" + to_string(s[3])
+        + ",\"state_walk_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_funcinfo_scope_table_summary",
+        "\"phase\":\"funcinfo_scope_table_complete\""
+        + ",\"research\":\"wine_cppexcept_h_direction\""
+        + ",\"magic_kinds\":3"
+        + ",\"walked_kinds\":3"
+        + ",\"funcinfo_struct_fields\":5"
+        + ",\"unwind_struct_fields\":2"
+        + ",\"tryblock_struct_fields\":5"
+        + ",\"handler_struct_fields\":3")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_funcinfo_scope_table FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmfst()
+    let s2 = pmfst_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_funcinfo_scope_table FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_funcinfo_scope_table self_test PASS (funcinfo=" + to_string(s[0])
+        + ", unwind=" + to_string(s[1]) + ", try=" + to_string(s[2])
+        + ", handler=" + to_string(s[3]) + ", walk=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmfst_stats()
+            println("funcinfo_parse_count\t" + to_string(s[0]))
+            println("unwind_map_count\t" + to_string(s[1]))
+            println("try_block_count\t" + to_string(s[2]))
+            println("handler_array_count\t" + to_string(s[3]))
+            println("state_walk_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmfst()
+            println("cleaned: " + pmfst_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmfst_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_funcinfo_scope_table.hexa { self-test | stats | cleanup | dir }")
+}

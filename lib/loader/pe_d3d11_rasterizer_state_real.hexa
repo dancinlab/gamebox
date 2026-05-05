@@ -1,0 +1,423 @@
+// lib/loader/pe_d3d11_rasterizer_state_real.hexa — D3D11 RasterizerState → MTLRenderCommandEncoder routing tracker
+//
+// ID3D11Device::CreateRasterizerState 호출의 D3D11_RASTERIZER_DESC 매핑 추적기.
+// 본 module 은 rasterizer state descriptor record/aggregate 만 — 실
+// ID3D11DeviceContext::RSSetState / RSSetViewports / RSSetScissorRects 호출은
+// stage2 native helper(D3DMetal binary 위임) 에서 처리.
+//
+// D3D11_RASTERIZER_DESC → MTLRenderPipelineDescriptor + MTLRenderCommandEncoder:
+//   D3D11_FILL_WIREFRAME (2) → setTriangleFillMode(MTLTriangleFillModeLines)
+//   D3D11_FILL_SOLID     (3) → setTriangleFillMode(MTLTriangleFillModeFill)
+//   D3D11_CULL_NONE      (1) → setCullMode(MTLCullModeNone)
+//   D3D11_CULL_FRONT     (2) → setCullMode(MTLCullModeFront)
+//   D3D11_CULL_BACK      (3) → setCullMode(MTLCullModeBack)
+//   DepthBias            (int) → setDepthBias:slopeScale:clamp:
+//   RSSetViewports        → setViewport (MTLViewport)
+//   RSSetScissorRects     → setScissorRect (MTLScissorRect)
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11RasterizerState. MoltenVK/DXVK 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// fill_mode code (본 schema — D3D11_FILL_MODE 와 인덱스 일치 X):
+//   1 = wireframe (D3D11_FILL_WIREFRAME)
+//   2 = solid     (D3D11_FILL_SOLID)
+//
+// cull_mode code (본 schema — D3D11_CULL_MODE 와 인덱스 일치 X):
+//   1 = none  (D3D11_CULL_NONE)
+//   2 = front (D3D11_CULL_FRONT)
+//   3 = back  (D3D11_CULL_BACK)
+//
+// persist schema (TSV — states.tsv):
+//   state_id<int> \t fill_mode<int> \t cull_mode<int> \t depth_bias<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdrs11_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_rasterizer_state_real"
+}
+
+fn pdrs11_states_path() -> str {
+    return pdrs11_dir() + "/states.tsv"
+}
+
+fn pdrs11_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdrs11_dir() + "'")
+}
+
+fn cleanup_pdrs11() -> void {
+    pdrs11_ensure_dir()
+    let _ = exec("rm -f '" + pdrs11_states_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdrs11_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdrs11_append_row(path: str, row: str) -> void {
+    pdrs11_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_state: rasterizer state descriptor 1 건 기록 ───
+fn record_state(state_id: int, fill_mode: int, cull_mode: int, depth_bias: int) -> void {
+    if state_id <= 0 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [record_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if fill_mode < 1 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [record_state] expected=fill_mode>=1 got=" + to_string(fill_mode))
+    }
+    if fill_mode > 2 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [record_state] expected=fill_mode<=2 got=" + to_string(fill_mode))
+    }
+    if cull_mode < 1 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [record_state] expected=cull_mode>=1 got=" + to_string(cull_mode))
+    }
+    if cull_mode > 3 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [record_state] expected=cull_mode<=3 got=" + to_string(cull_mode))
+    }
+    let row = to_string(state_id) + "\t" + to_string(fill_mode)
+        + "\t" + to_string(cull_mode) + "\t" + to_string(depth_bias) + "\n"
+    pdrs11_append_row(pdrs11_states_path(), row)
+}
+
+// ─── state_count: total rasterizer state 수 ───
+fn state_count() -> int {
+    let t = pdrs11_read_table(pdrs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_fill_mode: 특정 fill_mode 의 state 수 ───
+fn count_by_fill_mode(fill_mode: int) -> int {
+    let t = pdrs11_read_table(pdrs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == fill_mode {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_cull_mode: 특정 cull_mode 의 state 수 ───
+fn count_by_cull_mode(cull_mode: int) -> int {
+    let t = pdrs11_read_table(pdrs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == cull_mode {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_depth_bias: 모든 state depth_bias 합 ───
+fn total_depth_bias() -> int {
+    let t = pdrs11_read_table(pdrs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── solid_count: fill_mode=2 (solid) 의 state 수 ───
+fn solid_count() -> int {
+    return count_by_fill_mode(2)
+}
+
+// ─── state_depth_bias: 특정 state_id 의 depth_bias (없으면 0) ───
+fn state_depth_bias(state_id: int) -> int {
+    let t = pdrs11_read_table(pdrs11_states_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == state_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdrs11_stats: [state_count, solid_count, count_by_cull_mode(3), total_depth_bias] ───
+fn pdrs11_stats() -> array {
+    let mut out = []
+    out.push(state_count())
+    out.push(solid_count())
+    out.push(count_by_cull_mode(3))
+    out.push(total_depth_bias())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdrs11-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdrs11()
+
+    // 2. record 5 states — mix of fill_mode + cull_mode
+    //    s1: solid + back (default opaque, fill=2, cull=3, bias=0)
+    record_state(420001, 2, 3, 0)
+    r0_emit("pe_d3d11_rasterizer_state_real_record",
+        "\"state_id\":420001,\"fill_mode\":2,\"cull_mode\":3,\"depth_bias\":0,\"target\":\"setCullMode+setTriangleFillMode\"")
+
+    //    s2: solid + front (mirrored, fill=2, cull=2, bias=100)
+    record_state(420002, 2, 2, 100)
+    r0_emit("pe_d3d11_rasterizer_state_real_record",
+        "\"state_id\":420002,\"fill_mode\":2,\"cull_mode\":2,\"depth_bias\":100,\"target\":\"setCullMode+setTriangleFillMode\"")
+
+    //    s3: solid + none (decals, fill=2, cull=1, bias=200)
+    record_state(420003, 2, 1, 200)
+    r0_emit("pe_d3d11_rasterizer_state_real_record",
+        "\"state_id\":420003,\"fill_mode\":2,\"cull_mode\":1,\"depth_bias\":200,\"target\":\"setCullMode+setTriangleFillMode\"")
+
+    //    s4: wireframe + back (debug, fill=1, cull=3, bias=0)
+    record_state(420004, 1, 3, 0)
+    r0_emit("pe_d3d11_rasterizer_state_real_record",
+        "\"state_id\":420004,\"fill_mode\":1,\"cull_mode\":3,\"depth_bias\":0,\"target\":\"setCullMode+setTriangleFillMode\"")
+
+    //    s5: wireframe + none (debug overlay, fill=1, cull=1, bias=50)
+    record_state(420005, 1, 1, 50)
+    r0_emit("pe_d3d11_rasterizer_state_real_record",
+        "\"state_id\":420005,\"fill_mode\":1,\"cull_mode\":1,\"depth_bias\":50,\"target\":\"setCullMode+setTriangleFillMode\"")
+
+    // 3. state_count = 5
+    let c = state_count()
+    if c != 5 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [state_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_fill_mode sanity
+    //    fill=1 wireframe → s4, s5 = 2
+    let f1 = count_by_fill_mode(1)
+    if f1 != 2 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [count_by_fill_mode(1)] expected=2 got=" + to_string(f1))
+    }
+    //    fill=2 solid → s1, s2, s3 = 3
+    let f2 = count_by_fill_mode(2)
+    if f2 != 3 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [count_by_fill_mode(2)] expected=3 got=" + to_string(f2))
+    }
+    //    solid_count alias = 3
+    let sc = solid_count()
+    if sc != 3 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [solid_count] expected=3 got=" + to_string(sc))
+    }
+
+    // 5. count_by_cull_mode sanity
+    //    cull=1 none → s3, s5 = 2
+    let cn = count_by_cull_mode(1)
+    if cn != 2 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [count_by_cull_mode(1)] expected=2 got=" + to_string(cn))
+    }
+    //    cull=2 front → s2 = 1
+    let cf = count_by_cull_mode(2)
+    if cf != 1 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [count_by_cull_mode(2)] expected=1 got=" + to_string(cf))
+    }
+    //    cull=3 back → s1, s4 = 2
+    let cb = count_by_cull_mode(3)
+    if cb != 2 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [count_by_cull_mode(3)] expected=2 got=" + to_string(cb))
+    }
+
+    // 6. total_depth_bias = 0+100+200+0+50 = 350
+    let tb = total_depth_bias()
+    if tb != 350 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [total_depth_bias] expected=350 got=" + to_string(tb))
+    }
+
+    // 7. state_depth_bias sanity
+    let b3 = state_depth_bias(420003)
+    if b3 != 200 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [state_depth_bias(420003)] expected=200 got=" + to_string(b3))
+    }
+    let b5 = state_depth_bias(420005)
+    if b5 != 50 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [state_depth_bias(420005)] expected=50 got=" + to_string(b5))
+    }
+    let b_miss = state_depth_bias(99999)
+    if b_miss != 0 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [state_depth_bias(99999)] expected=0 got=" + to_string(b_miss))
+    }
+
+    // 8. pdrs11_stats() = [5, 3, 2, 350]
+    let s = pdrs11_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [stats state_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [stats solid_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [stats cull_back] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 350 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [stats total_depth_bias] expected=350 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_d3d11_rasterizer_state_real_stats",
+        "\"state_count\":" + to_string(s[0])
+        + ",\"solid_count\":" + to_string(s[1])
+        + ",\"cull_back\":" + to_string(s[2])
+        + ",\"total_depth_bias\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_d3d11_rasterizer_state_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pdrs11()
+    let s2 = pdrs11_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_rasterizer_state_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_rasterizer_state_real self_test PASS (states=" + to_string(s[0])
+        + ", solid=" + to_string(s[1]) + ", cull_back=" + to_string(s[2])
+        + ", depth_bias_sum=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdrs11_stats()
+            println("state_count\t" + to_string(s[0]))
+            println("solid_count\t" + to_string(s[1]))
+            println("cull_back\t" + to_string(s[2]))
+            println("total_depth_bias\t" + to_string(s[3]))
+            return
+        }
+        if sub == "depth-bias" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("state_depth_bias\t" + to_string(state_depth_bias(sid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_rasterizer_state_real.hexa depth-bias <state_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "fill" {
+                    println("count_by_fill_mode\t" + to_string(count_by_fill_mode(val)))
+                    return
+                }
+                if kind == "cull" {
+                    println("count_by_cull_mode\t" + to_string(count_by_cull_mode(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_rasterizer_state_real.hexa count { fill <fill_mode> | cull <cull_mode> }")
+                return
+            }
+            println("usage: hexa run pe_d3d11_rasterizer_state_real.hexa count { fill <fill_mode> | cull <cull_mode> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdrs11()
+            println("cleaned: " + pdrs11_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdrs11_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_rasterizer_state_real.hexa { self-test | stats | depth-bias <state_id> | count fill <fill_mode> | count cull <cull_mode> | cleanup | dir }")
+}

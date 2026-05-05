@@ -1,0 +1,415 @@
+// lib/loader/pe_shader_xlate_dxbc.hexa — DXBC → MSL shader cross-compile tracker
+//
+// DXBC (D3D11) → MSL cross-compile:
+//   DXBC opcode (D3D 5.0 bytecode) → MSL function/kernel
+//   - vs_5_0 → vertex function MSL
+//   - ps_5_0 → fragment function MSL
+//   - cs_5_0 → kernel function MSL
+//   - hs/ds (tessellation) → tessellation factor + post-tess vertex (Metal 2.0+)
+//   - gs (geometry) → Metal mesh shader (M3+ only) or fallback
+//   metal-shaderconverter (Apple) 위임 가능 — own1 § A D3DMetal binary 정합
+//   conversion overhead: ~1.5x bytes (textual MSL >  DXBC binary)
+// own1: DXBC spec + Metal Shading Language Spec only, MoltenVK / spirv-cross 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 xlate event tracker — 실 metal-shaderconverter 호출 X (stage2+).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// shader_stage code:
+//   1 = vertex
+//   2 = pixel (fragment)
+//   3 = geometry
+//   4 = hull (tessellation control)
+//   5 = domain (tessellation evaluation)
+//   6 = compute
+//
+// persist schema (TSV — xlates.tsv):
+//   xlate_id<int> \t shader_stage<int> \t input_bytes<int> \t output_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psxd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_shader_xlate_dxbc"
+}
+
+fn psxd_xlates_path() -> str {
+    return psxd_dir() + "/xlates.tsv"
+}
+
+fn psxd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psxd_dir() + "'")
+}
+
+fn cleanup_psxd() -> void {
+    psxd_ensure_dir()
+    let _ = exec("rm -f '" + psxd_xlates_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psxd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psxd_append_row(path: str, row: str) -> void {
+    psxd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_xlate: xlate 1 건 기록 ───
+fn record_xlate(xlate_id: int, shader_stage: int, input_bytes: int, output_bytes: int) -> void {
+    if xlate_id <= 0 {
+        panic("pe_shader_xlate_dxbc FAIL [record_xlate] expected=xlate_id>0 got=" + to_string(xlate_id))
+    }
+    if shader_stage < 1 {
+        panic("pe_shader_xlate_dxbc FAIL [record_xlate] expected=shader_stage>=1 got=" + to_string(shader_stage))
+    }
+    if shader_stage > 6 {
+        panic("pe_shader_xlate_dxbc FAIL [record_xlate] expected=shader_stage<=6 got=" + to_string(shader_stage))
+    }
+    if input_bytes < 0 {
+        panic("pe_shader_xlate_dxbc FAIL [record_xlate] expected=input_bytes>=0 got=" + to_string(input_bytes))
+    }
+    if output_bytes < 0 {
+        panic("pe_shader_xlate_dxbc FAIL [record_xlate] expected=output_bytes>=0 got=" + to_string(output_bytes))
+    }
+    let row = to_string(xlate_id) + "\t" + to_string(shader_stage)
+        + "\t" + to_string(input_bytes) + "\t" + to_string(output_bytes) + "\n"
+    psxd_append_row(psxd_xlates_path(), row)
+}
+
+// ─── xlate_count: total xlate 수 ───
+fn xlate_count() -> int {
+    let t = psxd_read_table(psxd_xlates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_input_bytes: 모든 xlate input_bytes 합 ───
+fn total_input_bytes() -> int {
+    let t = psxd_read_table(psxd_xlates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_output_bytes: 모든 xlate output_bytes 합 ───
+fn total_output_bytes() -> int {
+    let t = psxd_read_table(psxd_xlates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── expansion_pct: (total_output - total_input) / total_input * 100 (int %) ───
+fn expansion_pct() -> int {
+    let ti = total_input_bytes()
+    if ti <= 0 {
+        return 0
+    }
+    let to = total_output_bytes()
+    return ((to - ti) * 100) / ti
+}
+
+// ─── count_by_shader_stage: 특정 shader_stage 의 xlate 수 ───
+fn count_by_shader_stage(shader_stage: int) -> int {
+    let t = psxd_read_table(psxd_xlates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == shader_stage {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── xlate_output_bytes: 특정 xlate_id 의 output_bytes (없으면 0) ───
+fn xlate_output_bytes(xlate_id: int) -> int {
+    let t = psxd_read_table(psxd_xlates_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == xlate_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psxd_stats: [xlate_count, total_input_bytes, total_output_bytes, expansion_pct, count_stage(2)] ───
+fn psxd_stats() -> array {
+    let mut out = []
+    out.push(xlate_count())
+    out.push(total_input_bytes())
+    out.push(total_output_bytes())
+    out.push(expansion_pct())
+    out.push(count_by_shader_stage(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psxd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psxd()
+
+    // 2. record 5 xlates covering ≥4 shader_stages (vertex/pixel/compute/hull/pixel)
+    //    realistic byte sizes — DXBC opaque blob → MSL textual source
+    record_xlate(120001, 1, 800, 1200)
+    r0_emit("pe_shader_xlate_dxbc_record",
+        "\"xlate_id\":120001,\"shader_stage\":1,\"input_bytes\":800,\"output_bytes\":1200,\"target\":\"vertex\"")
+
+    record_xlate(120002, 2, 1200, 1800)
+    r0_emit("pe_shader_xlate_dxbc_record",
+        "\"xlate_id\":120002,\"shader_stage\":2,\"input_bytes\":1200,\"output_bytes\":1800,\"target\":\"pixel\"")
+
+    record_xlate(120003, 6, 2000, 3000)
+    r0_emit("pe_shader_xlate_dxbc_record",
+        "\"xlate_id\":120003,\"shader_stage\":6,\"input_bytes\":2000,\"output_bytes\":3000,\"target\":\"compute\"")
+
+    record_xlate(120004, 4, 600, 900)
+    r0_emit("pe_shader_xlate_dxbc_record",
+        "\"xlate_id\":120004,\"shader_stage\":4,\"input_bytes\":600,\"output_bytes\":900,\"target\":\"hull\"")
+
+    record_xlate(120005, 2, 400, 600)
+    r0_emit("pe_shader_xlate_dxbc_record",
+        "\"xlate_id\":120005,\"shader_stage\":2,\"input_bytes\":400,\"output_bytes\":600,\"target\":\"pixel\"")
+
+    // 3. xlate_count = 5
+    let c = xlate_count()
+    if c != 5 {
+        panic("pe_shader_xlate_dxbc FAIL [xlate_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_input_bytes = 5000
+    let ti = total_input_bytes()
+    if ti != 5000 {
+        panic("pe_shader_xlate_dxbc FAIL [total_input_bytes] expected=5000 got=" + to_string(ti))
+    }
+
+    // 5. total_output_bytes = 7500
+    let to = total_output_bytes()
+    if to != 7500 {
+        panic("pe_shader_xlate_dxbc FAIL [total_output_bytes] expected=7500 got=" + to_string(to))
+    }
+
+    // 6. expansion_pct = (7500 - 5000) * 100 / 5000 = 50
+    let ep = expansion_pct()
+    if ep != 50 {
+        panic("pe_shader_xlate_dxbc FAIL [expansion_pct] expected=50 got=" + to_string(ep))
+    }
+
+    // 7. count_by_shader_stage sanity
+    let s1 = count_by_shader_stage(1)
+    if s1 != 1 {
+        panic("pe_shader_xlate_dxbc FAIL [count_by_shader_stage(1)] expected=1 got=" + to_string(s1))
+    }
+    let s2 = count_by_shader_stage(2)
+    if s2 != 2 {
+        panic("pe_shader_xlate_dxbc FAIL [count_by_shader_stage(2)] expected=2 got=" + to_string(s2))
+    }
+    let s4 = count_by_shader_stage(4)
+    if s4 != 1 {
+        panic("pe_shader_xlate_dxbc FAIL [count_by_shader_stage(4)] expected=1 got=" + to_string(s4))
+    }
+    let s6 = count_by_shader_stage(6)
+    if s6 != 1 {
+        panic("pe_shader_xlate_dxbc FAIL [count_by_shader_stage(6)] expected=1 got=" + to_string(s6))
+    }
+    let s3 = count_by_shader_stage(3)
+    if s3 != 0 {
+        panic("pe_shader_xlate_dxbc FAIL [count_by_shader_stage(3)] expected=0 got=" + to_string(s3))
+    }
+
+    // 8. xlate_output_bytes sanity
+    let ob2 = xlate_output_bytes(120002)
+    if ob2 != 1800 {
+        panic("pe_shader_xlate_dxbc FAIL [xlate_output_bytes(120002)] expected=1800 got=" + to_string(ob2))
+    }
+    let ob3 = xlate_output_bytes(120003)
+    if ob3 != 3000 {
+        panic("pe_shader_xlate_dxbc FAIL [xlate_output_bytes(120003)] expected=3000 got=" + to_string(ob3))
+    }
+    let ob_miss = xlate_output_bytes(9999)
+    if ob_miss != 0 {
+        panic("pe_shader_xlate_dxbc FAIL [xlate_output_bytes(9999)] expected=0 got=" + to_string(ob_miss))
+    }
+
+    // 9. psxd_stats() = [5, 5000, 7500, 50, 2]
+    let s = psxd_stats()
+    if len(s) != 5 {
+        panic("pe_shader_xlate_dxbc FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_shader_xlate_dxbc FAIL [stats xlate_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 5000 {
+        panic("pe_shader_xlate_dxbc FAIL [stats total_input_bytes] expected=5000 got=" + to_string(s[1]))
+    }
+    if s[2] != 7500 {
+        panic("pe_shader_xlate_dxbc FAIL [stats total_output_bytes] expected=7500 got=" + to_string(s[2]))
+    }
+    if s[3] != 50 {
+        panic("pe_shader_xlate_dxbc FAIL [stats expansion_pct] expected=50 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_shader_xlate_dxbc FAIL [stats count_stage(2)] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_shader_xlate_dxbc_stats",
+        "\"xlate_count\":" + to_string(s[0])
+        + ",\"total_input_bytes\":" + to_string(s[1])
+        + ",\"total_output_bytes\":" + to_string(s[2])
+        + ",\"expansion_pct\":" + to_string(s[3])
+        + ",\"stage_pixel\":" + to_string(s[4]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_shader_xlate_dxbc FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_psxd()
+    let s2t = psxd_stats()
+    let i = 0
+    while i < len(s2t) {
+        if s2t[i] != 0 {
+            panic("pe_shader_xlate_dxbc FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2t[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_shader_xlate_dxbc self_test PASS (xlates=" + to_string(s[0])
+        + ", in=" + to_string(s[1]) + ", out=" + to_string(s[2])
+        + ", exp%=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psxd_stats()
+            println("xlate_count\t" + to_string(s[0]))
+            println("total_input_bytes\t" + to_string(s[1]))
+            println("total_output_bytes\t" + to_string(s[2]))
+            println("expansion_pct\t" + to_string(s[3]))
+            println("count_stage_pixel\t" + to_string(s[4]))
+            return
+        }
+        if sub == "output" {
+            if len(a) >= 4 {
+                let xid = to_int(a[3])
+                println("xlate_output_bytes\t" + to_string(xlate_output_bytes(xid)))
+                return
+            }
+            println("usage: hexa run pe_shader_xlate_dxbc.hexa output <xlate_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let stg = to_int(a[3])
+                println("count_by_shader_stage\t" + to_string(count_by_shader_stage(stg)))
+                return
+            }
+            println("usage: hexa run pe_shader_xlate_dxbc.hexa count <shader_stage>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psxd()
+            println("cleaned: " + psxd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psxd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_shader_xlate_dxbc.hexa { self-test | stats | output <xlate_id> | count <shader_stage> | cleanup | dir }")
+}

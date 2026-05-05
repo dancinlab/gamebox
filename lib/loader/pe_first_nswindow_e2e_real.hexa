@@ -1,0 +1,577 @@
+// lib/loader/pe_first_nswindow_e2e_real.hexa — R3-12 closure target
+// Battle.net Setup 의 first NSWindow 표시 end-to-end milestone tracker.
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / Bochs / community wrapper 0 줄.
+//        Microsoft Win32 spec (USER32 RegisterClassEx / CreateWindowEx / ShowWindow /
+//        GetMessage) + Apple AppKit doc (NSWindow alloc / makeKeyAndOrderFront,
+//        NSEvent kind) 의 contract 를 reference 만 하여 hexa-side milestone 을 기록한다.
+//        Apple SDK 직접 호출 X — instrumentation only.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// R3-12 closure 정의:
+//   "Battle.net Setup 의 first NSWindow 가 macOS 화면에 실제로 표시되는 시점"
+//   PE entry → __scrt_common_main_seh → WinMain → RegisterClass → CreateWindow →
+//   AppKit NSWindow alloc → makeKeyAndOrderFront → first_paint → first user input.
+//
+// milestone name spec (8 단계):
+//   scrt_main_seh_entry / winmain_call / register_class_call / create_window_call /
+//   ns_window_alloc / ns_window_make_key / first_paint / first_user_input
+//
+// Win32 reference (구현 X — telemetry only):
+//   - RegisterClassExA/W (USER32) : window class 등록
+//   - CreateWindowExA/W  (USER32) : HWND 생성 (WM_NCCREATE/WM_CREATE 발생)
+//   - ShowWindow / UpdateWindow   : WM_PAINT 트리거
+//   - GetMessage / DispatchMessage: message pump
+//
+// AppKit reference (구현 X — telemetry only):
+//   - NSWindow alloc / initWithContentRect:styleMask:backing:defer:
+//   - NSWindow makeKeyAndOrderFront:
+//   - NSEvent kind : LeftMouseDown(1), KeyDown(10), WindowDidBecomeKey, WindowWillClose
+//
+// persist schema (TSV — 5 separate tables):
+//   milestone.tsv     : milestone_id<int>  \t milestone_name<str>      \t ts_ns<int>          \t success<int>
+//   user32_call.tsv   : call_id<int>       \t fn_id<int>               \t args_count<int>     \t return_value_hex<str>
+//   appkit_event.tsv  : event_id<int>      \t ns_event_kind<int>       \t win32_msg_code_hex<str> \t hwnd_hex<str>
+//   dialog_visible.tsv: visible_id<int>    \t hwnd_hex<str>            \t x<int> \t y<int> \t width<int> \t height<int>
+//   inst_milestone.tsv: im_id<int>         \t milestone_id<int>        \t instructions_executed<int>
+//
+// 식별자 주의: type / mod / handle / resume 단독 identifier 금지 (hexa 예약어).
+// 사용 식별자: milestone_id / milestone_name / ts_ns / success / call_id / fn_id /
+// args_count / return_value_hex / event_id / ns_event_kind / win32_msg_code_hex /
+// hwnd_hex / visible_id / x / y / width / height / im_id / instructions_executed.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pfne_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_first_nswindow_e2e_real"
+}
+
+fn pfne_milestone_path() -> str {
+    return pfne_dir() + "/milestone.tsv"
+}
+
+fn pfne_user32_call_path() -> str {
+    return pfne_dir() + "/user32_call.tsv"
+}
+
+fn pfne_appkit_event_path() -> str {
+    return pfne_dir() + "/appkit_event.tsv"
+}
+
+fn pfne_dialog_visible_path() -> str {
+    return pfne_dir() + "/dialog_visible.tsv"
+}
+
+fn pfne_inst_milestone_path() -> str {
+    return pfne_dir() + "/inst_milestone.tsv"
+}
+
+fn pfne_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pfne_dir() + "'")
+}
+
+fn cleanup_pfne() -> void {
+    pfne_ensure_dir()
+    let _ = exec("rm -f '" + pfne_milestone_path() + "' '" + pfne_user32_call_path()
+        + "' '" + pfne_appkit_event_path() + "' '" + pfne_dialog_visible_path()
+        + "' '" + pfne_inst_milestone_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pfne_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pfne_append_row(path: str, row: str) -> void {
+    pfne_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pfne_count_rows(path: str, min_cols: int) -> int {
+    let t = pfne_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+// fn_id: 1=RegisterClassExW 2=CreateWindowExW 3=ShowWindow 4=GetMessageW
+//        5=UpdateWindow 6=DispatchMessageW 7=DefWindowProcW
+fn user32_fn_name(fn_id: int) -> str {
+    if fn_id == 1 { return "RegisterClassExW" }
+    if fn_id == 2 { return "CreateWindowExW" }
+    if fn_id == 3 { return "ShowWindow" }
+    if fn_id == 4 { return "GetMessageW" }
+    if fn_id == 5 { return "UpdateWindow" }
+    if fn_id == 6 { return "DispatchMessageW" }
+    if fn_id == 7 { return "DefWindowProcW" }
+    return "?"
+}
+
+// ns_event_kind: 1=LeftMouseDown 10=KeyDown 13=WindowDidBecomeKey
+//                14=WindowWillClose 20=AppDidFinishLaunching
+fn ns_event_kind_name(k: int) -> str {
+    if k == 1 { return "left_mouse_down" }
+    if k == 10 { return "key_down" }
+    if k == 13 { return "window_did_become_key" }
+    if k == 14 { return "window_will_close" }
+    if k == 20 { return "app_did_finish_launching" }
+    return "?"
+}
+
+// ─── record_milestone: 8단계 milestone (scrt_main_seh_entry → first_user_input) ───
+fn record_milestone(milestone_id: int, milestone_name: str, ts_ns: int, success: int) -> void {
+    if milestone_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_milestone] expected=milestone_id>0 got=" + to_string(milestone_id))
+    }
+    if milestone_name == "" {
+        panic("pe_first_nswindow_e2e_real FAIL [record_milestone] expected=milestone_name!=empty got=empty")
+    }
+    if ts_ns < 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_milestone] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    if success < 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_milestone] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_milestone] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(milestone_id) + "\t" + milestone_name + "\t"
+        + to_string(ts_ns) + "\t" + to_string(success) + "\n"
+    pfne_append_row(pfne_milestone_path(), row)
+}
+
+// ─── record_user32_call: USER32 API call entry 기록 ───
+fn record_user32_call(call_id: int, fn_id: int, args_count: int, return_value_hex: str) -> void {
+    if call_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_user32_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if fn_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_user32_call] expected=fn_id>0 got=" + to_string(fn_id))
+    }
+    if args_count < 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_user32_call] expected=args_count>=0 got=" + to_string(args_count))
+    }
+    if return_value_hex == "" {
+        panic("pe_first_nswindow_e2e_real FAIL [record_user32_call] expected=return_value_hex!=empty got=empty")
+    }
+    let row = to_string(call_id) + "\t" + to_string(fn_id) + "\t"
+        + to_string(args_count) + "\t" + return_value_hex + "\n"
+    pfne_append_row(pfne_user32_call_path(), row)
+}
+
+// ─── record_appkit_event: NSEvent → WM_* translation 기록 ───
+fn record_appkit_event(event_id: int, ns_event_kind: int, win32_msg_code_hex: str, hwnd_hex: str) -> void {
+    if event_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_appkit_event] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if ns_event_kind <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_appkit_event] expected=ns_event_kind>0 got=" + to_string(ns_event_kind))
+    }
+    if win32_msg_code_hex == "" {
+        panic("pe_first_nswindow_e2e_real FAIL [record_appkit_event] expected=win32_msg_code_hex!=empty got=empty")
+    }
+    if hwnd_hex == "" {
+        panic("pe_first_nswindow_e2e_real FAIL [record_appkit_event] expected=hwnd_hex!=empty got=empty")
+    }
+    let row = to_string(event_id) + "\t" + to_string(ns_event_kind) + "\t"
+        + win32_msg_code_hex + "\t" + hwnd_hex + "\n"
+    pfne_append_row(pfne_appkit_event_path(), row)
+}
+
+// ─── record_dialog_visible: NSWindow 가 화면에 표시된 시점의 geometry capture ───
+fn record_dialog_visible(visible_id: int, hwnd_hex: str, x: int, y: int, width: int, height: int) -> void {
+    if visible_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_dialog_visible] expected=visible_id>0 got=" + to_string(visible_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_first_nswindow_e2e_real FAIL [record_dialog_visible] expected=hwnd_hex!=empty got=empty")
+    }
+    if width <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_dialog_visible] expected=width>0 got=" + to_string(width))
+    }
+    if height <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_dialog_visible] expected=height>0 got=" + to_string(height))
+    }
+    let row = to_string(visible_id) + "\t" + hwnd_hex + "\t"
+        + to_string(x) + "\t" + to_string(y) + "\t"
+        + to_string(width) + "\t" + to_string(height) + "\n"
+    pfne_append_row(pfne_dialog_visible_path(), row)
+}
+
+// ─── record_inst_milestone: milestone 별 instruction count 기록 ───
+fn record_inst_milestone(im_id: int, milestone_id: int, instructions_executed: int) -> void {
+    if im_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_inst_milestone] expected=im_id>0 got=" + to_string(im_id))
+    }
+    if milestone_id <= 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_inst_milestone] expected=milestone_id>0 got=" + to_string(milestone_id))
+    }
+    if instructions_executed < 0 {
+        panic("pe_first_nswindow_e2e_real FAIL [record_inst_milestone] expected=instructions_executed>=0 got=" + to_string(instructions_executed))
+    }
+    let row = to_string(im_id) + "\t" + to_string(milestone_id) + "\t"
+        + to_string(instructions_executed) + "\n"
+    pfne_append_row(pfne_inst_milestone_path(), row)
+}
+
+// ─── statistics ───
+fn milestone_count() -> int {
+    return pfne_count_rows(pfne_milestone_path(), 4)
+}
+
+fn user32_call_count() -> int {
+    return pfne_count_rows(pfne_user32_call_path(), 4)
+}
+
+fn appkit_event_count() -> int {
+    return pfne_count_rows(pfne_appkit_event_path(), 4)
+}
+
+fn dialog_visible_count() -> int {
+    return pfne_count_rows(pfne_dialog_visible_path(), 6)
+}
+
+fn inst_milestone_count() -> int {
+    return pfne_count_rows(pfne_inst_milestone_path(), 3)
+}
+
+fn milestone_success_count() -> int {
+    let t = pfne_read_table(pfne_milestone_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn has_milestone(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let t = pfne_read_table(pfne_milestone_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[1] == name {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn pfne_stats() -> array {
+    let mut out = []
+    out.push(milestone_count())
+    out.push(user32_call_count())
+    out.push(appkit_event_count())
+    out.push(dialog_visible_count())
+    out.push(inst_milestone_count())
+    out.push(milestone_success_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record (8 milestone + 4 user32 + 4 appkit + 1 dialog +
+// 4 inst = 21 record) + assertions + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pfne-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pfne()
+
+    // ─── 1. milestone × 8 (scrt_main_seh_entry → first_user_input) ───
+    record_milestone(1, "scrt_main_seh_entry", 100, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":1,\"milestone_name\":\"scrt_main_seh_entry\",\"ts_ns\":100,\"success\":1")
+
+    record_milestone(2, "winmain_call", 350, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":2,\"milestone_name\":\"winmain_call\",\"ts_ns\":350,\"success\":1")
+
+    record_milestone(3, "register_class_call", 600, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":3,\"milestone_name\":\"register_class_call\",\"ts_ns\":600,\"success\":1")
+
+    record_milestone(4, "create_window_call", 900, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":4,\"milestone_name\":\"create_window_call\",\"ts_ns\":900,\"success\":1")
+
+    record_milestone(5, "ns_window_alloc", 1200, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":5,\"milestone_name\":\"ns_window_alloc\",\"ts_ns\":1200,\"success\":1")
+
+    record_milestone(6, "ns_window_make_key", 1500, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":6,\"milestone_name\":\"ns_window_make_key\",\"ts_ns\":1500,\"success\":1")
+
+    record_milestone(7, "first_paint", 1750, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":7,\"milestone_name\":\"first_paint\",\"ts_ns\":1750,\"success\":1")
+
+    record_milestone(8, "first_user_input", 2100, 1)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"milestone\",\"milestone_id\":8,\"milestone_name\":\"first_user_input\",\"ts_ns\":2100,\"success\":1")
+
+    // ─── 2. user32_call × 4 (RegisterClass / CreateWindow / ShowWindow / GetMessage) ───
+    // RegisterClassExW return = ATOM (low word 16-bit)
+    record_user32_call(1, 1, 1, "0x0000C001")
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"user32_call\",\"call_id\":1,\"fn_id\":1,\"fn\":\"RegisterClassExW\",\"args_count\":1,\"return\":\"0x0000C001\"")
+
+    // CreateWindowExW return = HWND
+    record_user32_call(2, 2, 12, "0x0000000000010001")
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"user32_call\",\"call_id\":2,\"fn_id\":2,\"fn\":\"CreateWindowExW\",\"args_count\":12,\"return\":\"0x0000000000010001\"")
+
+    // ShowWindow(SW_SHOW) return = previous visible state (BOOL)
+    record_user32_call(3, 3, 2, "0x00000000")
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"user32_call\",\"call_id\":3,\"fn_id\":3,\"fn\":\"ShowWindow\",\"args_count\":2,\"return\":\"0x00000000\"")
+
+    // GetMessageW return = BOOL (1=msg, 0=WM_QUIT, -1=err)
+    record_user32_call(4, 4, 4, "0x00000001")
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"user32_call\",\"call_id\":4,\"fn_id\":4,\"fn\":\"GetMessageW\",\"args_count\":4,\"return\":\"0x00000001\"")
+
+    // ─── 3. appkit_event × 4 (window_did_become_key / left_mouse_down / key_down / window_will_close) ───
+    record_appkit_event(1, 13, "0x0006", "0x10001")  // WM_ACTIVATE
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"appkit_event\",\"event_id\":1,\"ns_event_kind\":13,\"name\":\"window_did_become_key\",\"win32\":\"0x0006\",\"hwnd\":\"0x10001\"")
+
+    record_appkit_event(2, 1, "0x0201", "0x10001")  // WM_LBUTTONDOWN
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"appkit_event\",\"event_id\":2,\"ns_event_kind\":1,\"name\":\"left_mouse_down\",\"win32\":\"0x0201\",\"hwnd\":\"0x10001\"")
+
+    record_appkit_event(3, 10, "0x0100", "0x10001")  // WM_KEYDOWN
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"appkit_event\",\"event_id\":3,\"ns_event_kind\":10,\"name\":\"key_down\",\"win32\":\"0x0100\",\"hwnd\":\"0x10001\"")
+
+    record_appkit_event(4, 14, "0x0010", "0x10001")  // WM_CLOSE
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"appkit_event\",\"event_id\":4,\"ns_event_kind\":14,\"name\":\"window_will_close\",\"win32\":\"0x0010\",\"hwnd\":\"0x10001\"")
+
+    // ─── 4. dialog_visible × 1 (Battle.net Setup main window 800x600) ───
+    record_dialog_visible(1, "0x10001", 100, 80, 800, 600)
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"dialog_visible\",\"visible_id\":1,\"hwnd\":\"0x10001\",\"x\":100,\"y\":80,\"width\":800,\"height\":600")
+
+    // ─── 5. inst_milestone × 4 (각 milestone 별 inst count) ───
+    record_inst_milestone(1, 1, 142)   // scrt_main_seh_entry
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"inst_milestone\",\"im_id\":1,\"milestone_id\":1,\"instructions\":142")
+
+    record_inst_milestone(2, 2, 387)   // winmain_call
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"inst_milestone\",\"im_id\":2,\"milestone_id\":2,\"instructions\":387")
+
+    record_inst_milestone(3, 4, 521)   // create_window_call
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"inst_milestone\",\"im_id\":3,\"milestone_id\":4,\"instructions\":521")
+
+    record_inst_milestone(4, 7, 633)   // first_paint
+    r0_emit("pe_first_nswindow_e2e_real_record",
+        "\"kind\":\"inst_milestone\",\"im_id\":4,\"milestone_id\":7,\"instructions\":633")
+
+    // ─── assertions: count ───
+    let mc = milestone_count()
+    if mc != 8 {
+        panic("pe_first_nswindow_e2e_real FAIL [milestone_count] expected=8 got=" + to_string(mc))
+    }
+    let uc = user32_call_count()
+    if uc != 4 {
+        panic("pe_first_nswindow_e2e_real FAIL [user32_call_count] expected=4 got=" + to_string(uc))
+    }
+    let ac = appkit_event_count()
+    if ac != 4 {
+        panic("pe_first_nswindow_e2e_real FAIL [appkit_event_count] expected=4 got=" + to_string(ac))
+    }
+    let dc = dialog_visible_count()
+    if dc != 1 {
+        panic("pe_first_nswindow_e2e_real FAIL [dialog_visible_count] expected=1 got=" + to_string(dc))
+    }
+    let ic = inst_milestone_count()
+    if ic != 4 {
+        panic("pe_first_nswindow_e2e_real FAIL [inst_milestone_count] expected=4 got=" + to_string(ic))
+    }
+
+    // ─── assertions: success / has_milestone ───
+    let sc = milestone_success_count()
+    if sc != 8 {
+        panic("pe_first_nswindow_e2e_real FAIL [milestone_success_count] expected=8 got=" + to_string(sc))
+    }
+    let h_scrt = has_milestone("scrt_main_seh_entry")
+    if h_scrt != true {
+        panic("pe_first_nswindow_e2e_real FAIL [has_milestone(scrt_main_seh_entry)] expected=true got=false")
+    }
+    let h_first_paint = has_milestone("first_paint")
+    if h_first_paint != true {
+        panic("pe_first_nswindow_e2e_real FAIL [has_milestone(first_paint)] expected=true got=false")
+    }
+    let h_first_user = has_milestone("first_user_input")
+    if h_first_user != true {
+        panic("pe_first_nswindow_e2e_real FAIL [has_milestone(first_user_input)] expected=true got=false")
+    }
+    let h_unknown = has_milestone("never_recorded_milestone")
+    if h_unknown != false {
+        panic("pe_first_nswindow_e2e_real FAIL [has_milestone(never_recorded)] expected=false got=true")
+    }
+    let h_empty = has_milestone("")
+    if h_empty != false {
+        panic("pe_first_nswindow_e2e_real FAIL [has_milestone(\"\")] expected=false got=true")
+    }
+
+    // ─── name lookup assertions ───
+    if user32_fn_name(1) != "RegisterClassExW" {
+        panic("pe_first_nswindow_e2e_real FAIL [user32_fn_name(1)] expected=RegisterClassExW got=" + user32_fn_name(1))
+    }
+    if user32_fn_name(2) != "CreateWindowExW" {
+        panic("pe_first_nswindow_e2e_real FAIL [user32_fn_name(2)] expected=CreateWindowExW got=" + user32_fn_name(2))
+    }
+    if user32_fn_name(4) != "GetMessageW" {
+        panic("pe_first_nswindow_e2e_real FAIL [user32_fn_name(4)] expected=GetMessageW got=" + user32_fn_name(4))
+    }
+    if ns_event_kind_name(1) != "left_mouse_down" {
+        panic("pe_first_nswindow_e2e_real FAIL [ns_event_kind_name(1)] expected=left_mouse_down got=" + ns_event_kind_name(1))
+    }
+    if ns_event_kind_name(13) != "window_did_become_key" {
+        panic("pe_first_nswindow_e2e_real FAIL [ns_event_kind_name(13)] expected=window_did_become_key got=" + ns_event_kind_name(13))
+    }
+    if ns_event_kind_name(14) != "window_will_close" {
+        panic("pe_first_nswindow_e2e_real FAIL [ns_event_kind_name(14)] expected=window_will_close got=" + ns_event_kind_name(14))
+    }
+
+    // ─── stats sanity ───
+    let s = pfne_stats()
+    if len(s) != 6 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats len] expected=6 got=" + to_string(len(s)))
+    }
+    if s[0] != 8 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats milestone] expected=8 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats user32] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats appkit] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats dialog] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats inst] expected=4 got=" + to_string(s[4]))
+    }
+    if s[5] != 8 {
+        panic("pe_first_nswindow_e2e_real FAIL [stats success] expected=8 got=" + to_string(s[5]))
+    }
+
+    // ─── stats r0_emit (21 record + this 1 = 22 ≥ 14) ───
+    r0_emit("pe_first_nswindow_e2e_real_stats",
+        "\"milestone_count\":" + to_string(s[0])
+        + ",\"user32_call_count\":" + to_string(s[1])
+        + ",\"appkit_event_count\":" + to_string(s[2])
+        + ",\"dialog_visible_count\":" + to_string(s[3])
+        + ",\"inst_milestone_count\":" + to_string(s[4])
+        + ",\"milestone_success_count\":" + to_string(s[5]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_first_nswindow_e2e_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pfne()
+    let s2 = pfne_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_first_nswindow_e2e_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_first_nswindow_e2e_real self_test PASS (milestone="
+        + to_string(s[0]) + ", user32=" + to_string(s[1])
+        + ", appkit=" + to_string(s[2]) + ", dialog=" + to_string(s[3])
+        + ", inst=" + to_string(s[4]) + ", success=" + to_string(s[5])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pfne_stats()
+            println("milestone_count\t" + to_string(s[0]))
+            println("user32_call_count\t" + to_string(s[1]))
+            println("appkit_event_count\t" + to_string(s[2]))
+            println("dialog_visible_count\t" + to_string(s[3]))
+            println("inst_milestone_count\t" + to_string(s[4]))
+            println("milestone_success_count\t" + to_string(s[5]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pfne()
+            println("cleaned: " + pfne_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pfne_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_first_nswindow_e2e_real.hexa { self-test | stats | cleanup | dir }")
+}

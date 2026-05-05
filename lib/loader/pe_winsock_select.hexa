@@ -1,0 +1,385 @@
+// lib/loader/pe_winsock_select.hexa — Winsock select() bridge telemetry skeleton
+//
+// Winsock select() / WSAEventSelect / WSAAsyncSelect / WSAPoll → host kqueue/poll
+// bridge tracker. PE 게임이 호출하는 readiness 다중화 API 를 mac host poll/kqueue
+// 로 routing 하기 위한 record-only stage. 실 fd op 호출 X (stage6+).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 select op tracker — 실 select() / kqueue() 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// select_kind code:
+//   1 = select         (BSD-style timeout multiplexing)
+//   2 = WSAEventSelect (event-based notification)
+//   3 = WSAAsyncSelect (window message routing)
+//   4 = WSAPoll        (Vista+ poll equivalent)
+//
+// persist schema (TSV — selects.tsv):
+//   select_id<int> \t select_kind<int> \t fd_count<int> \t ready_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pws_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_winsock_select"
+}
+
+fn pws_selects_path() -> str {
+    return pws_dir() + "/selects.tsv"
+}
+
+fn pws_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pws_dir() + "'")
+}
+
+fn cleanup_pws() -> void {
+    pws_ensure_dir()
+    let _ = exec("rm -f '" + pws_selects_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pws_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pws_append_row(path: str, row: str) -> void {
+    pws_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_select: select op 1 건 기록 ───
+fn record_select(select_id: int, select_kind: int, fd_count: int, ready_count: int) -> void {
+    if select_id <= 0 {
+        panic("pe_winsock_select FAIL [record_select] expected=select_id>0 got=" + to_string(select_id))
+    }
+    if select_kind < 1 {
+        panic("pe_winsock_select FAIL [record_select] expected=select_kind>=1 got=" + to_string(select_kind))
+    }
+    if select_kind > 4 {
+        panic("pe_winsock_select FAIL [record_select] expected=select_kind<=4 got=" + to_string(select_kind))
+    }
+    if fd_count < 0 {
+        panic("pe_winsock_select FAIL [record_select] expected=fd_count>=0 got=" + to_string(fd_count))
+    }
+    if ready_count < 0 {
+        panic("pe_winsock_select FAIL [record_select] expected=ready_count>=0 got=" + to_string(ready_count))
+    }
+    if ready_count > fd_count {
+        panic("pe_winsock_select FAIL [record_select] expected=ready_count<=fd_count got=" + to_string(ready_count))
+    }
+    let row = to_string(select_id) + "\t" + to_string(select_kind)
+        + "\t" + to_string(fd_count) + "\t" + to_string(ready_count) + "\n"
+    pws_append_row(pws_selects_path(), row)
+}
+
+// ─── select_count: total select 수 ───
+fn select_count() -> int {
+    let t = pws_read_table(pws_selects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_fd_count: 모든 select fd_count 합 ───
+fn total_fd_count() -> int {
+    let t = pws_read_table(pws_selects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_ready_count: 모든 select ready_count 합 ───
+fn total_ready_count() -> int {
+    let t = pws_read_table(pws_selects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_select_kind: 특정 select_kind 의 select 수 ───
+fn count_by_select_kind(select_kind: int) -> int {
+    let t = pws_read_table(pws_selects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == select_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── select_ready_count: 특정 select_id 의 ready_count (없으면 0) ───
+fn select_ready_count(select_id: int) -> int {
+    let t = pws_read_table(pws_selects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == select_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pws_stats: [select_count, total_fd_count, total_ready_count, count_by_select_kind(2)] ───
+fn pws_stats() -> array {
+    let mut out = []
+    out.push(select_count())
+    out.push(total_fd_count())
+    out.push(total_ready_count())
+    out.push(count_by_select_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pws-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pws()
+
+    // 2. record 5 selects across ≥3 select_kinds (deterministic synthetic)
+    record_select(220001, 1, 8, 2)
+    r0_emit("pe_winsock_select_record",
+        "\"select_id\":220001,\"select_kind\":1,\"fd_count\":8,\"ready_count\":2,\"target\":\"select\"")
+
+    record_select(220002, 2, 16, 4)
+    r0_emit("pe_winsock_select_record",
+        "\"select_id\":220002,\"select_kind\":2,\"fd_count\":16,\"ready_count\":4,\"target\":\"event_select\"")
+
+    record_select(220003, 3, 4, 1)
+    r0_emit("pe_winsock_select_record",
+        "\"select_id\":220003,\"select_kind\":3,\"fd_count\":4,\"ready_count\":1,\"target\":\"async_select\"")
+
+    record_select(220004, 2, 32, 8)
+    r0_emit("pe_winsock_select_record",
+        "\"select_id\":220004,\"select_kind\":2,\"fd_count\":32,\"ready_count\":8,\"target\":\"event_select\"")
+
+    record_select(220005, 4, 64, 16)
+    r0_emit("pe_winsock_select_record",
+        "\"select_id\":220005,\"select_kind\":4,\"fd_count\":64,\"ready_count\":16,\"target\":\"wsa_poll\"")
+
+    // 3. select_count = 5
+    let c = select_count()
+    if c != 5 {
+        panic("pe_winsock_select FAIL [select_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_fd_count = 8+16+4+32+64 = 124
+    let tf = total_fd_count()
+    if tf != 124 {
+        panic("pe_winsock_select FAIL [total_fd_count] expected=124 got=" + to_string(tf))
+    }
+
+    // 5. total_ready_count = 2+4+1+8+16 = 31
+    let tr = total_ready_count()
+    if tr != 31 {
+        panic("pe_winsock_select FAIL [total_ready_count] expected=31 got=" + to_string(tr))
+    }
+
+    // 6. count_by_select_kind sanity
+    let k1 = count_by_select_kind(1)
+    if k1 != 1 {
+        panic("pe_winsock_select FAIL [count_by_select_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_select_kind(2)
+    if k2 != 2 {
+        panic("pe_winsock_select FAIL [count_by_select_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_select_kind(3)
+    if k3 != 1 {
+        panic("pe_winsock_select FAIL [count_by_select_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_select_kind(4)
+    if k4 != 1 {
+        panic("pe_winsock_select FAIL [count_by_select_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_select_kind(99)
+    if k99 != 0 {
+        panic("pe_winsock_select FAIL [count_by_select_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. select_ready_count sanity
+    let r2 = select_ready_count(220002)
+    if r2 != 4 {
+        panic("pe_winsock_select FAIL [select_ready_count(220002)] expected=4 got=" + to_string(r2))
+    }
+    let r5 = select_ready_count(220005)
+    if r5 != 16 {
+        panic("pe_winsock_select FAIL [select_ready_count(220005)] expected=16 got=" + to_string(r5))
+    }
+    let r_miss = select_ready_count(9999)
+    if r_miss != 0 {
+        panic("pe_winsock_select FAIL [select_ready_count(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 8. pws_stats() = [5, 124, 31, 2]
+    let s = pws_stats()
+    if len(s) != 4 {
+        panic("pe_winsock_select FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_winsock_select FAIL [stats select_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 124 {
+        panic("pe_winsock_select FAIL [stats total_fd_count] expected=124 got=" + to_string(s[1]))
+    }
+    if s[2] != 31 {
+        panic("pe_winsock_select FAIL [stats total_ready_count] expected=31 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_winsock_select FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_winsock_select_stats",
+        "\"select_count\":" + to_string(s[0])
+        + ",\"total_fd_count\":" + to_string(s[1])
+        + ",\"total_ready_count\":" + to_string(s[2])
+        + ",\"kind_event_select\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_winsock_select FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pws()
+    let s2 = pws_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_winsock_select FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_winsock_select self_test PASS (selects=" + to_string(s[0])
+        + ", fds=" + to_string(s[1]) + ", ready=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pws_stats()
+            println("select_count\t" + to_string(s[0]))
+            println("total_fd_count\t" + to_string(s[1]))
+            println("total_ready_count\t" + to_string(s[2]))
+            println("count_kind_event_select\t" + to_string(s[3]))
+            return
+        }
+        if sub == "ready" {
+            if len(a) >= 4 {
+                let sidv = to_int(a[3])
+                println("select_ready_count\t" + to_string(select_ready_count(sidv)))
+                return
+            }
+            println("usage: hexa run pe_winsock_select.hexa ready <select_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_select_kind\t" + to_string(count_by_select_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_winsock_select.hexa count <select_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pws()
+            println("cleaned: " + pws_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pws_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_winsock_select.hexa { self-test | stats | ready <select_id> | count <select_kind> | cleanup | dir }")
+}

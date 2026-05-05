@@ -1,0 +1,444 @@
+// lib/loader/pe_d3d11_srv_uav_real.hexa — D3D11 SRV/UAV/RTV/DSV view binding tracker
+//
+// ID3D11Device::CreateShaderResourceView / CreateUnorderedAccessView /
+// CreateRenderTargetView / CreateDepthStencilView 호출과 OM/PS/CS stage binding
+// (OMSetRenderTargets, PSSetShaderResources, CSSetUnorderedAccessViews 등)을
+// 추적하기 위한 module. 본 module 은 view descriptor 와 binding slot 의
+// record/aggregate 만 — 실 ID3D11Device::CreateXxxView / Metal MTLTexture
+// 생성은 stage2 native helper(D3DMetal binary 위임) 에서 처리.
+//
+// D3D11 view → Metal mapping:
+//   SRV (ShaderResourceView) → Metal MTLTexture / MTLBuffer (read-only).
+//                              shader 에서 sample/load. argument buffer
+//                              entry 또는 setFragmentTexture / setVertexTexture
+//                              로 binding.
+//   UAV (UnorderedAccessView) → Metal MTLTexture (read-write) + atomic.
+//                               compute / fragment shader 에서 read/write +
+//                               atomic_uint operation. setComputeTexture /
+//                               argument buffer 로 binding.
+//   RTV (RenderTargetView)    → MTLRenderPassDescriptor.colorAttachments[N].
+//                               render encoder 의 color output target.
+//                               loadAction/storeAction + clearColor 설정.
+//   DSV (DepthStencilView)    → MTLRenderPassDescriptor.depthAttachment.
+//                               (+ stencilAttachment if D24S8 / D32S8). depth
+//                               test/write 용.
+// own1: D3DMetal binary 위임 우선 + Metal SDK + MSDN ID3D11Device. MoltenVK/DXVK 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// view_kind code:
+//   1 = SRV (ShaderResourceView)
+//   2 = UAV (UnorderedAccessView)
+//   3 = RTV (RenderTargetView)
+//   4 = DSV (DepthStencilView)
+//
+// format_kind code (대표적인 D3D11 → Metal pixel format 그룹):
+//   1 = rgba8        (DXGI_FORMAT_R8G8B8A8_UNORM    → MTLPixelFormatRGBA8Unorm)
+//   2 = bc7          (DXGI_FORMAT_BC7_UNORM         → MTLPixelFormatBC7_RGBAUnorm)
+//   3 = r32_typeless (DXGI_FORMAT_R32_TYPELESS      → MTLPixelFormatR32Float / depth32)
+//   4 = r16_float    (DXGI_FORMAT_R16_FLOAT         → MTLPixelFormatR16Float)
+//   5 = r8_uint      (DXGI_FORMAT_R8_UINT           → MTLPixelFormatR8Uint)
+//
+// persist schema (TSV — views.tsv):
+//   view_id<int> \t view_kind<int> \t bind_slot<int> \t format_kind<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdsu_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_srv_uav_real"
+}
+
+fn pdsu_views_path() -> str {
+    return pdsu_dir() + "/views.tsv"
+}
+
+fn pdsu_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdsu_dir() + "'")
+}
+
+fn cleanup_pdsu() -> void {
+    pdsu_ensure_dir()
+    let _ = exec("rm -f '" + pdsu_views_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdsu_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdsu_append_row(path: str, row: str) -> void {
+    pdsu_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_view: view descriptor 1 건 기록 ───
+fn record_view(view_id: int, view_kind: int, bind_slot: int, format_kind: int) -> void {
+    if view_id <= 0 {
+        panic("pe_d3d11_srv_uav_real FAIL [record_view] expected=view_id>0 got=" + to_string(view_id))
+    }
+    if view_kind < 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [record_view] expected=view_kind>=1 got=" + to_string(view_kind))
+    }
+    if view_kind > 4 {
+        panic("pe_d3d11_srv_uav_real FAIL [record_view] expected=view_kind<=4 got=" + to_string(view_kind))
+    }
+    if bind_slot < 0 {
+        panic("pe_d3d11_srv_uav_real FAIL [record_view] expected=bind_slot>=0 got=" + to_string(bind_slot))
+    }
+    if format_kind < 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [record_view] expected=format_kind>=1 got=" + to_string(format_kind))
+    }
+    if format_kind > 5 {
+        panic("pe_d3d11_srv_uav_real FAIL [record_view] expected=format_kind<=5 got=" + to_string(format_kind))
+    }
+    let row = to_string(view_id) + "\t" + to_string(view_kind)
+        + "\t" + to_string(bind_slot) + "\t" + to_string(format_kind) + "\n"
+    pdsu_append_row(pdsu_views_path(), row)
+}
+
+// ─── view_count: total view 수 ───
+fn view_count() -> int {
+    let t = pdsu_read_table(pdsu_views_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_view_kind: 특정 view_kind 의 view 수 ───
+fn count_by_view_kind(view_kind: int) -> int {
+    let t = pdsu_read_table(pdsu_views_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == view_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_format_kind: 특정 format_kind 의 view 수 ───
+fn count_by_format_kind(format_kind: int) -> int {
+    let t = pdsu_read_table(pdsu_views_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == format_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── srv_count: view_kind=1 (SRV) view 수 ───
+fn srv_count() -> int {
+    return count_by_view_kind(1)
+}
+
+// ─── uav_count: view_kind=2 (UAV) view 수 ───
+fn uav_count() -> int {
+    return count_by_view_kind(2)
+}
+
+// ─── view_bind_slot: 특정 view_id 의 bind_slot (없으면 -1) ───
+fn view_bind_slot(view_id: int) -> int {
+    let t = pdsu_read_table(pdsu_views_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == view_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pdsu_stats: [view_count, srv_count, uav_count, count_by_format_kind(1)] ───
+fn pdsu_stats() -> array {
+    let mut out = []
+    out.push(view_count())
+    out.push(srv_count())
+    out.push(uav_count())
+    out.push(count_by_format_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdsu-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdsu()
+
+    // 2. record 6 views — 4 view_kinds (SRV/UAV/RTV/DSV), ≥3 format_kinds
+    //    v1: SRV  (kind=1), slot=0, format=rgba8(1)         — diffuse texture
+    record_view(410001, 1, 0, 1)
+    r0_emit("pe_d3d11_srv_uav_real_record",
+        "\"view_id\":410001,\"view_kind\":1,\"bind_slot\":0,\"format_kind\":1,\"target\":\"MTLTexture\"")
+
+    //    v2: SRV  (kind=1), slot=1, format=bc7(2)           — compressed texture
+    record_view(410002, 1, 1, 2)
+    r0_emit("pe_d3d11_srv_uav_real_record",
+        "\"view_id\":410002,\"view_kind\":1,\"bind_slot\":1,\"format_kind\":2,\"target\":\"MTLTexture\"")
+
+    //    v3: UAV  (kind=2), slot=0, format=r8_uint(5)       — atomic counter texture
+    record_view(410003, 2, 0, 5)
+    r0_emit("pe_d3d11_srv_uav_real_record",
+        "\"view_id\":410003,\"view_kind\":2,\"bind_slot\":0,\"format_kind\":5,\"target\":\"MTLTexture_RW\"")
+
+    //    v4: UAV  (kind=2), slot=1, format=r16_float(4)     — compute write target
+    record_view(410004, 2, 1, 4)
+    r0_emit("pe_d3d11_srv_uav_real_record",
+        "\"view_id\":410004,\"view_kind\":2,\"bind_slot\":1,\"format_kind\":4,\"target\":\"MTLTexture_RW\"")
+
+    //    v5: RTV  (kind=3), slot=0, format=rgba8(1)         — color attachment 0
+    record_view(410005, 3, 0, 1)
+    r0_emit("pe_d3d11_srv_uav_real_record",
+        "\"view_id\":410005,\"view_kind\":3,\"bind_slot\":0,\"format_kind\":1,\"target\":\"colorAttachments[0]\"")
+
+    //    v6: DSV  (kind=4), slot=0, format=r32_typeless(3)  — depth attachment
+    record_view(410006, 4, 0, 3)
+    r0_emit("pe_d3d11_srv_uav_real_record",
+        "\"view_id\":410006,\"view_kind\":4,\"bind_slot\":0,\"format_kind\":3,\"target\":\"depthAttachment\"")
+
+    // 3. view_count = 6
+    let c = view_count()
+    if c != 6 {
+        panic("pe_d3d11_srv_uav_real FAIL [view_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_view_kind sanity (all 4 view_kinds present)
+    //    SRV (kind=1) → v1, v2 = 2
+    let k1 = count_by_view_kind(1)
+    if k1 != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_view_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    //    UAV (kind=2) → v3, v4 = 2
+    let k2 = count_by_view_kind(2)
+    if k2 != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_view_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    //    RTV (kind=3) → v5 = 1
+    let k3 = count_by_view_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_view_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    //    DSV (kind=4) → v6 = 1
+    let k4 = count_by_view_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_view_kind(4)] expected=1 got=" + to_string(k4))
+    }
+
+    // 5. srv_count / uav_count alias sanity
+    let sc = srv_count()
+    if sc != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [srv_count] expected=2 got=" + to_string(sc))
+    }
+    let uc = uav_count()
+    if uc != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [uav_count] expected=2 got=" + to_string(uc))
+    }
+
+    // 6. count_by_format_kind sanity (≥3 format_kinds present: 1,2,3,4,5)
+    //    rgba8(1) → v1, v5 = 2
+    let f1 = count_by_format_kind(1)
+    if f1 != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_format_kind(1)] expected=2 got=" + to_string(f1))
+    }
+    //    bc7(2) → v2 = 1
+    let f2 = count_by_format_kind(2)
+    if f2 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_format_kind(2)] expected=1 got=" + to_string(f2))
+    }
+    //    r32_typeless(3) → v6 = 1
+    let f3 = count_by_format_kind(3)
+    if f3 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_format_kind(3)] expected=1 got=" + to_string(f3))
+    }
+    //    r16_float(4) → v4 = 1
+    let f4 = count_by_format_kind(4)
+    if f4 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_format_kind(4)] expected=1 got=" + to_string(f4))
+    }
+    //    r8_uint(5) → v3 = 1
+    let f5 = count_by_format_kind(5)
+    if f5 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [count_by_format_kind(5)] expected=1 got=" + to_string(f5))
+    }
+
+    // 7. view_bind_slot sanity
+    let b2 = view_bind_slot(410002)
+    if b2 != 1 {
+        panic("pe_d3d11_srv_uav_real FAIL [view_bind_slot(410002)] expected=1 got=" + to_string(b2))
+    }
+    let b5 = view_bind_slot(410005)
+    if b5 != 0 {
+        panic("pe_d3d11_srv_uav_real FAIL [view_bind_slot(410005)] expected=0 got=" + to_string(b5))
+    }
+    let b_miss = view_bind_slot(99999)
+    if b_miss != -1 {
+        panic("pe_d3d11_srv_uav_real FAIL [view_bind_slot(99999)] expected=-1 got=" + to_string(b_miss))
+    }
+
+    // 8. pdsu_stats() = [6, 2, 2, 2]
+    let s = pdsu_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_srv_uav_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d11_srv_uav_real FAIL [stats view_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [stats srv_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [stats uav_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d11_srv_uav_real FAIL [stats format_rgba8] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_d3d11_srv_uav_real_stats",
+        "\"view_count\":" + to_string(s[0])
+        + ",\"srv_count\":" + to_string(s[1])
+        + ",\"uav_count\":" + to_string(s[2])
+        + ",\"format_rgba8\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d11_srv_uav_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pdsu()
+    let s2 = pdsu_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_srv_uav_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_srv_uav_real self_test PASS (views=" + to_string(s[0])
+        + ", srv=" + to_string(s[1]) + ", uav=" + to_string(s[2])
+        + ", rgba8=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdsu_stats()
+            println("view_count\t" + to_string(s[0]))
+            println("srv_count\t" + to_string(s[1]))
+            println("uav_count\t" + to_string(s[2]))
+            println("format_rgba8\t" + to_string(s[3]))
+            return
+        }
+        if sub == "slot" {
+            if len(a) >= 4 {
+                let vid = to_int(a[3])
+                println("view_bind_slot\t" + to_string(view_bind_slot(vid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_srv_uav_real.hexa slot <view_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let kind = a[3]
+                let val = to_int(a[4])
+                if kind == "view" {
+                    println("count_by_view_kind\t" + to_string(count_by_view_kind(val)))
+                    return
+                }
+                if kind == "format" {
+                    println("count_by_format_kind\t" + to_string(count_by_format_kind(val)))
+                    return
+                }
+                println("usage: hexa run pe_d3d11_srv_uav_real.hexa count { view <view_kind> | format <format_kind> }")
+                return
+            }
+            println("usage: hexa run pe_d3d11_srv_uav_real.hexa count { view <view_kind> | format <format_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdsu()
+            println("cleaned: " + pdsu_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdsu_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_srv_uav_real.hexa { self-test | stats | slot <view_id> | count view <view_kind> | count format <format_kind> | cleanup | dir }")
+}

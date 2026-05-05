@@ -1,0 +1,424 @@
+// lib/loader/pe_ntdll_create_mutant_real.hexa — NTDLL NtCreateMutant/NtReleaseMutant/NtOpenMutant 실 호출 추적
+//
+// NTDLL NtCreateMutant → pthread_mutex_init(MUTEX_RECURSIVE) bridge:
+//   NtCreateMutant(out MutantHandle, DesiredAccess, OBJECT_ATTRIBUTES*, InitialOwner BOOLEAN)
+//     → pthread_mutex_init(&m, &attr_recursive) + handle table entry
+//     InitialOwner=TRUE  → 즉시 pthread_mutex_lock(&m) (현재 thread 가 소유)
+//     InitialOwner=FALSE → unowned mutex 로 시작
+//   NtReleaseMutant(MutantHandle, out PreviousCount)
+//     → pthread_mutex_unlock(&m); recursion 횟수 만큼 unlock 필요
+//   NtOpenMutant(out MutantHandle, DesiredAccess, OBJECT_ATTRIBUTES*)
+//     → handle table 에서 named mutant lookup, 새 handle 발급
+//   abandoned: owner thread 가 release 없이 종료된 경우 — 다음 acquire 시
+//             STATUS_ABANDONED (0x00000080) 반환 + mutex 자동 release
+// own1: NTDLL spec + Apple pthread. Wine 인용 X
+//
+// own 1 enforcement: 타사 Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NT API call tracker — 실 NtCreateMutant / pthread_mutex_init 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = NtCreateMutant
+//   2 = NtReleaseMutant
+//   3 = NtOpenMutant
+//   4 = NtClose (mutant handle close)
+//
+// initial_owner code:
+//   0 = FALSE (unowned 시작)
+//   1 = TRUE  (creator thread 가 즉시 lock — Recursion=1)
+//
+// abandoned code:
+//   0 = clean (owner 가 정상 release)
+//   1 = abandoned (owner thread 가 release 없이 종료 → STATUS_ABANDONED)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t initial_owner<int> \t abandoned<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pncmr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_create_mutant_real"
+}
+
+fn pncmr_ops_path() -> str {
+    return pncmr_dir() + "/ops.tsv"
+}
+
+fn pncmr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pncmr_dir() + "'")
+}
+
+fn cleanup_pncmr() -> void {
+    pncmr_ensure_dir()
+    let _ = exec("rm -f '" + pncmr_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pncmr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pncmr_append_row(path: str, row: str) -> void {
+    pncmr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: NT mutant API op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, initial_owner: int, abandoned: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if initial_owner < 0 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=initial_owner>=0 got=" + to_string(initial_owner))
+    }
+    if initial_owner > 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=initial_owner<=1 got=" + to_string(initial_owner))
+    }
+    if abandoned < 0 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=abandoned>=0 got=" + to_string(abandoned))
+    }
+    if abandoned > 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [record_op] expected=abandoned<=1 got=" + to_string(abandoned))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(initial_owner) + "\t" + to_string(abandoned) + "\n"
+    pncmr_append_row(pncmr_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pncmr_read_table(pncmr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pncmr_read_table(pncmr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── initial_owner_count: InitialOwner=TRUE op 수 ───
+fn initial_owner_count() -> int {
+    let t = pncmr_read_table(pncmr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── abandoned_count: abandoned=1 op 수 ───
+fn abandoned_count() -> int {
+    let t = pncmr_read_table(pncmr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── release_count: NtReleaseMutant op 수 (op_kind=2) ───
+fn release_count() -> int {
+    return count_by_op_kind(2)
+}
+
+// ─── op_initial_owner: 특정 op_id 의 initial_owner (없으면 -1) ───
+fn op_initial_owner(op_id: int) -> int {
+    let t = pncmr_read_table(pncmr_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pncmr_stats: [op_count, count_by_op_kind(1), release_count, abandoned_count] ───
+fn pncmr_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(count_by_op_kind(1))
+    out.push(release_count())
+    out.push(abandoned_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pncmr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pncmr()
+
+    // 2. record 5 ops — covers ≥3 op_kinds (1,2,3), mix of initial_owner / abandoned
+    //    NtCreateMutant InitialOwner=TRUE clean (creator thread 즉시 lock)
+    record_op(140001, 1, 1, 0)
+    r0_emit("pe_ntdll_create_mutant_real_record",
+        "\"op_id\":140001,\"op_kind\":1,\"initial_owner\":1,\"abandoned\":0,\"target\":\"NtCreateMutant\"")
+
+    //    NtReleaseMutant clean (owner 가 정상 release)
+    record_op(140002, 2, 0, 0)
+    r0_emit("pe_ntdll_create_mutant_real_record",
+        "\"op_id\":140002,\"op_kind\":2,\"initial_owner\":0,\"abandoned\":0,\"target\":\"NtReleaseMutant\"")
+
+    //    NtCreateMutant InitialOwner=FALSE clean (unowned 시작)
+    record_op(140003, 1, 0, 0)
+    r0_emit("pe_ntdll_create_mutant_real_record",
+        "\"op_id\":140003,\"op_kind\":1,\"initial_owner\":0,\"abandoned\":0,\"target\":\"NtCreateMutant\"")
+
+    //    NtOpenMutant — named mutant lookup 후 새 handle (named singleton 패턴)
+    record_op(140004, 3, 0, 0)
+    r0_emit("pe_ntdll_create_mutant_real_record",
+        "\"op_id\":140004,\"op_kind\":3,\"initial_owner\":0,\"abandoned\":0,\"target\":\"NtOpenMutant\"")
+
+    //    NtReleaseMutant abandoned=1 (owner thread 종료 → 다음 acquire 시 STATUS_ABANDONED)
+    record_op(140005, 2, 0, 1)
+    r0_emit("pe_ntdll_create_mutant_real_record",
+        "\"op_id\":140005,\"op_kind\":2,\"initial_owner\":0,\"abandoned\":1,\"target\":\"NtReleaseMutant\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_ntdll_create_mutant_real FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (≥3 op_kinds covered: 1,2,3)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_ntdll_create_mutant_real FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_ntdll_create_mutant_real FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ntdll_create_mutant_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. initial_owner_count = 1 (op 140001)
+    let io = initial_owner_count()
+    if io != 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [initial_owner_count] expected=1 got=" + to_string(io))
+    }
+
+    // 6. abandoned_count = 1 (op 140005)
+    let ab = abandoned_count()
+    if ab != 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [abandoned_count] expected=1 got=" + to_string(ab))
+    }
+
+    // 7. release_count = 2 (op_kind=2 == count_by_op_kind(2))
+    let rc = release_count()
+    if rc != 2 {
+        panic("pe_ntdll_create_mutant_real FAIL [release_count] expected=2 got=" + to_string(rc))
+    }
+
+    // 8. op_initial_owner sanity
+    let oi1 = op_initial_owner(140001)
+    if oi1 != 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [op_initial_owner(140001)] expected=1 got=" + to_string(oi1))
+    }
+    let oi3 = op_initial_owner(140003)
+    if oi3 != 0 {
+        panic("pe_ntdll_create_mutant_real FAIL [op_initial_owner(140003)] expected=0 got=" + to_string(oi3))
+    }
+    let oi_miss = op_initial_owner(9999)
+    if oi_miss != -1 {
+        panic("pe_ntdll_create_mutant_real FAIL [op_initial_owner(9999)] expected=-1 got=" + to_string(oi_miss))
+    }
+
+    // 9. pncmr_stats() = [5, 2, 2, 1]
+    let s = pncmr_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_create_mutant_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ntdll_create_mutant_real FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_ntdll_create_mutant_real FAIL [stats op_kind(1)] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_ntdll_create_mutant_real FAIL [stats release_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_ntdll_create_mutant_real FAIL [stats abandoned_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (6th r0_emit)
+    r0_emit("pe_ntdll_create_mutant_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"create_count\":" + to_string(s[1])
+        + ",\"release_count\":" + to_string(s[2])
+        + ",\"abandoned_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ntdll_create_mutant_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pncmr()
+    let s2 = pncmr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_create_mutant_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_create_mutant_real self_test PASS (ops=" + to_string(s[0])
+        + ", create=" + to_string(s[1]) + ", release=" + to_string(s[2])
+        + ", abandoned=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pncmr_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("count_op_kind_create\t" + to_string(s[1]))
+            println("release_count\t" + to_string(s[2]))
+            println("abandoned_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "owner" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_initial_owner\t" + to_string(op_initial_owner(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_create_mutant_real.hexa owner <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "kind" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_create_mutant_real.hexa count kind <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pncmr()
+            println("cleaned: " + pncmr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pncmr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_create_mutant_real.hexa { self-test | stats | owner <op_id> | count kind <op_kind> | cleanup | dir }")
+}

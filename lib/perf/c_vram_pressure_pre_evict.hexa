@@ -1,0 +1,172 @@
+// lib/perf/c_vram_pressure_pre_evict.hexa — CN-29 PSB-5 만점 15/15
+//
+// VRAM pressure 임박 *전* texture LRU eviction → swap thrash 방지.
+// D4 raid 진입 직전 VRAM 90%+ → 미리 oldest 20% evict.
+//
+// 무기: pressure forecast (c_swap_pressure_forecast 와 유사) + LRU.
+// 효과: 게임 stutter 의 swap-thrash 부분 제거.
+
+use "./r0_common"
+
+let VRP_DIR = GAMEBOX_HOME + "/persist/vram_pressure_pre_evict"
+let LRU_LOG = VRP_DIR + "/lru.tsv"
+let EVICTION_HISTORY = VRP_DIR + "/evictions.jsonl"
+
+fn vrp_dir() -> str { return VRP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + VRP_DIR + "'")
+}
+
+// ─── texture access 기록 — LRU 빌드용 ───
+//   resource_id, last_access_ts (us), size_kb
+fn record_access(resource_id: int, last_access_ts: int, size_kb: int) -> void {
+    ensure_dir()
+    let exists = exec("test -f '" + LRU_LOG + "' && echo ok").trim()
+    if exists == "ok" {
+        let _ = exec("awk -F'\\t' -v r=" + to_string(resource_id) + " '$1!=r' '" + LRU_LOG + "' > '" + LRU_LOG + ".tmp' && mv '" + LRU_LOG + ".tmp' '" + LRU_LOG + "'")
+    }
+    let line = to_string(resource_id) + "\t" + to_string(last_access_ts) + "\t" + to_string(size_kb)
+    let tmp = LRU_LOG + ".tmp2"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + LRU_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── pressure forecast — Holt-Winters 단순화 ───
+//   현재 + trend → next pressure
+fn forecast_pressure(current_percent: int, trend_per_sec: int, horizon_sec: int) -> int {
+    return current_percent + trend_per_sec * horizon_sec
+}
+
+// ─── pre-evict 결정 ───
+//   forecast >= 90% 면 oldest 20% evict
+fn should_pre_evict(current_percent: int, trend_per_sec: int, horizon_sec: int) -> bool {
+    let f = forecast_pressure(current_percent, trend_per_sec, horizon_sec)
+    return f >= 90
+}
+
+// ─── oldest N% LRU evict ───
+//   evicted resource IDs + total freed kb
+fn evict_oldest(percent: int) -> array {
+    let exists = exec("test -f '" + LRU_LOG + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0] }
+    let total_str = exec("wc -l < '" + LRU_LOG + "' | tr -d ' '").trim()
+    let total = to_int(total_str)
+    if total == 0 { return [0, 0] }
+    let evict_count = total * percent / 100
+    if evict_count < 1 { evict_count = 1 }
+    // sort by access ts ASC, take oldest evict_count, sum size
+    let cmd = "sort -k2,2n -t'\t' '" + LRU_LOG + "' | head -" + to_string(evict_count) + " | awk -F'\\t' '{s+=$3; c++} END{print c\"\\t\"s+0}'"
+    let result = exec(cmd).trim()
+    if result == "" { return [0, 0] }
+    let parts = result.split("\t")
+    if len(parts) < 2 { return [0, 0] }
+    let evicted = to_int(parts[0])
+    let freed_kb = to_int(parts[1])
+    // 실제 LRU 에서 제거 (oldest)
+    let _ = exec("sort -k2,2n -t'\t' '" + LRU_LOG + "' | tail -n +" + to_string(evict_count + 1) + " > '" + LRU_LOG + ".kept' && mv '" + LRU_LOG + ".kept' '" + LRU_LOG + "'")
+    return [evicted, freed_kb]
+}
+
+// ─── eviction 기록 ───
+fn record_eviction(reason: str, evicted: int, freed_kb: int, forecast: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"reason\":\"" + reason + "\",\"evicted\":" + to_string(evicted) + ",\"freed_kb\":" + to_string(freed_kb) + ",\"forecast\":" + to_string(forecast) + "}"
+    let tmp = EVICTION_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + EVICTION_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("vram_pre_evict", "\"reason\":\"" + reason + "\",\"evicted\":" + to_string(evicted) + ",\"freed_kb\":" + to_string(freed_kb) + ",\"forecast\":" + to_string(forecast))
+}
+
+// ─── auto pre-evict workflow ───
+fn auto_pre_evict(current_percent: int, trend_per_sec: int, horizon_sec: int) -> array {
+    let f = forecast_pressure(current_percent, trend_per_sec, horizon_sec)
+    if f < 90 { return [0, 0, f] }
+    let res = evict_oldest(20)
+    record_eviction("forecast_pressure", res[0], res[1], f)
+    return [res[0], res[1], f]
+}
+
+fn evict_stats() -> array {
+    let exists_l = exec("test -f '" + LRU_LOG + "' && echo ok").trim()
+    let entries = 0
+    if exists_l == "ok" {
+        entries = to_int(exec("wc -l < '" + LRU_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_e = exec("test -f '" + EVICTION_HISTORY + "' && echo ok").trim()
+    let evictions = 0
+    let freed_total = 0
+    if exists_e == "ok" {
+        evictions = to_int(exec("wc -l < '" + EVICTION_HISTORY + "' | tr -d ' '").trim())
+        let f_str = exec("grep -oE '\"freed_kb\":[0-9]+' '" + EVICTION_HISTORY + "' | cut -d: -f2 | awk '{s+=$1} END{print s+0}'").trim()
+        if f_str != "" { freed_total = to_int(f_str) }
+    }
+    return [entries, evictions, freed_total]
+}
+
+fn cleanup_vrp() -> void {
+    let _ = exec("rm -rf '" + VRP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "vrp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_vrp()
+
+    // forecast
+    let f1 = forecast_pressure(70, 5, 5)  // 70 + 25 = 95
+    if f1 != 95 { panic("c_vram_pressure_pre_evict FAIL [forecast] expected=95 got=" + to_string(f1)) }
+
+    // should pre-evict
+    if !should_pre_evict(70, 5, 5) { panic("c_vram_pressure_pre_evict FAIL [should evict 1]") }
+    if should_pre_evict(50, 1, 5) { panic("c_vram_pressure_pre_evict FAIL [should NOT evict]") }
+
+    // 합성 LRU 10 entries
+    let i = 0
+    while i < 10 {
+        let ts = 1000000 + i * 100000  // 점진 증가 (oldest = 0)
+        record_access(100 + i, ts, 1024 * (i + 1))
+        i = i + 1
+    }
+
+    // auto pre-evict — 90%+ forecast → 20% (2 of 10) evict
+    let am = auto_pre_evict(85, 2, 5)  // 95% forecast
+    if am[0] != 2 { panic("c_vram_pressure_pre_evict FAIL [evicted count] expected=2 got=" + to_string(am[0])) }
+    if am[1] < 1024 { panic("c_vram_pressure_pre_evict FAIL [freed] expected>=1024 got=" + to_string(am[1])) }
+    if am[2] != 95 { panic("c_vram_pressure_pre_evict FAIL [forecast] expected=95 got=" + to_string(am[2])) }
+
+    // 낮은 pressure — eviction 없음
+    let am_low = auto_pre_evict(50, 1, 5)
+    if am_low[0] != 0 { panic("c_vram_pressure_pre_evict FAIL [no evict expected]") }
+
+    // stats
+    let stats = evict_stats()
+    if stats[0] != 8 { panic("c_vram_pressure_pre_evict FAIL [stats entries] expected=8 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_vram_pressure_pre_evict FAIL [stats evictions] expected=1 got=" + to_string(stats[1])) }
+
+    r0_emit("vram_pre_evict_summary", "\"entries\":" + to_string(stats[0]) + ",\"evictions\":" + to_string(stats[1]) + ",\"freed\":" + to_string(stats[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_vram_pressure_pre_evict FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_vrp()
+
+    println("  ✅ c_vram_pressure_pre_evict self_test PASS (8 entries, 2 evicted, freed=" + to_string(am[1]) + "kb, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = evict_stats()
+            println("entries=" + to_string(s[0]) + " evictions=" + to_string(s[1]) + " freed=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_vrp(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_vram_pressure_pre_evict.hexa { self-test | stats | cleanup }")
+}

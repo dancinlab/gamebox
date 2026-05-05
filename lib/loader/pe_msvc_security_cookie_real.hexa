@@ -1,0 +1,471 @@
+// lib/loader/pe_msvc_security_cookie_real.hexa — MSVC /GS security cookie + CFG check tracker
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / community wrapper 0 줄.
+//        Microsoft MSVC ABI / PE LoadConfig / CFG public spec observation only —
+//        본 module 은 cookie/CFG/__fastfail telemetry 기록 전용 (no synthetic memcpy).
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   MSVC /GS security cookie (__security_cookie) init + check chain,
+//   Control Flow Guard (LdrpValidateUserCallTarget) indirect call validation,
+//   __fastfail() / __report_gsfailure() abort path,
+//   abort_avoidance milestone (cookie_match / cfg_pass / int29_skip).
+//
+// 각 record API 는 별도 TSV 에 append + r0_emit 1건 기록.
+//
+// persist schema (TSV — 5 separate tables):
+//   cookie_init.tsv:
+//     cookie_id<int> \t cookie_value_hex<str> \t source_kind<int>
+//   cookie_check.tsv:
+//     check_id<int> \t cookie_id<int> \t expected_hex<str> \t actual_hex<str> \t passed<int>
+//   cfg_target.tsv:
+//     cfg_id<int> \t target_va_hex<str> \t valid<int>
+//   fastfail.tsv:
+//     ff_id<int> \t reason_kind<int>
+//   abort_avoidance.tsv:
+//     avoid_id<int> \t source_kind<int> \t success<int>
+//
+// kind code reference:
+//   source_kind (cookie):    0=systime 1=tid 2=pid 3=hw_rng 4=combined
+//   reason_kind (fastfail):  0=stack_buffer_overrun 1=cookie_mismatch
+//                            2=invalid_target 3=control_flow_guard
+//   source_kind (avoidance): 0=cookie_match 1=cfg_pass 2=int29_skip
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmscr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_security_cookie_real"
+}
+
+fn pmscr_cookie_init_path() -> str {
+    return pmscr_dir() + "/cookie_init.tsv"
+}
+
+fn pmscr_cookie_check_path() -> str {
+    return pmscr_dir() + "/cookie_check.tsv"
+}
+
+fn pmscr_cfg_target_path() -> str {
+    return pmscr_dir() + "/cfg_target.tsv"
+}
+
+fn pmscr_fastfail_path() -> str {
+    return pmscr_dir() + "/fastfail.tsv"
+}
+
+fn pmscr_abort_avoidance_path() -> str {
+    return pmscr_dir() + "/abort_avoidance.tsv"
+}
+
+fn pmscr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmscr_dir() + "'")
+}
+
+fn cleanup_pmscr() -> void {
+    pmscr_ensure_dir()
+    let _ = exec("rm -f '" + pmscr_cookie_init_path() + "' '" + pmscr_cookie_check_path()
+        + "' '" + pmscr_cfg_target_path() + "' '" + pmscr_fastfail_path()
+        + "' '" + pmscr_abort_avoidance_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmscr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmscr_append_row(path: str, row: str) -> void {
+    pmscr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmscr_count_rows(path: str, min_cols: int) -> int {
+    let t = pmscr_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name helpers ───
+fn source_name(k: int) -> str {
+    if k == 0 { return "systime" }
+    if k == 1 { return "tid" }
+    if k == 2 { return "pid" }
+    if k == 3 { return "hw_rng" }
+    if k == 4 { return "combined" }
+    return "?"
+}
+
+fn reason_name(k: int) -> str {
+    if k == 0 { return "stack_buffer_overrun" }
+    if k == 1 { return "cookie_mismatch" }
+    if k == 2 { return "invalid_target" }
+    if k == 3 { return "control_flow_guard" }
+    return "?"
+}
+
+// ─── record_cookie_init: __security_cookie init milestone ───
+fn record_cookie_init(cookie_id: int, cookie_value_hex: str, source_kind: int) -> void {
+    if cookie_id <= 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_init] expected=cookie_id>0 got=" + to_string(cookie_id))
+    }
+    if cookie_value_hex == "" {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_init] expected=cookie_value_hex!=empty got=empty")
+    }
+    if source_kind < 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_init] expected=source_kind>=0 got=" + to_string(source_kind))
+    }
+    if source_kind > 4 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_init] expected=source_kind<=4 got=" + to_string(source_kind))
+    }
+    let row = to_string(cookie_id) + "\t" + cookie_value_hex + "\t" + to_string(source_kind) + "\n"
+    pmscr_append_row(pmscr_cookie_init_path(), row)
+}
+
+// ─── record_cookie_check: __security_check_cookie compare result ───
+fn record_cookie_check(check_id: int, cookie_id: int, expected_hex: str, actual_hex: str, passed: int) -> void {
+    if check_id <= 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_check] expected=check_id>0 got=" + to_string(check_id))
+    }
+    if cookie_id <= 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_check] expected=cookie_id>0 got=" + to_string(cookie_id))
+    }
+    if expected_hex == "" {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_check] expected=expected_hex!=empty got=empty")
+    }
+    if actual_hex == "" {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_check] expected=actual_hex!=empty got=empty")
+    }
+    if passed < 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_check] expected=passed>=0 got=" + to_string(passed))
+    }
+    if passed > 1 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cookie_check] expected=passed<=1 got=" + to_string(passed))
+    }
+    let row = to_string(check_id) + "\t" + to_string(cookie_id) + "\t"
+        + expected_hex + "\t" + actual_hex + "\t" + to_string(passed) + "\n"
+    pmscr_append_row(pmscr_cookie_check_path(), row)
+}
+
+// ─── record_cfg_target: CFG indirect call target validation milestone ───
+fn record_cfg_target(cfg_id: int, target_va_hex: str, valid: int) -> void {
+    if cfg_id <= 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cfg_target] expected=cfg_id>0 got=" + to_string(cfg_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_security_cookie_real FAIL [record_cfg_target] expected=target_va_hex!=empty got=empty")
+    }
+    if valid < 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cfg_target] expected=valid>=0 got=" + to_string(valid))
+    }
+    if valid > 1 {
+        panic("pe_msvc_security_cookie_real FAIL [record_cfg_target] expected=valid<=1 got=" + to_string(valid))
+    }
+    let row = to_string(cfg_id) + "\t" + target_va_hex + "\t" + to_string(valid) + "\n"
+    pmscr_append_row(pmscr_cfg_target_path(), row)
+}
+
+// ─── record_fastfail: __fastfail / int 29h trigger reason ───
+fn record_fastfail(ff_id: int, reason_kind: int) -> void {
+    if ff_id <= 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_fastfail] expected=ff_id>0 got=" + to_string(ff_id))
+    }
+    if reason_kind < 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_fastfail] expected=reason_kind>=0 got=" + to_string(reason_kind))
+    }
+    if reason_kind > 3 {
+        panic("pe_msvc_security_cookie_real FAIL [record_fastfail] expected=reason_kind<=3 got=" + to_string(reason_kind))
+    }
+    let row = to_string(ff_id) + "\t" + to_string(reason_kind) + "\n"
+    pmscr_append_row(pmscr_fastfail_path(), row)
+}
+
+// ─── record_abort_avoidance: cookie_match / cfg_pass / int29_skip success milestone ───
+fn record_abort_avoidance(avoid_id: int, source_kind: int, success: int) -> void {
+    if avoid_id <= 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_abort_avoidance] expected=avoid_id>0 got=" + to_string(avoid_id))
+    }
+    if source_kind < 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_abort_avoidance] expected=source_kind>=0 got=" + to_string(source_kind))
+    }
+    if source_kind > 2 {
+        panic("pe_msvc_security_cookie_real FAIL [record_abort_avoidance] expected=source_kind<=2 got=" + to_string(source_kind))
+    }
+    if success < 0 {
+        panic("pe_msvc_security_cookie_real FAIL [record_abort_avoidance] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_security_cookie_real FAIL [record_abort_avoidance] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(avoid_id) + "\t" + to_string(source_kind) + "\t" + to_string(success) + "\n"
+    pmscr_append_row(pmscr_abort_avoidance_path(), row)
+}
+
+// ─── statistics ───
+fn cookie_init_count() -> int {
+    return pmscr_count_rows(pmscr_cookie_init_path(), 3)
+}
+
+fn cookie_check_count() -> int {
+    return pmscr_count_rows(pmscr_cookie_check_path(), 5)
+}
+
+fn cfg_target_count() -> int {
+    return pmscr_count_rows(pmscr_cfg_target_path(), 3)
+}
+
+fn fastfail_count() -> int {
+    return pmscr_count_rows(pmscr_fastfail_path(), 2)
+}
+
+fn abort_avoidance_count() -> int {
+    return pmscr_count_rows(pmscr_abort_avoidance_path(), 3)
+}
+
+fn pmscr_stats() -> array {
+    let mut out = []
+    out.push(cookie_init_count())
+    out.push(cookie_check_count())
+    out.push(cfg_target_count())
+    out.push(fastfail_count())
+    out.push(abort_avoidance_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pmscr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmscr()
+
+    // ─── 1. cookie_init × 2 (systime base / combined entropy) ───
+    record_cookie_init(1, "00000000a1b2c3d4", 0)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cookie_init\",\"cookie_id\":1,\"cookie_value_hex\":\"00000000a1b2c3d4\",\"source_kind\":0,\"source\":\"systime\"")
+
+    record_cookie_init(2, "deadbeef12345678", 4)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cookie_init\",\"cookie_id\":2,\"cookie_value_hex\":\"deadbeef12345678\",\"source_kind\":4,\"source\":\"combined\"")
+
+    // ─── 2. cookie_check × 4 (모두 passed=1) ───
+    record_cookie_check(1, 1, "00000000a1b2c3d4", "00000000a1b2c3d4", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cookie_check\",\"check_id\":1,\"cookie_id\":1,\"expected_hex\":\"00000000a1b2c3d4\",\"actual_hex\":\"00000000a1b2c3d4\",\"passed\":1")
+
+    record_cookie_check(2, 1, "00000000a1b2c3d4", "00000000a1b2c3d4", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cookie_check\",\"check_id\":2,\"cookie_id\":1,\"expected_hex\":\"00000000a1b2c3d4\",\"actual_hex\":\"00000000a1b2c3d4\",\"passed\":1")
+
+    record_cookie_check(3, 2, "deadbeef12345678", "deadbeef12345678", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cookie_check\",\"check_id\":3,\"cookie_id\":2,\"expected_hex\":\"deadbeef12345678\",\"actual_hex\":\"deadbeef12345678\",\"passed\":1")
+
+    record_cookie_check(4, 2, "deadbeef12345678", "deadbeef12345678", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cookie_check\",\"check_id\":4,\"cookie_id\":2,\"expected_hex\":\"deadbeef12345678\",\"actual_hex\":\"deadbeef12345678\",\"passed\":1")
+
+    // ─── 3. cfg_target × 4 (모두 valid=1) ───
+    record_cfg_target(1, "0000000180001000", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cfg_target\",\"cfg_id\":1,\"target_va_hex\":\"0000000180001000\",\"valid\":1")
+
+    record_cfg_target(2, "0000000180001100", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cfg_target\",\"cfg_id\":2,\"target_va_hex\":\"0000000180001100\",\"valid\":1")
+
+    record_cfg_target(3, "0000000180001200", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cfg_target\",\"cfg_id\":3,\"target_va_hex\":\"0000000180001200\",\"valid\":1")
+
+    record_cfg_target(4, "0000000180001300", 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"cfg_target\",\"cfg_id\":4,\"target_va_hex\":\"0000000180001300\",\"valid\":1")
+
+    // ─── 4. fastfail × 1 (synthetic cookie_mismatch test trigger — 실제 발생 X) ───
+    record_fastfail(1, 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"fastfail\",\"ff_id\":1,\"reason_kind\":1,\"reason\":\"cookie_mismatch\"")
+
+    // ─── 5. abort_avoidance × 3 (cookie_match / cfg_pass / int29_skip) ───
+    record_abort_avoidance(1, 0, 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"abort_avoidance\",\"avoid_id\":1,\"source_kind\":0,\"success\":1,\"source\":\"cookie_match\"")
+
+    record_abort_avoidance(2, 1, 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"abort_avoidance\",\"avoid_id\":2,\"source_kind\":1,\"success\":1,\"source\":\"cfg_pass\"")
+
+    record_abort_avoidance(3, 2, 1)
+    r0_emit("pe_msvc_security_cookie_real_record",
+        "\"kind\":\"abort_avoidance\",\"avoid_id\":3,\"source_kind\":2,\"success\":1,\"source\":\"int29_skip\"")
+
+    // ─── assertions: count ───
+    let cic = cookie_init_count()
+    if cic != 2 {
+        panic("pe_msvc_security_cookie_real FAIL [cookie_init_count] expected=2 got=" + to_string(cic))
+    }
+    let ccc = cookie_check_count()
+    if ccc != 4 {
+        panic("pe_msvc_security_cookie_real FAIL [cookie_check_count] expected=4 got=" + to_string(ccc))
+    }
+    let ctc = cfg_target_count()
+    if ctc != 4 {
+        panic("pe_msvc_security_cookie_real FAIL [cfg_target_count] expected=4 got=" + to_string(ctc))
+    }
+    let ffc = fastfail_count()
+    if ffc != 1 {
+        panic("pe_msvc_security_cookie_real FAIL [fastfail_count] expected=1 got=" + to_string(ffc))
+    }
+    let aac = abort_avoidance_count()
+    if aac != 3 {
+        panic("pe_msvc_security_cookie_real FAIL [abort_avoidance_count] expected=3 got=" + to_string(aac))
+    }
+
+    // ─── name helper sanity ───
+    if source_name(0) != "systime" {
+        panic("pe_msvc_security_cookie_real FAIL [source_name(0)] expected=systime got=" + source_name(0))
+    }
+    if source_name(4) != "combined" {
+        panic("pe_msvc_security_cookie_real FAIL [source_name(4)] expected=combined got=" + source_name(4))
+    }
+    if source_name(99) != "?" {
+        panic("pe_msvc_security_cookie_real FAIL [source_name(99)] expected=? got=" + source_name(99))
+    }
+    if reason_name(1) != "cookie_mismatch" {
+        panic("pe_msvc_security_cookie_real FAIL [reason_name(1)] expected=cookie_mismatch got=" + reason_name(1))
+    }
+    if reason_name(3) != "control_flow_guard" {
+        panic("pe_msvc_security_cookie_real FAIL [reason_name(3)] expected=control_flow_guard got=" + reason_name(3))
+    }
+    if reason_name(99) != "?" {
+        panic("pe_msvc_security_cookie_real FAIL [reason_name(99)] expected=? got=" + reason_name(99))
+    }
+
+    // ─── stats sanity ───
+    let s = pmscr_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_security_cookie_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_msvc_security_cookie_real FAIL [stats cookie_init_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_security_cookie_real FAIL [stats cookie_check_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_security_cookie_real FAIL [stats cfg_target_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_msvc_security_cookie_real FAIL [stats fastfail_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 3 {
+        panic("pe_msvc_security_cookie_real FAIL [stats abort_avoidance_count] expected=3 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (14 record emit + summary/stats/kpi = 17 ≥ 14) ───
+    r0_emit("pe_msvc_security_cookie_real_stats",
+        "\"cookie_init_count\":" + to_string(s[0])
+        + ",\"cookie_check_count\":" + to_string(s[1])
+        + ",\"cfg_target_count\":" + to_string(s[2])
+        + ",\"fastfail_count\":" + to_string(s[3])
+        + ",\"abort_avoidance_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_security_cookie_real_summary",
+        "\"flow\":\"cookie_init -> cookie_check -> cfg_target -> abort_avoidance(cookie_match|cfg_pass|int29_skip)\",\"total_records\":14")
+
+    r0_emit("pe_msvc_security_cookie_real_kpi",
+        "\"cookie_check_pass_rate\":1.0,\"cfg_target_valid_rate\":1.0,\"fastfail_synthetic\":1,\"abort_avoidance_success\":3")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_security_cookie_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmscr()
+    let s2 = pmscr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_security_cookie_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_security_cookie_real self_test PASS (cookie_init="
+        + to_string(s[0]) + ", cookie_check=" + to_string(s[1])
+        + ", cfg_target=" + to_string(s[2]) + ", fastfail=" + to_string(s[3])
+        + ", abort_avoidance=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmscr_stats()
+            println("cookie_init_count\t" + to_string(s[0]))
+            println("cookie_check_count\t" + to_string(s[1]))
+            println("cfg_target_count\t" + to_string(s[2]))
+            println("fastfail_count\t" + to_string(s[3]))
+            println("abort_avoidance_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "source-name" {
+            if len(a) >= 4 {
+                println("source_name\t" + source_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_security_cookie_real.hexa source-name <kind>")
+            return
+        }
+        if sub == "reason-name" {
+            if len(a) >= 4 {
+                println("reason_name\t" + reason_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_security_cookie_real.hexa reason-name <kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmscr()
+            println("cleaned: " + pmscr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmscr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_security_cookie_real.hexa { self-test | stats | source-name <k> | reason-name <k> | cleanup | dir }")
+}

@@ -1,0 +1,395 @@
+// lib/loader/pe_seh_handler_register.hexa — cycle70 Win32 SEH __except handler register telemetry skeleton
+//
+// Win32 Structured Exception Handling (SEH) — i386 의 경우 fs:[0] 에 link 된
+// EXCEPTION_REGISTRATION_RECORD singly-linked list, x64 / arm64 의 경우 .pdata
+// section 의 RUNTIME_FUNCTION + UNWIND_INFO table-based handler. 본 module 은
+// per-thread chain depth 추적 — emulator 가 __except / __finally / handler
+// invocation 을 dispatch 할 때 register/unregister 통계를 누적.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 SEH register tracker — 실 fs:[0] write / .pdata parse 호출 X (cycle80+).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// chain_kind code:
+//   1 = fs0_x86            (i386 fs:[0] linked list EXCEPTION_REGISTRATION_RECORD)
+//   2 = pdata_x64          (x64 .pdata RUNTIME_FUNCTION table-based handler)
+//   3 = arm64_unwind       (arm64 unwind data based handler)
+//   4 = user_callback      (AddVectoredExceptionHandler / language-level callback)
+//
+// persist schema (TSV — registers.tsv):
+//   register_id<int> \t thread_id<int> \t chain_kind<int> \t chain_depth<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pshr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_seh_handler_register"
+}
+
+fn pshr_registers_path() -> str {
+    return pshr_dir() + "/registers.tsv"
+}
+
+fn pshr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pshr_dir() + "'")
+}
+
+fn cleanup_pshr() -> void {
+    pshr_ensure_dir()
+    let _ = exec("rm -f '" + pshr_registers_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pshr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pshr_append_row(path: str, row: str) -> void {
+    pshr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_register: SEH handler register 1 건 기록 ───
+fn record_register(register_id: int, thread_id: int, chain_kind: int, chain_depth: int) -> void {
+    if register_id <= 0 {
+        panic("pe_seh_handler_register FAIL [record_register] expected=register_id>0 got=" + to_string(register_id))
+    }
+    if thread_id <= 0 {
+        panic("pe_seh_handler_register FAIL [record_register] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    if chain_kind < 1 {
+        panic("pe_seh_handler_register FAIL [record_register] expected=chain_kind>=1 got=" + to_string(chain_kind))
+    }
+    if chain_kind > 4 {
+        panic("pe_seh_handler_register FAIL [record_register] expected=chain_kind<=4 got=" + to_string(chain_kind))
+    }
+    if chain_depth < 0 {
+        panic("pe_seh_handler_register FAIL [record_register] expected=chain_depth>=0 got=" + to_string(chain_depth))
+    }
+    let row = to_string(register_id) + "\t" + to_string(thread_id)
+        + "\t" + to_string(chain_kind) + "\t" + to_string(chain_depth) + "\n"
+    pshr_append_row(pshr_registers_path(), row)
+}
+
+// ─── register_count: total register 수 ───
+fn register_count() -> int {
+    let t = pshr_read_table(pshr_registers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_chain_depth: 모든 register chain_depth 합 ───
+fn total_chain_depth() -> int {
+    let t = pshr_read_table(pshr_registers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_chain_kind: 특정 chain_kind 의 register 수 ───
+fn count_by_chain_kind(kind: int) -> int {
+    let t = pshr_read_table(pshr_registers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 중복 제거된 thread_id 수 ───
+fn distinct_threads() -> int {
+    let t = pshr_read_table(pshr_registers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[1])
+                let mut found = false
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == tid {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── register_chain_depth: 특정 register_id 의 chain_depth (없으면 0) ───
+fn register_chain_depth(register_id: int) -> int {
+    let t = pshr_read_table(pshr_registers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == register_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pshr_stats: [register_count, total_chain_depth, distinct_threads, count_by_chain_kind(1)] ───
+fn pshr_stats() -> array {
+    let mut out = []
+    out.push(register_count())
+    out.push(total_chain_depth())
+    out.push(distinct_threads())
+    out.push(count_by_chain_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pshr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pshr()
+
+    // 2. record 5 registers — 4 chain_kinds, 3 threads
+    record_register(700001, 4001, 1, 1)
+    r0_emit("pe_seh_handler_register_record",
+        "\"register_id\":700001,\"thread_id\":4001,\"chain_kind\":1,\"chain_depth\":1,\"target\":\"fs0_x86\"")
+
+    record_register(700002, 4001, 1, 2)
+    r0_emit("pe_seh_handler_register_record",
+        "\"register_id\":700002,\"thread_id\":4001,\"chain_kind\":1,\"chain_depth\":2,\"target\":\"fs0_x86\"")
+
+    record_register(700003, 4002, 2, 0)
+    r0_emit("pe_seh_handler_register_record",
+        "\"register_id\":700003,\"thread_id\":4002,\"chain_kind\":2,\"chain_depth\":0,\"target\":\"pdata_x64\"")
+
+    record_register(700004, 4002, 3, 0)
+    r0_emit("pe_seh_handler_register_record",
+        "\"register_id\":700004,\"thread_id\":4002,\"chain_kind\":3,\"chain_depth\":0,\"target\":\"arm64_unwind\"")
+
+    record_register(700005, 4003, 4, 1)
+    r0_emit("pe_seh_handler_register_record",
+        "\"register_id\":700005,\"thread_id\":4003,\"chain_kind\":4,\"chain_depth\":1,\"target\":\"user_callback\"")
+
+    // 3. register_count = 5
+    let c = register_count()
+    if c != 5 {
+        panic("pe_seh_handler_register FAIL [register_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_chain_depth = 1+2+0+0+1 = 4
+    let td = total_chain_depth()
+    if td != 4 {
+        panic("pe_seh_handler_register FAIL [total_chain_depth] expected=4 got=" + to_string(td))
+    }
+
+    // 5. count_by_chain_kind sanity
+    let k1 = count_by_chain_kind(1)
+    if k1 != 2 {
+        panic("pe_seh_handler_register FAIL [count_by_chain_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_chain_kind(2)
+    if k2 != 1 {
+        panic("pe_seh_handler_register FAIL [count_by_chain_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_chain_kind(3)
+    if k3 != 1 {
+        panic("pe_seh_handler_register FAIL [count_by_chain_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_chain_kind(4)
+    if k4 != 1 {
+        panic("pe_seh_handler_register FAIL [count_by_chain_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_chain_kind(99)
+    if k99 != 0 {
+        panic("pe_seh_handler_register FAIL [count_by_chain_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_threads = 3 (4001, 4002, 4003)
+    let dt = distinct_threads()
+    if dt != 3 {
+        panic("pe_seh_handler_register FAIL [distinct_threads] expected=3 got=" + to_string(dt))
+    }
+
+    // 7. register_chain_depth sanity
+    let d2 = register_chain_depth(700002)
+    if d2 != 2 {
+        panic("pe_seh_handler_register FAIL [register_chain_depth(700002)] expected=2 got=" + to_string(d2))
+    }
+    let d5 = register_chain_depth(700005)
+    if d5 != 1 {
+        panic("pe_seh_handler_register FAIL [register_chain_depth(700005)] expected=1 got=" + to_string(d5))
+    }
+    let d_miss = register_chain_depth(9999)
+    if d_miss != 0 {
+        panic("pe_seh_handler_register FAIL [register_chain_depth(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 8. pshr_stats() = [5, 4, 3, 2]
+    let s = pshr_stats()
+    if len(s) != 4 {
+        panic("pe_seh_handler_register FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_seh_handler_register FAIL [stats register_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_seh_handler_register FAIL [stats total_chain_depth] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_seh_handler_register FAIL [stats distinct_threads] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_seh_handler_register FAIL [stats count_kind(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_seh_handler_register_stats",
+        "\"register_count\":" + to_string(s[0])
+        + ",\"total_chain_depth\":" + to_string(s[1])
+        + ",\"distinct_threads\":" + to_string(s[2])
+        + ",\"kind_fs0_x86\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_seh_handler_register FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pshr()
+    let s2 = pshr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_seh_handler_register FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_seh_handler_register self_test PASS (registers=" + to_string(s[0])
+        + ", depth=" + to_string(s[1]) + ", threads=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pshr_stats()
+            println("register_count\t" + to_string(s[0]))
+            println("total_chain_depth\t" + to_string(s[1]))
+            println("distinct_threads\t" + to_string(s[2]))
+            println("count_kind_fs0_x86\t" + to_string(s[3]))
+            return
+        }
+        if sub == "depth" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("register_chain_depth\t" + to_string(register_chain_depth(rid)))
+                return
+            }
+            println("usage: hexa run pe_seh_handler_register.hexa depth <register_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_chain_kind\t" + to_string(count_by_chain_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_seh_handler_register.hexa count <chain_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pshr()
+            println("cleaned: " + pshr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pshr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_seh_handler_register.hexa { self-test | stats | depth <register_id> | count <chain_kind> | cleanup | dir }")
+}

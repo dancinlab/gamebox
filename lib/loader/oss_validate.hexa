@@ -1,0 +1,476 @@
+// lib/loader/oss_validate.hexa — Phase 7 — OSS 게임 PE 검증 harness (skeleton)
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   참조 only — Microsoft PE/COFF spec + 각 OSS 프로젝트의 공개 metadata (GitHub
+//   release / homepage). Wine source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 1 (실제 ≥ 3: oss_catalog_lookup + oss_validate + oss_stats)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("oss_validate FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 7 — skeleton):
+//   OSS Win 게임 카탈로그 + 로컬 PE 검색 + 합성 PE 검증.
+//   Phase 0a~6 모듈들이 실제 OSS 게임의 PE 헤더 + imports + relocations 를
+//   처리할 수 있는지 검증할 entry-point.
+//
+//   Phase 7 skeleton 제약: own 1+2 mandate (only `use "../perf/r0_common"`)
+//   → pe_parser / pe_imports / pe_relocations 직접 import 불가.
+//      대신 inline byte read (od) 로 PE magic / e_lfanew / signature /
+//      import dir / reloc dir 만 직접 검사. 실제 import name list,
+//      relocation entry 분석은 Phase 7 후속 (pe_* 모듈 chain 호출).
+
+use "../perf/r0_common"
+
+// ═══════════════════════════════════════════════════════════════════════
+// OSS 게임 카탈로그 — TSV format
+// ═══════════════════════════════════════════════════════════════════════
+//
+// 한 줄 = "<name>\t<path_pattern>\t<category>\t<status>"
+// 줄 구분자 = "\n". 헤더 없음.
+//
+// status 값:
+//   "candidate" — 카탈로그 등재만 (Phase 7 현재 모든 entry)
+//   "tested"    — 1 회 이상 self_test 에서 실제 검증됨
+//   "passing"   — 전체 Phase 0a~6 chain 검증 통과
+//
+// 12 게임 카테고리 분포:
+//   FPS       5  (OpenJK, Tron2.0, Quake2, OpenArena, ioquake3)
+//   RPG       2  (OpenMW, Daggerfall-Unity)
+//   Strategy  3  (FreeCiv, Wesnoth, 0AD)
+//   Sim       1  (OpenTTD)
+//   Puzzle    1  (Hedgewars)
+//   ──────────
+//   total    12
+fn oss_catalog() -> str {
+    let t = ""
+    // FPS (5)
+    t = t + "OpenJK\t**/openjk_sp.x86.exe\tFPS\tcandidate\n"
+    t = t + "Tron2.0\t**/Tron 2.0/*.exe\tFPS\tcandidate\n"
+    t = t + "Quake2\t**/quake2.exe\tFPS\tcandidate\n"
+    t = t + "OpenArena\t**/openarena.exe\tFPS\tcandidate\n"
+    t = t + "ioquake3\t**/ioquake3.x86.exe\tFPS\tcandidate\n"
+    // RPG (2)
+    t = t + "OpenMW\t**/openmw.exe\tRPG\tcandidate\n"
+    t = t + "Daggerfall-Unity\t**/DaggerfallUnity.exe\tRPG\tcandidate\n"
+    // Strategy (3)
+    t = t + "FreeCiv\t**/freeciv.exe\tStrategy\tcandidate\n"
+    t = t + "Wesnoth\t**/wesnoth.exe\tStrategy\tcandidate\n"
+    t = t + "0AD\t**/pyrogenesis.exe\tStrategy\tcandidate\n"
+    // Sim (1)
+    t = t + "OpenTTD\t**/openttd.exe\tSim\tcandidate\n"
+    // Puzzle (1)
+    t = t + "Hedgewars\t**/hwengine.exe\tPuzzle\tcandidate\n"
+    return t
+}
+
+// ─── 카탈로그 entry 수 ───
+fn catalog_size() -> int {
+    let t = oss_catalog()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let count = 0
+    while i < n {
+        if lines[i] != "" {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── lookup: 게임명 → "<path_pattern>\t<category>\t<status>" 또는 "" ───
+fn lookup_game(name: str) -> str {
+    let t = oss_catalog()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == name {
+                    return parts[1] + "\t" + parts[2] + "\t" + parts[3]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PE inline byte read 헬퍼 — own 1+2 mandate (only r0_common import)
+//   pe_parser 직접 import 불가 → minimal byte read (od / dd) 직접 호출.
+//   Phase 7 후속에서 pe_parser / pe_imports / pe_relocations chain 호출
+//   가능해지면 이 helper 들은 제거 가능.
+// ═══════════════════════════════════════════════════════════════════════
+fn _r_u16(path: str, offset: int) -> int {
+    let cmd = "od -An -tu2 -N2 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    let s = exec(cmd).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn _r_u32(path: str, offset: int) -> int {
+    let cmd = "od -An -tu4 -N4 -j " + to_string(offset) + " '" + path + "' | tr -d ' '"
+    let s = exec(cmd).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PE validation — synthetic check
+//   path 가 존재하면 inline byte read 로 검증. 부재 시 모두 0.
+//
+// 반환: [is_pe, has_imports, has_relocs, num_dlls]
+//   is_pe        — DOS magic "MZ" + NT signature "PE\0\0" 모두 OK 면 1
+//   has_imports  — OptionalHeader DataDirectory[1] (Import) RVA != 0 이면 1
+//   has_relocs   — OptionalHeader DataDirectory[5] (BaseReloc) RVA != 0 이면 1
+//   num_dlls     — Phase 7 skeleton: 0 (Phase 7 후속에서 pe_imports.list_dependencies)
+// ═══════════════════════════════════════════════════════════════════════
+fn validate_pe(pe_path: str) -> array {
+    // 파일 존재 / size 검증
+    let exists = exec("test -f '" + pe_path + "' && echo ok").trim()
+    if exists != "ok" {
+        return [0, 0, 0, 0]
+    }
+    // 최소 size — DOS(64) + NT sig(4) + FileHeader(20) + OptHdr(96) ≈ 184
+    let sz = to_int(exec("wc -c < '" + pe_path + "' 2>/dev/null | tr -d ' '").trim())
+    if sz < 184 {
+        return [0, 0, 0, 0]
+    }
+
+    // DOS magic at offset 0 — 0x5A4D ("MZ", little-endian)
+    let dos_magic = _r_u16(pe_path, 0)
+    if dos_magic != 23117 {
+        return [0, 0, 0, 0]
+    }
+
+    // e_lfanew at offset 0x3C
+    let e_lfanew = _r_u32(pe_path, 60)
+    if e_lfanew <= 0 {
+        return [0, 0, 0, 0]
+    }
+    if e_lfanew + 24 > sz {
+        return [0, 0, 0, 0]
+    }
+
+    // NT signature at e_lfanew — 0x00004550 ("PE\0\0")
+    let nt_sig = _r_u32(pe_path, e_lfanew)
+    if nt_sig != 17744 {
+        return [0, 0, 0, 0]
+    }
+
+    // OptionalHeader Magic at e_lfanew + 24
+    let opt_magic = _r_u16(pe_path, e_lfanew + 24)
+    // 0x10B = PE32 (267), 0x20B = PE32+ (523)
+    let is_pe32 = 0
+    let is_pe64 = 0
+    if opt_magic == 267 { is_pe32 = 1 }
+    if opt_magic == 523 { is_pe64 = 1 }
+    if is_pe32 == 0 {
+        if is_pe64 == 0 {
+            return [0, 0, 0, 0]
+        }
+    }
+
+    // DataDirectory base offset — PE32: e_lfanew + 24 + 96 = e_lfanew + 120
+    //                              PE32+: e_lfanew + 24 + 112 = e_lfanew + 136
+    let dd_base = 0
+    if is_pe32 == 1 {
+        dd_base = e_lfanew + 120
+    }
+    if is_pe64 == 1 {
+        dd_base = e_lfanew + 136
+    }
+
+    // DataDirectory[1] = Import (RVA at dd_base + 8, Size at dd_base + 12)
+    // DataDirectory[5] = BaseReloc (RVA at dd_base + 40, Size at dd_base + 44)
+    let imp_rva = _r_u32(pe_path, dd_base + 8)
+    let rel_rva = _r_u32(pe_path, dd_base + 40)
+
+    let has_imp = 0
+    let has_rel = 0
+    if imp_rva > 0 { has_imp = 1 }
+    if rel_rva > 0 { has_rel = 1 }
+
+    // num_dlls — Phase 7 skeleton 은 0 (Phase 7 후속 작업에서 pe_imports chain).
+    // 실제 import descriptor 파싱은 RVA → file_offset 변환 (section table walk)
+    // 이 필요하므로, own 1+2 mandate 하에서는 pe_imports 모듈에 위임.
+    let n_dlls = 0
+
+    return [1, has_imp, has_rel, n_dlls]
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 로컬 OSS PE 검색
+//   ~/Downloads/gamebox/ 의 *.exe 파일을 모두 enumerate.
+//   Phase 7 skeleton 은 1-level (find -maxdepth 2). 후속에서 카탈로그
+//   pattern 별 매칭으로 강화.
+// ═══════════════════════════════════════════════════════════════════════
+fn discover_local_pes() -> array {
+    let mut out = []
+    let root = HOME + "/Downloads/gamebox"
+    let exists = exec("test -d '" + root + "' && echo ok").trim()
+    if exists != "ok" {
+        return out
+    }
+    let cmd = "find '" + root + "' -maxdepth 3 -type f -iname '*.exe' 2>/dev/null"
+    let res = exec(cmd).trim()
+    if res == "" {
+        return out
+    }
+    let lines = res.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let p = lines[i].trim()
+        if p != "" {
+            out.push(p)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 통계: category 별 entry count
+//
+//   반환: array of [category_name, count]
+//   (hexa stage1 dict 부재 → array of array).
+// ═══════════════════════════════════════════════════════════════════════
+fn oss_stats() -> array {
+    let mut cats = []
+    cats.push(["FPS", 0])
+    cats.push(["RPG", 0])
+    cats.push(["Strategy", 0])
+    cats.push(["Sim", 0])
+    cats.push(["Puzzle", 0])
+
+    let t = oss_catalog()
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let cat = parts[2]
+                let j = 0
+                while j < len(cats) {
+                    if cats[j][0] == cat {
+                        cats[j][1] = cats[j][1] + 1
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cats
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// self_test
+// ═══════════════════════════════════════════════════════════════════════
+fn self_test() -> void {
+    let sid = "ossval-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. catalog_size() ≥ 10
+    let sz = catalog_size()
+    if sz < 10 {
+        panic("oss_validate FAIL [catalog_size] expected=>=10 got=" + to_string(sz))
+    }
+
+    // 2. lookup_game("OpenJK") 정확 매치
+    let m_jk = lookup_game("OpenJK")
+    let exp_jk = "**/openjk_sp.x86.exe\tFPS\tcandidate"
+    if m_jk != exp_jk {
+        panic("oss_validate FAIL [lookup OpenJK] expected=" + exp_jk + " got=" + m_jk)
+    }
+
+    // 2b. lookup_game("OpenMW") 정확 매치
+    let m_mw = lookup_game("OpenMW")
+    let exp_mw = "**/openmw.exe\tRPG\tcandidate"
+    if m_mw != exp_mw {
+        panic("oss_validate FAIL [lookup OpenMW] expected=" + exp_mw + " got=" + m_mw)
+    }
+
+    // 2c. unknown game → empty
+    let m_unk = lookup_game("NoSuchGame")
+    if m_unk != "" {
+        panic("oss_validate FAIL [lookup unknown] expected=empty got=" + m_unk)
+    }
+
+    // 3. r0_emit oss_catalog_lookup
+    r0_emit("oss_catalog_lookup",
+        "\"name\":\"OpenJK\",\"category\":\"FPS\",\"status\":\"candidate\"")
+
+    // 4. discover_local_pes() — 발견된 path list
+    let local_pes = discover_local_pes()
+    let n_local = len(local_pes)
+
+    // 5. validate_pe — 발견된 PE 가 있으면 validate, 없으면 SKIP
+    let mut is_pe = 0
+    let mut has_imp = 0
+    let mut has_rel = 0
+    let mut n_dlls = 0
+    let mut tested_path = ""
+    if n_local > 0 {
+        // 우선 Battle.net-Setup.exe 가 있는지 — 없으면 첫 번째 PE 사용
+        let mut chosen = ""
+        let i = 0
+        while i < n_local {
+            let p = local_pes[i]
+            // ends with Battle.net-Setup.exe?
+            let suffix_check = exec("printf '%s' '" + p + "' | grep -E 'Battle\\.net-Setup\\.exe$' | head -1").trim()
+            if suffix_check != "" {
+                chosen = p
+            }
+            i = i + 1
+        }
+        if chosen == "" {
+            chosen = local_pes[0]
+        }
+        tested_path = chosen
+        let v = validate_pe(chosen)
+        is_pe = v[0]
+        has_imp = v[1]
+        has_rel = v[2]
+        n_dlls = v[3]
+        if is_pe != 1 {
+            panic("oss_validate FAIL [validate_pe is_pe] expected=1 got=" + to_string(is_pe) + " path=" + chosen)
+        }
+        // 실제 PE 라면 imports 는 거의 항상 있음 (kernel32 + 동반)
+        if has_imp != 1 {
+            panic("oss_validate FAIL [validate_pe has_imports] expected=1 got=" + to_string(has_imp) + " path=" + chosen)
+        }
+        // r0_emit oss_validate
+        r0_emit("oss_validate",
+            "\"path\":\"" + chosen + "\""
+            + ",\"is_pe\":" + to_string(is_pe)
+            + ",\"has_imports\":" + to_string(has_imp)
+            + ",\"has_relocs\":" + to_string(has_rel)
+            + ",\"num_dlls\":" + to_string(n_dlls))
+    } else {
+        // 로컬 PE 부재 → SKIP (own 2 r0_emit ≥ 1 위해 oss_validate skip event 만 emit)
+        r0_emit("oss_validate",
+            "\"path\":\"\""
+            + ",\"is_pe\":0,\"has_imports\":0,\"has_relocs\":0,\"num_dlls\":0"
+            + ",\"skip\":\"no_local_pe\"")
+    }
+
+    // 6. oss_stats — category 별 count + 합계 검증
+    let stats = oss_stats()
+    let cn = len(stats)
+    if cn < 5 {
+        panic("oss_validate FAIL [stats categories] expected=>=5 got=" + to_string(cn))
+    }
+    let mut sum_cat = 0
+    let i = 0
+    while i < cn {
+        sum_cat = sum_cat + stats[i][1]
+        i = i + 1
+    }
+    if sum_cat != sz {
+        panic("oss_validate FAIL [stats sum] expected=" + to_string(sz) + " got=" + to_string(sum_cat))
+    }
+
+    // 7. r0_emit oss_stats
+    r0_emit("oss_stats",
+        "\"catalog_size\":" + to_string(sz)
+        + ",\"local_pes\":" + to_string(n_local)
+        + ",\"categories\":" + to_string(cn))
+
+    // 8. r0 emit count 검증 — 정확히 3 events 기대
+    //    (oss_catalog_lookup + oss_validate + oss_stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n != 3 {
+        panic("oss_validate FAIL [r0 emit count] expected=3 got=" + to_string(emit_n))
+    }
+
+    // 9. PASS/SKIP banner
+    if n_local == 0 {
+        println("  ⚠ oss_validate self_test SKIP (no local PE; catalog_size=" + to_string(sz) + ", sid=" + sid + ")")
+        return
+    }
+    println("  ✅ oss_validate self_test PASS (catalog_size=" + to_string(sz)
+        + ", local_pes=" + to_string(n_local)
+        + ", tested=" + tested_path
+        + ", is_pe=" + to_string(is_pe)
+        + ", has_imports=" + to_string(has_imp)
+        + ", has_relocs=" + to_string(has_rel)
+        + ", sid=" + sid + ")")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// main dispatch
+// ═══════════════════════════════════════════════════════════════════════
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "catalog" {
+            print(oss_catalog())
+            return
+        }
+        if sub == "size" {
+            println(to_string(catalog_size()))
+            return
+        }
+        if sub == "lookup" {
+            if len(a) >= 4 {
+                let name = a[3]
+                let m = lookup_game(name)
+                if m == "" {
+                    println("(not found)")
+                } else {
+                    println(m)
+                }
+                return
+            }
+        }
+        if sub == "discover" {
+            let pes = discover_local_pes()
+            let n = len(pes)
+            let i = 0
+            while i < n {
+                println(pes[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "validate" {
+            if len(a) >= 4 {
+                let p = a[3]
+                let v = validate_pe(p)
+                println("is_pe="       + to_string(v[0])
+                    + " has_imports=" + to_string(v[1])
+                    + " has_relocs="  + to_string(v[2])
+                    + " num_dlls="    + to_string(v[3]))
+                return
+            }
+        }
+        if sub == "stats" {
+            let stats = oss_stats()
+            let n = len(stats)
+            let i = 0
+            while i < n {
+                println(stats[i][0] + "\t" + to_string(stats[i][1]))
+                i = i + 1
+            }
+            return
+        }
+    }
+    println("usage: hexa run oss_validate.hexa { self-test | catalog | size | lookup <name> | discover | validate <path> | stats }")
+}

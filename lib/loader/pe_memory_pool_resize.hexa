@@ -1,0 +1,374 @@
+// lib/loader/pe_memory_pool_resize.hexa — cycle 66 pool growth/shrink tracker
+//
+// PE loader 가 관리하는 memory pool 의 resize event 추적. growth (new>old) 와
+// shrink (new<old) 를 분리 집계, total delta bytes 로 누적 메모리 압박을 측정.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 resize event tracker — 실 mmap()/munmap()/mremap() X.
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — resizes.tsv):
+//   resize_id<int> \t pool_id<int> \t old_size<int> \t new_size<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmpr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_memory_pool_resize"
+}
+
+fn pmpr_resizes_path() -> str {
+    return pmpr_dir() + "/resizes.tsv"
+}
+
+fn pmpr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmpr_dir() + "'")
+}
+
+fn cleanup_pmpr() -> void {
+    pmpr_ensure_dir()
+    let _ = exec("rm -f '" + pmpr_resizes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmpr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmpr_append_row(path: str, row: str) -> void {
+    pmpr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_resize: resize event 1 건 기록 ───
+fn record_resize(resize_id: int, pool_id: int, old_size: int, new_size: int) -> void {
+    if resize_id <= 0 {
+        panic("pe_memory_pool_resize FAIL [record_resize] expected=resize_id>0 got=" + to_string(resize_id))
+    }
+    if pool_id <= 0 {
+        panic("pe_memory_pool_resize FAIL [record_resize] expected=pool_id>0 got=" + to_string(pool_id))
+    }
+    if old_size < 0 {
+        panic("pe_memory_pool_resize FAIL [record_resize] expected=old_size>=0 got=" + to_string(old_size))
+    }
+    if new_size < 0 {
+        panic("pe_memory_pool_resize FAIL [record_resize] expected=new_size>=0 got=" + to_string(new_size))
+    }
+    let row = to_string(resize_id) + "\t" + to_string(pool_id)
+        + "\t" + to_string(old_size) + "\t" + to_string(new_size) + "\n"
+    pmpr_append_row(pmpr_resizes_path(), row)
+}
+
+// ─── resize_count: total resize event 수 ───
+fn resize_count() -> int {
+    let t = pmpr_read_table(pmpr_resizes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── growth_count: new_size > old_size 인 row 수 ───
+fn growth_count() -> int {
+    let t = pmpr_read_table(pmpr_resizes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let old_s = to_int(parts[2])
+                let new_s = to_int(parts[3])
+                if new_s > old_s {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── shrink_count: new_size < old_size 인 row 수 ───
+fn shrink_count() -> int {
+    let t = pmpr_read_table(pmpr_resizes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let old_s = to_int(parts[2])
+                let new_s = to_int(parts[3])
+                if new_s < old_s {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_delta_bytes: Σ (new_size - old_size) ───
+fn total_delta_bytes() -> int {
+    let t = pmpr_read_table(pmpr_resizes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let old_s = to_int(parts[2])
+                let new_s = to_int(parts[3])
+                sum = sum + (new_s - old_s)
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── resize_delta: 특정 resize_id 의 (new_size - old_size) (없으면 0) ───
+fn resize_delta(resize_id: int) -> int {
+    let t = pmpr_read_table(pmpr_resizes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == resize_id {
+                    return to_int(parts[3]) - to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pmpr_stats: [resize_count, growth_count, shrink_count, total_delta_bytes] ───
+fn pmpr_stats() -> array {
+    let mut out = []
+    out.push(resize_count())
+    out.push(growth_count())
+    out.push(shrink_count())
+    out.push(total_delta_bytes())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmpr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmpr()
+
+    // 2. record 4 resize events (2 grow, 1 shrink, 1 equal)
+    record_resize(660001, 1, 1024, 4096)
+    r0_emit("pe_memory_pool_resize_record",
+        "\"resize_id\":660001,\"pool_id\":1,\"old_size\":1024,\"new_size\":4096,\"kind\":\"grow\"")
+
+    record_resize(660002, 1, 4096, 8192)
+    r0_emit("pe_memory_pool_resize_record",
+        "\"resize_id\":660002,\"pool_id\":1,\"old_size\":4096,\"new_size\":8192,\"kind\":\"grow\"")
+
+    record_resize(660003, 2, 2048, 512)
+    r0_emit("pe_memory_pool_resize_record",
+        "\"resize_id\":660003,\"pool_id\":2,\"old_size\":2048,\"new_size\":512,\"kind\":\"shrink\"")
+
+    record_resize(660004, 2, 512, 512)
+    r0_emit("pe_memory_pool_resize_record",
+        "\"resize_id\":660004,\"pool_id\":2,\"old_size\":512,\"new_size\":512,\"kind\":\"equal\"")
+
+    // 3. resize_count = 4
+    let c = resize_count()
+    if c != 4 {
+        panic("pe_memory_pool_resize FAIL [resize_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. growth_count = 2
+    let g = growth_count()
+    if g != 2 {
+        panic("pe_memory_pool_resize FAIL [growth_count] expected=2 got=" + to_string(g))
+    }
+
+    // 5. shrink_count = 1
+    let sh = shrink_count()
+    if sh != 1 {
+        panic("pe_memory_pool_resize FAIL [shrink_count] expected=1 got=" + to_string(sh))
+    }
+
+    // 6. total_delta_bytes = (4096-1024)+(8192-4096)+(512-2048)+(512-512)
+    //                     = 3072 + 4096 + (-1536) + 0 = 5632
+    let td = total_delta_bytes()
+    if td != 5632 {
+        panic("pe_memory_pool_resize FAIL [total_delta_bytes] expected=5632 got=" + to_string(td))
+    }
+
+    // 7. resize_delta sanity
+    let d1 = resize_delta(660001)
+    if d1 != 3072 {
+        panic("pe_memory_pool_resize FAIL [resize_delta(660001)] expected=3072 got=" + to_string(d1))
+    }
+    let d3 = resize_delta(660003)
+    if d3 != -1536 {
+        panic("pe_memory_pool_resize FAIL [resize_delta(660003)] expected=-1536 got=" + to_string(d3))
+    }
+    let d4 = resize_delta(660004)
+    if d4 != 0 {
+        panic("pe_memory_pool_resize FAIL [resize_delta(660004)] expected=0 got=" + to_string(d4))
+    }
+    let d_miss = resize_delta(9999)
+    if d_miss != 0 {
+        panic("pe_memory_pool_resize FAIL [resize_delta(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 8. pmpr_stats() = [4, 2, 1, 5632]
+    let s = pmpr_stats()
+    if len(s) != 4 {
+        panic("pe_memory_pool_resize FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_memory_pool_resize FAIL [stats resize_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_memory_pool_resize FAIL [stats growth_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_memory_pool_resize FAIL [stats shrink_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 5632 {
+        panic("pe_memory_pool_resize FAIL [stats total_delta_bytes] expected=5632 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_memory_pool_resize_stats",
+        "\"resize_count\":" + to_string(s[0])
+        + ",\"growth_count\":" + to_string(s[1])
+        + ",\"shrink_count\":" + to_string(s[2])
+        + ",\"total_delta_bytes\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_memory_pool_resize FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pmpr()
+    let s2 = pmpr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_memory_pool_resize FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_memory_pool_resize self_test PASS (resizes=" + to_string(s[0])
+        + ", grow=" + to_string(s[1]) + ", shrink=" + to_string(s[2])
+        + ", delta=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmpr_stats()
+            println("resize_count\t" + to_string(s[0]))
+            println("growth_count\t" + to_string(s[1]))
+            println("shrink_count\t" + to_string(s[2]))
+            println("total_delta_bytes\t" + to_string(s[3]))
+            return
+        }
+        if sub == "delta" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("resize_delta\t" + to_string(resize_delta(rid)))
+                return
+            }
+            println("usage: hexa run pe_memory_pool_resize.hexa delta <resize_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = a[3]
+                if kind == "growth" {
+                    println("growth_count\t" + to_string(growth_count()))
+                    return
+                }
+                if kind == "shrink" {
+                    println("shrink_count\t" + to_string(shrink_count()))
+                    return
+                }
+                println("usage: hexa run pe_memory_pool_resize.hexa count { growth | shrink }")
+                return
+            }
+            println("usage: hexa run pe_memory_pool_resize.hexa count { growth | shrink }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmpr()
+            println("cleaned: " + pmpr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmpr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_memory_pool_resize.hexa { self-test | stats | delta <resize_id> | count growth|shrink | cleanup | dir }")
+}

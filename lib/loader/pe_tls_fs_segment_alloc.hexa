@@ -1,0 +1,432 @@
+// lib/loader/pe_tls_fs_segment_alloc.hexa — phase 11 TLS fake FS segment per-thread 합성
+//
+// phase 11 — i386 PE32 의 FS:[0x18] = Self, FS:[0x30] = PEB, FS:[0x34] = LastError.
+// Apple-native = pthread_key_create per slot + signal handler 가 segment fault 시
+// 정확한 fs offset 을 매핑한다. 또는 inline asm 으로 fake gs register 합성.
+// own1: pthread + sigaction. (Wine kernel32/thread.c, CrossOver/Whisky 인용 X)
+//
+// i386 TEB FS segment 주요 offset (NT TIB):
+//   FS:[0x00] = ExceptionList     (= NT_TIB.ExceptionList,  Self_Alt 후보)
+//   FS:[0x18] = Self pointer      (= TEB linear address, NT_TIB.Self)
+//   FS:[0x30] = PEB pointer
+//   FS:[0x34] = LastErrorValue
+//   FS:[0x20] = ProcessId
+//   FS:[0x24] = ThreadId
+//
+// 본 phase 의 fs_offset code 는 위 offset 을 그대로 사용한다:
+//   0  = Self            (FS:[0x00]/NT_TIB.ExceptionList 자리 — own1 첫 슬롯)
+//   24 = Self_Alt        (FS:[0x18] = NT_TIB.Self)
+//   48 = PEB             (FS:[0x30])
+//   52 = LastError       (FS:[0x34])
+//   60 = ProcessId       (FS:[0x3C] — extended slot)
+//   64 = ThreadId        (FS:[0x40] — extended slot)
+//
+// 본 module 은 i386 PE32 의 fs:[0]/fs:[0x18]/fs:[0x30] 액세스를 Apple-native
+// pthread_key_create + signal trampoline 으로 emulation 하기 위한 per-thread
+// slot 합성 기록을 추적한다. 동일 thread_id 가 여러 fs_offset 슬롯을 가질 수
+// 있으며, 동일 fs_offset 도 여러 thread 에서 합성될 수 있다.
+//
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — allocs.tsv):
+//   alloc_id<int> \t fs_offset<int> \t thread_id<int> \t slot_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ptfsa_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_tls_fs_segment_alloc"
+}
+
+fn ptfsa_allocs_path() -> str {
+    return ptfsa_dir() + "/allocs.tsv"
+}
+
+fn ptfsa_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ptfsa_dir() + "'")
+}
+
+fn cleanup_ptfsa() -> void {
+    ptfsa_ensure_dir()
+    let _ = exec("rm -f '" + ptfsa_allocs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ptfsa_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ptfsa_append_row(path: str, row: str) -> void {
+    ptfsa_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_alloc: TLS fake FS segment slot 합성 1 건 기록 ───
+fn record_alloc(alloc_id: int, fs_offset: int, thread_id: int, slot_size_bytes: int) -> void {
+    if alloc_id <= 0 {
+        panic("pe_tls_fs_segment_alloc FAIL [record_alloc] expected=alloc_id>0 got=" + to_string(alloc_id))
+    }
+    if fs_offset < 0 {
+        panic("pe_tls_fs_segment_alloc FAIL [record_alloc] expected=fs_offset>=0 got=" + to_string(fs_offset))
+    }
+    if fs_offset > 4095 {
+        panic("pe_tls_fs_segment_alloc FAIL [record_alloc] expected=fs_offset<=4095 got=" + to_string(fs_offset))
+    }
+    if thread_id <= 0 {
+        panic("pe_tls_fs_segment_alloc FAIL [record_alloc] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    if slot_size_bytes < 0 {
+        panic("pe_tls_fs_segment_alloc FAIL [record_alloc] expected=slot_size_bytes>=0 got=" + to_string(slot_size_bytes))
+    }
+    let row = to_string(alloc_id) + "\t" + to_string(fs_offset)
+        + "\t" + to_string(thread_id) + "\t" + to_string(slot_size_bytes) + "\n"
+    ptfsa_append_row(ptfsa_allocs_path(), row)
+}
+
+// ─── alloc_count: total alloc 수 ───
+fn alloc_count() -> int {
+    let t = ptfsa_read_table(ptfsa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_fs_offset: 특정 fs_offset 의 alloc 수 ───
+fn count_by_fs_offset(fs_offset: int) -> int {
+    let t = ptfsa_read_table(ptfsa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == fs_offset {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 등장한 thread_id 의 distinct 수 ───
+fn distinct_threads() -> int {
+    let t = ptfsa_read_table(ptfsa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[2])
+                let mut found = false
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == tid {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── total_slot_size_bytes: 모든 alloc slot_size_bytes 합 ───
+fn total_slot_size_bytes() -> int {
+    let t = ptfsa_read_table(ptfsa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── peb_alloc_count: FS:[0x30] (PEB) alloc 수 (fs_offset == 48) ───
+fn peb_alloc_count() -> int {
+    return count_by_fs_offset(48)
+}
+
+// ─── alloc_slot_size: 특정 alloc_id 의 slot_size_bytes (없으면 0) ───
+fn alloc_slot_size(alloc_id: int) -> int {
+    let t = ptfsa_read_table(ptfsa_allocs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == alloc_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ptfsa_stats: [alloc_count, total_slot_size_bytes, distinct_threads, peb_alloc_count] ───
+fn ptfsa_stats() -> array {
+    let mut out = []
+    out.push(alloc_count())
+    out.push(total_slot_size_bytes())
+    out.push(distinct_threads())
+    out.push(peb_alloc_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ptfsa-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ptfsa()
+
+    // 2. record 6 allocs covering ≥4 fs_offsets and ≥2 threads
+    //    thread A (tid=1001): Self / Self_Alt / PEB / LastError
+    //    thread B (tid=1002): PEB / ThreadId
+    //
+    //    A: FS:[0x00] Self  (4 bytes pointer slot)
+    record_alloc(1101001, 0, 1001, 4)
+    r0_emit("pe_tls_fs_segment_alloc_record",
+        "\"alloc_id\":1101001,\"fs_offset\":0,\"thread_id\":1001,\"slot_size_bytes\":4,\"target\":\"Self\"")
+
+    //    A: FS:[0x18] Self_Alt
+    record_alloc(1101002, 24, 1001, 4)
+    r0_emit("pe_tls_fs_segment_alloc_record",
+        "\"alloc_id\":1101002,\"fs_offset\":24,\"thread_id\":1001,\"slot_size_bytes\":4,\"target\":\"Self_Alt\"")
+
+    //    A: FS:[0x30] PEB
+    record_alloc(1101003, 48, 1001, 4)
+    r0_emit("pe_tls_fs_segment_alloc_record",
+        "\"alloc_id\":1101003,\"fs_offset\":48,\"thread_id\":1001,\"slot_size_bytes\":4,\"target\":\"PEB\"")
+
+    //    A: FS:[0x34] LastError
+    record_alloc(1101004, 52, 1001, 4)
+    r0_emit("pe_tls_fs_segment_alloc_record",
+        "\"alloc_id\":1101004,\"fs_offset\":52,\"thread_id\":1001,\"slot_size_bytes\":4,\"target\":\"LastError\"")
+
+    //    B: FS:[0x30] PEB (same offset, different thread)
+    record_alloc(1101005, 48, 1002, 4)
+    r0_emit("pe_tls_fs_segment_alloc_record",
+        "\"alloc_id\":1101005,\"fs_offset\":48,\"thread_id\":1002,\"slot_size_bytes\":4,\"target\":\"PEB\"")
+
+    //    B: FS:[0x40] ThreadId
+    record_alloc(1101006, 64, 1002, 4)
+    r0_emit("pe_tls_fs_segment_alloc_record",
+        "\"alloc_id\":1101006,\"fs_offset\":64,\"thread_id\":1002,\"slot_size_bytes\":4,\"target\":\"ThreadId\"")
+
+    // 3. alloc_count = 6
+    let c = alloc_count()
+    if c != 6 {
+        panic("pe_tls_fs_segment_alloc FAIL [alloc_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_fs_offset sanity (0=1, 24=1, 48=2, 52=1, 64=1)
+    let f0 = count_by_fs_offset(0)
+    if f0 != 1 {
+        panic("pe_tls_fs_segment_alloc FAIL [count_by_fs_offset(0)] expected=1 got=" + to_string(f0))
+    }
+    let f24 = count_by_fs_offset(24)
+    if f24 != 1 {
+        panic("pe_tls_fs_segment_alloc FAIL [count_by_fs_offset(24)] expected=1 got=" + to_string(f24))
+    }
+    let f48 = count_by_fs_offset(48)
+    if f48 != 2 {
+        panic("pe_tls_fs_segment_alloc FAIL [count_by_fs_offset(48)] expected=2 got=" + to_string(f48))
+    }
+    let f52 = count_by_fs_offset(52)
+    if f52 != 1 {
+        panic("pe_tls_fs_segment_alloc FAIL [count_by_fs_offset(52)] expected=1 got=" + to_string(f52))
+    }
+    let f64 = count_by_fs_offset(64)
+    if f64 != 1 {
+        panic("pe_tls_fs_segment_alloc FAIL [count_by_fs_offset(64)] expected=1 got=" + to_string(f64))
+    }
+    let f_miss = count_by_fs_offset(999)
+    if f_miss != 0 {
+        panic("pe_tls_fs_segment_alloc FAIL [count_by_fs_offset(999)] expected=0 got=" + to_string(f_miss))
+    }
+
+    // 5. peb_alloc_count = count_by_fs_offset(48) = 2
+    let pebc = peb_alloc_count()
+    if pebc != 2 {
+        panic("pe_tls_fs_segment_alloc FAIL [peb_alloc_count] expected=2 got=" + to_string(pebc))
+    }
+
+    // 6. distinct_threads = 2 (1001, 1002)
+    let dt = distinct_threads()
+    if dt != 2 {
+        panic("pe_tls_fs_segment_alloc FAIL [distinct_threads] expected=2 got=" + to_string(dt))
+    }
+
+    // 7. total_slot_size_bytes = 4*6 = 24
+    let ts = total_slot_size_bytes()
+    if ts != 24 {
+        panic("pe_tls_fs_segment_alloc FAIL [total_slot_size_bytes] expected=24 got=" + to_string(ts))
+    }
+
+    // 8. alloc_slot_size sanity
+    let sz3 = alloc_slot_size(1101003)
+    if sz3 != 4 {
+        panic("pe_tls_fs_segment_alloc FAIL [alloc_slot_size(1101003)] expected=4 got=" + to_string(sz3))
+    }
+    let sz_miss = alloc_slot_size(9999)
+    if sz_miss != 0 {
+        panic("pe_tls_fs_segment_alloc FAIL [alloc_slot_size(9999)] expected=0 got=" + to_string(sz_miss))
+    }
+
+    // 9. ptfsa_stats() = [6, 24, 2, 2]
+    let s = ptfsa_stats()
+    if len(s) != 4 {
+        panic("pe_tls_fs_segment_alloc FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_tls_fs_segment_alloc FAIL [stats alloc_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 24 {
+        panic("pe_tls_fs_segment_alloc FAIL [stats total_slot_size_bytes] expected=24 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_tls_fs_segment_alloc FAIL [stats distinct_threads] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_tls_fs_segment_alloc FAIL [stats peb_alloc_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_tls_fs_segment_alloc_stats",
+        "\"alloc_count\":" + to_string(s[0])
+        + ",\"total_slot_size_bytes\":" + to_string(s[1])
+        + ",\"distinct_threads\":" + to_string(s[2])
+        + ",\"peb_alloc_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_tls_fs_segment_alloc FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_ptfsa()
+    let s2 = ptfsa_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_tls_fs_segment_alloc FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_tls_fs_segment_alloc self_test PASS (allocs=" + to_string(s[0])
+        + ", slot_bytes=" + to_string(s[1]) + ", threads=" + to_string(s[2])
+        + ", peb=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ptfsa_stats()
+            println("alloc_count\t" + to_string(s[0]))
+            println("total_slot_size_bytes\t" + to_string(s[1]))
+            println("distinct_threads\t" + to_string(s[2]))
+            println("peb_alloc_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let aid = to_int(a[3])
+                println("alloc_slot_size\t" + to_string(alloc_slot_size(aid)))
+                return
+            }
+            println("usage: hexa run pe_tls_fs_segment_alloc.hexa size <alloc_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let off = to_int(a[3])
+                println("count_by_fs_offset\t" + to_string(count_by_fs_offset(off)))
+                return
+            }
+            println("usage: hexa run pe_tls_fs_segment_alloc.hexa count <fs_offset>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ptfsa()
+            println("cleaned: " + ptfsa_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ptfsa_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_tls_fs_segment_alloc.hexa { self-test | stats | size <alloc_id> | count <fs_offset> | cleanup | dir }")
+}

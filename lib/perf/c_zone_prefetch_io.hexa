@@ -1,0 +1,191 @@
+// lib/perf/c_zone_prefetch_io.hexa — CN-13 PSB-2 sketch 즉시 채택 (만점 15/15)
+//
+// zone 진입 직전 asset 미리 read — 무기: trie + result_cache.
+// 효과: D4 zone 포털 클릭 → 200MB asset background read (OS page cache warm).
+//
+// own 1 + own 2 mandate.
+
+use "./r0_common"
+
+let ZONE_PREFETCH_DIR = GAMEBOX_HOME + "/persist/zone_prefetch"
+let ZONE_REGISTRY = ZONE_PREFETCH_DIR + "/zone_assets.tsv"
+let PREFETCH_HISTORY = ZONE_PREFETCH_DIR + "/history.jsonl"
+
+fn prefetch_dir() -> str { return ZONE_PREFETCH_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + ZONE_PREFETCH_DIR + "'")
+}
+
+// ─── zone → asset 등록 ───
+fn register_zone_assets(zone: str, asset_paths: array) -> void {
+    ensure_dir()
+    let csv = ""
+    let i = 0
+    while i < len(asset_paths) {
+        if i > 0 { csv = csv + "," }
+        csv = csv + asset_paths[i]
+        i = i + 1
+    }
+    let line = zone + "\t" + csv
+    let tmp = ZONE_REGISTRY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + ZONE_REGISTRY + "' && rm -f '" + tmp + "'")
+    r0_emit("zone_assets_registered", "\"zone\":\"" + zone + "\",\"count\":" + to_string(len(asset_paths)))
+}
+
+// ─── zone 의 asset paths lookup ───
+fn lookup_assets(zone: str) -> array {
+    let exists = exec("test -f '" + ZONE_REGISTRY + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+    let line = exec("grep -E '^" + zone + "\\s' '" + ZONE_REGISTRY + "' | tail -1").trim()
+    if line == "" { return [] }
+    let parts = line.split("\t")
+    if len(parts) < 2 { return [] }
+    let csv = parts[1]
+    if csv == "" { return [] }
+    return csv.split(",")
+}
+
+// ─── prefetch trigger ───
+//   asset paths 에 dummy read 시뮬 (cat > /dev/null)
+//   returns [files_read, total_bytes]
+fn trigger_prefetch(zone: str) -> array {
+    let assets = lookup_assets(zone)
+    if len(assets) == 0 {
+        r0_emit("zone_prefetch_skip", "\"zone\":\"" + zone + "\",\"reason\":\"no_assets\"")
+        return [0, 0]
+    }
+    let files_read = 0
+    let total_bytes = 0
+    let i = 0
+    while i < len(assets) {
+        let p = assets[i]
+        let exists = exec("test -f '" + p + "' && echo ok").trim()
+        if exists == "ok" {
+            let sz_str = exec("wc -c < '" + p + "' | tr -d ' '").trim()
+            let sz = to_int(sz_str)
+            let _read = exec("cat '" + p + "' > /dev/null 2>&1 && echo ok").trim()
+            files_read = files_read + 1
+            total_bytes = total_bytes + sz
+        }
+        i = i + 1
+    }
+    let ts = exec("date +%s").trim()
+    let h_line = "{\"zone\":\"" + zone + "\",\"files_read\":" + to_string(files_read) + ",\"total_bytes\":" + to_string(total_bytes) + ",\"ts\":" + ts + "}"
+    let tmp = PREFETCH_HISTORY + ".tmp"
+    write_file(tmp, h_line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PREFETCH_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("zone_prefetch_triggered",
+        "\"zone\":\"" + zone + "\",\"files_read\":" + to_string(files_read) + ",\"total_bytes\":" + to_string(total_bytes))
+    return [files_read, total_bytes]
+}
+
+// ─── page cache hit ratio ───
+fn pagecache_hit_ratio(prefetched_count: int, accessed_count: int) -> int {
+    if prefetched_count <= 0 { return 0 }
+    if accessed_count <= 0 { return 0 }
+    let hit = prefetched_count
+    if accessed_count < hit { hit = accessed_count }
+    return hit * 1000 / accessed_count
+}
+
+// ─── stats ───
+fn prefetch_stats() -> array {
+    let exists_r = exec("test -f '" + ZONE_REGISTRY + "' && echo ok").trim()
+    let zones = 0
+    if exists_r == "ok" {
+        zones = to_int(exec("wc -l < '" + ZONE_REGISTRY + "' | tr -d ' '").trim())
+    }
+    let exists_h = exec("test -f '" + PREFETCH_HISTORY + "' && echo ok").trim()
+    let prefetches = 0
+    let total_bytes = 0
+    if exists_h == "ok" {
+        prefetches = to_int(exec("wc -l < '" + PREFETCH_HISTORY + "' | tr -d ' '").trim())
+        total_bytes = to_int(exec("grep -oE '\"total_bytes\":[0-9]+' '" + PREFETCH_HISTORY + "' | cut -d: -f2 | awk '{s+=$1} END{print s+0}'").trim())
+    }
+    return [zones, prefetches, total_bytes]
+}
+
+fn cleanup_zone_prefetch() -> void {
+    let _ = exec("rm -rf '" + ZONE_PREFETCH_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "zoneprefetch-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_zone_prefetch()
+
+    // 1. 등록
+    let test_dir = "/tmp/zone_prefetch_test_" + exec("date +%s").trim()
+    let _mk = exec("mkdir -p '" + test_dir + "'")
+    let kyo_a = test_dir + "/kyo_a.bin"
+    let kyo_b = test_dir + "/kyo_b.bin"
+    let kyo_c = test_dir + "/kyo_c.bin"
+    write_file(kyo_a, "1024 bytes of dummy data " + exec("printf 'x%.0s' {1..1000}").trim())
+    write_file(kyo_b, "1024 bytes of dummy data " + exec("printf 'y%.0s' {1..1000}").trim())
+    write_file(kyo_c, "1024 bytes of dummy data " + exec("printf 'z%.0s' {1..1000}").trim())
+
+    register_zone_assets("Kyovashad", [kyo_a, kyo_b, kyo_c])
+    register_zone_assets("FracturedPeaks", [test_dir + "/fp_a.bin", test_dir + "/fp_b.bin"])
+    register_zone_assets("DryStepps", [test_dir + "/ds_a.bin"])
+
+    // 2. lookup
+    let kyo_assets = lookup_assets("Kyovashad")
+    if len(kyo_assets) != 3 {
+        panic("c_zone_prefetch_io FAIL [lookup Kyovashad] expected=3 got=" + to_string(len(kyo_assets)))
+    }
+    let unknown = lookup_assets("Unknown")
+    if len(unknown) != 0 {
+        panic("c_zone_prefetch_io FAIL [lookup Unknown] expected=0 got=" + to_string(len(unknown)))
+    }
+
+    // 3. prefetch
+    let kyo_result = trigger_prefetch("Kyovashad")
+    if kyo_result[0] != 3 {
+        panic("c_zone_prefetch_io FAIL [Kyovashad files] expected=3 got=" + to_string(kyo_result[0]))
+    }
+    if kyo_result[1] <= 0 {
+        panic("c_zone_prefetch_io FAIL [Kyovashad bytes] expected>0 got=" + to_string(kyo_result[1]))
+    }
+
+    // 4. unknown zone → skip
+    let unk_result = trigger_prefetch("Unknown")
+    if unk_result[0] != 0 {
+        panic("c_zone_prefetch_io FAIL [Unknown files] expected=0 got=" + to_string(unk_result[0]))
+    }
+
+    // 5. hit ratio
+    let hit = pagecache_hit_ratio(3, 3)
+    if hit != 1000 { panic("c_zone_prefetch_io FAIL [hit ratio] expected=1000 got=" + to_string(hit)) }
+
+    // 6. stats
+    let stats = prefetch_stats()
+    if stats[0] != 3 { panic("c_zone_prefetch_io FAIL [stats zones] expected=3 got=" + to_string(stats[0])) }
+
+    r0_emit("zone_prefetch_stats", "\"zones\":" + to_string(stats[0]) + ",\"prefetches\":" + to_string(stats[1]) + ",\"bytes\":" + to_string(stats[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_zone_prefetch_io FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    let _rm = exec("rm -rf '" + test_dir + "'")
+    cleanup_zone_prefetch()
+
+    println("  ✅ c_zone_prefetch_io self_test PASS (3 zones, prefetch 3 files / " + to_string(kyo_result[1]) + " bytes, hit 100%, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = prefetch_stats()
+            println("zones=" + to_string(s[0]) + " prefetches=" + to_string(s[1]) + " bytes=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_zone_prefetch(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_zone_prefetch_io.hexa { self-test | stats | cleanup }")
+}

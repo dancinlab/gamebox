@@ -1,0 +1,238 @@
+// lib/perf/c_oauth_device_flow.hexa — CN-141 skeleton manjeom 15/15
+//
+// Phase 2 OAuth Device Authorization Grant (RFC 8628) — TV/CLI 환경 device flow.
+// 목적: user_code + verification_uri 발급 → polling status (pending/approved/denied/expired).
+//
+// 무기: device table (client_id/device_code/user_code/verification_uri/status/ts) + columnar.
+// 효과: 키보드 없는 TV/CLI 클라이언트의 OAuth 인증 (Battle.net Console / Steam Big Picture).
+
+use "./r0_common"
+
+let CODF_DIR = GAMEBOX_HOME + "/persist/oauth_device_flow"
+let DEV_LOG = CODF_DIR + "/devices.tsv"
+
+fn codf_dir() -> str { return CODF_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CODF_DIR + "'")
+}
+
+// ─── user_code 생성 (RFC 8628 §6.1: 사람이 읽기 쉬운 short string) ───
+//   format: "ABCD-EFGH" (8 char A-Z + dash, 총 9자)
+//   seed: /dev/urandom → od hex → 첫 8문자 → 0-9 → A-J 매핑 (전부 영문대문자 보장).
+//   shasum 미설치 docker 환경 호환 (od / tr 만 사용).
+fn generate_user_code() -> str {
+    // /dev/urandom 4 bytes → od 로 hex 8자 추출 (shasum 미의존, docker 호환).
+    // od 실패 시 date +%s%N 기반 fallback (둘 다 cat | head -c 로 길이 보장).
+    let raw = exec("(od -An -tx1 -N8 /dev/urandom 2>/dev/null | tr -d ' \\n' | tr 'a-f' 'A-F'; date +%s%N) | tr -d ' \\n' | cut -c1-8 | tr '0-9' 'A-J'").trim()
+    if len(raw) != 8 {
+        panic("c_oauth_device_flow FAIL [generate_user_code raw len] got=" + to_string(len(raw)))
+    }
+    let part1 = exec("printf '%s' '" + raw + "' | cut -c1-4").trim()
+    let part2 = exec("printf '%s' '" + raw + "' | cut -c5-8").trim()
+    return part1 + "-" + part2
+}
+
+// ─── user_code 형식 검증 (4 + dash + 4 = 9자) ───
+fn is_valid_user_code(s: str) -> bool {
+    if len(s) != 9 { return false }
+    if s.contains(" ") { return false }
+    if s.contains("\t") { return false }
+    if s.contains("\n") { return false }
+    // 5번째 글자가 dash 인지 (cut으로 추출).
+    let mid = exec("printf '%s' '" + s + "' | cut -c5").trim()
+    if mid != "-" { return false }
+    return true
+}
+
+// ─── status 검증 (pending/approved/denied/expired) ───
+fn status_valid(status: str) -> bool {
+    if status == "pending" { return true }
+    if status == "approved" { return true }
+    if status == "denied" { return true }
+    if status == "expired" { return true }
+    return false
+}
+
+// ─── device 등록 (초기 status = pending) ───
+fn record_device(client_id: str, device_code: str, user_code: str, verification_uri: str, ts: int) -> void {
+    ensure_dir()
+    if client_id == "" { panic("c_oauth_device_flow FAIL [record_device empty client_id]") }
+    if device_code == "" { panic("c_oauth_device_flow FAIL [record_device empty device_code]") }
+    if !is_valid_user_code(user_code) { panic("c_oauth_device_flow FAIL [record_device bad user_code]") }
+    if verification_uri == "" { panic("c_oauth_device_flow FAIL [record_device empty verification_uri]") }
+    // 동일 device_code 중복 제거 (1:1 보장)
+    let exists = exec("test -f '" + DEV_LOG + "' && echo ok").trim()
+    if exists == "ok" {
+        let _ = exec("awk -F'\\t' -v d='" + device_code + "' '$2!=d' '" + DEV_LOG + "' > '" + DEV_LOG + ".tmp' && mv '" + DEV_LOG + ".tmp' '" + DEV_LOG + "'")
+    }
+    let line = client_id + "\t" + device_code + "\t" + user_code + "\t" + verification_uri + "\tpending\t" + to_string(ts)
+    let tmp = DEV_LOG + ".add"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + DEV_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("oauth_device_recorded", "\"client_id\":\"" + client_id + "\",\"user_code\":\"" + user_code + "\",\"ts\":" + to_string(ts))
+}
+
+// ─── status polling 갱신 ───
+fn poll_status(device_code: str, status: str) -> void {
+    if device_code == "" { panic("c_oauth_device_flow FAIL [poll_status empty device_code]") }
+    if !status_valid(status) { panic("c_oauth_device_flow FAIL [poll_status bad status] got=" + status) }
+    let exists = exec("test -f '" + DEV_LOG + "' && echo ok").trim()
+    if exists != "ok" { panic("c_oauth_device_flow FAIL [poll_status no log]") }
+    let _ = exec("awk -F'\\t' -v OFS='\\t' -v d='" + device_code + "' -v s='" + status + "' '{ if ($2==d) { $5=s } print }' '" + DEV_LOG + "' > '" + DEV_LOG + ".tmp' && mv '" + DEV_LOG + ".tmp' '" + DEV_LOG + "'")
+    r0_emit("oauth_device_polled", "\"device_code_len\":" + to_string(len(device_code)) + ",\"status\":\"" + status + "\"")
+}
+
+fn device_count() -> int {
+    let exists = exec("test -f '" + DEV_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    return to_int(exec("wc -l < '" + DEV_LOG + "' | tr -d ' '").trim())
+}
+
+fn approved_count() -> int {
+    let exists = exec("test -f '" + DEV_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$5==\"approved\"' '" + DEV_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn pending_count() -> int {
+    let exists = exec("test -f '" + DEV_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$5==\"pending\"' '" + DEV_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn cleanup_codf() -> void {
+    let _ = exec("rm -rf '" + CODF_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "codf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_codf()
+
+    // user_code 생성 / 형식 검증
+    let uc1 = generate_user_code()
+    if !is_valid_user_code(uc1) {
+        panic("c_oauth_device_flow FAIL [generate_user_code uc1] got=" + uc1)
+    }
+    // negative
+    if is_valid_user_code("ABCD-EFG") { panic("c_oauth_device_flow FAIL [valid len 8]") }
+    if is_valid_user_code("ABCDEFGHI") { panic("c_oauth_device_flow FAIL [valid no dash]") }
+    if is_valid_user_code("ABCD EFGH") { panic("c_oauth_device_flow FAIL [valid space]") }
+    if !is_valid_user_code("ABCD-EFGH") { panic("c_oauth_device_flow FAIL [valid pos]") }
+
+    // status 검증
+    if !status_valid("pending") { panic("c_oauth_device_flow FAIL [status pending]") }
+    if !status_valid("approved") { panic("c_oauth_device_flow FAIL [status approved]") }
+    if !status_valid("denied") { panic("c_oauth_device_flow FAIL [status denied]") }
+    if !status_valid("expired") { panic("c_oauth_device_flow FAIL [status expired]") }
+    if status_valid("garbage") { panic("c_oauth_device_flow FAIL [status garbage]") }
+
+    // 3 device 등록 (모두 초기 pending)
+    let v_uri = "https://oauth.battle.net/device"
+    record_device("bnet_console_v1", "DEVCODE_alpha_xxxxxxxxxxxxxxxx", "ABCD-EFGH", v_uri, 1735689600)
+    record_device("bnet_console_v1", "DEVCODE_beta_yyyyyyyyyyyyyyyyy", "IJKL-MNOP", v_uri, 1735689700)
+    record_device("steam_bigpic_v1", "DEVCODE_gamma_zzzzzzzzzzzzzzzz", "QRST-UVWX", v_uri, 1735689800)
+
+    let total = device_count()
+    if total != 3 { panic("c_oauth_device_flow FAIL [device_count] expected=3 got=" + to_string(total)) }
+
+    let p0 = pending_count()
+    if p0 != 3 { panic("c_oauth_device_flow FAIL [pending init] expected=3 got=" + to_string(p0)) }
+
+    let a0 = approved_count()
+    if a0 != 0 { panic("c_oauth_device_flow FAIL [approved init] expected=0 got=" + to_string(a0)) }
+
+    // poll: alpha → approved, gamma → expired, beta → pending(유지)
+    poll_status("DEVCODE_alpha_xxxxxxxxxxxxxxxx", "approved")
+    poll_status("DEVCODE_gamma_zzzzzzzzzzzzzzzz", "expired")
+
+    let p1 = pending_count()
+    if p1 != 1 { panic("c_oauth_device_flow FAIL [pending after] expected=1 got=" + to_string(p1)) }
+
+    let a1 = approved_count()
+    if a1 != 1 { panic("c_oauth_device_flow FAIL [approved after] expected=1 got=" + to_string(a1)) }
+
+    // total 불변 (poll 은 row 추가 없음)
+    let total2 = device_count()
+    if total2 != 3 { panic("c_oauth_device_flow FAIL [device_count after poll] expected=3 got=" + to_string(total2)) }
+
+    r0_emit("oauth_device_summary", "\"total\":" + to_string(total2) + ",\"approved\":" + to_string(a1) + ",\"pending\":" + to_string(p1) + ",\"expired\":1")
+
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_oauth_device_flow FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    // ─── synthetic OAuth Device flow state machine round-trip (Track-AR cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track-AR mission: battlenet cond.3 (OAuth 2-leg + login state track live)
+    // 측 evidence augment. cond.3 status `partial` 영구 유지 — 실 RFC 8628 device
+    // authorization grant endpoint + 실 polling round-trip 측 production smoke gate
+    // transitive (network-dependent, blk.1 + Battle.net Console / Steam Big Picture
+    // headless TV/CLI flow 정합).
+    //
+    // synthetic device flow state machine: USER_CODE_ISSUE → USER_VERIFY_PENDING
+    // → POLL_APPROVAL → TOKEN_DELIVERED 4 transition. hexa-native loop only —
+    // 실 device endpoint 0, 실 polling HTTP 0, 실 verification_uri 사용자 ack 0.
+    // payload = device_session_id + flow_step_kind + poll_interval_simulated_sec.
+    // round-trip emit = `__OAUTH_DEVICE__ PARTIAL <state>` per row.
+    //
+    // own1: Wine 0 / device endpoint binary linkage 0 / token spoof 0.
+    // own2: PARTIAL emit explicit (NOT PASS — production smoke deferred).
+    let dev_sid = "dev-synth-" + exec("date +%s").trim()
+
+    println("__OAUTH_DEVICE__ PARTIAL USER_CODE_ISSUE")
+    r0_emit("c_oauth_device_flow_synthetic_state",
+        "\"stage\":\"device_flow_state_machine\",\"device_session_id\":\"" + dev_sid + "\",\"flow_step_kind\":\"USER_CODE_ISSUE\",\"poll_interval_simulated_sec\":5,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"permanent_until_real_network — blk.1 transitive\"")
+
+    println("__OAUTH_DEVICE__ PARTIAL USER_VERIFY_PENDING")
+    r0_emit("c_oauth_device_flow_synthetic_state",
+        "\"stage\":\"device_flow_state_machine\",\"device_session_id\":\"" + dev_sid + "\",\"flow_step_kind\":\"USER_VERIFY_PENDING\",\"poll_interval_simulated_sec\":5,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__OAUTH_DEVICE__ PARTIAL POLL_APPROVAL")
+    r0_emit("c_oauth_device_flow_synthetic_state",
+        "\"stage\":\"device_flow_state_machine\",\"device_session_id\":\"" + dev_sid + "\",\"flow_step_kind\":\"POLL_APPROVAL\",\"poll_interval_simulated_sec\":5,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    println("__OAUTH_DEVICE__ PARTIAL TOKEN_DELIVERED")
+    r0_emit("c_oauth_device_flow_synthetic_state",
+        "\"stage\":\"device_flow_state_machine\",\"device_session_id\":\"" + dev_sid + "\",\"flow_step_kind\":\"TOKEN_DELIVERED\",\"poll_interval_simulated_sec\":0,\"transport_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\"")
+
+    r0_emit("c_oauth_device_flow_synthetic_round_trip_matrix",
+        "\"states_total\":4,\"states_partial\":4,\"states_pass\":0,\"device_session_id\":\"" + dev_sid + "\",\"transport_kind\":\"synthetic_inline\",\"network\":\"none\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"track\":\"AR\",\"lockin_iso\":\"2026-05-04\"")
+
+    cleanup_codf()
+
+    println("  ✅ c_oauth_device_flow self_test PASS (3 devices: 1 approved / 1 pending / 1 expired, +4 synthetic device state PARTIAL transitions, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "gen" {
+            println(generate_user_code())
+            return
+        }
+        if sub == "record" && len(a) >= 7 {
+            record_device(a[3], a[4], a[5], a[6], to_int(a[7]))
+            println("recorded")
+            return
+        }
+        if sub == "poll" && len(a) >= 5 {
+            poll_status(a[3], a[4])
+            println("polled")
+            return
+        }
+        if sub == "stats" {
+            println("total=" + to_string(device_count()) + " approved=" + to_string(approved_count()) + " pending=" + to_string(pending_count()))
+            return
+        }
+        if sub == "cleanup" { cleanup_codf(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_oauth_device_flow.hexa { self-test | gen | record <client_id> <device_code> <user_code> <verification_uri> <ts> | poll <device_code> <status> | stats | cleanup }")
+}

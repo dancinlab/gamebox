@@ -1,0 +1,489 @@
+// lib/loader/pe_i386_shim_phase_18_22.hexa — i386 shim phase 18~22 추적기 (R3-8 ~ R3-12).
+//
+// shim phase 1~17 (R3-1~7) 은 이미 통과. 본 module 은 다음 cycle 에서 shim cpp 측이
+// 통합할 phase 18~22 의 hexa-side telemetry sink. shim 측 phase 가 hexa 에 entry/exit/
+// substep/metric/closure_progress 를 record 하면, 본 module 이 누적 추적/검증한다.
+//
+// phase 매핑:
+//   phase 18 = R3-8  SEH FS:[0] runtime dispatch  (phase 11 fake TEB 통합)
+//   phase 19 = R3-9  FPU/SSE instruction interp   (helper IPC kind=12/13)
+//   phase 20 = R3-10 PEB/Ldr lookup               (KERNEL32!GetModuleHandleA 등)
+//   phase 21 = R3-11 USER32/GDI32 stub call       (helper IPC kind=14/15)
+//   phase 22 = R3-12 first dialog 표시            (NSEvent → Win32 msg translation)
+//
+// own 1 정합: Wine / Box86 / community 0 줄. 우회 0. Apple SDK 호출 X — 본 module 은
+//             pure hexa skeleton (telemetry sink). shim cpp 측 native bridge 의
+//             phase 진행을 hexa 가 수신만 한다.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — 5 separate tables):
+//   entry.tsv  : phase_kind<int> \t started_ns<int>   \t label<str>
+//   exit.tsv   : phase_kind<int> \t ended_ns<int>     \t success<int>
+//   substep.tsv: phase_kind<int> \t step_id<int>      \t step_name<str>     \t step_ok<int>
+//   metric.tsv : phase_kind<int> \t metric_name<str>  \t value<int>
+//   closure.tsv: phase_kind<int> \t cumul_pct<int>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 →
+//   phase_kind / step_id / step_ok / step_name / metric_name / cumul_pct.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pisp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_shim_phase_18_22"
+}
+
+fn pisp_phases_path() -> str {
+    return pisp_dir() + "/phases.tsv"
+}
+
+fn pisp_entry_path() -> str {
+    return pisp_dir() + "/entry.tsv"
+}
+
+fn pisp_exit_path() -> str {
+    return pisp_dir() + "/exit.tsv"
+}
+
+fn pisp_substep_path() -> str {
+    return pisp_dir() + "/substep.tsv"
+}
+
+fn pisp_metric_path() -> str {
+    return pisp_dir() + "/metric.tsv"
+}
+
+fn pisp_closure_path() -> str {
+    return pisp_dir() + "/closure.tsv"
+}
+
+fn pisp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pisp_dir() + "'")
+}
+
+fn cleanup_pisp() -> void {
+    pisp_ensure_dir()
+    let _ = exec("rm -f '" + pisp_entry_path() + "' '" + pisp_exit_path()
+        + "' '" + pisp_substep_path() + "' '" + pisp_metric_path()
+        + "' '" + pisp_closure_path() + "' '" + pisp_phases_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pisp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pisp_append_row(path: str, row: str) -> void {
+    pisp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pisp_count_rows(path: str, min_cols: int) -> int {
+    let t = pisp_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── phase_kind validation: 18..22 only ───
+fn pisp_assert_phase_kind(api: str, phase_kind: int) -> void {
+    if phase_kind < 18 {
+        panic("pe_i386_shim_phase_18_22 FAIL [" + api
+            + "] expected=phase_kind>=18 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 22 {
+        panic("pe_i386_shim_phase_18_22 FAIL [" + api
+            + "] expected=phase_kind<=22 got=" + to_string(phase_kind))
+    }
+}
+
+// ─── phase_name: phase_kind → R3 label ───
+fn phase_name(phase_kind: int) -> str {
+    if phase_kind == 18 {
+        return "R3-8 SEH"
+    }
+    if phase_kind == 19 {
+        return "R3-9 FPU/SSE"
+    }
+    if phase_kind == 20 {
+        return "R3-10 PEB-Ldr"
+    }
+    if phase_kind == 21 {
+        return "R3-11 USER32-GDI32"
+    }
+    if phase_kind == 22 {
+        return "R3-12 first-dialog"
+    }
+    panic("pe_i386_shim_phase_18_22 FAIL [phase_name] expected=phase_kind in 18..22 got="
+        + to_string(phase_kind))
+    return ""
+}
+
+// ─── record_phase_entry: phase 시작 1 건 ───
+fn record_phase_entry(phase_kind: int, started_ns: int, label: str) -> void {
+    pisp_assert_phase_kind("record_phase_entry", phase_kind)
+    if started_ns < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_entry] expected=started_ns>=0 got="
+            + to_string(started_ns))
+    }
+    if label == "" {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_entry] expected=label!=empty got=empty")
+    }
+    let row = to_string(phase_kind) + "\t" + to_string(started_ns) + "\t" + label + "\n"
+    pisp_append_row(pisp_entry_path(), row)
+}
+
+// ─── record_phase_exit: phase 종료 1 건 (success 0/1) ───
+fn record_phase_exit(phase_kind: int, ended_ns: int, success: int) -> void {
+    pisp_assert_phase_kind("record_phase_exit", phase_kind)
+    if ended_ns < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_exit] expected=ended_ns>=0 got="
+            + to_string(ended_ns))
+    }
+    if success < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_exit] expected=success in {0,1} got="
+            + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_exit] expected=success in {0,1} got="
+            + to_string(success))
+    }
+    let row = to_string(phase_kind) + "\t" + to_string(ended_ns) + "\t" + to_string(success) + "\n"
+    pisp_append_row(pisp_exit_path(), row)
+}
+
+// ─── record_phase_substep: phase 내 sub-step 1 건 ───
+fn record_phase_substep(phase_kind: int, step_id: int, step_name: str, step_ok: int) -> void {
+    pisp_assert_phase_kind("record_phase_substep", phase_kind)
+    if step_id < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_substep] expected=step_id>=0 got="
+            + to_string(step_id))
+    }
+    if step_name == "" {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_substep] expected=step_name!=empty got=empty")
+    }
+    if step_ok < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_substep] expected=step_ok in {0,1} got="
+            + to_string(step_ok))
+    }
+    if step_ok > 1 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_substep] expected=step_ok in {0,1} got="
+            + to_string(step_ok))
+    }
+    let row = to_string(phase_kind) + "\t" + to_string(step_id) + "\t"
+        + step_name + "\t" + to_string(step_ok) + "\n"
+    pisp_append_row(pisp_substep_path(), row)
+}
+
+// ─── record_phase_metric: phase 별 metric (counter/gauge) 1 건 ───
+fn record_phase_metric(phase_kind: int, metric_name: str, value: int) -> void {
+    pisp_assert_phase_kind("record_phase_metric", phase_kind)
+    if metric_name == "" {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_metric] expected=metric_name!=empty got=empty")
+    }
+    if value < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_phase_metric] expected=value>=0 got="
+            + to_string(value))
+    }
+    let row = to_string(phase_kind) + "\t" + metric_name + "\t" + to_string(value) + "\n"
+    pisp_append_row(pisp_metric_path(), row)
+}
+
+// ─── record_closure_progress: phase 별 누적 closure % (0..100) ───
+fn record_closure_progress(phase_kind: int, cumul_pct: int) -> void {
+    pisp_assert_phase_kind("record_closure_progress", phase_kind)
+    if cumul_pct < 0 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_closure_progress] expected=cumul_pct>=0 got="
+            + to_string(cumul_pct))
+    }
+    if cumul_pct > 100 {
+        panic("pe_i386_shim_phase_18_22 FAIL [record_closure_progress] expected=cumul_pct<=100 got="
+            + to_string(cumul_pct))
+    }
+    let row = to_string(phase_kind) + "\t" + to_string(cumul_pct) + "\n"
+    pisp_append_row(pisp_closure_path(), row)
+}
+
+// ─── 통계 카운터 ───
+fn phase_entry_count() -> int {
+    return pisp_count_rows(pisp_entry_path(), 3)
+}
+
+fn phase_exit_count() -> int {
+    return pisp_count_rows(pisp_exit_path(), 3)
+}
+
+fn substep_count() -> int {
+    return pisp_count_rows(pisp_substep_path(), 4)
+}
+
+fn metric_count() -> int {
+    return pisp_count_rows(pisp_metric_path(), 3)
+}
+
+fn closure_records() -> int {
+    return pisp_count_rows(pisp_closure_path(), 2)
+}
+
+// ─── pisp_stats: [entry, exit, substep, metric, closure] ───
+fn pisp_stats() -> array {
+    let mut out = []
+    out.push(phase_entry_count())
+    out.push(phase_exit_count())
+    out.push(substep_count())
+    out.push(metric_count())
+    out.push(closure_records())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pisp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pisp()
+
+    // 2. phase_entry 5 건 (phase 18~22)
+    record_phase_entry(18, 100000, "R3-8 SEH")
+    r0_emit("pe_i386_shim_phase_18_22_entry",
+        "\"phase_kind\":18,\"started_ns\":100000,\"label\":\"R3-8 SEH\"")
+
+    record_phase_entry(19, 200000, "R3-9 FPU/SSE")
+    r0_emit("pe_i386_shim_phase_18_22_entry",
+        "\"phase_kind\":19,\"started_ns\":200000,\"label\":\"R3-9 FPU/SSE\"")
+
+    record_phase_entry(20, 300000, "R3-10 PEB-Ldr")
+    r0_emit("pe_i386_shim_phase_18_22_entry",
+        "\"phase_kind\":20,\"started_ns\":300000,\"label\":\"R3-10 PEB-Ldr\"")
+
+    record_phase_entry(21, 400000, "R3-11 USER32-GDI32")
+    r0_emit("pe_i386_shim_phase_18_22_entry",
+        "\"phase_kind\":21,\"started_ns\":400000,\"label\":\"R3-11 USER32-GDI32\"")
+
+    record_phase_entry(22, 500000, "R3-12 first-dialog")
+    r0_emit("pe_i386_shim_phase_18_22_entry",
+        "\"phase_kind\":22,\"started_ns\":500000,\"label\":\"R3-12 first-dialog\"")
+
+    // 3. phase_exit 5 건 (모두 success=1)
+    record_phase_exit(18, 150000, 1)
+    r0_emit("pe_i386_shim_phase_18_22_exit",
+        "\"phase_kind\":18,\"ended_ns\":150000,\"success\":1")
+
+    record_phase_exit(19, 250000, 1)
+    r0_emit("pe_i386_shim_phase_18_22_exit",
+        "\"phase_kind\":19,\"ended_ns\":250000,\"success\":1")
+
+    record_phase_exit(20, 350000, 1)
+    r0_emit("pe_i386_shim_phase_18_22_exit",
+        "\"phase_kind\":20,\"ended_ns\":350000,\"success\":1")
+
+    record_phase_exit(21, 450000, 1)
+    r0_emit("pe_i386_shim_phase_18_22_exit",
+        "\"phase_kind\":21,\"ended_ns\":450000,\"success\":1")
+
+    record_phase_exit(22, 550000, 1)
+    r0_emit("pe_i386_shim_phase_18_22_exit",
+        "\"phase_kind\":22,\"ended_ns\":550000,\"success\":1")
+
+    // 4. substep 8 건 (각 phase 1~2 step)
+    //    phase 18 (SEH): SEH register / SEH dispatch
+    record_phase_substep(18, 0, "seh_register", 1)
+    record_phase_substep(18, 1, "seh_dispatch", 1)
+    //    phase 19 (FPU/SSE): FPU push
+    record_phase_substep(19, 0, "fpu_push_st0", 1)
+    //    phase 19 (FPU/SSE): MOVZX (i386 8/16→32 zero-extend)
+    record_phase_substep(19, 1, "movzx_reg32_rm8", 1)
+    //    phase 20 (PEB/Ldr): GetModuleHandleA
+    record_phase_substep(20, 0, "get_module_handle_a", 1)
+    //    phase 21 (USER32/GDI32): RegisterClassEx / CreateWindow
+    record_phase_substep(21, 0, "register_class_ex", 1)
+    record_phase_substep(21, 1, "create_window", 1)
+    //    phase 22 (first dialog): DialogBoxA modal entry
+    record_phase_substep(22, 0, "dialog_box_a_modal", 1)
+
+    r0_emit("pe_i386_shim_phase_18_22_substep_batch",
+        "\"phase_18\":2,\"phase_19\":2,\"phase_20\":1,\"phase_21\":2,\"phase_22\":1,\"total\":8")
+
+    // 5. metric 5 건
+    record_phase_metric(18, "seh_dispatched", 3)
+    r0_emit("pe_i386_shim_phase_18_22_metric",
+        "\"phase_kind\":18,\"metric_name\":\"seh_dispatched\",\"value\":3")
+
+    record_phase_metric(19, "instructions_passed", 17)
+    r0_emit("pe_i386_shim_phase_18_22_metric",
+        "\"phase_kind\":19,\"metric_name\":\"instructions_passed\",\"value\":17")
+
+    record_phase_metric(20, "iat_thunks_resolved", 4)
+    r0_emit("pe_i386_shim_phase_18_22_metric",
+        "\"phase_kind\":20,\"metric_name\":\"iat_thunks_resolved\",\"value\":4")
+
+    record_phase_metric(21, "stub_calls_dispatched", 6)
+    r0_emit("pe_i386_shim_phase_18_22_metric",
+        "\"phase_kind\":21,\"metric_name\":\"stub_calls_dispatched\",\"value\":6")
+
+    record_phase_metric(22, "windows_created", 1)
+    r0_emit("pe_i386_shim_phase_18_22_metric",
+        "\"phase_kind\":22,\"metric_name\":\"windows_created\",\"value\":1")
+
+    // 6. closure_progress 5 건 (R3 누적: 55/65/75/90/100%)
+    record_closure_progress(18, 55)
+    record_closure_progress(19, 65)
+    record_closure_progress(20, 75)
+    record_closure_progress(21, 90)
+    record_closure_progress(22, 100)
+    r0_emit("pe_i386_shim_phase_18_22_closure",
+        "\"phase_18\":55,\"phase_19\":65,\"phase_20\":75,\"phase_21\":90,\"phase_22\":100")
+
+    // 7. assertion: counts
+    let ec = phase_entry_count()
+    if ec != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_entry_count] expected=5 got=" + to_string(ec))
+    }
+
+    let xc = phase_exit_count()
+    if xc != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_exit_count] expected=5 got=" + to_string(xc))
+    }
+
+    let sc = substep_count()
+    if sc != 8 {
+        panic("pe_i386_shim_phase_18_22 FAIL [substep_count] expected=8 got=" + to_string(sc))
+    }
+
+    let mc = metric_count()
+    if mc != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [metric_count] expected=5 got=" + to_string(mc))
+    }
+
+    let cc = closure_records()
+    if cc != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [closure_records] expected=5 got=" + to_string(cc))
+    }
+
+    // 8. pisp_stats sanity
+    let s = pisp_stats()
+    if len(s) != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [stats entry] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [stats exit] expected=5 got=" + to_string(s[1]))
+    }
+    if s[2] != 8 {
+        panic("pe_i386_shim_phase_18_22 FAIL [stats substep] expected=8 got=" + to_string(s[2]))
+    }
+    if s[3] != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [stats metric] expected=5 got=" + to_string(s[3]))
+    }
+    if s[4] != 5 {
+        panic("pe_i386_shim_phase_18_22 FAIL [stats closure] expected=5 got=" + to_string(s[4]))
+    }
+
+    // 9. phase_name mapping sanity
+    let n18 = phase_name(18)
+    if n18 != "R3-8 SEH" {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_name(18)] expected=R3-8 SEH got=" + n18)
+    }
+    let n19 = phase_name(19)
+    if n19 != "R3-9 FPU/SSE" {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_name(19)] expected=R3-9 FPU/SSE got=" + n19)
+    }
+    let n20 = phase_name(20)
+    if n20 != "R3-10 PEB-Ldr" {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_name(20)] expected=R3-10 PEB-Ldr got=" + n20)
+    }
+    let n21 = phase_name(21)
+    if n21 != "R3-11 USER32-GDI32" {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_name(21)] expected=R3-11 USER32-GDI32 got=" + n21)
+    }
+    let n22 = phase_name(22)
+    if n22 != "R3-12 first-dialog" {
+        panic("pe_i386_shim_phase_18_22 FAIL [phase_name(22)] expected=R3-12 first-dialog got=" + n22)
+    }
+
+    // 10. emit stats
+    r0_emit("pe_i386_shim_phase_18_22_stats",
+        "\"phase_entry\":" + to_string(s[0])
+        + ",\"phase_exit\":" + to_string(s[1])
+        + ",\"substep\":" + to_string(s[2])
+        + ",\"metric\":" + to_string(s[3])
+        + ",\"closure\":" + to_string(s[4]))
+
+    // 11. emit count >= 14
+    //     5 entry + 5 exit + 1 substep_batch + 5 metric + 1 closure + 1 stats = 18
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_shim_phase_18_22 FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pisp()
+    let s2 = pisp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_shim_phase_18_22 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_shim_phase_18_22 self_test PASS (entry=" + to_string(s[0])
+        + ", exit=" + to_string(s[1]) + ", substep=" + to_string(s[2])
+        + ", metric=" + to_string(s[3]) + ", closure=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pisp_stats()
+            println("phase_entry_count\t" + to_string(s[0]))
+            println("phase_exit_count\t" + to_string(s[1]))
+            println("substep_count\t" + to_string(s[2]))
+            println("metric_count\t" + to_string(s[3]))
+            println("closure_records\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pisp()
+            println("cleaned: " + pisp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pisp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_shim_phase_18_22.hexa { self-test | stats | cleanup | dir }")
+}

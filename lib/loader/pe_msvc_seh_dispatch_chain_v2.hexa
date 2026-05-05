@@ -1,0 +1,524 @@
+// lib/loader/pe_msvc_seh_dispatch_chain_v2.hexa — Wine + ReactOS 통합 SEH dispatch chain v2 추적기
+//
+// 본 module 은 기존 pe_i386_seh_chain_real (cycle 88) 의 진보 (v2). v1 은 FS:[0]
+// linked-list register/unwind/dispatch/handler/invariant 만 추적. v2 는 한 단계 위:
+//
+//   1. dispatch_kind  — KiUserExceptionDispatcher 진입 시 dispatch 분류
+//                       (normal / unwind / collided / consolidate)
+//   2. handler_scope  — try block 의 [scope_va_start, scope_va_end) 범위 + handler_va
+//   3. disposition    — handler return 의 4 값 (Continue / Search / Nested / Collided)
+//   4. unwind_target  — RtlUnwind / RtlUnwindEx 의 target frame + EIP + 복원 reg 수
+//   5. nested_exception — handler 실행 중 발생한 child exception 을 parent 와 link
+//
+// research-A : Wine source (dlls/ntdll/signal_*.c, dlls/ntdll/exception.c)
+//              RtlDispatchException, EXCEPTION_NESTED_CALL, dispatcher_context spec
+// research-D : ReactOS source (sdk/lib/rtl/i386/except.c, ntoskrnl/ke/i386/except.c)
+//              KiDispatchException, ExceptionCollidedUnwind, RtlpUnwindHandler
+//
+// own 1 enforcement: Wine/CrossOver/GPTK/Whisky/Box86/QEMU 코드 0 줄 import.
+//   research 는 PE/COFF spec + Microsoft x86 SEH ABI + Wine/ReactOS 가 같은
+//   Microsoft spec 을 reverse 한 결과를 spec 차원에서 참조 (코드 복제 X).
+//   본 module 은 pure tracker — 실 dispatch / unwind 호출 X. Apple SDK 호출 X.
+// own 2 mandate: panic + r0_emit ≥ 14 + self_test() + main() dispatch.
+//
+// persist schema (TSV — records.tsv):
+//   record_id<int> \t kind<str> \t entry_id<int> \t a<int> \t b<int>
+//     \t c<int> \t d<int> \t e<int> \t f<int>
+//
+//   kind 별 의미:
+//     "dispatch_entry"    — a=exception_code, b=fault_va, c=dispatch_kind
+//     "handler_scope"     — a=scope_va_start, b=scope_va_end, c=handler_va, d=scope_id
+//     "disposition"       — a=disposition_value, d=disposition_id
+//     "unwind_target"     — a=target_frame_va, b=target_eip, c=regs_restored_count, d=unwind_id
+//     "nested_exception"  — entry_id=parent_entry_id, a=child_entry_id, d=nested_id
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psdc_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_seh_dispatch_chain_v2"
+}
+
+fn psdc_records_path() -> str {
+    return psdc_dir() + "/records.tsv"
+}
+
+fn psdc_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psdc_dir() + "'")
+}
+
+fn cleanup_psdc() -> void {
+    psdc_ensure_dir()
+    let _ = exec("rm -f '" + psdc_records_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psdc_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psdc_append_row(path: str, row: str) -> void {
+    psdc_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int ───
+fn psdc_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_seh_dispatch_chain_v2 FAIL [psdc_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── dispatch_kind_name: 0/1/2/3 → spec 이름 ───
+//   0 = normal       (KiDispatchException 일반 진입)
+//   1 = unwind       (RtlUnwind 진입)
+//   2 = collided     (unwind 중 또 unwind — ExceptionCollidedUnwind)
+//   3 = consolidate  (RtlRestoreContext consolidate frame)
+fn dispatch_kind_name(k: int) -> str {
+    if k == 0 { return "normal" }
+    if k == 1 { return "unwind" }
+    if k == 2 { return "collided" }
+    if k == 3 { return "consolidate" }
+    return "?"
+}
+
+// ─── disposition_value_name: 0/1/2/3 → spec 이름 ───
+fn disposition_value_name(v: int) -> str {
+    if v == 0 { return "ContinueExecution" }
+    if v == 1 { return "ContinueSearch" }
+    if v == 2 { return "NestedException" }
+    if v == 3 { return "CollidedUnwind" }
+    return "?"
+}
+
+// ─── record_dispatch_entry: KiUserExceptionDispatcher / KiDispatchException 진입 ───
+fn record_dispatch_entry(entry_id: int, exception_code_hex: str, fault_va_hex: str, dispatch_kind: int) -> void {
+    if entry_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_dispatch_entry] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    let exception_code = psdc_hex_to_int(exception_code_hex)
+    if exception_code < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_dispatch_entry] expected=exception_code>=0 got=" + to_string(exception_code))
+    }
+    let fault_va = psdc_hex_to_int(fault_va_hex)
+    if fault_va < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_dispatch_entry] expected=fault_va>=0 got=" + to_string(fault_va))
+    }
+    if dispatch_kind < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_dispatch_entry] expected=dispatch_kind>=0 got=" + to_string(dispatch_kind))
+    }
+    if dispatch_kind > 3 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_dispatch_entry] expected=dispatch_kind<=3 got=" + to_string(dispatch_kind))
+    }
+    let row = to_string(entry_id) + "\tdispatch_entry\t" + to_string(entry_id)
+        + "\t" + to_string(exception_code) + "\t" + to_string(fault_va)
+        + "\t" + to_string(dispatch_kind) + "\t0\t0\t0\n"
+    psdc_append_row(psdc_records_path(), row)
+}
+
+// ─── record_handler_scope: try block scope 등록 ───
+fn record_handler_scope(scope_id: int, entry_id: int, scope_va_start_hex: str, scope_va_end_hex: str, handler_va_hex: str) -> void {
+    if scope_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_handler_scope] expected=scope_id>0 got=" + to_string(scope_id))
+    }
+    if entry_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_handler_scope] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    let s = psdc_hex_to_int(scope_va_start_hex)
+    let e = psdc_hex_to_int(scope_va_end_hex)
+    if s < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_handler_scope] expected=scope_va_start>=0 got=" + to_string(s))
+    }
+    if e < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_handler_scope] expected=scope_va_end>=0 got=" + to_string(e))
+    }
+    if e <= s {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_handler_scope] expected=scope_va_end>scope_va_start got_start=" + to_string(s) + " got_end=" + to_string(e))
+    }
+    let h = psdc_hex_to_int(handler_va_hex)
+    if h < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_handler_scope] expected=handler_va>=0 got=" + to_string(h))
+    }
+    let row = to_string(scope_id) + "\thandler_scope\t" + to_string(entry_id)
+        + "\t" + to_string(s) + "\t" + to_string(e)
+        + "\t" + to_string(h) + "\t" + to_string(scope_id) + "\t0\t0\n"
+    psdc_append_row(psdc_records_path(), row)
+}
+
+// ─── record_disposition: handler return value ───
+fn record_disposition(disposition_id: int, entry_id: int, disposition_value: int) -> void {
+    if disposition_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_disposition] expected=disposition_id>0 got=" + to_string(disposition_id))
+    }
+    if entry_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_disposition] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    if disposition_value < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_disposition] expected=disposition_value>=0 got=" + to_string(disposition_value))
+    }
+    if disposition_value > 3 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_disposition] expected=disposition_value<=3 got=" + to_string(disposition_value))
+    }
+    let row = to_string(disposition_id) + "\tdisposition\t" + to_string(entry_id)
+        + "\t" + to_string(disposition_value) + "\t0\t0\t" + to_string(disposition_id) + "\t0\t0\n"
+    psdc_append_row(psdc_records_path(), row)
+}
+
+// ─── record_unwind_target: RtlUnwind / RtlUnwindEx target frame ───
+fn record_unwind_target(unwind_id: int, entry_id: int, target_frame_va_hex: str, target_eip_hex: str, regs_restored_count: int) -> void {
+    if unwind_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_unwind_target] expected=unwind_id>0 got=" + to_string(unwind_id))
+    }
+    if entry_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_unwind_target] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    let f = psdc_hex_to_int(target_frame_va_hex)
+    let p = psdc_hex_to_int(target_eip_hex)
+    if f < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_unwind_target] expected=target_frame_va>=0 got=" + to_string(f))
+    }
+    if p < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_unwind_target] expected=target_eip>=0 got=" + to_string(p))
+    }
+    if regs_restored_count < 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_unwind_target] expected=regs_restored_count>=0 got=" + to_string(regs_restored_count))
+    }
+    let row = to_string(unwind_id) + "\tunwind_target\t" + to_string(entry_id)
+        + "\t" + to_string(f) + "\t" + to_string(p)
+        + "\t" + to_string(regs_restored_count) + "\t" + to_string(unwind_id) + "\t0\t0\n"
+    psdc_append_row(psdc_records_path(), row)
+}
+
+// ─── record_nested_exception: parent ↔ child link ───
+fn record_nested_exception(nested_id: int, parent_entry_id: int, child_entry_id: int) -> void {
+    if nested_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_nested_exception] expected=nested_id>0 got=" + to_string(nested_id))
+    }
+    if parent_entry_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_nested_exception] expected=parent_entry_id>0 got=" + to_string(parent_entry_id))
+    }
+    if child_entry_id <= 0 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_nested_exception] expected=child_entry_id>0 got=" + to_string(child_entry_id))
+    }
+    if child_entry_id == parent_entry_id {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [record_nested_exception] expected=child!=parent got=" + to_string(child_entry_id))
+    }
+    let row = to_string(nested_id) + "\tnested_exception\t" + to_string(parent_entry_id)
+        + "\t" + to_string(child_entry_id) + "\t0\t0\t" + to_string(nested_id) + "\t0\t0\n"
+    psdc_append_row(psdc_records_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn psdc_count_kind(kind_filter: str) -> int {
+    let t = psdc_read_table(psdc_records_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 9 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn dispatch_entry_count() -> int {
+    return psdc_count_kind("dispatch_entry")
+}
+
+fn handler_scope_count() -> int {
+    return psdc_count_kind("handler_scope")
+}
+
+fn disposition_count() -> int {
+    return psdc_count_kind("disposition")
+}
+
+fn unwind_target_count() -> int {
+    return psdc_count_kind("unwind_target")
+}
+
+fn nested_exception_count() -> int {
+    return psdc_count_kind("nested_exception")
+}
+
+fn psdc_stats() -> array {
+    let mut out = []
+    out.push(dispatch_entry_count())
+    out.push(handler_scope_count())
+    out.push(disposition_count())
+    out.push(unwind_target_count())
+    out.push(nested_exception_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "psdc-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_psdc()
+
+    // ─── 4 dispatch_entry — 각 dispatch_kind ───
+    record_dispatch_entry(1, "C0000005", "00401234", 0)  // normal — access violation
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"dispatch_entry\",\"entry_id\":1,\"exception_code\":\"0xC0000005\",\"fault_va\":\"0x00401234\",\"dispatch_kind\":0,\"name\":\"normal\"")
+
+    record_dispatch_entry(2, "C0000026", "00402000", 1)  // unwind — invalid disposition trigger
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"dispatch_entry\",\"entry_id\":2,\"exception_code\":\"0xC0000026\",\"fault_va\":\"0x00402000\",\"dispatch_kind\":1,\"name\":\"unwind\"")
+
+    record_dispatch_entry(3, "C0000027", "00402100", 2)  // collided — collided unwind
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"dispatch_entry\",\"entry_id\":3,\"exception_code\":\"0xC0000027\",\"fault_va\":\"0x00402100\",\"dispatch_kind\":2,\"name\":\"collided\"")
+
+    record_dispatch_entry(4, "80000003", "00402200", 3)  // consolidate — breakpoint consolidate
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"dispatch_entry\",\"entry_id\":4,\"exception_code\":\"0x80000003\",\"fault_va\":\"0x00402200\",\"dispatch_kind\":3,\"name\":\"consolidate\"")
+
+    // ─── 4 handler_scope — 4 scope range 다름 ───
+    record_handler_scope(1, 1, "00401200", "00401300", "00401400")
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"handler_scope\",\"scope_id\":1,\"entry_id\":1,\"scope_va_start\":\"0x00401200\",\"scope_va_end\":\"0x00401300\",\"handler_va\":\"0x00401400\"")
+
+    record_handler_scope(2, 2, "00401500", "00401600", "00401700")
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"handler_scope\",\"scope_id\":2,\"entry_id\":2,\"scope_va_start\":\"0x00401500\",\"scope_va_end\":\"0x00401600\",\"handler_va\":\"0x00401700\"")
+
+    record_handler_scope(3, 3, "00401800", "00401900", "00401A00")
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"handler_scope\",\"scope_id\":3,\"entry_id\":3,\"scope_va_start\":\"0x00401800\",\"scope_va_end\":\"0x00401900\",\"handler_va\":\"0x00401A00\"")
+
+    record_handler_scope(4, 4, "00401B00", "00401C00", "00401D00")
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"handler_scope\",\"scope_id\":4,\"entry_id\":4,\"scope_va_start\":\"0x00401B00\",\"scope_va_end\":\"0x00401C00\",\"handler_va\":\"0x00401D00\"")
+
+    // ─── 4 disposition — 각 disposition_value ───
+    record_disposition(1, 1, 0)  // ContinueExecution
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"disposition\",\"disposition_id\":1,\"entry_id\":1,\"value\":0,\"name\":\"ContinueExecution\"")
+
+    record_disposition(2, 2, 1)  // ContinueSearch
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"disposition\",\"disposition_id\":2,\"entry_id\":2,\"value\":1,\"name\":\"ContinueSearch\"")
+
+    record_disposition(3, 3, 2)  // NestedException
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"disposition\",\"disposition_id\":3,\"entry_id\":3,\"value\":2,\"name\":\"NestedException\"")
+
+    record_disposition(4, 4, 3)  // CollidedUnwind
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"disposition\",\"disposition_id\":4,\"entry_id\":4,\"value\":3,\"name\":\"CollidedUnwind\"")
+
+    // ─── 2 unwind_target ───
+    record_unwind_target(1, 2, "0012FF80", "00401700", 6)
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"unwind_target\",\"unwind_id\":1,\"entry_id\":2,\"target_frame_va\":\"0x0012FF80\",\"target_eip\":\"0x00401700\",\"regs_restored_count\":6")
+
+    record_unwind_target(2, 3, "0012FF60", "00401A00", 8)
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"unwind_target\",\"unwind_id\":2,\"entry_id\":3,\"target_frame_va\":\"0x0012FF60\",\"target_eip\":\"0x00401A00\",\"regs_restored_count\":8")
+
+    // ─── 1 nested_exception — entry 1 (normal) 안에서 child entry 3 (collided) ───
+    record_nested_exception(1, 1, 3)
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_record",
+        "\"kind\":\"nested_exception\",\"nested_id\":1,\"parent_entry_id\":1,\"child_entry_id\":3")
+
+    // ─── assertions ───
+    let de = dispatch_entry_count()
+    if de != 4 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [dispatch_entry_count] expected=4 got=" + to_string(de))
+    }
+    let hs = handler_scope_count()
+    if hs != 4 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [handler_scope_count] expected=4 got=" + to_string(hs))
+    }
+    let dc = disposition_count()
+    if dc != 4 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [disposition_count] expected=4 got=" + to_string(dc))
+    }
+    let uc = unwind_target_count()
+    if uc != 2 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [unwind_target_count] expected=2 got=" + to_string(uc))
+    }
+    let ne = nested_exception_count()
+    if ne != 1 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [nested_exception_count] expected=1 got=" + to_string(ne))
+    }
+
+    // ─── dispatch_kind_name lookups ───
+    let n_norm = dispatch_kind_name(0)
+    if n_norm != "normal" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [dispatch_kind_name(0)] expected=normal got=" + n_norm)
+    }
+    let n_unw = dispatch_kind_name(1)
+    if n_unw != "unwind" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [dispatch_kind_name(1)] expected=unwind got=" + n_unw)
+    }
+    let n_coll = dispatch_kind_name(2)
+    if n_coll != "collided" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [dispatch_kind_name(2)] expected=collided got=" + n_coll)
+    }
+    let n_cons = dispatch_kind_name(3)
+    if n_cons != "consolidate" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [dispatch_kind_name(3)] expected=consolidate got=" + n_cons)
+    }
+
+    // ─── disposition_value_name lookups ───
+    let dv0 = disposition_value_name(0)
+    if dv0 != "ContinueExecution" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [disposition_value_name(0)] expected=ContinueExecution got=" + dv0)
+    }
+    let dv1 = disposition_value_name(1)
+    if dv1 != "ContinueSearch" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [disposition_value_name(1)] expected=ContinueSearch got=" + dv1)
+    }
+    let dv2 = disposition_value_name(2)
+    if dv2 != "NestedException" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [disposition_value_name(2)] expected=NestedException got=" + dv2)
+    }
+    let dv3 = disposition_value_name(3)
+    if dv3 != "CollidedUnwind" {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [disposition_value_name(3)] expected=CollidedUnwind got=" + dv3)
+    }
+
+    // ─── hex parser sanity ───
+    let h_ac = psdc_hex_to_int("C0000005")
+    if h_ac != 3221225477 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [psdc_hex_to_int(C0000005)] expected=3221225477 got=" + to_string(h_ac))
+    }
+
+    // ─── stats sanity ───
+    let s = psdc_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [stats dispatch_entry] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [stats handler_scope] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [stats disposition] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [stats unwind_target] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [stats nested_exception] expected=1 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (전체 emit ≥ 14: 위 record 15 + 이 1 + summary 1 = 17) ───
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_stats",
+        "\"dispatch_entry_count\":" + to_string(s[0])
+        + ",\"handler_scope_count\":" + to_string(s[1])
+        + ",\"disposition_count\":" + to_string(s[2])
+        + ",\"unwind_target_count\":" + to_string(s[3])
+        + ",\"nested_exception_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_seh_dispatch_chain_v2_summary",
+        "\"phase\":\"seh_dispatch_chain_v2_complete\""
+        + ",\"research\":\"wine+reactos\""
+        + ",\"dispatch_kinds\":4"
+        + ",\"disposition_values\":4"
+        + ",\"nested_links\":1")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_seh_dispatch_chain_v2 FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_psdc()
+    let s2 = psdc_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_seh_dispatch_chain_v2 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_seh_dispatch_chain_v2 self_test PASS (dispatch=" + to_string(s[0])
+        + ", scope=" + to_string(s[1]) + ", disposition=" + to_string(s[2])
+        + ", unwind=" + to_string(s[3]) + ", nested=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psdc_stats()
+            println("dispatch_entry_count\t" + to_string(s[0]))
+            println("handler_scope_count\t" + to_string(s[1]))
+            println("disposition_count\t" + to_string(s[2]))
+            println("unwind_target_count\t" + to_string(s[3]))
+            println("nested_exception_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psdc()
+            println("cleaned: " + psdc_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psdc_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_seh_dispatch_chain_v2.hexa { self-test | stats | cleanup | dir }")
+}

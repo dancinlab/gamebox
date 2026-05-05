@@ -1,0 +1,377 @@
+// lib/loader/pe_thread_creation_bridge.hexa — stage3 Win32 thread → pthread skeleton
+//
+// CreateThread (LPSECURITY_ATTRIBUTES, dwStackSize, lpStartAddress, lpParameter,
+// dwCreationFlags, lpThreadId) → pthread_create. stack 도 PE 식 stack frame 으로
+// 별도 setup (pe_stack_stage2 와 연계).
+//
+// own 1 enforcement: Wine / CrossOver / ReactOS / community thread bridge 0 줄.
+//   참조 only — Microsoft 공식 Thread API spec:
+//     - CreateThread:        https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createthread
+//     - CreateRemoteThread:  https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createremotethread
+//     - _beginthreadex:      https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_thread_creation_bridge FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — PE thread creation recording):
+//   stage3 = thread record skeleton (실 pthread_create 는 stage4).
+//
+// source_kind 정의:
+//   1 = CreateThread       (Win32 base)
+//   2 = CreateRemoteThread (cross-process)
+//   3 = BeginThreadEx      (msvcrt _beginthreadex)
+//
+// schema (threads.tsv): thread_id<int> | source_kind<int> | stack_size<int> | started<int>
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 ───
+fn ptcb_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_thread_creation_bridge"
+}
+
+fn threads_path() -> str {
+    return ptcb_dir() + "/threads.tsv"
+}
+
+fn ensure_ptcb_dir() -> void {
+    let _ = exec("mkdir -p '" + ptcb_dir() + "'")
+}
+
+fn cleanup_ptcb() -> void {
+    ensure_ptcb_dir()
+    let _ = exec("rm -f '" + threads_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_ptcb_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_ptcb_row(path: str, row: str) -> void {
+    ensure_ptcb_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_thread ───
+//   source_kind: 1=CreateThread, 2=CreateRemoteThread, 3=BeginThreadEx
+fn record_thread(thread_id: int, source_kind: int, stack_size: int, started: int) -> void {
+    let row = to_string(thread_id) + "\t" + to_string(source_kind)
+        + "\t" + to_string(stack_size) + "\t" + to_string(started) + "\n"
+    append_ptcb_row(threads_path(), row)
+}
+
+// ─── thread_count: 전체 row 수 ───
+fn thread_count() -> int {
+    let t = read_ptcb_table(threads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total_stack_bytes: stack_size 합 ───
+fn total_stack_bytes() -> int {
+    let t = read_ptcb_table(threads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_source: 특정 source_kind 의 row 수 ───
+fn count_by_source(kind: int) -> int {
+    let t = read_ptcb_table(threads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let k = to_int(parts[1])
+                if k == kind {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── started_count: started==1 인 row 수 ───
+fn started_count() -> int {
+    let t = read_ptcb_table(threads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let s = to_int(parts[3])
+                if s == 1 {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── thread_stack_size: thread_id 의 stack_size ───
+fn thread_stack_size(thread_id: int) -> int {
+    let t = read_ptcb_table(threads_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[0])
+                if tid == thread_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ptcb_stats: [thread_count, total_stack_bytes, count_by_source(1), started_count] ───
+fn ptcb_stats() -> array {
+    let mut out = []
+    out.push(thread_count())
+    out.push(total_stack_bytes())
+    out.push(count_by_source(1))
+    out.push(started_count())
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "ptcb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ptcb()
+
+    // 1b. cleanup 후 thread_count == 0
+    let c0 = thread_count()
+    if c0 != 0 {
+        panic("pe_thread_creation_bridge FAIL [cleanup thread_count] expected=0 got=" + to_string(c0))
+    }
+
+    // 2. record 4 threads
+    record_thread(84001, 1, 1048576, 1)  // CreateThread 1MB started
+    r0_emit("ptcb_record",
+        "\"thread_id\":84001,\"source_kind\":1,\"stack_size\":1048576,\"started\":1")
+
+    record_thread(84002, 1, 524288, 1)   // CreateThread 512KB started
+    r0_emit("ptcb_record",
+        "\"thread_id\":84002,\"source_kind\":1,\"stack_size\":524288,\"started\":1")
+
+    record_thread(84003, 3, 524288, 1)   // BeginThreadEx started
+    r0_emit("ptcb_record",
+        "\"thread_id\":84003,\"source_kind\":3,\"stack_size\":524288,\"started\":1")
+
+    record_thread(84004, 1, 524288, 0)   // CreateThread failed (started=0)
+    r0_emit("ptcb_record",
+        "\"thread_id\":84004,\"source_kind\":1,\"stack_size\":524288,\"started\":0")
+
+    // 3. thread_count == 4
+    let c = thread_count()
+    if c != 4 {
+        panic("pe_thread_creation_bridge FAIL [thread_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_stack_bytes == 2621440
+    let tb = total_stack_bytes()
+    if tb != 2621440 {
+        panic("pe_thread_creation_bridge FAIL [total_stack_bytes] expected=2621440 got=" + to_string(tb))
+    }
+
+    // 5. count_by_source: 1=3, 2=0, 3=1, 99=0
+    let n1 = count_by_source(1)
+    if n1 != 3 {
+        panic("pe_thread_creation_bridge FAIL [count_by_source 1] expected=3 got=" + to_string(n1))
+    }
+    let n2 = count_by_source(2)
+    if n2 != 0 {
+        panic("pe_thread_creation_bridge FAIL [count_by_source 2] expected=0 got=" + to_string(n2))
+    }
+    let n3 = count_by_source(3)
+    if n3 != 1 {
+        panic("pe_thread_creation_bridge FAIL [count_by_source 3] expected=1 got=" + to_string(n3))
+    }
+    let n99 = count_by_source(99)
+    if n99 != 0 {
+        panic("pe_thread_creation_bridge FAIL [count_by_source 99] expected=0 got=" + to_string(n99))
+    }
+
+    // 6. started_count == 3
+    let sc = started_count()
+    if sc != 3 {
+        panic("pe_thread_creation_bridge FAIL [started_count] expected=3 got=" + to_string(sc))
+    }
+
+    // 7. thread_stack_size lookups
+    let ss1 = thread_stack_size(84001)
+    if ss1 != 1048576 {
+        panic("pe_thread_creation_bridge FAIL [thread_stack_size 84001] expected=1048576 got=" + to_string(ss1))
+    }
+    let ss4 = thread_stack_size(84004)
+    if ss4 != 524288 {
+        panic("pe_thread_creation_bridge FAIL [thread_stack_size 84004] expected=524288 got=" + to_string(ss4))
+    }
+    let ss_miss = thread_stack_size(9999)
+    if ss_miss != 0 {
+        panic("pe_thread_creation_bridge FAIL [thread_stack_size 9999] expected=0 got=" + to_string(ss_miss))
+    }
+
+    // 8. ptcb_stats() == [4, 2621440, 3, 3]
+    let s = ptcb_stats()
+    if len(s) != 4 {
+        panic("pe_thread_creation_bridge FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_thread_creation_bridge FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 2621440 {
+        panic("pe_thread_creation_bridge FAIL [stats[1]] expected=2621440 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_thread_creation_bridge FAIL [stats[2]] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_thread_creation_bridge FAIL [stats[3]] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit ptcb_stats (final aggregator)
+    r0_emit("ptcb_stats",
+        "\"thread_count\":" + to_string(s[0])
+        + ",\"total_stack_bytes\":" + to_string(s[1])
+        + ",\"create_thread\":" + to_string(s[2])
+        + ",\"started\":" + to_string(s[3]))
+
+    // 10. r0_emit count 검증 (≥ 5; 실제 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_thread_creation_bridge FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → 모든 stat 0
+    cleanup_ptcb()
+    let s2 = ptcb_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_thread_creation_bridge FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    // 12. PASS
+    println("  ✅ pe_thread_creation_bridge self_test PASS (4 threads, total_stack="
+        + to_string(tb) + ", started=" + to_string(sc)
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ptcb_stats()
+            println("thread_count\t" + to_string(s[0]))
+            println("total_stack_bytes\t" + to_string(s[1]))
+            println("create_thread_count\t" + to_string(s[2]))
+            println("started_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "stack" {
+            if len(a) >= 4 {
+                let tid = to_int(a[3])
+                println(to_string(thread_stack_size(tid)))
+                return
+            }
+            println("usage: hexa run pe_thread_creation_bridge.hexa stack <thread_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println(to_string(count_by_source(kind)))
+                return
+            }
+            println("usage: hexa run pe_thread_creation_bridge.hexa count <source_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ptcb()
+            println("cleaned: " + ptcb_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ptcb_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_thread_creation_bridge.hexa { self-test | stats | stack <thread_id> | count <source_kind> | cleanup | dir }")
+}

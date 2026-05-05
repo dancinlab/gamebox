@@ -1,0 +1,438 @@
+// lib/loader/pe_d3d12_root_signature_real.hexa — cycle 83 R5 phase
+// D3D12 ID3D12RootSignature → Metal argument buffer (tier 2) 매핑 추적.
+//
+// D3D12 root signature → Metal argument buffer (tier 2):
+//   D3D12_ROOT_PARAMETER:
+//     RootCBV/RootSRV/RootUAV → 직접 binding (root constant)
+//     DescriptorTable (CBV/SRV/UAV/Sampler) → Metal argument buffer
+//     RootConstants → MTLRenderCommandEncoder setVertexBytes (small)
+//   register_space → argument buffer index
+//   bindless: descriptor heap (D3D12) → argument buffer tier 2 (Metal M1+)
+//   D4 Fenris/CS2 source 2 모두 root signature 활용
+// own1: D3DMetal + MSDN ID3D12RootSignature only
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 root signature tracker — 실 ID3D12RootSignature 호출 X (D3DMetal 위임 stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// param_kind code:
+//   1 = cbv_root
+//   2 = srv_root
+//   3 = uav_root
+//   4 = descriptor_table_cbv
+//   5 = descriptor_table_srv
+//   6 = descriptor_table_uav
+//   7 = descriptor_table_sampler
+//   8 = root_constants
+//
+// persist schema (TSV — signatures.tsv):
+//   signature_id<int> \t param_kind<int> \t register_space<int> \t descriptor_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdrs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d12_root_signature_real"
+}
+
+fn pdrs_signatures_path() -> str {
+    return pdrs_dir() + "/signatures.tsv"
+}
+
+fn pdrs_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdrs_dir() + "'")
+}
+
+fn cleanup_pdrs() -> void {
+    pdrs_ensure_dir()
+    let _ = exec("rm -f '" + pdrs_signatures_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdrs_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdrs_append_row(path: str, row: str) -> void {
+    pdrs_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_signature: root signature param 1 건 기록 ───
+fn record_signature(signature_id: int, param_kind: int, register_space: int, descriptor_count: int) -> void {
+    if signature_id <= 0 {
+        panic("pe_d3d12_root_signature_real FAIL [record_signature] expected=signature_id>0 got=" + to_string(signature_id))
+    }
+    if param_kind < 1 {
+        panic("pe_d3d12_root_signature_real FAIL [record_signature] expected=param_kind>=1 got=" + to_string(param_kind))
+    }
+    if param_kind > 8 {
+        panic("pe_d3d12_root_signature_real FAIL [record_signature] expected=param_kind<=8 got=" + to_string(param_kind))
+    }
+    if register_space < 0 {
+        panic("pe_d3d12_root_signature_real FAIL [record_signature] expected=register_space>=0 got=" + to_string(register_space))
+    }
+    if descriptor_count < 0 {
+        panic("pe_d3d12_root_signature_real FAIL [record_signature] expected=descriptor_count>=0 got=" + to_string(descriptor_count))
+    }
+    let row = to_string(signature_id) + "\t" + to_string(param_kind)
+        + "\t" + to_string(register_space) + "\t" + to_string(descriptor_count) + "\n"
+    pdrs_append_row(pdrs_signatures_path(), row)
+}
+
+// ─── signature_count: total signature row 수 ───
+fn signature_count() -> int {
+    let t = pdrs_read_table(pdrs_signatures_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_descriptor_count: 모든 row descriptor_count 합 ───
+fn total_descriptor_count() -> int {
+    let t = pdrs_read_table(pdrs_signatures_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_param_kind: 특정 param_kind 의 row 수 ───
+fn count_by_param_kind(kind: int) -> int {
+    let t = pdrs_read_table(pdrs_signatures_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_register_spaces: 등장한 register_space 종류 수 ───
+fn distinct_register_spaces() -> int {
+    let t = pdrs_read_table(pdrs_signatures_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let space = to_int(parts[2])
+                let mut found = 0
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == space {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    seen.push(space)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── bindless_count: descriptor_table_* (kind 4..7) row 수 ───
+fn bindless_count() -> int {
+    return count_by_param_kind(4) + count_by_param_kind(5) + count_by_param_kind(6) + count_by_param_kind(7)
+}
+
+// ─── signature_descriptor_count: 특정 signature_id 의 descriptor_count 합 ───
+fn signature_descriptor_count(signature_id: int) -> int {
+    let t = pdrs_read_table(pdrs_signatures_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == signature_id {
+                    sum = sum + to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── pdrs_stats: [signature_count, total_descriptor_count, bindless_count, distinct_register_spaces] ───
+fn pdrs_stats() -> array {
+    let mut out = []
+    out.push(signature_count())
+    out.push(total_descriptor_count())
+    out.push(bindless_count())
+    out.push(distinct_register_spaces())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdrs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdrs()
+
+    // 2. record 6 signatures across ≥4 param_kinds and ≥2 register_spaces
+    //    sig 130001 → cbv_root,    space 0, desc 1
+    //    sig 130002 → srv_root,    space 0, desc 1
+    //    sig 130003 → desc_tbl_srv,space 1, desc 32   (bindless)
+    //    sig 130004 → desc_tbl_cbv,space 0, desc 8    (bindless)
+    //    sig 130005 → desc_tbl_sampler, space 1, desc 16 (bindless)
+    //    sig 130006 → root_constants, space 0, desc 4
+    //   → total_desc = 1+1+32+8+16+4 = 62
+    //   → bindless = 3
+    //   → distinct_spaces = 2 (0,1)
+    //   → kinds present = {1,2,4,5,7,8} (6 kinds)
+    record_signature(130001, 1, 0, 1)
+    r0_emit("pe_d3d12_root_signature_real_record",
+        "\"signature_id\":130001,\"param_kind\":1,\"register_space\":0,\"descriptor_count\":1,\"target\":\"cbv_root\"")
+
+    record_signature(130002, 2, 0, 1)
+    r0_emit("pe_d3d12_root_signature_real_record",
+        "\"signature_id\":130002,\"param_kind\":2,\"register_space\":0,\"descriptor_count\":1,\"target\":\"srv_root\"")
+
+    record_signature(130003, 5, 1, 32)
+    r0_emit("pe_d3d12_root_signature_real_record",
+        "\"signature_id\":130003,\"param_kind\":5,\"register_space\":1,\"descriptor_count\":32,\"target\":\"descriptor_table_srv\"")
+
+    record_signature(130004, 4, 0, 8)
+    r0_emit("pe_d3d12_root_signature_real_record",
+        "\"signature_id\":130004,\"param_kind\":4,\"register_space\":0,\"descriptor_count\":8,\"target\":\"descriptor_table_cbv\"")
+
+    record_signature(130005, 7, 1, 16)
+    r0_emit("pe_d3d12_root_signature_real_record",
+        "\"signature_id\":130005,\"param_kind\":7,\"register_space\":1,\"descriptor_count\":16,\"target\":\"descriptor_table_sampler\"")
+
+    record_signature(130006, 8, 0, 4)
+    r0_emit("pe_d3d12_root_signature_real_record",
+        "\"signature_id\":130006,\"param_kind\":8,\"register_space\":0,\"descriptor_count\":4,\"target\":\"root_constants\"")
+
+    // 3. signature_count = 6
+    let c = signature_count()
+    if c != 6 {
+        panic("pe_d3d12_root_signature_real FAIL [signature_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_descriptor_count = 62
+    let td = total_descriptor_count()
+    if td != 62 {
+        panic("pe_d3d12_root_signature_real FAIL [total_descriptor_count] expected=62 got=" + to_string(td))
+    }
+
+    // 5. count_by_param_kind sanity (≥4 kinds present)
+    let k1 = count_by_param_kind(1)
+    if k1 != 1 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_param_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k4 = count_by_param_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_param_kind(5)
+    if k5 != 1 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k7 = count_by_param_kind(7)
+    if k7 != 1 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(7)] expected=1 got=" + to_string(k7))
+    }
+    let k8 = count_by_param_kind(8)
+    if k8 != 1 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(8)] expected=1 got=" + to_string(k8))
+    }
+    let k_miss = count_by_param_kind(3)
+    if k_miss != 0 {
+        panic("pe_d3d12_root_signature_real FAIL [count_by_param_kind(3)] expected=0 got=" + to_string(k_miss))
+    }
+
+    // 6. bindless_count = 3 (kind 4 + 5 + 7)
+    let bc = bindless_count()
+    if bc != 3 {
+        panic("pe_d3d12_root_signature_real FAIL [bindless_count] expected=3 got=" + to_string(bc))
+    }
+
+    // 7. distinct_register_spaces = 2
+    let drs = distinct_register_spaces()
+    if drs != 2 {
+        panic("pe_d3d12_root_signature_real FAIL [distinct_register_spaces] expected=2 got=" + to_string(drs))
+    }
+
+    // 8. signature_descriptor_count sanity
+    let sd3 = signature_descriptor_count(130003)
+    if sd3 != 32 {
+        panic("pe_d3d12_root_signature_real FAIL [signature_descriptor_count(130003)] expected=32 got=" + to_string(sd3))
+    }
+    let sd5 = signature_descriptor_count(130005)
+    if sd5 != 16 {
+        panic("pe_d3d12_root_signature_real FAIL [signature_descriptor_count(130005)] expected=16 got=" + to_string(sd5))
+    }
+    let sd_miss = signature_descriptor_count(99999)
+    if sd_miss != 0 {
+        panic("pe_d3d12_root_signature_real FAIL [signature_descriptor_count(99999)] expected=0 got=" + to_string(sd_miss))
+    }
+
+    // 9. pdrs_stats() = [6, 62, 3, 2]
+    let s = pdrs_stats()
+    if len(s) != 4 {
+        panic("pe_d3d12_root_signature_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d12_root_signature_real FAIL [stats signature_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 62 {
+        panic("pe_d3d12_root_signature_real FAIL [stats total_desc] expected=62 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_d3d12_root_signature_real FAIL [stats bindless] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_d3d12_root_signature_real FAIL [stats distinct_spaces] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d12_root_signature_real_stats",
+        "\"signature_count\":" + to_string(s[0])
+        + ",\"total_descriptor_count\":" + to_string(s[1])
+        + ",\"bindless_count\":" + to_string(s[2])
+        + ",\"distinct_register_spaces\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d12_root_signature_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdrs()
+    let s2 = pdrs_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d12_root_signature_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d12_root_signature_real self_test PASS (signatures=" + to_string(s[0])
+        + ", descriptors=" + to_string(s[1]) + ", bindless=" + to_string(s[2])
+        + ", spaces=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdrs_stats()
+            println("signature_count\t" + to_string(s[0]))
+            println("total_descriptor_count\t" + to_string(s[1]))
+            println("bindless_count\t" + to_string(s[2]))
+            println("distinct_register_spaces\t" + to_string(s[3]))
+            return
+        }
+        if sub == "descriptors" {
+            if len(a) >= 4 {
+                let sigid = to_int(a[3])
+                println("signature_descriptor_count\t" + to_string(signature_descriptor_count(sigid)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_root_signature_real.hexa descriptors <signature_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_param_kind\t" + to_string(count_by_param_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d12_root_signature_real.hexa count <param_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdrs()
+            println("cleaned: " + pdrs_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdrs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d12_root_signature_real.hexa { self-test | stats | descriptors <signature_id> | count <param_kind> | cleanup | dir }")
+}

@@ -1,0 +1,529 @@
+// lib/loader/pe_i386_iat_thunk_routing.hexa — IAT thunk lookup + native stub routing tracker (R3-6 hexa pair).
+//
+// shim 측 (native cpp) 에서 PE i386 IAT walk + dlsym → host arm64 ptr patch 진행.
+// 본 hexa module 은 그 결과를 record + coverage 추적 (instrumentation only) — Apple SDK 호출 X.
+//
+// PE Import Directory ref (Microsoft PE/COFF spec §6.4):
+//   IMAGE_IMPORT_DESCRIPTOR (5 × 4 byte = 20 byte 각):
+//     OriginalFirstThunk (ILT RVA), TimeDateStamp, ForwarderChain,
+//     Name (DLL name RVA), FirstThunk (IAT RVA)
+//   ILT entry: hint+name (2 byte hint + null-terminated string) OR ordinal (high bit set: 0x80000000 | ord)
+//   IAT entry: PE loader 가 patch — 함수 실 주소 32-bit (i386)
+//
+// own 1 enforcement: Wine / Box86 / CrossOver / GPTK / Whisky / community 0줄.
+//   Microsoft PE/COFF spec 참조 OK. 우회 X.
+// own 2 mandate: r0_emit ≥ 14 (record + stats) + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   descriptor.tsv  : desc_id<int>   \t dll_name<str>      \t ilt_rva_hex<str> \t iat_rva_hex<str> \t name_rva_hex<str>
+//   thunk.tsv       : thunk_id<int>  \t desc_id<int>       \t iat_va_hex<str>  \t fn_name<str>     \t hint_or_ordinal_kind<int> \t hint_or_ord<int>
+//   resolution.tsv  : thunk_id<int>  \t host_handle_hex<str> \t posix_routed<int>
+//   call.tsv        : call_id<int>   \t thunk_id<int>      \t return_value_hex<str> \t succeeded<int>
+//   unresolved.tsv  : thunk_id<int>  \t fn_name<str>       \t fallback_kind<int>
+//
+// Hexa 예약어 회피 (type/mod/resume/handle 단독 식별자 금지) → desc_id / thunk_id / call_id /
+// fallback_kind / posix_routed / hint_or_ordinal_kind / host_handle_hex.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piit_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_iat_thunk_routing"
+}
+
+fn piit_table_path() -> str {
+    return piit_dir() + "/descriptor.tsv"
+}
+
+fn piit_thunk_path() -> str {
+    return piit_dir() + "/thunk.tsv"
+}
+
+fn piit_resolution_path() -> str {
+    return piit_dir() + "/resolution.tsv"
+}
+
+fn piit_call_path() -> str {
+    return piit_dir() + "/call.tsv"
+}
+
+fn piit_unresolved_path() -> str {
+    return piit_dir() + "/unresolved.tsv"
+}
+
+fn piit_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piit_dir() + "'")
+}
+
+fn cleanup_piit() -> void {
+    piit_ensure_dir()
+    let _ = exec("rm -f '" + piit_table_path() + "' '" + piit_thunk_path()
+        + "' '" + piit_resolution_path() + "' '" + piit_call_path()
+        + "' '" + piit_unresolved_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piit_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piit_append_row(path: str, row: str) -> void {
+    piit_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_descriptor: IMAGE_IMPORT_DESCRIPTOR 1 건 ───
+fn record_descriptor(desc_id: int, dll_name: str, ilt_rva_hex: str, iat_rva_hex: str, name_rva_hex: str) -> void {
+    if desc_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_descriptor] expected=desc_id>0 got=" + to_string(desc_id))
+    }
+    if dll_name == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_descriptor] expected=dll_name!=empty got=empty")
+    }
+    if ilt_rva_hex == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_descriptor] expected=ilt_rva_hex!=empty got=empty")
+    }
+    if iat_rva_hex == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_descriptor] expected=iat_rva_hex!=empty got=empty")
+    }
+    if name_rva_hex == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_descriptor] expected=name_rva_hex!=empty got=empty")
+    }
+    let row = to_string(desc_id) + "\t" + dll_name + "\t" + ilt_rva_hex + "\t"
+        + iat_rva_hex + "\t" + name_rva_hex + "\n"
+    piit_append_row(piit_table_path(), row)
+}
+
+// ─── record_thunk: ILT entry (hint+name OR ordinal) 1 건 ───
+//   hint_or_ordinal_kind: 0=hint+name, 1=ordinal
+fn record_thunk(thunk_id: int, desc_id: int, iat_va_hex: str, fn_name: str,
+                hint_or_ordinal_kind: int, hint_or_ord: int) -> void {
+    if thunk_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if desc_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=desc_id>0 got=" + to_string(desc_id))
+    }
+    if iat_va_hex == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=iat_va_hex!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=fn_name!=empty got=empty")
+    }
+    if hint_or_ordinal_kind < 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=hint_or_ordinal_kind>=0 got=" + to_string(hint_or_ordinal_kind))
+    }
+    if hint_or_ordinal_kind > 1 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=hint_or_ordinal_kind<=1 got=" + to_string(hint_or_ordinal_kind))
+    }
+    if hint_or_ord < 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_thunk] expected=hint_or_ord>=0 got=" + to_string(hint_or_ord))
+    }
+    let row = to_string(thunk_id) + "\t" + to_string(desc_id) + "\t" + iat_va_hex + "\t"
+        + fn_name + "\t" + to_string(hint_or_ordinal_kind) + "\t" + to_string(hint_or_ord) + "\n"
+    piit_append_row(piit_thunk_path(), row)
+}
+
+// ─── record_resolution: dlsym → host arm64 ptr patch 결과 ───
+//   posix_routed: 0=raw RVA stub, 1=POSIX dlsym, 2=missing
+fn record_resolution(thunk_id: int, host_handle_hex: str, posix_routed: int) -> void {
+    if thunk_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_resolution] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if host_handle_hex == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_resolution] expected=host_handle_hex!=empty got=empty")
+    }
+    if posix_routed < 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_resolution] expected=posix_routed>=0 got=" + to_string(posix_routed))
+    }
+    if posix_routed > 2 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_resolution] expected=posix_routed<=2 got=" + to_string(posix_routed))
+    }
+    let row = to_string(thunk_id) + "\t" + host_handle_hex + "\t" + to_string(posix_routed) + "\n"
+    piit_append_row(piit_resolution_path(), row)
+}
+
+// ─── record_call: routed thunk 호출 결과 ───
+fn record_call(call_id: int, thunk_id: int, return_value_hex: str, succeeded: int) -> void {
+    if call_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if thunk_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_call] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if return_value_hex == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_call] expected=return_value_hex!=empty got=empty")
+    }
+    if succeeded < 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_call] expected=succeeded>=0 got=" + to_string(succeeded))
+    }
+    if succeeded > 1 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_call] expected=succeeded<=1 got=" + to_string(succeeded))
+    }
+    let row = to_string(call_id) + "\t" + to_string(thunk_id) + "\t" + return_value_hex + "\t"
+        + to_string(succeeded) + "\n"
+    piit_append_row(piit_call_path(), row)
+}
+
+// ─── record_unresolved: dlsym 실패 + fallback ───
+//   fallback_kind: 0=stub_zero, 1=halt
+fn record_unresolved(thunk_id: int, fn_name: str, fallback_kind: int) -> void {
+    if thunk_id <= 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_unresolved] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if fn_name == "" {
+        panic("pe_i386_iat_thunk_routing FAIL [record_unresolved] expected=fn_name!=empty got=empty")
+    }
+    if fallback_kind < 0 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_unresolved] expected=fallback_kind>=0 got=" + to_string(fallback_kind))
+    }
+    if fallback_kind > 1 {
+        panic("pe_i386_iat_thunk_routing FAIL [record_unresolved] expected=fallback_kind<=1 got=" + to_string(fallback_kind))
+    }
+    let row = to_string(thunk_id) + "\t" + fn_name + "\t" + to_string(fallback_kind) + "\n"
+    piit_append_row(piit_unresolved_path(), row)
+}
+
+// ─── 통계 helpers ───
+fn piit_count_rows(path: str, min_cols: int) -> int {
+    let t = piit_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn descriptor_count() -> int {
+    return piit_count_rows(piit_table_path(), 5)
+}
+
+fn thunk_count() -> int {
+    return piit_count_rows(piit_thunk_path(), 6)
+}
+
+fn resolution_count() -> int {
+    return piit_count_rows(piit_resolution_path(), 3)
+}
+
+fn call_count() -> int {
+    return piit_count_rows(piit_call_path(), 4)
+}
+
+fn unresolved_count() -> int {
+    return piit_count_rows(piit_unresolved_path(), 3)
+}
+
+// ─── resolved_pct: POSIX-routed (posix_routed==1) / total resolutions * 100 ───
+fn resolved_pct() -> int {
+    let t = piit_read_table(piit_resolution_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut total = 0
+    let mut routed = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 3 {
+                total = total + 1
+                let v = to_int(parts[2])
+                if v == 1 {
+                    routed = routed + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if total <= 0 {
+        return 0
+    }
+    return (routed * 100) / total
+}
+
+// ─── kind_name: hint_or_ordinal_kind → 라벨 ───
+fn kind_name(k: int) -> str {
+    if k == 0 {
+        return "hint+name"
+    }
+    if k == 1 {
+        return "ordinal"
+    }
+    return "unknown"
+}
+
+// ─── piit_stats: [descriptor_count, thunk_count, resolution_count, call_count, unresolved_count] ───
+fn piit_stats() -> array {
+    let mut out = []
+    out.push(descriptor_count())
+    out.push(thunk_count())
+    out.push(resolution_count())
+    out.push(call_count())
+    out.push(unresolved_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piit-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_piit()
+
+    // 2. record 3 descriptors (KERNEL32 / NTDLL / USER32)
+    //    RVA 값은 PE32 typical layout sample (not real Battle.net binary — instrumentation skeleton).
+    record_descriptor(1, "KERNEL32.DLL", "0x00012000", "0x00018000", "0x0001A000")
+    r0_emit("pe_i386_iat_thunk_routing_record_descriptor",
+        "\"desc_id\":1,\"dll_name\":\"KERNEL32.DLL\",\"ilt_rva\":\"0x00012000\",\"iat_rva\":\"0x00018000\"")
+
+    record_descriptor(2, "NTDLL.DLL", "0x00012040", "0x00018080", "0x0001A040")
+    r0_emit("pe_i386_iat_thunk_routing_record_descriptor",
+        "\"desc_id\":2,\"dll_name\":\"NTDLL.DLL\",\"ilt_rva\":\"0x00012040\",\"iat_rva\":\"0x00018080\"")
+
+    record_descriptor(3, "USER32.DLL", "0x00012080", "0x00018100", "0x0001A080")
+    r0_emit("pe_i386_iat_thunk_routing_record_descriptor",
+        "\"desc_id\":3,\"dll_name\":\"USER32.DLL\",\"ilt_rva\":\"0x00012080\",\"iat_rva\":\"0x00018100\"")
+
+    // 3. record 8 thunks
+    //    KERNEL32 (4): GetCurrentThreadId / GetTickCount / Sleep / CloseHandle
+    //    NTDLL    (2): NtClose / NtQueryInfo
+    //    USER32   (2): GetMessageA / PostMessageA
+    record_thunk(1, 1, "0x00418000", "GetCurrentThreadId", 0, 0x012A)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":1,\"desc_id\":1,\"fn_name\":\"GetCurrentThreadId\",\"kind\":\"hint+name\"")
+
+    record_thunk(2, 1, "0x00418004", "GetTickCount", 0, 0x012B)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":2,\"desc_id\":1,\"fn_name\":\"GetTickCount\",\"kind\":\"hint+name\"")
+
+    record_thunk(3, 1, "0x00418008", "Sleep", 0, 0x028C)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":3,\"desc_id\":1,\"fn_name\":\"Sleep\",\"kind\":\"hint+name\"")
+
+    record_thunk(4, 1, "0x0041800C", "CloseHandle", 0, 0x0061)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":4,\"desc_id\":1,\"fn_name\":\"CloseHandle\",\"kind\":\"hint+name\"")
+
+    record_thunk(5, 2, "0x00418080", "NtClose", 0, 0x0040)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":5,\"desc_id\":2,\"fn_name\":\"NtClose\",\"kind\":\"hint+name\"")
+
+    record_thunk(6, 2, "0x00418084", "NtQueryInformationProcess", 1, 0x0019)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":6,\"desc_id\":2,\"fn_name\":\"NtQueryInformationProcess\",\"kind\":\"ordinal\"")
+
+    record_thunk(7, 3, "0x00418100", "GetMessageA", 0, 0x01D5)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":7,\"desc_id\":3,\"fn_name\":\"GetMessageA\",\"kind\":\"hint+name\"")
+
+    record_thunk(8, 3, "0x00418104", "PostMessageA", 0, 0x024C)
+    r0_emit("pe_i386_iat_thunk_routing_record_thunk",
+        "\"thunk_id\":8,\"desc_id\":3,\"fn_name\":\"PostMessageA\",\"kind\":\"hint+name\"")
+
+    // 4. record 6 resolutions
+    //    KERNEL32 4종 → POSIX dlsym routed (posix_routed=1)
+    //    NTDLL/USER32 2종 → raw stub (posix_routed=0)
+    record_resolution(1, "0x100A0000", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_resolution",
+        "\"thunk_id\":1,\"host_handle\":\"0x100A0000\",\"posix_routed\":1")
+
+    record_resolution(2, "0x100A0010", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_resolution",
+        "\"thunk_id\":2,\"host_handle\":\"0x100A0010\",\"posix_routed\":1")
+
+    record_resolution(3, "0x100A0020", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_resolution",
+        "\"thunk_id\":3,\"host_handle\":\"0x100A0020\",\"posix_routed\":1")
+
+    record_resolution(4, "0x100A0030", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_resolution",
+        "\"thunk_id\":4,\"host_handle\":\"0x100A0030\",\"posix_routed\":1")
+
+    record_resolution(5, "0x100B0000", 0)
+    r0_emit("pe_i386_iat_thunk_routing_record_resolution",
+        "\"thunk_id\":5,\"host_handle\":\"0x100B0000\",\"posix_routed\":0")
+
+    record_resolution(7, "0x100C0000", 0)
+    r0_emit("pe_i386_iat_thunk_routing_record_resolution",
+        "\"thunk_id\":7,\"host_handle\":\"0x100C0000\",\"posix_routed\":0")
+
+    // 5. record 4 calls (return 0, succeeded=1)
+    record_call(1, 1, "0x00000000", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_call",
+        "\"call_id\":1,\"thunk_id\":1,\"return_value\":\"0x00000000\",\"succeeded\":1")
+
+    record_call(2, 2, "0x00000000", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_call",
+        "\"call_id\":2,\"thunk_id\":2,\"return_value\":\"0x00000000\",\"succeeded\":1")
+
+    record_call(3, 3, "0x00000000", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_call",
+        "\"call_id\":3,\"thunk_id\":3,\"return_value\":\"0x00000000\",\"succeeded\":1")
+
+    record_call(4, 4, "0x00000000", 1)
+    r0_emit("pe_i386_iat_thunk_routing_record_call",
+        "\"call_id\":4,\"thunk_id\":4,\"return_value\":\"0x00000000\",\"succeeded\":1")
+
+    // 6. record 2 unresolved (fallback=stub_zero)
+    record_unresolved(6, "NtQueryInformationProcess", 0)
+    r0_emit("pe_i386_iat_thunk_routing_record_unresolved",
+        "\"thunk_id\":6,\"fn_name\":\"NtQueryInformationProcess\",\"fallback\":\"stub_zero\"")
+
+    record_unresolved(8, "PostMessageA", 0)
+    r0_emit("pe_i386_iat_thunk_routing_record_unresolved",
+        "\"thunk_id\":8,\"fn_name\":\"PostMessageA\",\"fallback\":\"stub_zero\"")
+
+    // 7. assertions
+    let dc = descriptor_count()
+    if dc != 3 {
+        panic("pe_i386_iat_thunk_routing FAIL [descriptor_count] expected=3 got=" + to_string(dc))
+    }
+
+    let tc = thunk_count()
+    if tc != 8 {
+        panic("pe_i386_iat_thunk_routing FAIL [thunk_count] expected=8 got=" + to_string(tc))
+    }
+
+    let rc = resolution_count()
+    if rc != 6 {
+        panic("pe_i386_iat_thunk_routing FAIL [resolution_count] expected=6 got=" + to_string(rc))
+    }
+
+    let cc = call_count()
+    if cc != 4 {
+        panic("pe_i386_iat_thunk_routing FAIL [call_count] expected=4 got=" + to_string(cc))
+    }
+
+    let uc = unresolved_count()
+    if uc != 2 {
+        panic("pe_i386_iat_thunk_routing FAIL [unresolved_count] expected=2 got=" + to_string(uc))
+    }
+
+    // 8. resolved_pct >= 50 (4/6 = 66)
+    let pct = resolved_pct()
+    if pct < 50 {
+        panic("pe_i386_iat_thunk_routing FAIL [resolved_pct] expected=>=50 got=" + to_string(pct))
+    }
+    if pct > 100 {
+        panic("pe_i386_iat_thunk_routing FAIL [resolved_pct] expected=<=100 got=" + to_string(pct))
+    }
+
+    // 9. kind_name 검증
+    let kn0 = kind_name(0)
+    if kn0 != "hint+name" {
+        panic("pe_i386_iat_thunk_routing FAIL [kind_name(0)] expected=hint+name got=" + kn0)
+    }
+    let kn1 = kind_name(1)
+    if kn1 != "ordinal" {
+        panic("pe_i386_iat_thunk_routing FAIL [kind_name(1)] expected=ordinal got=" + kn1)
+    }
+
+    // 10. piit_stats() = [3, 8, 6, 4, 2]
+    let s = piit_stats()
+    if len(s) != 5 {
+        panic("pe_i386_iat_thunk_routing FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_i386_iat_thunk_routing FAIL [stats descriptor] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 8 {
+        panic("pe_i386_iat_thunk_routing FAIL [stats thunk] expected=8 got=" + to_string(s[1]))
+    }
+    if s[2] != 6 {
+        panic("pe_i386_iat_thunk_routing FAIL [stats resolution] expected=6 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_i386_iat_thunk_routing FAIL [stats call] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_iat_thunk_routing FAIL [stats unresolved] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 11. emit stats summary
+    r0_emit("pe_i386_iat_thunk_routing_stats",
+        "\"descriptor_count\":" + to_string(s[0])
+        + ",\"thunk_count\":" + to_string(s[1])
+        + ",\"resolution_count\":" + to_string(s[2])
+        + ",\"call_count\":" + to_string(s[3])
+        + ",\"unresolved_count\":" + to_string(s[4])
+        + ",\"resolved_pct\":" + to_string(pct))
+
+    // 12. emit count >= 14 (3 desc + 8 thunk + 6 res + 4 call + 2 unres + 1 stats = 24)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_iat_thunk_routing FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 13. cleanup → stats 모두 0
+    cleanup_piit()
+    let s2 = piit_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_iat_thunk_routing FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_iat_thunk_routing self_test PASS (desc=" + to_string(s[0])
+        + ", thunk=" + to_string(s[1]) + ", res=" + to_string(s[2])
+        + ", call=" + to_string(s[3]) + ", unres=" + to_string(s[4])
+        + ", routed_pct=" + to_string(pct) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piit_stats()
+            println("descriptor_count\t" + to_string(s[0]))
+            println("thunk_count\t" + to_string(s[1]))
+            println("resolution_count\t" + to_string(s[2]))
+            println("call_count\t" + to_string(s[3]))
+            println("unresolved_count\t" + to_string(s[4]))
+            println("resolved_pct\t" + to_string(resolved_pct()))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piit()
+            println("cleaned: " + piit_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piit_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_iat_thunk_routing.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,500 @@
+// lib/loader/pe_msvc_initterm_array_real.hexa
+// — _initterm / _initterm_e CRT/CXX init array walk 추적기
+//
+// MSVC C runtime 의 startup path (`__scrt_common_main_seh`, MSDN UCRT 공개 doc 기준)
+// 는 PE image 의 ".CRT$XCA".."CRT$XCZ" / ".CRT$XIA".."CRT$XIZ" 사이에 채워진
+// function-pointer table 을 walk 하면서 ctor 를 호출:
+//
+//   _initterm   (PVFV* first, PVFV* last)            // void (*)(void) — CRT C++
+//   _initterm_e (PVCFV* first, PVCFV* last) -> int   // int  (*)(void) — CRT C, 실패 가능
+//
+// segment 매핑 (MSVC linker 가 alphabetic merge):
+//   .CRT$XIA / .CRT$XIZ   → CRT C  init array (_initterm_e)
+//   .CRT$XCA / .CRT$XCZ   → CRT C++ init array (_initterm)
+//   .CRT$XPA / .CRT$XPZ   → pre-terminator (atexit-like)
+//   .CRT$XTA / .CRT$XTZ   → post-terminator
+//
+// pe_msvcr_crt_init_stub_real 는 stub 호출 path 를, 본 hexa 는 그 stub 안쪽의
+// "array walk + ctor invocation" detail 을 기록 — 호환 layer 가 아니라 보조 layer.
+//
+// own 1 enforcement: Wine msvcrt source / Microsoft msvcrt source / CrossOver / GPTK /
+//                    Whisky 0 줄. Microsoft UCRT API doc 만 참조.
+//   - Wine dlls/msvcrt 인용 X
+//   - third-party Wine 계열 추천/언급 X (game-changer trigger 금지)
+//   - Microsoft msvcrt source 인용 X
+// own 2 mandate: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종):
+//   array_walks.tsv      : walk_id<int>     \t array_kind<int> \t start_va_hex<str>
+//                          \t end_va_hex<str> \t total_count<int>
+//   ctor_invocations.tsv : ctor_id<int>     \t walk_id<int>    \t slot_index<int>
+//                          \t ctor_va_hex<str> \t returned<int>
+//   array_segments.tsv   : seg_id<int>      \t segment_name<str> \t va_hex<str>
+//   init_array_sizes.tsv : size_id<int>     \t walk_id<int>    \t valid_entries<int>
+//                          \t null_entries<int>
+//   walk_decisions.tsv   : dec_id<int>      \t walk_id<int>    \t full_walk<int>
+//                          \t cap_used<int>
+//
+// array_kind code: 0=CRT_C 1=CRT_CXX 2=DLL 3=PRE_CRT 4=PRE_CXX
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지 → array_kind / kind.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmia_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_initterm_array_real"
+}
+
+fn pmia_array_walks_path() -> str {
+    return pmia_dir() + "/array_walks.tsv"
+}
+
+fn pmia_ctor_invocations_path() -> str {
+    return pmia_dir() + "/ctor_invocations.tsv"
+}
+
+fn pmia_array_segments_path() -> str {
+    return pmia_dir() + "/array_segments.tsv"
+}
+
+fn pmia_init_array_sizes_path() -> str {
+    return pmia_dir() + "/init_array_sizes.tsv"
+}
+
+fn pmia_walk_decisions_path() -> str {
+    return pmia_dir() + "/walk_decisions.tsv"
+}
+
+fn pmia_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmia_dir() + "'")
+}
+
+fn cleanup_pmia() -> void {
+    pmia_ensure_dir()
+    let _ = exec("rm -f '" + pmia_array_walks_path()
+        + "' '" + pmia_ctor_invocations_path()
+        + "' '" + pmia_array_segments_path()
+        + "' '" + pmia_init_array_sizes_path()
+        + "' '" + pmia_walk_decisions_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmia_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmia_append_row(path: str, row: str) -> void {
+    pmia_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_array_walk: _initterm / _initterm_e walk 1 건 ───
+//   array_kind: 0=CRT_C 1=CRT_CXX 2=DLL 3=PRE_CRT 4=PRE_CXX
+fn record_array_walk(walk_id: int, array_kind: int, start_va_hex: str, end_va_hex: str, total_count: int) -> void {
+    if walk_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_walk] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if array_kind < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_walk] expected=array_kind>=0 got=" + to_string(array_kind))
+    }
+    if array_kind > 4 {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_walk] expected=array_kind<=4 got=" + to_string(array_kind))
+    }
+    if start_va_hex == "" {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_walk] expected=start_va_hex!=empty got=empty")
+    }
+    if end_va_hex == "" {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_walk] expected=end_va_hex!=empty got=empty")
+    }
+    if total_count < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_walk] expected=total_count>=0 got=" + to_string(total_count))
+    }
+    let row = to_string(walk_id) + "\t" + to_string(array_kind) + "\t" + start_va_hex
+        + "\t" + end_va_hex + "\t" + to_string(total_count) + "\n"
+    pmia_append_row(pmia_array_walks_path(), row)
+}
+
+// ─── record_ctor_invocation: walk 안의 한 slot ctor 호출 1 건 ───
+fn record_ctor_invocation(ctor_id: int, walk_id: int, slot_index: int, ctor_va_hex: str, returned: int) -> void {
+    if ctor_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_ctor_invocation] expected=ctor_id>0 got=" + to_string(ctor_id))
+    }
+    if walk_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_ctor_invocation] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if slot_index < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_ctor_invocation] expected=slot_index>=0 got=" + to_string(slot_index))
+    }
+    if ctor_va_hex == "" {
+        panic("pe_msvc_initterm_array_real FAIL [record_ctor_invocation] expected=ctor_va_hex!=empty got=empty")
+    }
+    let row = to_string(ctor_id) + "\t" + to_string(walk_id) + "\t" + to_string(slot_index)
+        + "\t" + ctor_va_hex + "\t" + to_string(returned) + "\n"
+    pmia_append_row(pmia_ctor_invocations_path(), row)
+}
+
+// ─── record_array_segment: ".CRT$XCA"/".CRT$XCZ"/".CRT$XIA"/".CRT$XIZ" 1 건 ───
+fn record_array_segment(seg_id: int, segment_name: str, va_hex: str) -> void {
+    if seg_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_segment] expected=seg_id>0 got=" + to_string(seg_id))
+    }
+    if segment_name == "" {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_segment] expected=segment_name!=empty got=empty")
+    }
+    if va_hex == "" {
+        panic("pe_msvc_initterm_array_real FAIL [record_array_segment] expected=va_hex!=empty got=empty")
+    }
+    let row = to_string(seg_id) + "\t" + segment_name + "\t" + va_hex + "\n"
+    pmia_append_row(pmia_array_segments_path(), row)
+}
+
+// ─── record_init_array_size: walk 의 valid/null entry 통계 1 건 ───
+fn record_init_array_size(size_id: int, walk_id: int, valid_entries: int, null_entries: int) -> void {
+    if size_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_init_array_size] expected=size_id>0 got=" + to_string(size_id))
+    }
+    if walk_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_init_array_size] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if valid_entries < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_init_array_size] expected=valid_entries>=0 got=" + to_string(valid_entries))
+    }
+    if null_entries < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_init_array_size] expected=null_entries>=0 got=" + to_string(null_entries))
+    }
+    let row = to_string(size_id) + "\t" + to_string(walk_id) + "\t" + to_string(valid_entries)
+        + "\t" + to_string(null_entries) + "\n"
+    pmia_append_row(pmia_init_array_sizes_path(), row)
+}
+
+// ─── record_walk_decision: full walk vs cap (early-out) 결정 1 건 ───
+fn record_walk_decision(dec_id: int, walk_id: int, full_walk: int, cap_used: int) -> void {
+    if dec_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_walk_decision] expected=dec_id>0 got=" + to_string(dec_id))
+    }
+    if walk_id <= 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_walk_decision] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if full_walk < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_walk_decision] expected=full_walk>=0 got=" + to_string(full_walk))
+    }
+    if full_walk > 1 {
+        panic("pe_msvc_initterm_array_real FAIL [record_walk_decision] expected=full_walk<=1 got=" + to_string(full_walk))
+    }
+    if cap_used < 0 {
+        panic("pe_msvc_initterm_array_real FAIL [record_walk_decision] expected=cap_used>=0 got=" + to_string(cap_used))
+    }
+    if cap_used > 1 {
+        panic("pe_msvc_initterm_array_real FAIL [record_walk_decision] expected=cap_used<=1 got=" + to_string(cap_used))
+    }
+    let row = to_string(dec_id) + "\t" + to_string(walk_id) + "\t" + to_string(full_walk)
+        + "\t" + to_string(cap_used) + "\n"
+    pmia_append_row(pmia_walk_decisions_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pmia_count_rows(path: str, min_fields: int) -> int {
+    let t = pmia_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn array_walk_count() -> int {
+    return pmia_count_rows(pmia_array_walks_path(), 5)
+}
+
+fn ctor_invocation_count() -> int {
+    return pmia_count_rows(pmia_ctor_invocations_path(), 5)
+}
+
+fn segment_count() -> int {
+    return pmia_count_rows(pmia_array_segments_path(), 3)
+}
+
+fn size_count() -> int {
+    return pmia_count_rows(pmia_init_array_sizes_path(), 4)
+}
+
+fn decision_count() -> int {
+    return pmia_count_rows(pmia_walk_decisions_path(), 4)
+}
+
+// ─── array_kind_name: 0..4 → 명칭 ───
+fn array_kind_name(k: int) -> str {
+    if k == 0 {
+        return "CRT_C"
+    }
+    if k == 1 {
+        return "CRT_CXX"
+    }
+    if k == 2 {
+        return "DLL"
+    }
+    if k == 3 {
+        return "PRE_CRT"
+    }
+    if k == 4 {
+        return "PRE_CXX"
+    }
+    panic("pe_msvc_initterm_array_real FAIL [array_kind_name] expected=0..4 got=" + to_string(k))
+}
+
+// ─── pmia_stats: [array_walk, ctor_invocation, segment, size, decision] ───
+fn pmia_stats() -> array {
+    let mut out = []
+    out.push(array_walk_count())
+    out.push(ctor_invocation_count())
+    out.push(segment_count())
+    out.push(size_count())
+    out.push(decision_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmia-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmia()
+
+    // 2. record_array_walk x2 — CRT_C (walk_id=1, total 8) / CRT_CXX (walk_id=2, total 4)
+    //    CRT_C  : 0x401000..0x401020 → 0x20/4 = 8
+    //    CRT_CXX: 0x401020..0x401030 → 0x10/4 = 4
+    record_array_walk(1, 0, "0x401000", "0x401020", 8)
+    r0_emit("pe_msvc_initterm_array_real_record_array_walk",
+        "\"walk_id\":1,\"array_kind\":0,\"name\":\"" + array_kind_name(0)
+        + "\",\"start_va_hex\":\"0x401000\",\"end_va_hex\":\"0x401020\",\"total_count\":8")
+
+    record_array_walk(2, 1, "0x401020", "0x401030", 4)
+    r0_emit("pe_msvc_initterm_array_real_record_array_walk",
+        "\"walk_id\":2,\"array_kind\":1,\"name\":\"" + array_kind_name(1)
+        + "\",\"start_va_hex\":\"0x401020\",\"end_va_hex\":\"0x401030\",\"total_count\":4")
+
+    // 3. record_ctor_invocation x8 — CRT_C 4 (walk_id=1, slot 0..3) + CRT_CXX 4 (walk_id=2, slot 0..3)
+    //    CRT_C: ctor_va = 0x402000 + slot*0x40, returned 0 (성공)
+    record_ctor_invocation(1, 1, 0, "0x402000", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":1,\"walk_id\":1,\"slot_index\":0,\"ctor_va_hex\":\"0x402000\",\"returned\":0")
+
+    record_ctor_invocation(2, 1, 1, "0x402040", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":2,\"walk_id\":1,\"slot_index\":1,\"ctor_va_hex\":\"0x402040\",\"returned\":0")
+
+    record_ctor_invocation(3, 1, 2, "0x402080", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":3,\"walk_id\":1,\"slot_index\":2,\"ctor_va_hex\":\"0x402080\",\"returned\":0")
+
+    record_ctor_invocation(4, 1, 3, "0x4020c0", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":4,\"walk_id\":1,\"slot_index\":3,\"ctor_va_hex\":\"0x4020c0\",\"returned\":0")
+
+    //    CRT_CXX: ctor_va = 0x403000 + slot*0x40, returned 0 (void → 0 placeholder)
+    record_ctor_invocation(5, 2, 0, "0x403000", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":5,\"walk_id\":2,\"slot_index\":0,\"ctor_va_hex\":\"0x403000\",\"returned\":0")
+
+    record_ctor_invocation(6, 2, 1, "0x403040", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":6,\"walk_id\":2,\"slot_index\":1,\"ctor_va_hex\":\"0x403040\",\"returned\":0")
+
+    record_ctor_invocation(7, 2, 2, "0x403080", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":7,\"walk_id\":2,\"slot_index\":2,\"ctor_va_hex\":\"0x403080\",\"returned\":0")
+
+    record_ctor_invocation(8, 2, 3, "0x4030c0", 0)
+    r0_emit("pe_msvc_initterm_array_real_record_ctor_invocation",
+        "\"ctor_id\":8,\"walk_id\":2,\"slot_index\":3,\"ctor_va_hex\":\"0x4030c0\",\"returned\":0")
+
+    // 4. record_array_segment x4 — .CRT$XCA / .CRT$XCZ / .CRT$XIA / .CRT$XIZ
+    record_array_segment(1, ".CRT$XIA", "0x401000")
+    r0_emit("pe_msvc_initterm_array_real_record_array_segment",
+        "\"seg_id\":1,\"segment_name\":\".CRT$XIA\",\"va_hex\":\"0x401000\"")
+
+    record_array_segment(2, ".CRT$XIZ", "0x401020")
+    r0_emit("pe_msvc_initterm_array_real_record_array_segment",
+        "\"seg_id\":2,\"segment_name\":\".CRT$XIZ\",\"va_hex\":\"0x401020\"")
+
+    record_array_segment(3, ".CRT$XCA", "0x401020")
+    r0_emit("pe_msvc_initterm_array_real_record_array_segment",
+        "\"seg_id\":3,\"segment_name\":\".CRT$XCA\",\"va_hex\":\"0x401020\"")
+
+    record_array_segment(4, ".CRT$XCZ", "0x401030")
+    r0_emit("pe_msvc_initterm_array_real_record_array_segment",
+        "\"seg_id\":4,\"segment_name\":\".CRT$XCZ\",\"va_hex\":\"0x401030\"")
+
+    // 5. record_init_array_size x2 — CRT_C valid=8 null=2 (즉 padding/null 2 개) / CRT_CXX valid=4 null=0
+    record_init_array_size(1, 1, 8, 2)
+    r0_emit("pe_msvc_initterm_array_real_record_init_array_size",
+        "\"size_id\":1,\"walk_id\":1,\"valid_entries\":8,\"null_entries\":2")
+
+    record_init_array_size(2, 2, 4, 0)
+    r0_emit("pe_msvc_initterm_array_real_record_init_array_size",
+        "\"size_id\":2,\"walk_id\":2,\"valid_entries\":4,\"null_entries\":0")
+
+    // 6. record_walk_decision x2 — full (CRT_C: full=1 cap=0) / cap (CRT_CXX: full=0 cap=1)
+    record_walk_decision(1, 1, 1, 0)
+    r0_emit("pe_msvc_initterm_array_real_record_walk_decision",
+        "\"dec_id\":1,\"walk_id\":1,\"full_walk\":1,\"cap_used\":0")
+
+    record_walk_decision(2, 2, 0, 1)
+    r0_emit("pe_msvc_initterm_array_real_record_walk_decision",
+        "\"dec_id\":2,\"walk_id\":2,\"full_walk\":0,\"cap_used\":1")
+
+    // 7. assertion: array_walk == 2
+    let aw = array_walk_count()
+    if aw != 2 {
+        panic("pe_msvc_initterm_array_real FAIL [array_walk_count] expected=2 got=" + to_string(aw))
+    }
+
+    // 8. assertion: ctor_invocation == 8
+    let ci = ctor_invocation_count()
+    if ci != 8 {
+        panic("pe_msvc_initterm_array_real FAIL [ctor_invocation_count] expected=8 got=" + to_string(ci))
+    }
+
+    // 9. assertion: segment == 4
+    let sg = segment_count()
+    if sg != 4 {
+        panic("pe_msvc_initterm_array_real FAIL [segment_count] expected=4 got=" + to_string(sg))
+    }
+
+    // 10. assertion: size == 2
+    let sz = size_count()
+    if sz != 2 {
+        panic("pe_msvc_initterm_array_real FAIL [size_count] expected=2 got=" + to_string(sz))
+    }
+
+    // 11. assertion: decision == 2
+    let dc = decision_count()
+    if dc != 2 {
+        panic("pe_msvc_initterm_array_real FAIL [decision_count] expected=2 got=" + to_string(dc))
+    }
+
+    // 12. array_kind_name sanity (0..4)
+    let k0 = array_kind_name(0)
+    if k0 != "CRT_C" {
+        panic("pe_msvc_initterm_array_real FAIL [array_kind_name(0)] expected=CRT_C got=" + k0)
+    }
+    let k1 = array_kind_name(1)
+    if k1 != "CRT_CXX" {
+        panic("pe_msvc_initterm_array_real FAIL [array_kind_name(1)] expected=CRT_CXX got=" + k1)
+    }
+    let k2 = array_kind_name(2)
+    if k2 != "DLL" {
+        panic("pe_msvc_initterm_array_real FAIL [array_kind_name(2)] expected=DLL got=" + k2)
+    }
+    let k3 = array_kind_name(3)
+    if k3 != "PRE_CRT" {
+        panic("pe_msvc_initterm_array_real FAIL [array_kind_name(3)] expected=PRE_CRT got=" + k3)
+    }
+    let k4 = array_kind_name(4)
+    if k4 != "PRE_CXX" {
+        panic("pe_msvc_initterm_array_real FAIL [array_kind_name(4)] expected=PRE_CXX got=" + k4)
+    }
+
+    // 13. pmia_stats() == [2, 8, 4, 2, 2]
+    let s = pmia_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_initterm_array_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_msvc_initterm_array_real FAIL [stats array_walk] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 8 {
+        panic("pe_msvc_initterm_array_real FAIL [stats ctor_invocation] expected=8 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_initterm_array_real FAIL [stats segment] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_msvc_initterm_array_real FAIL [stats size] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_initterm_array_real FAIL [stats decision] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 14. emit stats summary
+    r0_emit("pe_msvc_initterm_array_real_stats",
+        "\"array_walk\":" + to_string(s[0])
+        + ",\"ctor_invocation\":" + to_string(s[1])
+        + ",\"segment\":" + to_string(s[2])
+        + ",\"size\":" + to_string(s[3])
+        + ",\"decision\":" + to_string(s[4]))
+
+    // 15. emit count >= 12 — 2 walk + 8 ctor + 4 seg + 2 size + 2 dec + 1 stats = 19
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_msvc_initterm_array_real FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // 16. cleanup → stats 모두 0
+    cleanup_pmia()
+    let s2 = pmia_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_initterm_array_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_initterm_array_real self_test PASS (array_walk=" + to_string(s[0])
+        + ", ctor_invocation=" + to_string(s[1]) + ", segment=" + to_string(s[2])
+        + ", size=" + to_string(s[3]) + ", decision=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmia_stats()
+            println("array_walk_count\t" + to_string(s[0]))
+            println("ctor_invocation_count\t" + to_string(s[1]))
+            println("segment_count\t" + to_string(s[2]))
+            println("size_count\t" + to_string(s[3]))
+            println("decision_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmia()
+            println("cleaned: " + pmia_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmia_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_initterm_array_real.hexa { self-test | stats | cleanup | dir }")
+}

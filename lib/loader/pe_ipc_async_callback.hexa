@@ -1,0 +1,377 @@
+// lib/loader/pe_ipc_async_callback.hexa — stage5 async callback pattern skeleton
+//
+// 비동기 IPC: send + callback register → continue → response 도착 시 callback
+// fired. Win32 OVERLAPPED I/O, ReadFileEx, IOCP 등의 native equivalent.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 callback metric tracker — 실 OVERLAPPED / IOCP 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = read
+//   2 = write
+//   3 = connect
+//   4 = accept
+//
+// persist schema (TSV — callbacks.tsv):
+//   callback_id<int> \t op_kind<int> \t queue_us<int> \t fire_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piac_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_async_callback"
+}
+
+fn piac_callbacks_path() -> str {
+    return piac_dir() + "/callbacks.tsv"
+}
+
+fn piac_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piac_dir() + "'")
+}
+
+fn cleanup_piac() -> void {
+    piac_ensure_dir()
+    let _ = exec("rm -f '" + piac_callbacks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piac_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piac_append_row(path: str, row: str) -> void {
+    piac_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_callback: callback 1 건 기록 ───
+fn record_callback(callback_id: int, op_kind: int, queue_us: int, fire_us: int) -> void {
+    if callback_id <= 0 {
+        panic("pe_ipc_async_callback FAIL [record_callback] expected=callback_id>0 got=" + to_string(callback_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ipc_async_callback FAIL [record_callback] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_ipc_async_callback FAIL [record_callback] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if queue_us < 0 {
+        panic("pe_ipc_async_callback FAIL [record_callback] expected=queue_us>=0 got=" + to_string(queue_us))
+    }
+    if fire_us < 0 {
+        panic("pe_ipc_async_callback FAIL [record_callback] expected=fire_us>=0 got=" + to_string(fire_us))
+    }
+    let row = to_string(callback_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(queue_us) + "\t" + to_string(fire_us) + "\n"
+    piac_append_row(piac_callbacks_path(), row)
+}
+
+// ─── callback_count: total callback 수 ───
+fn callback_count() -> int {
+    let t = piac_read_table(piac_callbacks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_queue_us: 모든 callback queue_us 합 ───
+fn total_queue_us() -> int {
+    let t = piac_read_table(piac_callbacks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_fire_us: 모든 callback fire_us 합 ───
+fn total_fire_us() -> int {
+    let t = piac_read_table(piac_callbacks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 callback 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = piac_read_table(piac_callbacks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── callback_total_us: 특정 callback_id 의 queue_us + fire_us (없으면 0) ───
+fn callback_total_us(callback_id: int) -> int {
+    let t = piac_read_table(piac_callbacks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == callback_id {
+                    return to_int(parts[2]) + to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── piac_stats: [callback_count, total_queue_us, total_fire_us, count_by_op_kind(1)] ───
+fn piac_stats() -> array {
+    let mut out = []
+    out.push(callback_count())
+    out.push(total_queue_us())
+    out.push(total_fire_us())
+    out.push(count_by_op_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piac-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_piac()
+
+    // 2. record 4 callbacks (deterministic synthetic)
+    record_callback(114001, 1, 80, 240)
+    r0_emit("pe_ipc_async_callback_record",
+        "\"callback_id\":114001,\"op_kind\":1,\"queue_us\":80,\"fire_us\":240,\"target\":\"read\"")
+
+    record_callback(114002, 2, 60, 180)
+    r0_emit("pe_ipc_async_callback_record",
+        "\"callback_id\":114002,\"op_kind\":2,\"queue_us\":60,\"fire_us\":180,\"target\":\"write\"")
+
+    record_callback(114003, 3, 40, 600)
+    r0_emit("pe_ipc_async_callback_record",
+        "\"callback_id\":114003,\"op_kind\":3,\"queue_us\":40,\"fire_us\":600,\"target\":\"connect\"")
+
+    record_callback(114004, 1, 100, 320)
+    r0_emit("pe_ipc_async_callback_record",
+        "\"callback_id\":114004,\"op_kind\":1,\"queue_us\":100,\"fire_us\":320,\"target\":\"read\"")
+
+    // 3. callback_count = 4
+    let c = callback_count()
+    if c != 4 {
+        panic("pe_ipc_async_callback FAIL [callback_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_queue_us = 280
+    let tq = total_queue_us()
+    if tq != 280 {
+        panic("pe_ipc_async_callback FAIL [total_queue_us] expected=280 got=" + to_string(tq))
+    }
+
+    // 5. total_fire_us = 1340
+    let tf = total_fire_us()
+    if tf != 1340 {
+        panic("pe_ipc_async_callback FAIL [total_fire_us] expected=1340 got=" + to_string(tf))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_ipc_async_callback FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_ipc_async_callback FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ipc_async_callback FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 0 {
+        panic("pe_ipc_async_callback FAIL [count_by_op_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ipc_async_callback FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. callback_total_us sanity
+    let t1 = callback_total_us(114001)
+    if t1 != 320 {
+        panic("pe_ipc_async_callback FAIL [callback_total_us(114001)] expected=320 got=" + to_string(t1))
+    }
+    let t3 = callback_total_us(114003)
+    if t3 != 640 {
+        panic("pe_ipc_async_callback FAIL [callback_total_us(114003)] expected=640 got=" + to_string(t3))
+    }
+    let t_miss = callback_total_us(9999)
+    if t_miss != 0 {
+        panic("pe_ipc_async_callback FAIL [callback_total_us(9999)] expected=0 got=" + to_string(t_miss))
+    }
+
+    // 8. piac_stats() = [4, 280, 1340, 2]
+    let s = piac_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_async_callback FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_ipc_async_callback FAIL [stats callback_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 280 {
+        panic("pe_ipc_async_callback FAIL [stats total_queue_us] expected=280 got=" + to_string(s[1]))
+    }
+    if s[2] != 1340 {
+        panic("pe_ipc_async_callback FAIL [stats total_fire_us] expected=1340 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ipc_async_callback FAIL [stats count_kind(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_async_callback_stats",
+        "\"callback_count\":" + to_string(s[0])
+        + ",\"total_queue_us\":" + to_string(s[1])
+        + ",\"total_fire_us\":" + to_string(s[2])
+        + ",\"kind_read\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_ipc_async_callback FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_piac()
+    let s2 = piac_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_async_callback FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_async_callback self_test PASS (callbacks=" + to_string(s[0])
+        + ", queue_us=" + to_string(s[1]) + ", fire_us=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piac_stats()
+            println("callback_count\t" + to_string(s[0]))
+            println("total_queue_us\t" + to_string(s[1]))
+            println("total_fire_us\t" + to_string(s[2]))
+            println("count_kind_read\t" + to_string(s[3]))
+            return
+        }
+        if sub == "total" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("callback_total_us\t" + to_string(callback_total_us(cid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_async_callback.hexa total <callback_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_ipc_async_callback.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piac()
+            println("cleaned: " + piac_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piac_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_async_callback.hexa { self-test | stats | total <callback_id> | count <op_kind> | cleanup | dir }")
+}

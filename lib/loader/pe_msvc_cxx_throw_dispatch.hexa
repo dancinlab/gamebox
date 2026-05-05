@@ -1,0 +1,512 @@
+// lib/loader/pe_msvc_cxx_throw_dispatch.hexa
+// — MSVC _CxxThrowException catch dispatch + ThrowInfo + CatchableType 추적기
+//
+// 본 module 은 MSVC C++ EH (synchronous exception) 의 throw → unwind → catch
+// dispatch chain 을 spec 차원에서 추적한다. SEH (pe_msvc_seh_dispatch_chain_v2)
+// 가 OS 레벨 KiDispatchException 을 본다면, 본 module 은 그 위에 얹힌
+// MSVC C++ runtime 의 _CxxThrowException 메커니즘을 본다.
+//
+// _CxxThrowException(exception_obj, ThrowInfo*) 시그너처 (vcruntime):
+//   ThrowInfo {
+//     uint32_t  attributes;            // bit0=isConst, bit1=isVolatile, bit2=isUnaligned
+//     int32_t   pmfnUnwind;            // 객체 destructor (RVA) — exception object 정리
+//     int32_t   pForwardCompat;        // forward compat func (RVA, 미사용 0)
+//     int32_t   pCatchableTypeArray;   // CatchableTypeArray RVA
+//   }
+//   CatchableTypeArray {
+//     int32_t   nCatchableTypes;
+//     int32_t   arrayOfCatchableTypes[]; // CatchableType RVA 배열
+//   }
+//   CatchableType {
+//     uint32_t  properties;            // bit0=byReference, bit1=hasVirtualBase ...
+//     int32_t   pType;                 // TypeDescriptor RVA (mangled name)
+//     PMD       thisDisplacement;      // mdisp/pdisp/vdisp
+//     int32_t   sizeOrOffset;          // 객체 size (byte)
+//     int32_t   copyFunction;          // copy ctor (RVA, trivial 시 0)
+//   }
+//
+// research-A : Microsoft Open Source vcruntime header (ehdata.h public spec)
+//              (ThrowInfo / CatchableType / TypeDescriptor 구조 — Microsoft 공개 헤더)
+// research-D : llvm/llvm-project libcxxabi 의 microsoft EH ABI 문서화 +
+//              Wine vcruntime stub 의 type alias 만 spec 차원 참조 (코드 복제 X).
+//
+// own 1 enforcement: Wine/CrossOver/GPTK/Whisky/Box86/QEMU 코드 0 줄 import.
+//                   spec/header layout 만 reference. 본 module 은 pure tracker —
+//                   실 _CxxThrowException 호출 X. Apple SDK 호출 X.
+// own 2 mandate: panic + r0_emit ≥ 14 + self_test() + main() dispatch.
+//
+// persist schema (TSV — records.tsv):
+//   record_id<int> \t kind<str> \t link_id<int> \t a<int> \t b<int>
+//     \t c<int> \t d<int> \t e<int> \t f<int>
+//
+//   kind 별 의미:
+//     "throw_event"          — link_id=throw_id, a=exception_obj_va, b=throw_info_va,
+//                              c=caller_eip, d=throw_kind
+//     "throw_info"           — link_id=info_id, a=attributes, b=pmfn_unwind_va,
+//                              c=p_catchable_array_va
+//     "catchable_type"       — link_id=catchable_id, a=info_id, b=properties,
+//                              c=type_descriptor_va, d=this_displacement
+//     "catch_handler_invoke" — link_id=invoke_id, a=throw_id, b=handler_va,
+//                              c=catch_obj_offset, d=success
+//     "unwind_step"          — link_id=unwind_id, a=throw_id, b=frame_va,
+//                              c=regs_restored
+//
+// throw_kind code (record_throw_event):
+//   0 = normal   (일반 throw — std::throw_with_nested 포함)
+//   1 = rethrow  (catch block 내부의 throw; / 빈 throw)
+//   2 = longjmp  (setjmp/longjmp → SEH bridge — vcruntime 내부 변환)
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmctd_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_cxx_throw_dispatch"
+}
+
+fn pmctd_records_path() -> str {
+    return pmctd_dir() + "/records.tsv"
+}
+
+fn pmctd_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmctd_dir() + "'")
+}
+
+fn cleanup_pmctd() -> void {
+    pmctd_ensure_dir()
+    let _ = exec("rm -f '" + pmctd_records_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmctd_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmctd_append_row(path: str, row: str) -> void {
+    pmctd_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── helper: hex string → int ───
+fn pmctd_hex_to_int(h: str) -> int {
+    let n = len(h)
+    if n == 0 {
+        return 0
+    }
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let ch = h[i]
+        let mut d = -1
+        if ch == "0" { d = 0 }
+        if ch == "1" { d = 1 }
+        if ch == "2" { d = 2 }
+        if ch == "3" { d = 3 }
+        if ch == "4" { d = 4 }
+        if ch == "5" { d = 5 }
+        if ch == "6" { d = 6 }
+        if ch == "7" { d = 7 }
+        if ch == "8" { d = 8 }
+        if ch == "9" { d = 9 }
+        if ch == "a" || ch == "A" { d = 10 }
+        if ch == "b" || ch == "B" { d = 11 }
+        if ch == "c" || ch == "C" { d = 12 }
+        if ch == "d" || ch == "D" { d = 13 }
+        if ch == "e" || ch == "E" { d = 14 }
+        if ch == "f" || ch == "F" { d = 15 }
+        if d < 0 {
+            panic("pe_msvc_cxx_throw_dispatch FAIL [pmctd_hex_to_int] expected=hex got=" + h)
+        }
+        acc = acc * 16 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// ─── throw_kind_name: 0/1/2 → spec 이름 ───
+fn throw_kind_name(k: int) -> str {
+    if k == 0 { return "normal" }
+    if k == 1 { return "rethrow" }
+    if k == 2 { return "longjmp" }
+    return "?"
+}
+
+// ─── record_throw_event: _CxxThrowException 진입 ───
+fn record_throw_event(throw_id: int, exception_obj_va_hex: str, throw_info_va_hex: str, caller_eip_hex: str, throw_kind: int) -> void {
+    if throw_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_event] expected=throw_id>0 got=" + to_string(throw_id))
+    }
+    let obj_va = pmctd_hex_to_int(exception_obj_va_hex)
+    if obj_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_event] expected=exception_obj_va>=0 got=" + to_string(obj_va))
+    }
+    let info_va = pmctd_hex_to_int(throw_info_va_hex)
+    if info_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_event] expected=throw_info_va>=0 got=" + to_string(info_va))
+    }
+    let eip = pmctd_hex_to_int(caller_eip_hex)
+    if eip < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_event] expected=caller_eip>=0 got=" + to_string(eip))
+    }
+    if throw_kind < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_event] expected=throw_kind>=0 got=" + to_string(throw_kind))
+    }
+    if throw_kind > 2 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_event] expected=throw_kind<=2 got=" + to_string(throw_kind))
+    }
+    let row = to_string(throw_id) + "\tthrow_event\t" + to_string(throw_id)
+        + "\t" + to_string(obj_va) + "\t" + to_string(info_va)
+        + "\t" + to_string(eip) + "\t" + to_string(throw_kind) + "\t0\t0\n"
+    pmctd_append_row(pmctd_records_path(), row)
+}
+
+// ─── record_throw_info: ThrowInfo 구조 등록 ───
+fn record_throw_info(info_id: int, attributes: int, pmfn_unwind_va_hex: str, p_catchable_array_va_hex: str) -> void {
+    if info_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_info] expected=info_id>0 got=" + to_string(info_id))
+    }
+    if attributes < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_info] expected=attributes>=0 got=" + to_string(attributes))
+    }
+    let unwind_va = pmctd_hex_to_int(pmfn_unwind_va_hex)
+    if unwind_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_info] expected=pmfn_unwind_va>=0 got=" + to_string(unwind_va))
+    }
+    let arr_va = pmctd_hex_to_int(p_catchable_array_va_hex)
+    if arr_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_throw_info] expected=p_catchable_array_va>=0 got=" + to_string(arr_va))
+    }
+    let row = to_string(info_id) + "\tthrow_info\t" + to_string(info_id)
+        + "\t" + to_string(attributes) + "\t" + to_string(unwind_va)
+        + "\t" + to_string(arr_va) + "\t0\t0\t0\n"
+    pmctd_append_row(pmctd_records_path(), row)
+}
+
+// ─── record_catchable_type: CatchableType 구조 등록 ───
+fn record_catchable_type(catchable_id: int, info_id: int, properties: int, type_descriptor_va_hex: str, this_displacement: int) -> void {
+    if catchable_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catchable_type] expected=catchable_id>0 got=" + to_string(catchable_id))
+    }
+    if info_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catchable_type] expected=info_id>0 got=" + to_string(info_id))
+    }
+    if properties < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catchable_type] expected=properties>=0 got=" + to_string(properties))
+    }
+    let td_va = pmctd_hex_to_int(type_descriptor_va_hex)
+    if td_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catchable_type] expected=type_descriptor_va>=0 got=" + to_string(td_va))
+    }
+    let row = to_string(catchable_id) + "\tcatchable_type\t" + to_string(catchable_id)
+        + "\t" + to_string(info_id) + "\t" + to_string(properties)
+        + "\t" + to_string(td_va) + "\t" + to_string(this_displacement) + "\t0\t0\n"
+    pmctd_append_row(pmctd_records_path(), row)
+}
+
+// ─── record_catch_handler_invoke: catch handler 진입 ───
+fn record_catch_handler_invoke(invoke_id: int, throw_id: int, handler_va_hex: str, catch_obj_offset: int, success: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catch_handler_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if throw_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catch_handler_invoke] expected=throw_id>0 got=" + to_string(throw_id))
+    }
+    let h_va = pmctd_hex_to_int(handler_va_hex)
+    if h_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catch_handler_invoke] expected=handler_va>=0 got=" + to_string(h_va))
+    }
+    if catch_obj_offset < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catch_handler_invoke] expected=catch_obj_offset>=0 got=" + to_string(catch_obj_offset))
+    }
+    if success < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catch_handler_invoke] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_catch_handler_invoke] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(invoke_id) + "\tcatch_handler_invoke\t" + to_string(invoke_id)
+        + "\t" + to_string(throw_id) + "\t" + to_string(h_va)
+        + "\t" + to_string(catch_obj_offset) + "\t" + to_string(success) + "\t0\t0\n"
+    pmctd_append_row(pmctd_records_path(), row)
+}
+
+// ─── record_unwind_step: catch 도달 전 frame unwind 단계 ───
+fn record_unwind_step(unwind_id: int, throw_id: int, frame_va_hex: str, regs_restored: int) -> void {
+    if unwind_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_unwind_step] expected=unwind_id>0 got=" + to_string(unwind_id))
+    }
+    if throw_id <= 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_unwind_step] expected=throw_id>0 got=" + to_string(throw_id))
+    }
+    let f_va = pmctd_hex_to_int(frame_va_hex)
+    if f_va < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_unwind_step] expected=frame_va>=0 got=" + to_string(f_va))
+    }
+    if regs_restored < 0 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [record_unwind_step] expected=regs_restored>=0 got=" + to_string(regs_restored))
+    }
+    let row = to_string(unwind_id) + "\tunwind_step\t" + to_string(unwind_id)
+        + "\t" + to_string(throw_id) + "\t" + to_string(f_va)
+        + "\t" + to_string(regs_restored) + "\t0\t0\t0\n"
+    pmctd_append_row(pmctd_records_path(), row)
+}
+
+// ─── 공통: kind 별 row count ───
+fn pmctd_count_kind(kind_filter: str) -> int {
+    let t = pmctd_read_table(pmctd_records_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 9 {
+                if parts[1] == kind_filter {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn throw_event_count() -> int {
+    return pmctd_count_kind("throw_event")
+}
+
+fn throw_info_count() -> int {
+    return pmctd_count_kind("throw_info")
+}
+
+fn catchable_type_count() -> int {
+    return pmctd_count_kind("catchable_type")
+}
+
+fn catch_handler_invoke_count() -> int {
+    return pmctd_count_kind("catch_handler_invoke")
+}
+
+fn unwind_step_count() -> int {
+    return pmctd_count_kind("unwind_step")
+}
+
+fn pmctd_stats() -> array {
+    let mut out = []
+    out.push(throw_event_count())
+    out.push(throw_info_count())
+    out.push(catchable_type_count())
+    out.push(catch_handler_invoke_count())
+    out.push(unwind_step_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pmctd-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmctd()
+
+    // ─── 3 throw_event — 3 throw_kind (normal / rethrow / longjmp) ───
+    record_throw_event(1, "0012F800", "00410100", "00401050", 0)  // normal
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"throw_event\",\"throw_id\":1,\"exception_obj_va\":\"0x0012F800\",\"throw_info_va\":\"0x00410100\",\"caller_eip\":\"0x00401050\",\"throw_kind\":0,\"name\":\"normal\"")
+
+    record_throw_event(2, "0012F820", "00410100", "00401120", 1)  // rethrow
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"throw_event\",\"throw_id\":2,\"exception_obj_va\":\"0x0012F820\",\"throw_info_va\":\"0x00410100\",\"caller_eip\":\"0x00401120\",\"throw_kind\":1,\"name\":\"rethrow\"")
+
+    record_throw_event(3, "0012F840", "00410200", "004013A0", 2)  // longjmp
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"throw_event\",\"throw_id\":3,\"exception_obj_va\":\"0x0012F840\",\"throw_info_va\":\"0x00410200\",\"caller_eip\":\"0x004013A0\",\"throw_kind\":2,\"name\":\"longjmp\"")
+
+    // ─── 2 throw_info ───
+    record_throw_info(1, 0, "00402100", "00410140")  // attr=0 (no const/vol), pmfnUnwind=trivial
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"throw_info\",\"info_id\":1,\"attributes\":0,\"pmfn_unwind_va\":\"0x00402100\",\"p_catchable_array_va\":\"0x00410140\"")
+
+    record_throw_info(2, 1, "00402200", "00410240")  // attr=1 (isConst)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"throw_info\",\"info_id\":2,\"attributes\":1,\"pmfn_unwind_va\":\"0x00402200\",\"p_catchable_array_va\":\"0x00410240\"")
+
+    // ─── 4 catchable_type — 각 다른 properties ───
+    record_catchable_type(1, 1, 0, "00410300", 0)   // properties=0 (by-value, simple POD)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catchable_type\",\"catchable_id\":1,\"info_id\":1,\"properties\":0,\"type_descriptor_va\":\"0x00410300\",\"this_displacement\":0")
+
+    record_catchable_type(2, 1, 1, "00410320", 0)   // properties=1 (byReference)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catchable_type\",\"catchable_id\":2,\"info_id\":1,\"properties\":1,\"type_descriptor_va\":\"0x00410320\",\"this_displacement\":0")
+
+    record_catchable_type(3, 2, 4, "00410340", 8)   // properties=4 (hasVirtualBase)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catchable_type\",\"catchable_id\":3,\"info_id\":2,\"properties\":4,\"type_descriptor_va\":\"0x00410340\",\"this_displacement\":8")
+
+    record_catchable_type(4, 2, 5, "00410360", 16)  // properties=5 (byReference + hasVirtualBase)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catchable_type\",\"catchable_id\":4,\"info_id\":2,\"properties\":5,\"type_descriptor_va\":\"0x00410360\",\"this_displacement\":16")
+
+    // ─── 3 catch_handler_invoke — 2 success + 1 fail ───
+    record_catch_handler_invoke(1, 1, "00403100", 32, 1)  // success — match exact type
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catch_handler_invoke\",\"invoke_id\":1,\"throw_id\":1,\"handler_va\":\"0x00403100\",\"catch_obj_offset\":32,\"success\":1")
+
+    record_catch_handler_invoke(2, 2, "00403200", 48, 1)  // success — base class match
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catch_handler_invoke\",\"invoke_id\":2,\"throw_id\":2,\"handler_va\":\"0x00403200\",\"catch_obj_offset\":48,\"success\":1")
+
+    record_catch_handler_invoke(3, 3, "00403300", 0, 0)   // fail — no matching handler (terminate)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"catch_handler_invoke\",\"invoke_id\":3,\"throw_id\":3,\"handler_va\":\"0x00403300\",\"catch_obj_offset\":0,\"success\":0")
+
+    // ─── 2 unwind_step ───
+    record_unwind_step(1, 1, "0012FF00", 6)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"unwind_step\",\"unwind_id\":1,\"throw_id\":1,\"frame_va\":\"0x0012FF00\",\"regs_restored\":6")
+
+    record_unwind_step(2, 2, "0012FEC0", 8)
+    r0_emit("pe_msvc_cxx_throw_dispatch_record",
+        "\"kind\":\"unwind_step\",\"unwind_id\":2,\"throw_id\":2,\"frame_va\":\"0x0012FEC0\",\"regs_restored\":8")
+
+    // ─── assertions ───
+    let te = throw_event_count()
+    if te != 3 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [throw_event_count] expected=3 got=" + to_string(te))
+    }
+    let ti = throw_info_count()
+    if ti != 2 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [throw_info_count] expected=2 got=" + to_string(ti))
+    }
+    let ct = catchable_type_count()
+    if ct != 4 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [catchable_type_count] expected=4 got=" + to_string(ct))
+    }
+    let ch = catch_handler_invoke_count()
+    if ch != 3 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [catch_handler_invoke_count] expected=3 got=" + to_string(ch))
+    }
+    let us = unwind_step_count()
+    if us != 2 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [unwind_step_count] expected=2 got=" + to_string(us))
+    }
+
+    // ─── throw_kind_name lookups ───
+    let n_norm = throw_kind_name(0)
+    if n_norm != "normal" {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [throw_kind_name(0)] expected=normal got=" + n_norm)
+    }
+    let n_re = throw_kind_name(1)
+    if n_re != "rethrow" {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [throw_kind_name(1)] expected=rethrow got=" + n_re)
+    }
+    let n_lj = throw_kind_name(2)
+    if n_lj != "longjmp" {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [throw_kind_name(2)] expected=longjmp got=" + n_lj)
+    }
+
+    // ─── hex parser sanity ───
+    let h_va = pmctd_hex_to_int("0012F800")
+    if h_va != 1243136 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [pmctd_hex_to_int(0012F800)] expected=1243136 got=" + to_string(h_va))
+    }
+
+    // ─── stats sanity ───
+    let s = pmctd_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 3 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [stats throw_event] expected=3 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [stats throw_info] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [stats catchable_type] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [stats catch_handler_invoke] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [stats unwind_step] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (위 record 14 + 이 1 + summary 1 = 16 ≥ 14) ───
+    r0_emit("pe_msvc_cxx_throw_dispatch_stats",
+        "\"throw_event_count\":" + to_string(s[0])
+        + ",\"throw_info_count\":" + to_string(s[1])
+        + ",\"catchable_type_count\":" + to_string(s[2])
+        + ",\"catch_handler_invoke_count\":" + to_string(s[3])
+        + ",\"unwind_step_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_cxx_throw_dispatch_summary",
+        "\"phase\":\"cxx_throw_dispatch_complete\""
+        + ",\"research\":\"vcruntime_ehdata_spec\""
+        + ",\"throw_kinds\":3"
+        + ",\"catchable_variants\":4"
+        + ",\"handler_success\":2"
+        + ",\"handler_fail\":1")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_cxx_throw_dispatch FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmctd()
+    let s2 = pmctd_stats()
+    let mut i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_cxx_throw_dispatch FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_cxx_throw_dispatch self_test PASS (throw=" + to_string(s[0])
+        + ", info=" + to_string(s[1]) + ", catchable=" + to_string(s[2])
+        + ", invoke=" + to_string(s[3]) + ", unwind=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmctd_stats()
+            println("throw_event_count\t" + to_string(s[0]))
+            println("throw_info_count\t" + to_string(s[1]))
+            println("catchable_type_count\t" + to_string(s[2]))
+            println("catch_handler_invoke_count\t" + to_string(s[3]))
+            println("unwind_step_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmctd()
+            println("cleaned: " + pmctd_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmctd_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_cxx_throw_dispatch.hexa { self-test | stats | cleanup | dir }")
+}

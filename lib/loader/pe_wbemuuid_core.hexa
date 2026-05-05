@@ -1,0 +1,432 @@
+// lib/loader/pe_wbemuuid_core.hexa — WBEMUUID/WMI COM surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine wbem source 인용 0.
+//       wbemuuid.lib / wbemcli.h / wbemprox.dll 직접 binding 0. macOS IOKit IORegistryEntry /
+//       IOServiceMatching / system_profiler / ioreg / sysctl(3) / DAR DiskArbitration 직접
+//       binding 0. NOTE: WBEMUUID 측 Battle.net Agent 측 system inventory query (CPU/GPU/RAM/
+//       motherboard/MAC) + D2R/D4 anti-cheat baseline system fingerprint + Warden compat
+//       hardware inventory; CoCreateInstance(CLSID_WbemLocator)/IWbemServices::ExecQuery/
+//       IEnumWbemClassObject::Next 측 IWbemLocator/IWbemServices/IWbemClassObject/IWbemContext
+//       round-trip baseline (long-horizon production smoke pending separate cycle).
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+// online_expansion_lockin: L1+L2+L3+L4+L5 OK 사용자 lock-in 2026-05-03.
+//
+// Track BD2 — WBEMUUID locator/service/object_enum surface 10 fn skeleton-tier.
+// cycle 48 272/435 (~62.53%) → cycle 49 ~282/435 (~64.83%) (+10 fn, BD bundled part 2/4).
+//
+// 대상 fn (10 fn — 3 group, fn_kind 0..9):
+//   LOCATOR     (3): IWbemLocator_ConnectServer(0) /
+//                    CoCreateInstance_CLSID_WbemLocator(1) / IWbemContext_init(2)
+//   SERVICE     (4): IWbemServices_ExecQuery(3) / IWbemServices_GetObject(4) /
+//                    IWbemServices_CreateInstanceEnum(5) / IWbemServices_ExecMethod(6)
+//   OBJECT_ENUM (3): IEnumWbemClassObject_Next(7) / IEnumWbemClassObject_Reset(8) /
+//                    IEnumWbemClassObject_Skip(9)
+//
+// synthetic struct families:
+//   IID_IWbemLocator 16B LE: dc12a687_737f_11cf_884d_00aa004b2e24.
+//   CLSID_WbemLocator 16B LE: 4590f811_1d3a_11d0_891f_00aa004b2e24.
+//   IID_IWbemServices 16B LE: 9556dc99_828c_11cf_a37e_00aa003240c7.
+//   IID_IEnumWbemClassObject 16B LE: 027947e1_d731_11ce_a357_000000000001.
+//   IID_IWbemClassObject 16B LE: dc12a681_737f_11cf_884d_00aa004b2e24.
+//   IID_IWbemContext 16B LE: 44aca674_e8fc_11d0_a07c_00c04fb68820.
+//   IWbemLocator vtable 32B (4 slot × 8B): QueryInterface / AddRef / Release / ConnectServer.
+//   IWbemServices vtable 88B (11 slot × 8B per truncated): QueryInterface .. ExecMethodAsync.
+//   IWbemClassObject vtable 152B (19 slot × 8B): Get / Put / GetMethodOrigin / etc.
+//   BSTR Namespace "ROOT__CIMV2" 24B WCHAR LE-NUL.
+//   BSTR WQL "SELECT__FROM_Win32_Processor" + Win32_OperatingSystem + Win32_VideoController.
+//
+// persist schema (TSV — 4 table):
+//   syscall_invoke / locator_event / service_event / enum_event.
+// 식별자: type/mod/handle/class/interface/module/import 모두 hexa 예약어 — 사용 X.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwb_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wbemuuid_core"
+}
+
+fn pwb_syscall_invoke_path() -> str {
+    return pwb_dir() + "/syscall_invoke.tsv"
+}
+
+fn pwb_locator_event_path() -> str {
+    return pwb_dir() + "/locator_event.tsv"
+}
+
+fn pwb_service_event_path() -> str {
+    return pwb_dir() + "/service_event.tsv"
+}
+
+fn pwb_enum_event_path() -> str {
+    return pwb_dir() + "/enum_event.tsv"
+}
+
+fn pwb_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwb_dir() + "'")
+}
+
+fn cleanup_pwb() -> void {
+    pwb_ensure_dir()
+    let _ = exec("rm -f '" + pwb_syscall_invoke_path() + "' '" + pwb_locator_event_path()
+        + "' '" + pwb_service_event_path() + "' '" + pwb_enum_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwb_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwb_append_row(path: str, row: str) -> void {
+    pwb_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pwb_count_rows(path: str, min_cols: int) -> int {
+    let t = pwb_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (10 fn coverage, fn_kind 0..9) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "IWbemLocator_ConnectServer" }
+    if k == 1 { return "CoCreateInstance_CLSID_WbemLocator" }
+    if k == 2 { return "IWbemContext_init" }
+    if k == 3 { return "IWbemServices_ExecQuery" }
+    if k == 4 { return "IWbemServices_GetObject" }
+    if k == 5 { return "IWbemServices_CreateInstanceEnum" }
+    if k == 6 { return "IWbemServices_ExecMethod" }
+    if k == 7 { return "IEnumWbemClassObject_Next" }
+    if k == 8 { return "IEnumWbemClassObject_Reset" }
+    if k == 9 { return "IEnumWbemClassObject_Skip" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (3 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 2 {
+            return "locator"
+        }
+    }
+    if k >= 3 {
+        if k <= 6 {
+            return "service"
+        }
+    }
+    if k >= 7 {
+        if k <= 9 {
+            return "object_enum"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: WBEMUUID/WMI fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_wbemuuid_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_wbemuuid_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 9 {
+        panic("pe_wbemuuid_core FAIL [record_syscall_invoke] expected=fn_kind<=9 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_wbemuuid_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_wbemuuid_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    pwb_append_row(pwb_syscall_invoke_path(), row)
+}
+
+// ─── record_locator_event: ConnectServer/CoCreateInstance/IWbemContext_init row ───
+fn record_locator_event(evt_id: int, l_kind: str, iid_synth: str, namespace_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wbemuuid_core FAIL [record_locator_event] evt_id<=0") }
+    if l_kind == "" { panic("pe_wbemuuid_core FAIL [record_locator_event] l_kind=empty") }
+    if iid_synth == "" { panic("pe_wbemuuid_core FAIL [record_locator_event] iid_synth=empty") }
+    if namespace_synth == "" { panic("pe_wbemuuid_core FAIL [record_locator_event] namespace_synth=empty") }
+    if status == "" { panic("pe_wbemuuid_core FAIL [record_locator_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + l_kind + "\t" + iid_synth + "\t" + namespace_synth + "\t" + status + "\n"
+    pwb_append_row(pwb_locator_event_path(), row)
+}
+
+// ─── record_service_event: ExecQuery/GetObject/CreateInstanceEnum/ExecMethod row ───
+fn record_service_event(evt_id: int, s_kind: str, services_hex: str, query_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wbemuuid_core FAIL [record_service_event] evt_id<=0") }
+    if s_kind == "" { panic("pe_wbemuuid_core FAIL [record_service_event] s_kind=empty") }
+    if services_hex == "" { panic("pe_wbemuuid_core FAIL [record_service_event] services_hex=empty") }
+    if query_synth == "" { panic("pe_wbemuuid_core FAIL [record_service_event] query_synth=empty") }
+    if status == "" { panic("pe_wbemuuid_core FAIL [record_service_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + s_kind + "\t" + services_hex + "\t" + query_synth + "\t" + status + "\n"
+    pwb_append_row(pwb_service_event_path(), row)
+}
+
+// ─── record_enum_event: IEnumWbemClassObject Next/Reset/Skip row ───
+fn record_enum_event(evt_id: int, e_kind: str, enum_hex: str, obj_synth: str, status: str) -> void {
+    if evt_id <= 0 { panic("pe_wbemuuid_core FAIL [record_enum_event] evt_id<=0") }
+    if e_kind == "" { panic("pe_wbemuuid_core FAIL [record_enum_event] e_kind=empty") }
+    if enum_hex == "" { panic("pe_wbemuuid_core FAIL [record_enum_event] enum_hex=empty") }
+    if obj_synth == "" { panic("pe_wbemuuid_core FAIL [record_enum_event] obj_synth=empty") }
+    if status == "" { panic("pe_wbemuuid_core FAIL [record_enum_event] status=empty") }
+    let row = to_string(evt_id) + "\t" + e_kind + "\t" + enum_hex + "\t" + obj_synth + "\t" + status + "\n"
+    pwb_append_row(pwb_enum_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return pwb_count_rows(pwb_syscall_invoke_path(), 4)
+}
+
+fn locator_event_count() -> int {
+    return pwb_count_rows(pwb_locator_event_path(), 5)
+}
+
+fn service_event_count() -> int {
+    return pwb_count_rows(pwb_service_event_path(), 5)
+}
+
+fn enum_event_count() -> int {
+    return pwb_count_rows(pwb_enum_event_path(), 5)
+}
+
+fn pwb_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(locator_event_count())
+    out.push(service_event_count())
+    out.push(enum_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pwb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pwb()
+
+    // ─── 1. syscall_invoke × 10 (one per fn, 3 group coverage) ───
+    //   LOCATOR group (3)
+    record_syscall_invoke(1, 0, "IWbemLocator_ConnectServer", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IWbemLocator_ConnectServer")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"IWbemLocator_ConnectServer\",\"fn_group\":\"locator\",\"status\":\"PARTIAL\",\"pLocator\":\"0x9D010000\",\"strNetworkResource_BSTR\":\"ROOT__CIMV2_24B\",\"strUser\":\"NULL\",\"strPassword\":\"NULL\",\"strLocale\":\"NULL\",\"lSecurityFlags\":0,\"strAuthority\":\"NULL\",\"out_ppNamespace\":\"0x9D020000_IWbemServices\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(2, 1, "CoCreateInstance_CLSID_WbemLocator", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL CoCreateInstance_CLSID_WbemLocator")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"CoCreateInstance_CLSID_WbemLocator\",\"fn_group\":\"locator\",\"status\":\"PARTIAL\",\"rclsid\":\"CLSID_WbemLocator_4590f811_LE\",\"pUnkOuter\":\"NULL\",\"dwClsContext\":\"CLSCTX_INPROC_SERVER_1\",\"riid\":\"IID_IWbemLocator_dc12a687_LE\",\"struct_bytes\":16,\"out_ppv\":\"0x9D010000\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(3, 2, "IWbemContext_init", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IWbemContext_init")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"IWbemContext_init\",\"fn_group\":\"locator\",\"status\":\"PARTIAL\",\"rclsid\":\"CLSID_WbemContext_674b6698_LE\",\"riid\":\"IID_IWbemContext_44aca674_LE\",\"struct_bytes\":16,\"out_ppv\":\"0x9D030000_IWbemContext\",\"return_hresult\":\"S_OK_0\"")
+
+    //   SERVICE group (4)
+    record_syscall_invoke(4, 3, "IWbemServices_ExecQuery", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IWbemServices_ExecQuery")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"IWbemServices_ExecQuery\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"pServices\":\"0x9D020000\",\"strQueryLanguage_BSTR\":\"WQL\",\"strQuery_BSTR\":\"SELECT__FROM_Win32_Processor\",\"lFlags\":\"WBEM_FLAG_FORWARD_ONLY_0x20\",\"pCtx\":\"0x9D030000\",\"out_ppEnum\":\"0x9D040000_IEnumWbemClassObject\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(5, 4, "IWbemServices_GetObject", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IWbemServices_GetObject")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"IWbemServices_GetObject\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"pServices\":\"0x9D020000\",\"strObjectPath_BSTR\":\"Win32_OperatingSystem.Name=Microsoft_Windows_10\",\"lFlags\":0,\"pCtx\":\"0x9D030000\",\"out_ppObject\":\"0x9D050000_IWbemClassObject\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(6, 5, "IWbemServices_CreateInstanceEnum", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IWbemServices_CreateInstanceEnum")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"IWbemServices_CreateInstanceEnum\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"pServices\":\"0x9D020000\",\"strFilter_BSTR\":\"Win32_VideoController\",\"lFlags\":\"WBEM_FLAG_RETURN_IMMEDIATELY_0x10\",\"pCtx\":\"0x9D030000\",\"out_ppEnum\":\"0x9D040100\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(7, 6, "IWbemServices_ExecMethod", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IWbemServices_ExecMethod")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"IWbemServices_ExecMethod\",\"fn_group\":\"service\",\"status\":\"PARTIAL\",\"pServices\":\"0x9D020000\",\"strObjectPath_BSTR\":\"Win32_Process.Handle__1234\",\"strMethodName_BSTR\":\"GetOwner\",\"pInParams\":\"NULL\",\"out_ppOutParams\":\"0x9D060000_IWbemClassObject\",\"return_hresult\":\"S_OK_0\"")
+
+    //   OBJECT_ENUM group (3)
+    record_syscall_invoke(8, 7, "IEnumWbemClassObject_Next", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IEnumWbemClassObject_Next")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"IEnumWbemClassObject_Next\",\"fn_group\":\"object_enum\",\"status\":\"PARTIAL\",\"pEnum\":\"0x9D040000\",\"lTimeout\":\"WBEM_INFINITE_-1\",\"uCount\":1,\"out_apObjects\":\"0x9D050100_IWbemClassObject_Win32_Processor_Apple_M_Synthetic\",\"out_puReturned\":1,\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(9, 8, "IEnumWbemClassObject_Reset", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IEnumWbemClassObject_Reset")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"IEnumWbemClassObject_Reset\",\"fn_group\":\"object_enum\",\"status\":\"PARTIAL\",\"pEnum\":\"0x9D040000\",\"return_hresult\":\"S_OK_0\"")
+    record_syscall_invoke(10, 9, "IEnumWbemClassObject_Skip", "PARTIAL")
+    println("__WBEMUUID__ PARTIAL IEnumWbemClassObject_Skip")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"IEnumWbemClassObject_Skip\",\"fn_group\":\"object_enum\",\"status\":\"PARTIAL\",\"pEnum\":\"0x9D040000\",\"lTimeout\":\"WBEM_INFINITE_-1\",\"nCount\":1,\"return_hresult\":\"S_OK_0\"")
+
+    // ─── 2. locator_event × 3 (cocreate/connect/context_init) ───
+    record_locator_event(1, "cocreate_clsid_wbem_locator", "IID_IWbemLocator_dc12a687_LE_16B", "in_proc_server_1", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"locator_event\",\"evt_id\":1,\"l_kind\":\"cocreate_clsid_wbem_locator\",\"iid_synth\":\"IID_IWbemLocator_dc12a687_LE_16B\",\"struct_bytes\":16,\"namespace_synth\":\"in_proc_server_1\",\"vtable_bytes\":32,\"status\":\"PARTIAL\"")
+    record_locator_event(2, "connect_server_root_cimv2", "IID_IWbemServices_9556dc99_LE_16B", "ROOT__CIMV2_BSTR_24B", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"locator_event\",\"evt_id\":2,\"l_kind\":\"connect_server_root_cimv2\",\"iid_synth\":\"IID_IWbemServices_9556dc99_LE_16B\",\"namespace_synth\":\"ROOT__CIMV2_BSTR_24B\",\"struct_bytes\":24,\"battle_net_inventory_baseline\":true,\"status\":\"PARTIAL\"")
+    record_locator_event(3, "context_init_default", "IID_IWbemContext_44aca674_LE_16B", "default_no_named_value", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"locator_event\",\"evt_id\":3,\"l_kind\":\"context_init_default\",\"iid_synth\":\"IID_IWbemContext_44aca674_LE_16B\",\"namespace_synth\":\"default_no_named_value\",\"struct_bytes\":16,\"status\":\"PARTIAL\"")
+
+    // ─── 3. service_event × 4 (exec_query/get_object/create_instance_enum/exec_method) ───
+    record_service_event(1, "exec_query_win32_processor", "0x9D020000", "WQL_SELECT_FROM_Win32_Processor", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"service_event\",\"evt_id\":1,\"s_kind\":\"exec_query_win32_processor\",\"services_hex\":\"0x9D020000\",\"query_synth\":\"WQL_SELECT_FROM_Win32_Processor\",\"warden_inventory_baseline\":true,\"d2r_d4_anti_cheat_baseline\":true,\"status\":\"PARTIAL\"")
+    record_service_event(2, "get_object_win32_os", "0x9D020000", "Win32_OperatingSystem.Name=Microsoft_Windows_10", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"service_event\",\"evt_id\":2,\"s_kind\":\"get_object_win32_os\",\"services_hex\":\"0x9D020000\",\"query_synth\":\"Win32_OperatingSystem.Name=Microsoft_Windows_10\",\"return_hresult\":\"S_OK_0\",\"status\":\"PARTIAL\"")
+    record_service_event(3, "create_instance_enum_video_controller", "0x9D020000", "Win32_VideoController_GUID_synth", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"service_event\",\"evt_id\":3,\"s_kind\":\"create_instance_enum_video_controller\",\"services_hex\":\"0x9D020000\",\"query_synth\":\"Win32_VideoController_GUID_synth\",\"adapter_synth\":\"Apple_M_synthetic_VendorId_0x000010DE\",\"status\":\"PARTIAL\"")
+    record_service_event(4, "exec_method_get_owner_pid_1234", "0x9D020000", "Win32_Process.Handle__1234.GetOwner", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"service_event\",\"evt_id\":4,\"s_kind\":\"exec_method_get_owner_pid_1234\",\"services_hex\":\"0x9D020000\",\"query_synth\":\"Win32_Process.Handle__1234.GetOwner\",\"out_user_synth\":\"User=BattleNetUser_Domain=DESKTOP-D2R\",\"status\":\"PARTIAL\"")
+
+    // ─── 4. enum_event × 3 (next/reset/skip) ───
+    record_enum_event(1, "next_processor_apple_m_synthetic", "0x9D040000", "IWbemClassObject_Win32_Processor_Apple_M_Synthetic", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"enum_event\",\"evt_id\":1,\"e_kind\":\"next_processor_apple_m_synthetic\",\"enum_hex\":\"0x9D040000\",\"obj_synth\":\"IWbemClassObject_Win32_Processor_Apple_M_Synthetic\",\"vtable_bytes\":152,\"return_hresult\":\"S_OK_0\",\"uReturned\":1,\"status\":\"PARTIAL\"")
+    record_enum_event(2, "reset_to_first", "0x9D040000", "rewind_no_object", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"enum_event\",\"evt_id\":2,\"e_kind\":\"reset_to_first\",\"enum_hex\":\"0x9D040000\",\"obj_synth\":\"rewind_no_object\",\"return_hresult\":\"S_OK_0\",\"status\":\"PARTIAL\"")
+    record_enum_event(3, "skip_one_object", "0x9D040000", "skip_count_1", "PARTIAL")
+    r0_emit("pe_wbemuuid_core_record", "\"kind\":\"enum_event\",\"evt_id\":3,\"e_kind\":\"skip_one_object\",\"enum_hex\":\"0x9D040000\",\"obj_synth\":\"skip_count_1\",\"return_hresult\":\"S_OK_0\",\"nCount\":1,\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 10 {
+        panic("pe_wbemuuid_core FAIL [syscall_invoke_count] expected=10 got=" + to_string(si))
+    }
+    let le = locator_event_count()
+    if le != 3 {
+        panic("pe_wbemuuid_core FAIL [locator_event_count] expected=3 got=" + to_string(le))
+    }
+    let se = service_event_count()
+    if se != 4 {
+        panic("pe_wbemuuid_core FAIL [service_event_count] expected=4 got=" + to_string(se))
+    }
+    let ee = enum_event_count()
+    if ee != 3 {
+        panic("pe_wbemuuid_core FAIL [enum_event_count] expected=3 got=" + to_string(ee))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "IWbemLocator_ConnectServer" { panic("pe_wbemuuid_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(1) != "CoCreateInstance_CLSID_WbemLocator" { panic("pe_wbemuuid_core FAIL [fn_kind_name(1)]") }
+    if fn_kind_name(3) != "IWbemServices_ExecQuery" { panic("pe_wbemuuid_core FAIL [fn_kind_name(3)]") }
+    if fn_kind_name(7) != "IEnumWbemClassObject_Next" { panic("pe_wbemuuid_core FAIL [fn_kind_name(7)]") }
+    if fn_kind_name(9) != "IEnumWbemClassObject_Skip" { panic("pe_wbemuuid_core FAIL [fn_kind_name(9)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_wbemuuid_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "locator" { panic("pe_wbemuuid_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(3) != "service" { panic("pe_wbemuuid_core FAIL [fn_group_name(3)]") }
+    if fn_group_name(7) != "object_enum" { panic("pe_wbemuuid_core FAIL [fn_group_name(7)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_wbemuuid_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = pwb_stats()
+    if len(s) != 4 { panic("pe_wbemuuid_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 10 { panic("pe_wbemuuid_core FAIL [stats syscall_invoke_count] expected=10 got=" + to_string(s[0])) }
+    if s[1] != 3 { panic("pe_wbemuuid_core FAIL [stats locator_event_count] expected=3 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_wbemuuid_core FAIL [stats service_event_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 3 { panic("pe_wbemuuid_core FAIL [stats enum_event_count] expected=3 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_wbemuuid_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"locator_event_count\":" + to_string(s[1])
+        + ",\"service_event_count\":" + to_string(s[2])
+        + ",\"enum_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_wbemuuid_core_summary",
+        "\"target\":\"WBEMUUID/wbemprox.dll\",\"fn_total\":10,\"fn_emit_partial\":10,\"groups\":[\"locator\",\"service\",\"object_enum\"],\"iid_synth_bytes\":16,\"iwbemlocator_vtable_bytes\":32,\"iwbemservices_vtable_bytes\":88,\"iwbemclassobject_vtable_bytes\":152,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_wbemuuid_core_kpi",
+        "\"locator_emits\":3,\"service_emits\":4,\"enum_emits\":3,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true,\"battlenet_agent_inventory_baseline\":true,\"d2r_d4_anti_cheat_inventory_baseline\":true,\"iokit_ioregistry_ioservicematching_binding\":false,\"system_profiler_ioreg_sysctl_binding\":false")
+
+    // ─── cycle 48 → 49 WBEMUUID coverage progression evidence emit ───
+    r0_emit("pe_wbemuuid_core_coverage_progression",
+        "\"surface\":\"WBEMUUID_full_435_fn\",\"cycle_48_count\":272,\"cycle_49_count\":282,\"delta\":10,\"cycle_48_percent\":62.53,\"cycle_49_percent\":64.83,\"cycle_49_module\":\"pe_wbemuuid_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\",\"track_bd2_cycle_increment\":10,\"track_bd_bundled_part_2_of_4\":true")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_wbemuuid_core_round_trip_matrix",
+        "\"surface\":\"WBEMUUID_core_10_fn\",\"fn_partial\":10,\"fn_groups\":3,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real IWbemLocator::ConnectServer + IWbemServices::ExecQuery + IEnumWbemClassObject::Next = IOKit IORegistryEntry/IOServiceMatching/system_profiler/ioreg/sysctl(3) bridge pending separate cycle (long-horizon system inventory pipeline)\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\"")
+
+    // ─── Track BD2 expansion emit (cycle 49, WBEMUUID +10 fn) ───
+    r0_emit("pe_wbemuuid_core_bd2_expansion",
+        "\"track\":\"BD2\",\"cycle\":49,\"surface\":\"WBEMUUID_new\",\"new_fn\":10,\"groups\":[\"locator\",\"service\",\"object_enum\"],\"locator_count\":3,\"service_count\":4,\"object_enum_count\":3,\"emit_format\":\"__WBEMUUID__ PARTIAL <fn>\",\"additive_only\":true,\"existing_modules_preserved\":true,\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK_2026_05_03\",\"cond_1_evidence_augment\":true,\"track_bd_bundled_part_2_of_4\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_wbemuuid_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pwb()
+    let s2 = pwb_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wbemuuid_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wbemuuid_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", locator_event=" + to_string(s[1])
+        + ", service_event=" + to_string(s[2]) + ", enum_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwb_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("locator_event_count\t" + to_string(s[1]))
+            println("service_event_count\t" + to_string(s[2]))
+            println("enum_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_wbemuuid_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_wbemuuid_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwb()
+            println("cleaned: " + pwb_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwb_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wbemuuid_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

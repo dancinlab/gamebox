@@ -1,0 +1,378 @@
+// lib/loader/pe_gpu_memory_residency.hexa — Apple Silicon unified-memory GPU residency tracking skeleton
+//
+// Apple Silicon UMA(unified memory architecture) 환경 — CPU 와 GPU 가 동일한
+// physical RAM 을 공유. resource(buffer / texture) 별 residency 상태를 기록 →
+// docker hexa 에서 host Metal 메모리 hint 결정 (stage6 actual MTLResource).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 residency tracker — 실 MTL* / IOSurface 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// residency_kind code:
+//   1 = cpu_only     (host 전용)
+//   2 = gpu_only     (private storage mode)
+//   3 = shared       (shared storage — UMA zero-copy)
+//   4 = managed      (managed storage — sync 필요)
+//
+// persist schema (TSV — resources.tsv):
+//   resource_id<int> \t residency_kind<int> \t size_bytes<int> \t access_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pgmr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_gpu_memory_residency"
+}
+
+fn pgmr_resources_path() -> str {
+    return pgmr_dir() + "/resources.tsv"
+}
+
+fn pgmr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pgmr_dir() + "'")
+}
+
+fn cleanup_pgmr() -> void {
+    pgmr_ensure_dir()
+    let _ = exec("rm -f '" + pgmr_resources_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pgmr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pgmr_append_row(path: str, row: str) -> void {
+    pgmr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_resource: GPU residency resource 1 건 기록 ───
+fn record_resource(resource_id: int, residency_kind: int, size_bytes: int, access_count: int) -> void {
+    if resource_id <= 0 {
+        panic("pe_gpu_memory_residency FAIL [record_resource] expected=resource_id>0 got=" + to_string(resource_id))
+    }
+    if residency_kind < 1 {
+        panic("pe_gpu_memory_residency FAIL [record_resource] expected=residency_kind>=1 got=" + to_string(residency_kind))
+    }
+    if residency_kind > 4 {
+        panic("pe_gpu_memory_residency FAIL [record_resource] expected=residency_kind<=4 got=" + to_string(residency_kind))
+    }
+    if size_bytes < 0 {
+        panic("pe_gpu_memory_residency FAIL [record_resource] expected=size_bytes>=0 got=" + to_string(size_bytes))
+    }
+    if access_count < 0 {
+        panic("pe_gpu_memory_residency FAIL [record_resource] expected=access_count>=0 got=" + to_string(access_count))
+    }
+    let row = to_string(resource_id) + "\t" + to_string(residency_kind)
+        + "\t" + to_string(size_bytes) + "\t" + to_string(access_count) + "\n"
+    pgmr_append_row(pgmr_resources_path(), row)
+}
+
+// ─── resource_count: total resource 수 ───
+fn resource_count() -> int {
+    let t = pgmr_read_table(pgmr_resources_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_bytes: 모든 resource size_bytes 합 ───
+fn total_size_bytes() -> int {
+    let t = pgmr_read_table(pgmr_resources_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_accesses: 모든 resource access_count 합 ───
+fn total_accesses() -> int {
+    let t = pgmr_read_table(pgmr_resources_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_kind: 특정 residency_kind 의 resource 수 ───
+fn count_by_kind(kind: int) -> int {
+    let t = pgmr_read_table(pgmr_resources_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── resource_accesses: 특정 resource_id 의 access_count (없으면 0) ───
+fn resource_accesses(resource_id: int) -> int {
+    let t = pgmr_read_table(pgmr_resources_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == resource_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pgmr_stats: [resource_count, total_size_bytes, total_accesses, count_by_kind(3)] ───
+fn pgmr_stats() -> array {
+    let mut out = []
+    out.push(resource_count())
+    out.push(total_size_bytes())
+    out.push(total_accesses())
+    out.push(count_by_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pgmr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pgmr()
+
+    // 2. record 4 resources across 4 residency kinds
+    record_resource(220001, 1, 4096, 12)
+    r0_emit("pe_gpu_memory_residency_record",
+        "\"resource_id\":220001,\"residency_kind\":1,\"size_bytes\":4096,\"access_count\":12,\"target\":\"cpu_only\"")
+
+    record_resource(220002, 2, 65536, 33)
+    r0_emit("pe_gpu_memory_residency_record",
+        "\"resource_id\":220002,\"residency_kind\":2,\"size_bytes\":65536,\"access_count\":33,\"target\":\"gpu_only\"")
+
+    record_resource(220003, 3, 16384, 55)
+    r0_emit("pe_gpu_memory_residency_record",
+        "\"resource_id\":220003,\"residency_kind\":3,\"size_bytes\":16384,\"access_count\":55,\"target\":\"shared\"")
+
+    record_resource(220004, 4, 8192, 7)
+    r0_emit("pe_gpu_memory_residency_record",
+        "\"resource_id\":220004,\"residency_kind\":4,\"size_bytes\":8192,\"access_count\":7,\"target\":\"managed\"")
+
+    // 3. resource_count = 4
+    let c = resource_count()
+    if c != 4 {
+        panic("pe_gpu_memory_residency FAIL [resource_count] expected=4 got=" + to_string(c))
+    }
+
+    // 4. total_size_bytes = 94208
+    let tb = total_size_bytes()
+    if tb != 94208 {
+        panic("pe_gpu_memory_residency FAIL [total_size_bytes] expected=94208 got=" + to_string(tb))
+    }
+
+    // 5. total_accesses = 107
+    let ta = total_accesses()
+    if ta != 107 {
+        panic("pe_gpu_memory_residency FAIL [total_accesses] expected=107 got=" + to_string(ta))
+    }
+
+    // 6. count_by_kind sanity (≥3 kinds covered)
+    let k1 = count_by_kind(1)
+    if k1 != 1 {
+        panic("pe_gpu_memory_residency FAIL [count_by_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_kind(2)
+    if k2 != 1 {
+        panic("pe_gpu_memory_residency FAIL [count_by_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_kind(3)
+    if k3 != 1 {
+        panic("pe_gpu_memory_residency FAIL [count_by_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_kind(4)
+    if k4 != 1 {
+        panic("pe_gpu_memory_residency FAIL [count_by_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_kind(99)
+    if k99 != 0 {
+        panic("pe_gpu_memory_residency FAIL [count_by_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. resource_accesses sanity
+    let a2 = resource_accesses(220002)
+    if a2 != 33 {
+        panic("pe_gpu_memory_residency FAIL [resource_accesses(220002)] expected=33 got=" + to_string(a2))
+    }
+    let a3 = resource_accesses(220003)
+    if a3 != 55 {
+        panic("pe_gpu_memory_residency FAIL [resource_accesses(220003)] expected=55 got=" + to_string(a3))
+    }
+    let a_miss = resource_accesses(9999)
+    if a_miss != 0 {
+        panic("pe_gpu_memory_residency FAIL [resource_accesses(9999)] expected=0 got=" + to_string(a_miss))
+    }
+
+    // 8. pgmr_stats() = [4, 94208, 107, 1]
+    let s = pgmr_stats()
+    if len(s) != 4 {
+        panic("pe_gpu_memory_residency FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_gpu_memory_residency FAIL [stats resource_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 94208 {
+        panic("pe_gpu_memory_residency FAIL [stats total_size_bytes] expected=94208 got=" + to_string(s[1]))
+    }
+    if s[2] != 107 {
+        panic("pe_gpu_memory_residency FAIL [stats total_accesses] expected=107 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_gpu_memory_residency FAIL [stats count_kind(3)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_gpu_memory_residency_stats",
+        "\"resource_count\":" + to_string(s[0])
+        + ",\"total_size_bytes\":" + to_string(s[1])
+        + ",\"total_accesses\":" + to_string(s[2])
+        + ",\"kind_shared\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_gpu_memory_residency FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pgmr()
+    let s2 = pgmr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_gpu_memory_residency FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_gpu_memory_residency self_test PASS (resources=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", accesses=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pgmr_stats()
+            println("resource_count\t" + to_string(s[0]))
+            println("total_size_bytes\t" + to_string(s[1]))
+            println("total_accesses\t" + to_string(s[2]))
+            println("count_kind_shared\t" + to_string(s[3]))
+            return
+        }
+        if sub == "accesses" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("resource_accesses\t" + to_string(resource_accesses(rid)))
+                return
+            }
+            println("usage: hexa run pe_gpu_memory_residency.hexa accesses <resource_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_kind\t" + to_string(count_by_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_gpu_memory_residency.hexa count <kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pgmr()
+            println("cleaned: " + pgmr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pgmr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_gpu_memory_residency.hexa { self-test | stats | accesses <resource_id> | count <kind> | cleanup | dir }")
+}

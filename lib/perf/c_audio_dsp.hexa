@@ -1,0 +1,473 @@
+// lib/perf/c_audio_dsp.hexa — CN-11 C-AUDIO-DSP (14/15)
+//
+// 무엇:
+//   DirectSound (generic Wine audio backend) DSP 처리 비용 추적. D4 도시
+//   (Kyovashad) ambient + 군중 대화 시나리오에서 audio CPU 가 frame budget 의
+//   5% 이상 잡아먹는지 측정 → frame stutter 의 잠복 원인을 분리.
+//
+// 무기:
+//   - columnar (audio buffer 정의 + DSP cost timeline) — events.jsonl row 별
+//     fixed schema (event_id, ts_us, buffer_size, sample_rate, channels,
+//     cpu_cost_us, mix_count, backend).
+//   - Holt 이중지수평활 forecast (CPU cost trend) — alpha/beta percent int math
+//     (c_input_latency / c_frame 와 동일 pattern).
+//   - hot zone classifier — mix > N OR cpu_cost ≥ 5% frame budget.
+//
+// 효과:
+//   D4 도시 같은 ambient 군중 시나리오에서 audio CPU cost 5%+ 차지 시 hint.
+//   stutter 가 audio_cpu 폭주에서 비롯됐는지 mix_count 폭주에서 비롯됐는지
+//   classify_audio_load 한 번에 식별.
+//
+// schema (JSONL row, columnar):
+//   {"event_id":N,"ts_us":U,"buffer_size":B,"sample_rate":R,"channels":C,
+//    "cpu_cost_us":X,"mix_count":M,"backend":"DirectSound"|"WASAPI"|"XAudio2",
+//    "ts":<unix>}
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X,
+// args() = [hexa, file, ...userargs] → a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. 본 모듈은 DirectSound
+// 처리 비용 *측정 / 분류 / 예측* 만 — synthetic event 로 round-trip 검증.
+//
+// own 2 mandate: r0_emit ≥ 4 (audio_recorded × 3 + audio_classify × 3 +
+// audio_stats), fn self_test() + main() dispatch, headless,
+// panic 형식 "c_audio_dsp FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── audio load thresholds ───
+//   cpu_cost % of frame (centi-percent, e.g. 480 = 4.80%):
+//     < 250          → ok       (audio < 2.5% frame)
+//     250 ≤ x < 500  → elevated (audio 2.5~5% frame, hint 영역)
+//     ≥ 500          → hot      (audio ≥ 5% frame, D4 도시 위험)
+//   mix_count:
+//     ≤ 20           → ok 영향 없음
+//     20 < m ≤ 40    → elevated
+//     > 40           → hot      (concurrent sound 폭주)
+let AUDIO_PCT_ELEVATED   = 250   // 2.50%
+let AUDIO_PCT_HOT        = 500   // 5.00%
+let AUDIO_MIX_ELEVATED   = 20
+let AUDIO_MIX_HOT        = 40
+
+// ─── Holt smoothing 기본값 ───
+let AUDIO_ALPHA_DEFAULT = 50
+let AUDIO_BETA_DEFAULT  = 50
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/audio_dsp/events.jsonl
+fn audio_dir() -> str {
+    return GAMEBOX_HOME + "/persist/audio_dsp"
+}
+
+fn events_path() -> str {
+    return audio_dir() + "/events.jsonl"
+}
+
+fn audio_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + audio_dir() + "'")
+}
+
+// ─── cpu_cost_pct ───
+//   audio_cost_us / frame_us → centi-percent (480 = 4.80%).
+//   formula: (audio_cost_us * 10000) / frame_us — int math, truncate.
+//   frame_us ≤ 0 방어: 0 반환.
+fn cpu_cost_pct(audio_cost_us: int, frame_us: int) -> int {
+    if frame_us <= 0 { return 0 }
+    if audio_cost_us <= 0 { return 0 }
+    return (audio_cost_us * 10000) / frame_us
+}
+
+// ─── classify_audio_load ───
+//   "ok" | "elevated" | "hot"
+//   hot:      pct ≥ 500 (5%) OR mix_count > 40
+//   elevated: pct ≥ 250 (2.5%) OR mix_count > 20
+//   else:     ok
+fn classify_audio_load(cpu_cost_us: int, mix_count: int, frame_us: int) -> str {
+    let pct = cpu_cost_pct(cpu_cost_us, frame_us)
+    if pct >= AUDIO_PCT_HOT      { return "hot" }
+    if mix_count > AUDIO_MIX_HOT { return "hot" }
+    if pct >= AUDIO_PCT_ELEVATED      { return "elevated" }
+    if mix_count > AUDIO_MIX_ELEVATED { return "elevated" }
+    return "ok"
+}
+
+// ─── record_audio_event ───
+//   single audio buffer 처리 결과를 events.jsonl 에 append + emit.
+//   "audio_recorded" event 1회.
+fn record_audio_event(event_id: int, buffer_size: int, sample_rate: int, channels: int, cpu_cost_us: int, mix_count: int, backend: str) -> void {
+    audio_ensure_dir()
+    let ts_unix = exec("date +%s").trim()
+    let ts_us   = exec("date +%s%6N 2>/dev/null | tr -d '\n'").trim()
+    if ts_us == "" { ts_us = ts_unix + "000000" }
+
+    let line = "{\"event_id\":" + to_string(event_id)
+        + ",\"ts_us\":" + ts_us
+        + ",\"buffer_size\":" + to_string(buffer_size)
+        + ",\"sample_rate\":" + to_string(sample_rate)
+        + ",\"channels\":" + to_string(channels)
+        + ",\"cpu_cost_us\":" + to_string(cpu_cost_us)
+        + ",\"mix_count\":" + to_string(mix_count)
+        + ",\"backend\":\"" + backend + "\""
+        + ",\"ts\":" + ts_unix
+        + "}"
+    r0_append_line(events_path(), line)
+
+    r0_emit("audio_recorded",
+        "\"event_id\":" + to_string(event_id)
+        + ",\"buffer_size\":" + to_string(buffer_size)
+        + ",\"sample_rate\":" + to_string(sample_rate)
+        + ",\"channels\":" + to_string(channels)
+        + ",\"cpu_cost_us\":" + to_string(cpu_cost_us)
+        + ",\"mix_count\":" + to_string(mix_count)
+        + ",\"backend\":\"" + backend + "\"")
+}
+
+// ─── load all cpu_cost_us / mix_count (events.jsonl 전체) ───
+fn load_costs() -> array {
+    audio_ensure_dir()
+    let path = events_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let cmd = "sed -E 's/.*\"cpu_cost_us\":([0-9]+).*/\\1/' '" + path
+        + "' 2>/dev/null"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            out = out + [to_int(ln)]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_mix_counts() -> array {
+    audio_ensure_dir()
+    let path = events_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let cmd = "sed -E 's/.*\"mix_count\":([0-9]+).*/\\1/' '" + path
+        + "' 2>/dev/null"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            out = out + [to_int(ln)]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── insertion sort (int array) ───
+fn audio_isort(xs: array) -> array {
+    let n = len(xs)
+    let copy = []
+    let i = 0
+    while i < n {
+        copy = copy + [xs[i]]
+        i = i + 1
+    }
+    let k = 1
+    while k < n {
+        let v = copy[k]
+        let j = k - 1
+        let done = false
+        while j >= 0 && !done {
+            if copy[j] > v {
+                copy[j + 1] = copy[j]
+                j = j - 1
+            } else {
+                done = true
+            }
+        }
+        copy[j + 1] = v
+        k = k + 1
+    }
+    return copy
+}
+
+fn audio_percentile(xs: array, pct: int) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let s = audio_isort(xs)
+    let idx = ((n - 1) * pct) / 100
+    if idx < 0 { idx = 0 }
+    if idx >= n { idx = n - 1 }
+    return s[idx]
+}
+
+// ─── forecast_cost ───
+//   Holt 이중지수평활 1-step ahead. history = 최근 N second 의 audio cost
+//   평균 array (us). alpha/beta ∈ [0..100] 정수 percent.
+fn forecast_cost(history: array, alpha: int, beta: int) -> int {
+    let n = len(history)
+    if n == 0 { return 0 }
+    if n == 1 { return history[0] }
+
+    let a = alpha
+    if a < 0 { a = 0 }
+    if a > 100 { a = 100 }
+    let b = beta
+    if b < 0 { b = 0 }
+    if b > 100 { b = 100 }
+
+    let level = history[0]
+    let trend = history[1] - history[0]
+    let i = 1
+    while i < n {
+        let y = history[i]
+        let one_step = level + trend
+        let level_new = (a * y + (100 - a) * one_step) / 100
+        let trend_new = (b * (level_new - level) + (100 - b) * trend) / 100
+        level = level_new
+        trend = trend_new
+        i = i + 1
+    }
+    return level + trend
+}
+
+// ─── audio_stats ───
+//   [total_events, avg_cost_us, p99_cost_us, max_mix_count]
+//   emit "audio_stats" 1회.
+fn audio_stats() -> array {
+    let xs = load_costs()
+    let mx = load_mix_counts()
+    let n = len(xs)
+    if n == 0 {
+        r0_emit("audio_stats",
+            "\"total_events\":0,\"avg_cost_us\":0,\"p99_cost_us\":0,\"max_mix_count\":0")
+        return [0, 0, 0, 0]
+    }
+    let s = 0
+    let i = 0
+    while i < n {
+        s = s + xs[i]
+        i = i + 1
+    }
+    let avg = s / n
+    let p99 = audio_percentile(xs, 99)
+
+    let max_mix = 0
+    let j = 0
+    while j < len(mx) {
+        if mx[j] > max_mix { max_mix = mx[j] }
+        j = j + 1
+    }
+
+    r0_emit("audio_stats",
+        "\"total_events\":" + to_string(n)
+        + ",\"avg_cost_us\":" + to_string(avg)
+        + ",\"p99_cost_us\":" + to_string(p99)
+        + ",\"max_mix_count\":" + to_string(max_mix))
+    return [n, avg, p99, max_mix]
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "caudio-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    let path = events_path()
+    let _rm0 = exec("rm -f '" + path + "'")
+
+    // 2. record event #1 — DirectSound, 1024 buf, 44.1kHz stereo, 200us cost,
+    //    mix=5 → ~1.2% frame, "ok"
+    record_audio_event(1, 1024, 44100, 2, 200, 5, "DirectSound")
+
+    // 3. record event #2 — DirectSound, 2048 buf, 48kHz stereo, 800us cost,
+    //    mix=30 → ~4.8% frame, "elevated" (mix>20)
+    record_audio_event(2, 2048, 48000, 2, 800, 30, "DirectSound")
+
+    // 4. record event #3 — DirectSound, 1024 buf, 44.1kHz 5.1ch, 1200us cost,
+    //    mix=50 → ~7.2% frame, "hot"
+    record_audio_event(3, 1024, 44100, 6, 1200, 50, "DirectSound")
+
+    // 5. cpu_cost_pct(800, 16670) → ~480 (4.8% = 480 centi-percent)
+    //    실제: 800 * 10000 / 16670 = 8_000_000 / 16670 = 479
+    let pct1 = cpu_cost_pct(800, 16670)
+    if pct1 < 470 {
+        panic("c_audio_dsp FAIL [pct 800 low] expected~480 got=" + to_string(pct1))
+    }
+    if pct1 > 490 {
+        panic("c_audio_dsp FAIL [pct 800 high] expected~480 got=" + to_string(pct1))
+    }
+
+    // 6. cpu_cost_pct(1200, 16670) → ~720 (7.2%)
+    //    실제: 1200 * 10000 / 16670 = 12_000_000 / 16670 = 719
+    let pct2 = cpu_cost_pct(1200, 16670)
+    if pct2 < 710 {
+        panic("c_audio_dsp FAIL [pct 1200 low] expected~720 got=" + to_string(pct2))
+    }
+    if pct2 > 730 {
+        panic("c_audio_dsp FAIL [pct 1200 high] expected~720 got=" + to_string(pct2))
+    }
+
+    // 6b. cpu_cost_pct edge cases — frame_us ≤ 0, audio_cost ≤ 0
+    if cpu_cost_pct(100, 0) != 0 {
+        panic("c_audio_dsp FAIL [pct frame_us=0]")
+    }
+    if cpu_cost_pct(0, 16670) != 0 {
+        panic("c_audio_dsp FAIL [pct audio=0]")
+    }
+
+    // 7. classify_audio_load(200, 5, 16670) → "ok"
+    //    pct = 200*10000/16670 = 119 (< 250), mix=5 (≤ 20) → ok
+    let cls1 = classify_audio_load(200, 5, 16670)
+    if cls1 != "ok" {
+        panic("c_audio_dsp FAIL [classify ok] expected=ok got=" + cls1)
+    }
+    r0_emit("audio_classify",
+        "\"event_id\":1,\"cpu_cost_us\":200,\"mix_count\":5,\"class\":\"" + cls1 + "\"")
+
+    // 8. classify_audio_load(800, 30, 16670) → "elevated"
+    //    pct = 479 (< 500), mix=30 (> 20) → elevated
+    let cls2 = classify_audio_load(800, 30, 16670)
+    if cls2 != "elevated" {
+        panic("c_audio_dsp FAIL [classify elevated] expected=elevated got=" + cls2)
+    }
+    r0_emit("audio_classify",
+        "\"event_id\":2,\"cpu_cost_us\":800,\"mix_count\":30,\"class\":\"" + cls2 + "\"")
+
+    // 9. classify_audio_load(1200, 50, 16670) → "hot"
+    //    pct = 719 (≥ 500), mix=50 (> 40) → hot (둘 중 하나만 매칭해도 hot)
+    let cls3 = classify_audio_load(1200, 50, 16670)
+    if cls3 != "hot" {
+        panic("c_audio_dsp FAIL [classify hot] expected=hot got=" + cls3)
+    }
+    r0_emit("audio_classify",
+        "\"event_id\":3,\"cpu_cost_us\":1200,\"mix_count\":50,\"class\":\"" + cls3 + "\"")
+
+    // 9b. classify edge — pct hot 단독 (mix 작아도 hot)
+    let cls4 = classify_audio_load(900, 5, 16670)
+    if cls4 != "hot" {
+        panic("c_audio_dsp FAIL [classify pct-hot] expected=hot got=" + cls4)
+    }
+    // 9c. classify edge — mix hot 단독 (cost 작아도 hot)
+    let cls5 = classify_audio_load(50, 50, 16670)
+    if cls5 != "hot" {
+        panic("c_audio_dsp FAIL [classify mix-hot] expected=hot got=" + cls5)
+    }
+
+    // 10. forecast — synthetic upward trend (audio cost 가 점점 늘어남)
+    let trend = [200, 400, 600, 800, 1000, 1200]
+    let fc = forecast_cost(trend, AUDIO_ALPHA_DEFAULT, AUDIO_BETA_DEFAULT)
+    if fc <= 1200 {
+        panic("c_audio_dsp FAIL [forecast trend] expected>1200 got=" + to_string(fc))
+    }
+    // flat 시리즈 → forecast ≈ 동일 값
+    let flat = [500, 500, 500, 500, 500]
+    let fc_flat = forecast_cost(flat, AUDIO_ALPHA_DEFAULT, AUDIO_BETA_DEFAULT)
+    if fc_flat < 460 {
+        panic("c_audio_dsp FAIL [forecast flat low] got=" + to_string(fc_flat))
+    }
+    if fc_flat > 540 {
+        panic("c_audio_dsp FAIL [forecast flat high] got=" + to_string(fc_flat))
+    }
+    // empty / single
+    if forecast_cost([], 50, 50) != 0 {
+        panic("c_audio_dsp FAIL [forecast empty]")
+    }
+    if forecast_cost([777], 50, 50) != 777 {
+        panic("c_audio_dsp FAIL [forecast single]")
+    }
+
+    // 11. audio_stats → [3, avg, p99, max_mix]
+    //     avg = (200 + 800 + 1200) / 3 = 2200 / 3 = 733
+    //     sorted = [200, 800, 1200], p99 idx = (3-1)*99/100 = 1 → 800
+    //     max_mix = 50
+    let st = audio_stats()
+    if st[0] != 3 {
+        panic("c_audio_dsp FAIL [stats count] expected=3 got=" + to_string(st[0]))
+    }
+    if st[1] != 733 {
+        panic("c_audio_dsp FAIL [stats avg] expected=733 got=" + to_string(st[1]))
+    }
+    if st[2] != 800 {
+        panic("c_audio_dsp FAIL [stats p99] expected=800 got=" + to_string(st[2]))
+    }
+    if st[3] != 50 {
+        panic("c_audio_dsp FAIL [stats max_mix] expected=50 got=" + to_string(st[3]))
+    }
+
+    // emit count 검증:
+    //   3 audio_recorded + 3 audio_classify + 1 audio_stats = 7 (≥ 4)
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 4 {
+        panic("c_audio_dsp FAIL [emit count] expected>=4 got=" + to_string(evt_cnt))
+    }
+
+    // 12. cleanup
+    let _rm = exec("rm -f '" + path + "'")
+
+    // 13. PASS line
+    println("  ✅ c_audio_dsp self_test PASS (3 events, "
+        + cls1 + "/" + cls2 + "/" + cls3
+        + ", emits=" + to_string(evt_cnt)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "record" {
+            // record <event_id> <buffer_size> <sample_rate> <channels> <cpu_cost_us> <mix_count> <backend>
+            if len(a) >= 10 {
+                record_audio_event(
+                    to_int(a[3]), to_int(a[4]), to_int(a[5]), to_int(a[6]),
+                    to_int(a[7]), to_int(a[8]), a[9])
+                println("recorded: event_id=" + a[3] + " backend=" + a[9])
+                return
+            }
+        }
+        if sub == "pct" {
+            // pct <audio_cost_us> <frame_us>
+            if len(a) >= 5 {
+                println(to_string(cpu_cost_pct(to_int(a[3]), to_int(a[4]))))
+                return
+            }
+        }
+        if sub == "classify" {
+            // classify <cpu_cost_us> <mix_count> <frame_us>
+            if len(a) >= 6 {
+                println(classify_audio_load(to_int(a[3]), to_int(a[4]), to_int(a[5])))
+                return
+            }
+        }
+        if sub == "stats" {
+            let s = audio_stats()
+            println("total_events=" + to_string(s[0])
+                + " avg_cost_us=" + to_string(s[1])
+                + " p99_cost_us=" + to_string(s[2])
+                + " max_mix_count=" + to_string(s[3]))
+            return
+        }
+        if sub == "audio-dir" {
+            println(audio_dir())
+            return
+        }
+        if sub == "events-path" {
+            println(events_path())
+            return
+        }
+    }
+    println("usage: hexa run c_audio_dsp.hexa { self-test | record <id> <buf> <sr> <ch> <cost_us> <mix> <backend> | pct <cost_us> <frame_us> | classify <cost_us> <mix> <frame_us> | stats | audio-dir | events-path }")
+}

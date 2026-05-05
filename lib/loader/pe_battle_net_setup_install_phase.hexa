@@ -1,0 +1,441 @@
+// lib/loader/pe_battle_net_setup_install_phase.hexa — Battle.net Setup install 5-phase 추적.
+//
+// Battle.net Setup (i386 PE32, 16 DLL, 435 fn, 74% coverage) 의 install chain (own1: protocol observation).
+// 실 install 시 발생하는 단계 — Setup.exe 부터 Apple registry hive 등록까지.
+//   process_attach              — Setup.exe entry, NT TLS_CALLBACK array fire
+//   copy_to_program_files       — 실 macOS = ~/Applications/Battle.net.app 으로 복사
+//   launchd_install             — Win32 service install → macOS launchd plist 등록
+//   agent_spawn                 — Battle.net Agent → Mach launchd 로 spawn
+//   cdn_initial_download        — bnetcdn manifest fetch + chunks 다운로드
+//   installed_state_register    — Apple registry hive (HKLM/Software 대응) 에 install state 기록
+// own1: Battle.net protocol 공개 observation. Wine / CrossOver / community fix 인용 X
+//
+// own 1 enforcement: 타사 Wine wrapper / community 코드 0 줄.
+//   본 module 은 Battle.net Setup install phase tracker — 실 Setup.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = process_attach              (Setup.exe entry + TLS_CALLBACK)
+//   2 = copy_to_program_files       (~/Applications/Battle.net.app copy)
+//   3 = launchd_install             (Win32 service → macOS launchd plist)
+//   4 = agent_spawn                 (Battle.net Agent → Mach launchd)
+//   5 = cdn_initial_download        (bnetcdn manifest + chunks)
+//   6 = installed_state_register    (Apple registry hive install state)
+//
+// elevated:
+//   0 = no sudo prompt
+//   1 = sudo prompt (예: launchd_install, installed_state_register)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t elevated<int> \t dll_loaded<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pbsip_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_battle_net_setup_install_phase"
+}
+
+fn pbsip_steps_path() -> str {
+    return pbsip_dir() + "/steps.tsv"
+}
+
+fn pbsip_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pbsip_dir() + "'")
+}
+
+fn cleanup_pbsip() -> void {
+    pbsip_ensure_dir()
+    let _ = exec("rm -f '" + pbsip_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pbsip_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbsip_append_row(path: str, row: str) -> void {
+    pbsip_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: Battle.net Setup install step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, elevated: int, dll_loaded: int) -> void {
+    if step_id <= 0 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 6 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=phase_kind<=6 got=" + to_string(phase_kind))
+    }
+    if elevated < 0 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    if dll_loaded < 0 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(elevated) + "\t" + to_string(dll_loaded) + "\n"
+    pbsip_append_row(pbsip_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = pbsip_read_table(pbsip_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pbsip_read_table(pbsip_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = pbsip_read_table(pbsip_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── elevated_count: elevated=1 인 step 수 ───
+fn elevated_count() -> int {
+    let t = pbsip_read_table(pbsip_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── cdn_download_count: phase_kind=5 step 수 (cdn_initial_download) ───
+fn cdn_download_count() -> int {
+    return count_by_phase_kind(5)
+}
+
+// ─── step_elevated: 특정 step_id 의 elevated 값 (없으면 0) ───
+fn step_elevated(step_id: int) -> int {
+    let t = pbsip_read_table(pbsip_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pbsip_stats: [step_count, loaded_count, elevated_count, cdn_download_count, count_by_phase_kind(3)] ───
+fn pbsip_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(elevated_count())
+    out.push(cdn_download_count())
+    out.push(count_by_phase_kind(3))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pbsip-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pbsip()
+
+    // 2. record 6 steps — Battle.net Setup install chain 전체, phase_kind 1..6 각 1건
+    //   id 140001: phase 1 process_attach              elev=0 dll=0 (Setup.exe entry, TLS_CALLBACK fire)
+    //   id 140002: phase 2 copy_to_program_files       elev=0 dll=1 (~/Applications/Battle.net.app)
+    //   id 140003: phase 3 launchd_install             elev=1 dll=1 (Win32 service → launchd, sudo)
+    //   id 140004: phase 4 agent_spawn                 elev=0 dll=1 (Battle.net Agent → Mach launchd)
+    //   id 140005: phase 5 cdn_initial_download        elev=0 dll=1 (bnetcdn manifest + chunks)
+    //   id 140006: phase 6 installed_state_register    elev=1 dll=0 (Apple registry hive, sudo)
+    //   sums: steps=6, loaded=4, elevated=2, cdn=1, count_kind(3)=1
+    record_step(140001, 1, 0, 0)
+    r0_emit("pe_battle_net_setup_install_phase_record",
+        "\"step_id\":140001,\"phase_kind\":1,\"elevated\":0,\"dll_loaded\":0,\"target\":\"process_attach\"")
+
+    record_step(140002, 2, 0, 1)
+    r0_emit("pe_battle_net_setup_install_phase_record",
+        "\"step_id\":140002,\"phase_kind\":2,\"elevated\":0,\"dll_loaded\":1,\"target\":\"copy_to_program_files\"")
+
+    record_step(140003, 3, 1, 1)
+    r0_emit("pe_battle_net_setup_install_phase_record",
+        "\"step_id\":140003,\"phase_kind\":3,\"elevated\":1,\"dll_loaded\":1,\"target\":\"launchd_install\"")
+
+    record_step(140004, 4, 0, 1)
+    r0_emit("pe_battle_net_setup_install_phase_record",
+        "\"step_id\":140004,\"phase_kind\":4,\"elevated\":0,\"dll_loaded\":1,\"target\":\"agent_spawn\"")
+
+    record_step(140005, 5, 0, 1)
+    r0_emit("pe_battle_net_setup_install_phase_record",
+        "\"step_id\":140005,\"phase_kind\":5,\"elevated\":0,\"dll_loaded\":1,\"target\":\"cdn_initial_download\"")
+
+    record_step(140006, 6, 1, 0)
+    r0_emit("pe_battle_net_setup_install_phase_record",
+        "\"step_id\":140006,\"phase_kind\":6,\"elevated\":1,\"dll_loaded\":0,\"target\":\"installed_state_register\"")
+
+    // 3. step_count = 6
+    let c = step_count()
+    if c != 6 {
+        panic("pe_battle_net_setup_install_phase FAIL [step_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..6 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_battle_net_setup_install_phase FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (140002..140005)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_battle_net_setup_install_phase FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. elevated_count = 2 (140003, 140006)
+    let ec = elevated_count()
+    if ec != 2 {
+        panic("pe_battle_net_setup_install_phase FAIL [elevated_count] expected=2 got=" + to_string(ec))
+    }
+
+    // 7. cdn_download_count = 1
+    let cdn = cdn_download_count()
+    if cdn != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [cdn_download_count] expected=1 got=" + to_string(cdn))
+    }
+
+    // 8. step_elevated sanity
+    let e3 = step_elevated(140003)
+    if e3 != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [step_elevated(140003)] expected=1 got=" + to_string(e3))
+    }
+    let e1 = step_elevated(140001)
+    if e1 != 0 {
+        panic("pe_battle_net_setup_install_phase FAIL [step_elevated(140001)] expected=0 got=" + to_string(e1))
+    }
+    let e_miss = step_elevated(9999)
+    if e_miss != 0 {
+        panic("pe_battle_net_setup_install_phase FAIL [step_elevated(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 9. pbsip_stats() = [6, 4, 2, 1, 1]
+    let s = pbsip_stats()
+    if len(s) != 5 {
+        panic("pe_battle_net_setup_install_phase FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_battle_net_setup_install_phase FAIL [stats step_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_battle_net_setup_install_phase FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_battle_net_setup_install_phase FAIL [stats elevated_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [stats cdn_download_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_battle_net_setup_install_phase FAIL [stats count_phase(3)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_battle_net_setup_install_phase_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"elevated_count\":" + to_string(s[2])
+        + ",\"cdn_download_count\":" + to_string(s[3])
+        + ",\"count_launchd_install\":" + to_string(s[4]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_battle_net_setup_install_phase FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pbsip()
+    let s2 = pbsip_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_battle_net_setup_install_phase FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battle_net_setup_install_phase self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", elevated=" + to_string(s[2])
+        + ", cdn=" + to_string(s[3]) + ", launchd_install=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pbsip_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("elevated_count\t" + to_string(s[2]))
+            println("cdn_download_count\t" + to_string(s[3]))
+            println("count_launchd_install\t" + to_string(s[4]))
+            return
+        }
+        if sub == "elevated" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_elevated\t" + to_string(step_elevated(sid)))
+                return
+            }
+            println("usage: hexa run pe_battle_net_setup_install_phase.hexa elevated <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_battle_net_setup_install_phase.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pbsip()
+            println("cleaned: " + pbsip_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pbsip_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_battle_net_setup_install_phase.hexa { self-test | stats | elevated <step_id> | count <phase_kind> | cleanup | dir }")
+}

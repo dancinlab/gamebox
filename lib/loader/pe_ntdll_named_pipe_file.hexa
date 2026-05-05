@@ -1,0 +1,450 @@
+// lib/loader/pe_ntdll_named_pipe_file.hexa — NTDLL NtCreateNamedPipeFile / NtFsControlFile (FSCTL_PIPE_*) → POSIX FIFO bridge
+//
+// NTDLL named pipe surface → POSIX bridge:
+//   NtCreateNamedPipeFile(out FileHandle, DesiredAccess, OBJECT_ATTRIBUTES*, IO_STATUS_BLOCK*,
+//                         ShareAccess, CreateDisposition, CreateOptions,
+//                         NamedPipeType, ReadMode, CompletionMode,
+//                         MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout)
+//     → POSIX mkfifo(utf8_path, mode) + open(utf8_path, O_RDWR|O_NONBLOCK)
+//   NtFsControlFile(FileHandle, ..., FsControlCode, InputBuffer, InputBufferLength,
+//                   OutputBuffer, OutputBufferLength)
+//     FSCTL_PIPE_TRANSCEIVE  → POSIX write(fd, in, in_len) + read(fd, out, out_len) atomic pair
+//     FSCTL_PIPE_LISTEN      → POSIX poll(fd, POLLIN) wait for first writer
+//     FSCTL_PIPE_PEEK        → POSIX ioctl(fd, FIONREAD, &avail) — non-destructive availability
+//     FSCTL_PIPE_DISCONNECT  → POSIX close(fd) + unlink(path)
+//   pipe_kind translation (NamedPipeType / ReadMode):
+//     PIPE_TYPE_BYTE    + PIPE_READMODE_BYTE    → POSIX FIFO byte stream (default)
+//     PIPE_TYPE_MESSAGE + PIPE_READMODE_BYTE    → SOCK_SEQPACKET-style framing, byte read
+//     PIPE_TYPE_MESSAGE + PIPE_READMODE_MESSAGE → SOCK_SEQPACKET full message-mode
+//     PIPE_TYPE_BYTE    + PIPE_READMODE_MESSAGE → invalid on Win32 (NT) / not supported
+//   Battle.net Agent / D2R installer IPC + D4 launcher → child process 사이 named pipe 사용
+// own1: NTDLL spec + Apple POSIX (mkfifo(2), poll(2), ioctl(2) FIONREAD). Wine 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NT named pipe API call tracker — 실 mkfifo/poll/ioctl 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// func_kind code:
+//   1 = create_named_pipe   (NtCreateNamedPipeFile)
+//   2 = fs_control_pipe     (NtFsControlFile — FSCTL_PIPE_*)
+//   3 = write_pipe          (NtWriteFile on pipe handle)
+//   4 = read_pipe           (NtReadFile  on pipe handle)
+//   5 = peek_pipe           (FSCTL_PIPE_PEEK shortcut)
+//
+// pipe_kind code:
+//   1 = byte           (PIPE_TYPE_BYTE    + PIPE_READMODE_BYTE)
+//   2 = message_byte   (PIPE_TYPE_MESSAGE + PIPE_READMODE_BYTE)
+//   3 = message_message(PIPE_TYPE_MESSAGE + PIPE_READMODE_MESSAGE)
+//   4 = byte_message   (PIPE_TYPE_BYTE    + PIPE_READMODE_MESSAGE — invalid combo, recorded for trace)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t func_kind<int> \t pipe_kind<int> \t data_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnnpf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_named_pipe_file"
+}
+
+fn pnnpf_ops_path() -> str {
+    return pnnpf_dir() + "/ops.tsv"
+}
+
+fn pnnpf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnnpf_dir() + "'")
+}
+
+fn cleanup_pnnpf() -> void {
+    pnnpf_ensure_dir()
+    let _ = exec("rm -f '" + pnnpf_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnnpf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnnpf_append_row(path: str, row: str) -> void {
+    pnnpf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: NT named-pipe API op 1 건 기록 ───
+fn record_op(op_id: int, func_kind: int, pipe_kind: int, data_bytes: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_named_pipe_file FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if func_kind < 1 {
+        panic("pe_ntdll_named_pipe_file FAIL [record_op] expected=func_kind>=1 got=" + to_string(func_kind))
+    }
+    if func_kind > 5 {
+        panic("pe_ntdll_named_pipe_file FAIL [record_op] expected=func_kind<=5 got=" + to_string(func_kind))
+    }
+    if pipe_kind < 1 {
+        panic("pe_ntdll_named_pipe_file FAIL [record_op] expected=pipe_kind>=1 got=" + to_string(pipe_kind))
+    }
+    if pipe_kind > 4 {
+        panic("pe_ntdll_named_pipe_file FAIL [record_op] expected=pipe_kind<=4 got=" + to_string(pipe_kind))
+    }
+    if data_bytes < 0 {
+        panic("pe_ntdll_named_pipe_file FAIL [record_op] expected=data_bytes>=0 got=" + to_string(data_bytes))
+    }
+    let row = to_string(op_id) + "\t" + to_string(func_kind)
+        + "\t" + to_string(pipe_kind) + "\t" + to_string(data_bytes) + "\n"
+    pnnpf_append_row(pnnpf_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pnnpf_read_table(pnnpf_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_func_kind: 특정 func_kind 의 op 수 ───
+fn count_by_func_kind(kind: int) -> int {
+    let t = pnnpf_read_table(pnnpf_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_pipe_kind: 특정 pipe_kind 의 op 수 ───
+fn count_by_pipe_kind(kind: int) -> int {
+    let t = pnnpf_read_table(pnnpf_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_data_bytes: 전체 op 의 data_bytes 합 ───
+fn total_data_bytes() -> int {
+    let t = pnnpf_read_table(pnnpf_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── create_count: NtCreateNamedPipeFile call 수 (func_kind == 1) ───
+fn create_count() -> int {
+    return count_by_func_kind(1)
+}
+
+// ─── op_data_bytes: 특정 op_id 의 data_bytes (없으면 -1) ───
+fn op_data_bytes(op_id: int) -> int {
+    let t = pnnpf_read_table(pnnpf_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnnpf_stats: [op_count, create_count, count_by_pipe_kind(1), total_data_bytes] ───
+fn pnnpf_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(create_count())
+    out.push(count_by_pipe_kind(1))
+    out.push(total_data_bytes())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnnpf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnnpf()
+
+    // 2. record 6 ops — covers ≥3 func_kinds (1,2,3,4,5) and ≥2 pipe_kinds (1,3)
+    //    NtCreateNamedPipeFile byte-stream FIFO (Battle.net Agent IPC default)
+    record_op(140001, 1, 1, 0)
+    r0_emit("pe_ntdll_named_pipe_file_record",
+        "\"op_id\":140001,\"func_kind\":1,\"pipe_kind\":1,\"data_bytes\":0,\"target\":\"NtCreateNamedPipeFile\"")
+
+    //    NtCreateNamedPipeFile message-mode (D4 launcher → game IPC frame)
+    record_op(140002, 1, 3, 0)
+    r0_emit("pe_ntdll_named_pipe_file_record",
+        "\"op_id\":140002,\"func_kind\":1,\"pipe_kind\":3,\"data_bytes\":0,\"target\":\"NtCreateNamedPipeFile\"")
+
+    //    NtWriteFile on pipe (handshake message — 64 bytes)
+    record_op(140003, 3, 3, 64)
+    r0_emit("pe_ntdll_named_pipe_file_record",
+        "\"op_id\":140003,\"func_kind\":3,\"pipe_kind\":3,\"data_bytes\":64,\"target\":\"NtWriteFile_pipe\"")
+
+    //    NtFsControlFile FSCTL_PIPE_TRANSCEIVE (write+read atomic — 128 bytes)
+    record_op(140004, 2, 3, 128)
+    r0_emit("pe_ntdll_named_pipe_file_record",
+        "\"op_id\":140004,\"func_kind\":2,\"pipe_kind\":3,\"data_bytes\":128,\"target\":\"NtFsControlFile_TRANSCEIVE\"")
+
+    //    NtReadFile on byte-stream pipe (256 bytes payload)
+    record_op(140005, 4, 1, 256)
+    r0_emit("pe_ntdll_named_pipe_file_record",
+        "\"op_id\":140005,\"func_kind\":4,\"pipe_kind\":1,\"data_bytes\":256,\"target\":\"NtReadFile_pipe\"")
+
+    //    FSCTL_PIPE_PEEK (peek availability — non-destructive, 0 bytes consumed)
+    record_op(140006, 5, 1, 0)
+    r0_emit("pe_ntdll_named_pipe_file_record",
+        "\"op_id\":140006,\"func_kind\":5,\"pipe_kind\":1,\"data_bytes\":0,\"target\":\"FSCTL_PIPE_PEEK\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_ntdll_named_pipe_file FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_func_kind sanity (5 func_kinds covered: 1×2, 2,3,4,5)
+    let f1 = count_by_func_kind(1)
+    if f1 != 2 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_func_kind(1)] expected=2 got=" + to_string(f1))
+    }
+    let f2 = count_by_func_kind(2)
+    if f2 != 1 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_func_kind(2)] expected=1 got=" + to_string(f2))
+    }
+    let f3 = count_by_func_kind(3)
+    if f3 != 1 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_func_kind(3)] expected=1 got=" + to_string(f3))
+    }
+    let f4 = count_by_func_kind(4)
+    if f4 != 1 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_func_kind(4)] expected=1 got=" + to_string(f4))
+    }
+    let f5 = count_by_func_kind(5)
+    if f5 != 1 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_func_kind(5)] expected=1 got=" + to_string(f5))
+    }
+    let f99 = count_by_func_kind(99)
+    if f99 != 0 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_func_kind(99)] expected=0 got=" + to_string(f99))
+    }
+
+    // 5. count_by_pipe_kind sanity (≥2 pipe_kinds: 1 byte ×3, 3 message_message ×3)
+    let p1 = count_by_pipe_kind(1)
+    if p1 != 3 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_pipe_kind(1)] expected=3 got=" + to_string(p1))
+    }
+    let p3 = count_by_pipe_kind(3)
+    if p3 != 3 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_pipe_kind(3)] expected=3 got=" + to_string(p3))
+    }
+    let p4 = count_by_pipe_kind(4)
+    if p4 != 0 {
+        panic("pe_ntdll_named_pipe_file FAIL [count_by_pipe_kind(4)] expected=0 got=" + to_string(p4))
+    }
+
+    // 6. create_count = count_by_func_kind(1) = 2
+    let cc = create_count()
+    if cc != 2 {
+        panic("pe_ntdll_named_pipe_file FAIL [create_count] expected=2 got=" + to_string(cc))
+    }
+
+    // 7. total_data_bytes = 0+0+64+128+256+0 = 448
+    let tb = total_data_bytes()
+    if tb != 448 {
+        panic("pe_ntdll_named_pipe_file FAIL [total_data_bytes] expected=448 got=" + to_string(tb))
+    }
+
+    // 8. op_data_bytes sanity
+    let b1 = op_data_bytes(140003)
+    if b1 != 64 {
+        panic("pe_ntdll_named_pipe_file FAIL [op_data_bytes(140003)] expected=64 got=" + to_string(b1))
+    }
+    let b2 = op_data_bytes(140004)
+    if b2 != 128 {
+        panic("pe_ntdll_named_pipe_file FAIL [op_data_bytes(140004)] expected=128 got=" + to_string(b2))
+    }
+    let b_miss = op_data_bytes(9999)
+    if b_miss != -1 {
+        panic("pe_ntdll_named_pipe_file FAIL [op_data_bytes(9999)] expected=-1 got=" + to_string(b_miss))
+    }
+
+    // 9. pnnpf_stats() = [6, 2, 3, 448]
+    let s = pnnpf_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_named_pipe_file FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_ntdll_named_pipe_file FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_ntdll_named_pipe_file FAIL [stats create_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_ntdll_named_pipe_file FAIL [stats pipe_kind(byte)] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 448 {
+        panic("pe_ntdll_named_pipe_file FAIL [stats total_data_bytes] expected=448 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit)
+    r0_emit("pe_ntdll_named_pipe_file_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"create_count\":" + to_string(s[1])
+        + ",\"pipe_kind_byte\":" + to_string(s[2])
+        + ",\"total_data_bytes\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_ntdll_named_pipe_file FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pnnpf()
+    let s2 = pnnpf_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_named_pipe_file FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_named_pipe_file self_test PASS (ops=" + to_string(s[0])
+        + ", create=" + to_string(s[1]) + ", byte=" + to_string(s[2])
+        + ", bytes=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnnpf_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("create_count\t" + to_string(s[1]))
+            println("count_pipe_kind_byte\t" + to_string(s[2]))
+            println("total_data_bytes\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_data_bytes\t" + to_string(op_data_bytes(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_named_pipe_file.hexa bytes <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "func" {
+                    println("count_by_func_kind\t" + to_string(count_by_func_kind(val)))
+                    return
+                }
+                if what == "pipe" {
+                    println("count_by_pipe_kind\t" + to_string(count_by_pipe_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_named_pipe_file.hexa count { func <func_kind> | pipe <pipe_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnnpf()
+            println("cleaned: " + pnnpf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnnpf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_named_pipe_file.hexa { self-test | stats | bytes <op_id> | count func <func_kind> | count pipe <pipe_kind> | cleanup | dir }")
+}

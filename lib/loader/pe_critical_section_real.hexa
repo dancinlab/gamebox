@@ -1,0 +1,430 @@
+// lib/loader/pe_critical_section_real.hexa — Win32 CRITICAL_SECTION 실 구현 (R6 Tier 5)
+//
+// CRITICAL_SECTION 실 구현 (R6 Tier 5):
+//   Win64 layout: 40 byte struct {
+//     PVOID DebugInfo, LONG LockCount, LONG RecursionCount,
+//     HANDLE OwningThread, HANDLE LockSemaphore, ULONG_PTR SpinCount }
+//   Apple-native 매핑:
+//     pthread_mutex_t (recursive attribute) + 40-byte shadow struct
+//     spin: pthread_yield_np 또는 _mm_pause loop (Win32 SpinCount)
+//   D2R/D4 entry 직후 immediately CRITICAL_SECTION init/enter 사용
+//   InitializeCriticalSectionAndSpinCount: spin loop limit 명시 형
+// own1: Apple pthread + MSDN CRITICAL_SECTION spec. Wine ntdll/sync.c 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 CRITICAL_SECTION op tracker — 실 pthread_mutex_lock() 호출 X (native).
+// own 2 mandate: r0_emit ≥ 8 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = init                        (InitializeCriticalSection)
+//   2 = delete                      (DeleteCriticalSection)
+//   3 = enter                       (EnterCriticalSection)
+//   4 = tryenter_succeed            (TryEnterCriticalSection → TRUE)
+//   5 = tryenter_fail               (TryEnterCriticalSection → FALSE)
+//   6 = leave                       (LeaveCriticalSection)
+//   7 = init_with_spin              (InitializeCriticalSectionAndSpinCount)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t spin_count<int> \t contended<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pcsr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_critical_section_real"
+}
+
+fn pcsr_ops_path() -> str {
+    return pcsr_dir() + "/ops.tsv"
+}
+
+fn pcsr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pcsr_dir() + "'")
+}
+
+fn cleanup_pcsr() -> void {
+    pcsr_ensure_dir()
+    let _ = exec("rm -f '" + pcsr_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pcsr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pcsr_append_row(path: str, row: str) -> void {
+    pcsr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: CRITICAL_SECTION op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, spin_count: int, contended: int) -> void {
+    if op_id <= 0 {
+        panic("pe_critical_section_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_critical_section_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 7 {
+        panic("pe_critical_section_real FAIL [record_op] expected=op_kind<=7 got=" + to_string(op_kind))
+    }
+    if spin_count < 0 {
+        panic("pe_critical_section_real FAIL [record_op] expected=spin_count>=0 got=" + to_string(spin_count))
+    }
+    if contended < 0 {
+        panic("pe_critical_section_real FAIL [record_op] expected=contended>=0 got=" + to_string(contended))
+    }
+    if contended > 1 {
+        panic("pe_critical_section_real FAIL [record_op] expected=contended<=1 got=" + to_string(contended))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(spin_count) + "\t" + to_string(contended) + "\n"
+    pcsr_append_row(pcsr_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pcsr_read_table(pcsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pcsr_read_table(pcsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_spin_count: 모든 op spin_count 합 ───
+fn total_spin_count() -> int {
+    let t = pcsr_read_table(pcsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── contended_count: contended=1 인 op 수 ───
+fn contended_count() -> int {
+    let t = pcsr_read_table(pcsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── enter_leave_balance: count_by_op_kind(3) - count_by_op_kind(6) ───
+fn enter_leave_balance() -> int {
+    return count_by_op_kind(3) - count_by_op_kind(6)
+}
+
+// ─── op_spin_count: 특정 op_id 의 spin_count (없으면 0, multi 발견 시 last 반환) ───
+fn op_spin_count(op_id: int) -> int {
+    let t = pcsr_read_table(pcsr_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut found = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    found = to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ─── pcsr_stats: [op_count, total_spin_count, contended_count, enter_leave_balance] ───
+fn pcsr_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_spin_count())
+    out.push(contended_count())
+    out.push(enter_leave_balance())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pcsr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pcsr()
+
+    // 2. record 7 CRITICAL_SECTION ops across 6 op_kinds (deterministic synthetic)
+    //    sequence:
+    //      130001 init                (kind 1, spin=0,    contended=0)
+    //      130001 enter               (kind 3, spin=0,    contended=0)
+    //      130001 leave               (kind 6, spin=0,    contended=0)
+    //      130002 init_with_spin      (kind 7, spin=4000, contended=0)
+    //      130002 enter (contended)   (kind 3, spin=2500, contended=1)
+    //      130002 tryenter_fail       (kind 5, spin=100,  contended=1)
+    //      130002 leave               (kind 6, spin=0,    contended=0)
+    record_op(130001, 1, 0, 0)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130001,\"op_kind\":1,\"spin_count\":0,\"contended\":0,\"target\":\"init\"")
+
+    record_op(130001, 3, 0, 0)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130001,\"op_kind\":3,\"spin_count\":0,\"contended\":0,\"target\":\"enter\"")
+
+    record_op(130001, 6, 0, 0)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130001,\"op_kind\":6,\"spin_count\":0,\"contended\":0,\"target\":\"leave\"")
+
+    record_op(130002, 7, 4000, 0)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130002,\"op_kind\":7,\"spin_count\":4000,\"contended\":0,\"target\":\"init_with_spin\"")
+
+    record_op(130002, 3, 2500, 1)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130002,\"op_kind\":3,\"spin_count\":2500,\"contended\":1,\"target\":\"enter\"")
+
+    record_op(130002, 5, 100, 1)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130002,\"op_kind\":5,\"spin_count\":100,\"contended\":1,\"target\":\"tryenter_fail\"")
+
+    record_op(130002, 6, 0, 0)
+    r0_emit("pe_critical_section_real_record",
+        "\"op_id\":130002,\"op_kind\":6,\"spin_count\":0,\"contended\":0,\"target\":\"leave\"")
+
+    // 3. op_count = 7
+    let c = op_count()
+    if c != 7 {
+        panic("pe_critical_section_real FAIL [op_count] expected=7 got=" + to_string(c))
+    }
+
+    // 4. total_spin_count = 0 + 0 + 0 + 4000 + 2500 + 100 + 0 = 6600
+    let ts = total_spin_count()
+    if ts != 6600 {
+        panic("pe_critical_section_real FAIL [total_spin_count] expected=6600 got=" + to_string(ts))
+    }
+
+    // 5. contended_count = 2
+    let cc = contended_count()
+    if cc != 2 {
+        panic("pe_critical_section_real FAIL [contended_count] expected=2 got=" + to_string(cc))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_critical_section_real FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 2 {
+        panic("pe_critical_section_real FAIL [count_by_op_kind(3)] expected=2 got=" + to_string(k3))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 1 {
+        panic("pe_critical_section_real FAIL [count_by_op_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_op_kind(6)
+    if k6 != 2 {
+        panic("pe_critical_section_real FAIL [count_by_op_kind(6)] expected=2 got=" + to_string(k6))
+    }
+    let k7 = count_by_op_kind(7)
+    if k7 != 1 {
+        panic("pe_critical_section_real FAIL [count_by_op_kind(7)] expected=1 got=" + to_string(k7))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_critical_section_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. enter_leave_balance = 2 - 2 = 0 (well-paired)
+    let bal = enter_leave_balance()
+    if bal != 0 {
+        panic("pe_critical_section_real FAIL [enter_leave_balance] expected=0 got=" + to_string(bal))
+    }
+
+    // 8. op_spin_count sanity (130002 last spin row = 0 from leave; 130001 last = 0)
+    let sp1 = op_spin_count(130001)
+    if sp1 != 0 {
+        panic("pe_critical_section_real FAIL [op_spin_count(130001)] expected=0 got=" + to_string(sp1))
+    }
+    let sp2 = op_spin_count(130002)
+    if sp2 != 0 {
+        panic("pe_critical_section_real FAIL [op_spin_count(130002)] expected=0 got=" + to_string(sp2))
+    }
+    let sp_miss = op_spin_count(9999)
+    if sp_miss != 0 {
+        panic("pe_critical_section_real FAIL [op_spin_count(9999)] expected=0 got=" + to_string(sp_miss))
+    }
+
+    // 9. pcsr_stats() = [7, 6600, 2, 0]
+    let s = pcsr_stats()
+    if len(s) != 4 {
+        panic("pe_critical_section_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 7 {
+        panic("pe_critical_section_real FAIL [stats op_count] expected=7 got=" + to_string(s[0]))
+    }
+    if s[1] != 6600 {
+        panic("pe_critical_section_real FAIL [stats total_spin_count] expected=6600 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_critical_section_real FAIL [stats contended_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 0 {
+        panic("pe_critical_section_real FAIL [stats enter_leave_balance] expected=0 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_critical_section_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_spin_count\":" + to_string(s[1])
+        + ",\"contended_count\":" + to_string(s[2])
+        + ",\"enter_leave_balance\":" + to_string(s[3]))
+
+    // 11. emit count >= 8 (7 records + 1 stats = 8)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 8 {
+        panic("pe_critical_section_real FAIL [r0 emit count] expected=>=8 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pcsr()
+    let s2 = pcsr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_critical_section_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_critical_section_real self_test PASS (ops=" + to_string(s[0])
+        + ", spin=" + to_string(s[1]) + ", contended=" + to_string(s[2])
+        + ", balance=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pcsr_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_spin_count\t" + to_string(s[1]))
+            println("contended_count\t" + to_string(s[2]))
+            println("enter_leave_balance\t" + to_string(s[3]))
+            return
+        }
+        if sub == "spin" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_spin_count\t" + to_string(op_spin_count(oid)))
+                return
+            }
+            println("usage: hexa run pe_critical_section_real.hexa spin <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_critical_section_real.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pcsr()
+            println("cleaned: " + pcsr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pcsr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_critical_section_real.hexa { self-test | stats | spin <op_id> | count <op_kind> | cleanup | dir }")
+}

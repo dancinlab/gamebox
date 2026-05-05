@@ -1,0 +1,130 @@
+// lib/perf/c_frame.hexa — C-FRAME (15/15)
+//
+// per-frame command buffer 카테고리별 합 → per-second roll-up → 다음-second draw 예측.
+// 7-axis 24-byte/record (per-second). Holt 이중 지수평활 1초 ahead forecast.
+//
+// 무기: state vector + Holt forecast.
+// upstream candidate: float 안정화 (Holt smoothing factor 정확도).
+// stage1 우회: int math (alpha, beta as percent integer, smoothing 곱셈을 / 100).
+
+use "./r0_common"
+
+let RING_FRAME = GAMEBOX_HOME + "/forge/genomes-gptk-frame.ring"
+
+// ─── per-second roll-up emit ───
+fn append_frame(draw: int, state_chg: int, tex_bind: int, buf_upd_bytes: int, compute: int, blit: int, present_wait_us: int, ts_sec: int, frame_count: int) -> void {
+    let payload = "\"draw\":" + to_string(draw)
+        + ",\"state_chg\":" + to_string(state_chg)
+        + ",\"tex_bind\":" + to_string(tex_bind)
+        + ",\"buf_upd_bytes\":" + to_string(buf_upd_bytes)
+        + ",\"compute\":" + to_string(compute)
+        + ",\"blit\":" + to_string(blit)
+        + ",\"present_wait_us\":" + to_string(present_wait_us)
+        + ",\"ts_sec\":" + to_string(ts_sec)
+        + ",\"frame_count\":" + to_string(frame_count)
+    r0_emit("frame_summary", payload)
+
+    // ring file append (header + 1 record)
+    let _mk = exec("mkdir -p '" + GAMEBOX_HOME + "/forge'")
+    let line = "{\"axes\":7,\"rec_bytes\":24,\"component\":\"FRAME\"," + payload + "}"
+    r0_append_line(RING_FRAME, line)
+}
+
+// ─── Holt 이중 지수평활 (int math) ───
+//   level_t   = alpha * value + (100-alpha) * (level_{t-1} + trend_{t-1})  / 100
+//   trend_t   = beta * (level_t - level_{t-1}) + (100-beta) * trend_{t-1} / 100
+//   forecast  = level + trend
+//
+// alpha, beta ∈ [0..100] 정수 (percent).
+fn holt_step(value: int, prev_level: int, prev_trend: int, alpha: int, beta: int) -> array {
+    let one_step = prev_level + prev_trend
+    let level_t = (alpha * value + (100 - alpha) * one_step) / 100
+    let trend_t = (beta * (level_t - prev_level) + (100 - beta) * prev_trend) / 100
+    return [level_t, trend_t]
+}
+
+// values array → 마지막 forecast (1-step ahead) 반환
+fn holt_forecast(values: array, alpha: int, beta: int) -> int {
+    if len(values) < 2 {
+        if len(values) == 1 { return values[0] }
+        return 0
+    }
+    let level = values[0]
+    let trend = values[1] - values[0]
+    let i = 1
+    while i < len(values) {
+        let r = holt_step(values[i], level, trend, alpha, beta)
+        level = r[0]
+        trend = r[1]
+        i = i + 1
+    }
+    return level + trend
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "cframe-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. append_frame 3 회 → ring file 에 3 line + session 에 3 event
+    append_frame(1500, 200, 80, 4096, 5, 2, 8000, 1700000000, 60)
+    append_frame(1600, 210, 85, 4200, 6, 3, 8100, 1700000001, 60)
+    append_frame(1450, 195, 75, 3900, 4, 1, 7950, 1700000002, 60)
+
+    let session_cnt = r0_session_count(sid)
+    if session_cnt != 3 {
+        panic("c_frame FAIL [session emit count] expected=3 got=" + to_string(session_cnt))
+    }
+
+    let ring_cnt_str = exec("wc -l < '" + RING_FRAME + "' | tr -d ' '").trim()
+    let ring_cnt = to_int(ring_cnt_str)
+    if ring_cnt < 3 {
+        panic("c_frame FAIL [ring count] expected>=3 got=" + to_string(ring_cnt))
+    }
+
+    // 2. Holt forecast — monotonic 증가 → forecast > 마지막 값
+    let mono = [100, 110, 120, 130, 140, 150]
+    let f_mono = holt_forecast(mono, 60, 30)
+    if f_mono < 145 {
+        panic("c_frame FAIL [holt monotonic] expected>=145 got=" + to_string(f_mono))
+    }
+
+    // 3. flat 시리즈 → forecast ≈ 동일 값
+    let flat = [100, 100, 100, 100, 100]
+    let f_flat = holt_forecast(flat, 50, 50)
+    if f_flat < 95 || f_flat > 105 {
+        panic("c_frame FAIL [holt flat] expected≈100 got=" + to_string(f_flat))
+    }
+
+    // 4. 빈 array / 단일 element
+    let f_empty = holt_forecast([], 50, 50)
+    if f_empty != 0 { panic("c_frame FAIL [holt empty] expected=0 got=" + to_string(f_empty)) }
+    let f_one = holt_forecast([42], 50, 50)
+    if f_one != 42 { panic("c_frame FAIL [holt one] expected=42 got=" + to_string(f_one)) }
+
+    println("  ✅ c_frame self_test PASS (3 emits + Holt monotonic=" + to_string(f_mono) + " flat=" + to_string(f_flat) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "forecast" {
+            // forecast <v1> <v2> ... — int 시리즈 forecast (alpha=60 beta=30)
+            let vals = []
+            let i = 3
+            while i < len(a) {
+                vals = vals + [to_int(a[i])]
+                i = i + 1
+            }
+            let f = holt_forecast(vals, 60, 30)
+            println(to_string(f))
+            return
+        }
+    }
+    println("usage: hexa run c_frame.hexa { self-test | forecast <v1> <v2> ... }")
+}

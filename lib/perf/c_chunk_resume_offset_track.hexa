@@ -1,0 +1,122 @@
+// lib/perf/c_chunk_resume_offset_track.hexa — CN-102 skeleton manjeom 15/15
+//
+// Phase 3 download chunk resume — 다운 중단 후 재개 시 정확한 byte offset 추적.
+// HTTP Range header (bytes=start-end) 정확도 검증.
+//
+// 무기: range request table + columnar (chunk × bytes_done × bytes_total).
+// 효과: 부분 download 후 resume 시 중복/누락 없이 정확.
+
+use "./r0_common"
+
+let CCRO_DIR = GAMEBOX_HOME + "/persist/chunk_resume_offset"
+let RANGE_LOG = CCRO_DIR + "/ranges.tsv"
+
+fn ccro_dir() -> str { return CCRO_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CCRO_DIR + "'")
+}
+
+fn record_range(chunk_id: int, start: int, end: int, ok: bool) -> void {
+    ensure_dir()
+    let s = "fail"
+    if ok { s = "pass" }
+    let bytes = end - start + 1
+    let line = to_string(chunk_id) + "\t" + to_string(start) + "\t" + to_string(end) + "\t" + to_string(bytes) + "\t" + s
+    let tmp = RANGE_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + RANGE_LOG + "' && rm -f '" + tmp + "'")
+    if ok {
+        r0_emit("chunk_range_ok", "\"chunk\":" + to_string(chunk_id) + ",\"bytes\":" + to_string(bytes))
+    } else {
+        r0_emit("chunk_range_fail", "\"chunk\":" + to_string(chunk_id))
+    }
+}
+
+fn total_done() -> int {
+    let exists = exec("test -f '" + RANGE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$5==\"pass\"{s+=$4} END{print s+0}' '" + RANGE_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn next_offset() -> int {
+    let exists = exec("test -f '" + RANGE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$5==\"pass\" {if($3 > m) m = $3} END{print m+1}' '" + RANGE_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn gap_check(total_size: int) -> int {
+    // expected = 0 ~ total_size-1, gap = expected - sum(passed)
+    return total_size - total_done()
+}
+
+fn cleanup_ccro() -> void {
+    let _ = exec("rm -rf '" + CCRO_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "ccro-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_ccro()
+
+    // 100MB 파일 = 25 chunks × 4MB
+    let chunk_size = 4194304
+    let total = chunk_size * 25
+
+    // 첫 10 chunks 다운 완료
+    let i = 0
+    while i < 10 {
+        record_range(i, i * chunk_size, (i + 1) * chunk_size - 1, true)
+        i = i + 1
+    }
+    // chunk 10 fail
+    record_range(10, 10 * chunk_size, 11 * chunk_size - 1, false)
+
+    let done = total_done()
+    if done != 10 * chunk_size { panic("c_chunk_resume_offset_track FAIL [done] expected=" + to_string(10 * chunk_size) + " got=" + to_string(done)) }
+
+    let next = next_offset()
+    if next != 10 * chunk_size { panic("c_chunk_resume_offset_track FAIL [next] expected=" + to_string(10 * chunk_size) + " got=" + to_string(next)) }
+
+    let gap = gap_check(total)
+    if gap != 15 * chunk_size { panic("c_chunk_resume_offset_track FAIL [gap] expected=" + to_string(15 * chunk_size) + " got=" + to_string(gap)) }
+
+    // resume — chunk 10 재시도 ok
+    record_range(10, 10 * chunk_size, 11 * chunk_size - 1, true)
+    let done2 = total_done()
+    if done2 != 11 * chunk_size { panic("c_chunk_resume_offset_track FAIL [resume done] got=" + to_string(done2)) }
+
+    r0_emit("chunk_resume_summary", "\"done\":" + to_string(done2) + ",\"gap\":" + to_string(gap_check(total)))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 11 { panic("c_chunk_resume_offset_track FAIL [emit] got=" + to_string(cnt)) }
+
+    cleanup_ccro()
+
+    println("  ✅ c_chunk_resume_offset_track self_test PASS (25 chunks total, 11 done after resume, next_offset accurate, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "range" && len(a) >= 7 {
+            let ok = a[6] == "1"
+            record_range(to_int(a[3]), to_int(a[4]), to_int(a[5]), ok)
+            println("recorded")
+            return
+        }
+        if sub == "stats" && len(a) >= 4 {
+            println("done=" + to_string(total_done()) + " next=" + to_string(next_offset()) + " gap=" + to_string(gap_check(to_int(a[3]))))
+            return
+        }
+        if sub == "cleanup" { cleanup_ccro(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_chunk_resume_offset_track.hexa { self-test | range <chunk> <start> <end> <ok0_1> | stats <total> | cleanup }")
+}

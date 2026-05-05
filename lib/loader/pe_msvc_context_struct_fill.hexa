@@ -1,0 +1,508 @@
+// lib/loader/pe_msvc_context_struct_fill.hexa — Win32 i386 CONTEXT / STACKFRAME64 / EXCEPTION_RECORD struct fill tracker
+//
+// own 1: Wine / CrossOver / Whisky / GPTK / Box86 / community wrapper 0 줄.
+//        Microsoft Win32 public ABI (CONTEXT i386 / STACKFRAME64 / EXCEPTION_RECORD)
+//        observation only — 본 module 은 struct fill telemetry 만 기록.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// 추적 대상:
+//   MSVC CRT / KERNEL32 / NTDLL 가 i386 PE 실행 중 user struct buffer 에 쓰는
+//     CONTEXT (716 byte: ContextFlags + Dr0..7 + FloatSave + SegGs..Cs + Edi/Esi/Ebx/Edx/Ecx/Eax/Ebp/Eip/EFlags/Esp/SegSs + ExtRegs),
+//     STACKFRAME64 (frame_index + Eip/Esp/Ebp 3 register),
+//     EXCEPTION_RECORD (target_va + ExceptionCode + ExceptionAddress)
+//   세 종류의 struct fill 시점과,
+//   register dump (8 i386 GPR: EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI) 의 단발 capture,
+//   struct validation (CONTEXT 716 byte + ExceptionRecord field 정합성) 을 별도 테이블로 기록.
+//
+// fill_kind (CONTEXT capture 종류):
+//   0=zero       — RtlZeroMemory(ContextFlags=0) baseline
+//   1=current    — RtlCaptureContext / GetThreadContext live snapshot
+//   2=snapshot   — SuspendThread → GetThreadContext → ResumeThread cold snapshot
+//
+// struct_kind (validation 대상):
+//   "CONTEXT" — 716 byte i386 layout
+//   "STACKFRAME64" — KdHelp + AddrPC/AddrFrame/AddrStack
+//   "EXCEPTION_RECORD" — code + flags + addr + nparam
+//
+// persist schema (TSV — 5 separate tables):
+//   context.tsv:
+//     ctx_id<int> \t target_va_hex<str> \t context_flags_hex<str> \t fill_kind<int>
+//   register_dump.tsv:
+//     dump_id<int> \t ctx_id<int> \t reg_name<str> \t value_hex<str>
+//   stack_frame.tsv:
+//     frame_id<int> \t frame_index<int> \t eip_hex<str> \t esp_hex<str> \t ebp_hex<str>
+//   exception_record.tsv:
+//     er_id<int> \t target_va_hex<str> \t code_hex<str> \t address_hex<str>
+//   struct_validation.tsv:
+//     validation_id<int> \t struct_kind<str> \t target_va_hex<str> \t valid<int>
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: ctx_id / dump_id / frame_id / er_id / validation_id /
+// target_va_hex / context_flags_hex / fill_kind / reg_name / value_hex /
+// frame_index / eip_hex / esp_hex / ebp_hex / code_hex / address_hex /
+// struct_kind / valid.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmcsf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_msvc_context_struct_fill"
+}
+
+fn pmcsf_context_path() -> str {
+    return pmcsf_dir() + "/context.tsv"
+}
+
+fn pmcsf_register_dump_path() -> str {
+    return pmcsf_dir() + "/register_dump.tsv"
+}
+
+fn pmcsf_stack_frame_path() -> str {
+    return pmcsf_dir() + "/stack_frame.tsv"
+}
+
+fn pmcsf_exception_record_path() -> str {
+    return pmcsf_dir() + "/exception_record.tsv"
+}
+
+fn pmcsf_struct_validation_path() -> str {
+    return pmcsf_dir() + "/struct_validation.tsv"
+}
+
+fn pmcsf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmcsf_dir() + "'")
+}
+
+fn cleanup_pmcsf() -> void {
+    pmcsf_ensure_dir()
+    let _ = exec("rm -f '" + pmcsf_context_path() + "' '" + pmcsf_register_dump_path()
+        + "' '" + pmcsf_stack_frame_path() + "' '" + pmcsf_exception_record_path()
+        + "' '" + pmcsf_struct_validation_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmcsf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmcsf_append_row(path: str, row: str) -> void {
+    pmcsf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pmcsf_count_rows(path: str, min_cols: int) -> int {
+    let t = pmcsf_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fill_kind / struct_kind name lookup ───
+fn fill_kind_name(k: int) -> str {
+    if k == 0 {
+        return "zero"
+    }
+    if k == 1 {
+        return "current"
+    }
+    if k == 2 {
+        return "snapshot"
+    }
+    return "unknown"
+}
+
+fn struct_kind_name(k: str) -> str {
+    if k == "CONTEXT" {
+        return "CONTEXT (i386 716 byte)"
+    }
+    if k == "STACKFRAME64" {
+        return "STACKFRAME64 (Eip/Esp/Ebp)"
+    }
+    if k == "EXCEPTION_RECORD" {
+        return "EXCEPTION_RECORD (code/addr/nparam)"
+    }
+    return "unknown"
+}
+
+// ─── record_context_fill: CONTEXT struct fill (ContextFlags + fill_kind) milestone ───
+fn record_context_fill(ctx_id: int, target_va_hex: str, context_flags_hex: str, fill_kind: int) -> void {
+    if ctx_id <= 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_context_fill] expected=ctx_id>0 got=" + to_string(ctx_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_context_fill] expected=target_va_hex!=empty got=empty")
+    }
+    if context_flags_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_context_fill] expected=context_flags_hex!=empty got=empty")
+    }
+    if fill_kind < 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_context_fill] expected=fill_kind>=0 got=" + to_string(fill_kind))
+    }
+    if fill_kind > 2 {
+        panic("pe_msvc_context_struct_fill FAIL [record_context_fill] expected=fill_kind<=2 got=" + to_string(fill_kind))
+    }
+    let row = to_string(ctx_id) + "\t" + target_va_hex + "\t"
+        + context_flags_hex + "\t" + to_string(fill_kind) + "\n"
+    pmcsf_append_row(pmcsf_context_path(), row)
+}
+
+// ─── record_register_dump: i386 GPR single-register capture milestone ───
+fn record_register_dump(dump_id: int, ctx_id: int, reg_name: str, value_hex: str) -> void {
+    if dump_id <= 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_register_dump] expected=dump_id>0 got=" + to_string(dump_id))
+    }
+    if ctx_id <= 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_register_dump] expected=ctx_id>0 got=" + to_string(ctx_id))
+    }
+    if reg_name == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_register_dump] expected=reg_name!=empty got=empty")
+    }
+    if value_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_register_dump] expected=value_hex!=empty got=empty")
+    }
+    let row = to_string(dump_id) + "\t" + to_string(ctx_id) + "\t"
+        + reg_name + "\t" + value_hex + "\n"
+    pmcsf_append_row(pmcsf_register_dump_path(), row)
+}
+
+// ─── record_stack_frame: STACKFRAME64 (Eip/Esp/Ebp) milestone ───
+fn record_stack_frame(frame_id: int, frame_index: int, eip_hex: str, esp_hex: str, ebp_hex: str) -> void {
+    if frame_id <= 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_stack_frame] expected=frame_id>0 got=" + to_string(frame_id))
+    }
+    if frame_index < 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_stack_frame] expected=frame_index>=0 got=" + to_string(frame_index))
+    }
+    if eip_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_stack_frame] expected=eip_hex!=empty got=empty")
+    }
+    if esp_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_stack_frame] expected=esp_hex!=empty got=empty")
+    }
+    if ebp_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_stack_frame] expected=ebp_hex!=empty got=empty")
+    }
+    let row = to_string(frame_id) + "\t" + to_string(frame_index) + "\t"
+        + eip_hex + "\t" + esp_hex + "\t" + ebp_hex + "\n"
+    pmcsf_append_row(pmcsf_stack_frame_path(), row)
+}
+
+// ─── record_exception_record: EXCEPTION_RECORD (code + address) milestone ───
+fn record_exception_record(er_id: int, target_va_hex: str, code_hex: str, address_hex: str) -> void {
+    if er_id <= 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_exception_record] expected=er_id>0 got=" + to_string(er_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_exception_record] expected=target_va_hex!=empty got=empty")
+    }
+    if code_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_exception_record] expected=code_hex!=empty got=empty")
+    }
+    if address_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_exception_record] expected=address_hex!=empty got=empty")
+    }
+    let row = to_string(er_id) + "\t" + target_va_hex + "\t"
+        + code_hex + "\t" + address_hex + "\n"
+    pmcsf_append_row(pmcsf_exception_record_path(), row)
+}
+
+// ─── record_struct_validation: CONTEXT/STACKFRAME64/EXCEPTION_RECORD field 정합성 milestone ───
+fn record_struct_validation(validation_id: int, struct_kind: str, target_va_hex: str, valid: int) -> void {
+    if validation_id <= 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_struct_validation] expected=validation_id>0 got=" + to_string(validation_id))
+    }
+    if struct_kind == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_struct_validation] expected=struct_kind!=empty got=empty")
+    }
+    if target_va_hex == "" {
+        panic("pe_msvc_context_struct_fill FAIL [record_struct_validation] expected=target_va_hex!=empty got=empty")
+    }
+    if valid < 0 {
+        panic("pe_msvc_context_struct_fill FAIL [record_struct_validation] expected=valid>=0 got=" + to_string(valid))
+    }
+    if valid > 1 {
+        panic("pe_msvc_context_struct_fill FAIL [record_struct_validation] expected=valid<=1 got=" + to_string(valid))
+    }
+    let row = to_string(validation_id) + "\t" + struct_kind + "\t" + target_va_hex + "\t"
+        + to_string(valid) + "\n"
+    pmcsf_append_row(pmcsf_struct_validation_path(), row)
+}
+
+// ─── statistics ───
+fn context_fill_count() -> int {
+    return pmcsf_count_rows(pmcsf_context_path(), 4)
+}
+
+fn register_dump_count() -> int {
+    return pmcsf_count_rows(pmcsf_register_dump_path(), 4)
+}
+
+fn stack_frame_count() -> int {
+    return pmcsf_count_rows(pmcsf_stack_frame_path(), 5)
+}
+
+fn exception_record_count() -> int {
+    return pmcsf_count_rows(pmcsf_exception_record_path(), 4)
+}
+
+fn validation_count() -> int {
+    return pmcsf_count_rows(pmcsf_struct_validation_path(), 4)
+}
+
+fn pmcsf_stats() -> array {
+    let mut out = []
+    out.push(context_fill_count())
+    out.push(register_dump_count())
+    out.push(stack_frame_count())
+    out.push(exception_record_count())
+    out.push(validation_count())
+    return out
+}
+
+// ─── self_test ≥ 17 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pmcsf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pmcsf()
+
+    // ─── 1. context_fill × 2 (zero / snapshot, ContextFlags 0x10005 = CONTROL|INTEGER|SEGMENTS) ───
+    record_context_fill(1, "0x10001000", "0x10005", 0)
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"context_fill\",\"ctx_id\":1,\"target_va_hex\":\"0x10001000\",\"context_flags_hex\":\"0x10005\",\"fill_kind\":0,\"fill\":\"zero\"")
+
+    record_context_fill(2, "0x100012CC", "0x10005", 2)
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"context_fill\",\"ctx_id\":2,\"target_va_hex\":\"0x100012CC\",\"context_flags_hex\":\"0x10005\",\"fill_kind\":2,\"fill\":\"snapshot\"")
+
+    // ─── 2. register_dump × 8 (i386 GPR EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI bound to ctx_id=2) ───
+    record_register_dump(1, 2, "EAX", "0x00000000")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":1,\"ctx_id\":2,\"reg_name\":\"EAX\",\"value_hex\":\"0x00000000\"")
+
+    record_register_dump(2, 2, "ECX", "0x7FFE0000")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":2,\"ctx_id\":2,\"reg_name\":\"ECX\",\"value_hex\":\"0x7FFE0000\"")
+
+    record_register_dump(3, 2, "EDX", "0x00401000")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":3,\"ctx_id\":2,\"reg_name\":\"EDX\",\"value_hex\":\"0x00401000\"")
+
+    record_register_dump(4, 2, "EBX", "0x00000001")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":4,\"ctx_id\":2,\"reg_name\":\"EBX\",\"value_hex\":\"0x00000001\"")
+
+    record_register_dump(5, 2, "ESP", "0x0019FF80")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":5,\"ctx_id\":2,\"reg_name\":\"ESP\",\"value_hex\":\"0x0019FF80\"")
+
+    record_register_dump(6, 2, "EBP", "0x0019FFC0")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":6,\"ctx_id\":2,\"reg_name\":\"EBP\",\"value_hex\":\"0x0019FFC0\"")
+
+    record_register_dump(7, 2, "ESI", "0x00000000")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":7,\"ctx_id\":2,\"reg_name\":\"ESI\",\"value_hex\":\"0x00000000\"")
+
+    record_register_dump(8, 2, "EDI", "0x00000000")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"register_dump\",\"dump_id\":8,\"ctx_id\":2,\"reg_name\":\"EDI\",\"value_hex\":\"0x00000000\"")
+
+    // ─── 3. stack_frame × 4 (4-frame backtrace; frame_index 0..3) ───
+    record_stack_frame(1, 0, "0x00401234", "0x0019FF80", "0x0019FFC0")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"stack_frame\",\"frame_id\":1,\"frame_index\":0,\"eip_hex\":\"0x00401234\",\"esp_hex\":\"0x0019FF80\",\"ebp_hex\":\"0x0019FFC0\",\"label\":\"top frame (winmain inner)\"")
+
+    record_stack_frame(2, 1, "0x004011A0", "0x0019FFA0", "0x0019FFD0")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"stack_frame\",\"frame_id\":2,\"frame_index\":1,\"eip_hex\":\"0x004011A0\",\"esp_hex\":\"0x0019FFA0\",\"ebp_hex\":\"0x0019FFD0\",\"label\":\"winmain entry\"")
+
+    record_stack_frame(3, 2, "0x00401050", "0x0019FFC0", "0x0019FFE0")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"stack_frame\",\"frame_id\":3,\"frame_index\":2,\"eip_hex\":\"0x00401050\",\"esp_hex\":\"0x0019FFC0\",\"ebp_hex\":\"0x0019FFE0\",\"label\":\"crt startup\"")
+
+    record_stack_frame(4, 3, "0x77E80000", "0x0019FFE0", "0x0019FFF0")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"stack_frame\",\"frame_id\":4,\"frame_index\":3,\"eip_hex\":\"0x77E80000\",\"esp_hex\":\"0x0019FFE0\",\"ebp_hex\":\"0x0019FFF0\",\"label\":\"kernel32 BaseProcessStart\"")
+
+    // ─── 4. exception_record × 1 (access violation 0xC0000005 at EIP) ───
+    record_exception_record(1, "0x10005000", "0xC0000005", "0x00401234")
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"exception_record\",\"er_id\":1,\"target_va_hex\":\"0x10005000\",\"code_hex\":\"0xC0000005\",\"address_hex\":\"0x00401234\",\"label\":\"access violation\"")
+
+    // ─── 5. struct_validation × 2 (CONTEXT 716 byte valid + EXCEPTION_RECORD valid) ───
+    record_struct_validation(1, "CONTEXT", "0x100012CC", 1)
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"struct_validation\",\"validation_id\":1,\"struct_kind\":\"CONTEXT\",\"target_va_hex\":\"0x100012CC\",\"valid\":1,\"size_bytes\":716")
+
+    record_struct_validation(2, "EXCEPTION_RECORD", "0x10005000", 1)
+    r0_emit("pe_msvc_context_struct_fill_record",
+        "\"kind\":\"struct_validation\",\"validation_id\":2,\"struct_kind\":\"EXCEPTION_RECORD\",\"target_va_hex\":\"0x10005000\",\"valid\":1,\"code\":\"0xC0000005\"")
+
+    // ─── assertions: count ───
+    let cc = context_fill_count()
+    if cc != 2 {
+        panic("pe_msvc_context_struct_fill FAIL [context_fill_count] expected=2 got=" + to_string(cc))
+    }
+    let rc = register_dump_count()
+    if rc != 8 {
+        panic("pe_msvc_context_struct_fill FAIL [register_dump_count] expected=8 got=" + to_string(rc))
+    }
+    let fc = stack_frame_count()
+    if fc != 4 {
+        panic("pe_msvc_context_struct_fill FAIL [stack_frame_count] expected=4 got=" + to_string(fc))
+    }
+    let ec = exception_record_count()
+    if ec != 1 {
+        panic("pe_msvc_context_struct_fill FAIL [exception_record_count] expected=1 got=" + to_string(ec))
+    }
+    let vc = validation_count()
+    if vc != 2 {
+        panic("pe_msvc_context_struct_fill FAIL [validation_count] expected=2 got=" + to_string(vc))
+    }
+
+    // ─── helper sanity ───
+    if fill_kind_name(0) != "zero" {
+        panic("pe_msvc_context_struct_fill FAIL [fill_kind_name(0)] expected=zero got=" + fill_kind_name(0))
+    }
+    if fill_kind_name(1) != "current" {
+        panic("pe_msvc_context_struct_fill FAIL [fill_kind_name(1)] expected=current got=" + fill_kind_name(1))
+    }
+    if fill_kind_name(2) != "snapshot" {
+        panic("pe_msvc_context_struct_fill FAIL [fill_kind_name(2)] expected=snapshot got=" + fill_kind_name(2))
+    }
+    if struct_kind_name("CONTEXT") != "CONTEXT (i386 716 byte)" {
+        panic("pe_msvc_context_struct_fill FAIL [struct_kind_name(CONTEXT)] expected=\"CONTEXT (i386 716 byte)\" got=" + struct_kind_name("CONTEXT"))
+    }
+    if struct_kind_name("STACKFRAME64") != "STACKFRAME64 (Eip/Esp/Ebp)" {
+        panic("pe_msvc_context_struct_fill FAIL [struct_kind_name(STACKFRAME64)] expected=\"STACKFRAME64 (Eip/Esp/Ebp)\" got=" + struct_kind_name("STACKFRAME64"))
+    }
+    if struct_kind_name("EXCEPTION_RECORD") != "EXCEPTION_RECORD (code/addr/nparam)" {
+        panic("pe_msvc_context_struct_fill FAIL [struct_kind_name(EXCEPTION_RECORD)] expected=\"EXCEPTION_RECORD (code/addr/nparam)\" got=" + struct_kind_name("EXCEPTION_RECORD"))
+    }
+
+    // ─── stats sanity ───
+    let s = pmcsf_stats()
+    if len(s) != 5 {
+        panic("pe_msvc_context_struct_fill FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_msvc_context_struct_fill FAIL [stats context_fill_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 8 {
+        panic("pe_msvc_context_struct_fill FAIL [stats register_dump_count] expected=8 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_msvc_context_struct_fill FAIL [stats stack_frame_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_msvc_context_struct_fill FAIL [stats exception_record_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_msvc_context_struct_fill FAIL [stats validation_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (17 record emits + stats/summary/kpi = 20 ≥ 14) ───
+    r0_emit("pe_msvc_context_struct_fill_stats",
+        "\"context_fill_count\":" + to_string(s[0])
+        + ",\"register_dump_count\":" + to_string(s[1])
+        + ",\"stack_frame_count\":" + to_string(s[2])
+        + ",\"exception_record_count\":" + to_string(s[3])
+        + ",\"validation_count\":" + to_string(s[4]))
+
+    r0_emit("pe_msvc_context_struct_fill_summary",
+        "\"struct_kinds\":[\"CONTEXT\",\"STACKFRAME64\",\"EXCEPTION_RECORD\"],\"i386_gpr\":[\"EAX\",\"ECX\",\"EDX\",\"EBX\",\"ESP\",\"EBP\",\"ESI\",\"EDI\"],\"total_records\":17")
+
+    r0_emit("pe_msvc_context_struct_fill_kpi",
+        "\"context_size_bytes\":716,\"context_flags\":\"0x10005\",\"frame_depth\":4,\"exception_code\":\"0xC0000005\",\"exception_label\":\"access violation\",\"all_validations_pass\":true")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_msvc_context_struct_fill FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pmcsf()
+    let s2 = pmcsf_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_msvc_context_struct_fill FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_msvc_context_struct_fill self_test PASS (context="
+        + to_string(s[0]) + ", dump=" + to_string(s[1])
+        + ", frame=" + to_string(s[2]) + ", er=" + to_string(s[3])
+        + ", validation=" + to_string(s[4]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmcsf_stats()
+            println("context_fill_count\t" + to_string(s[0]))
+            println("register_dump_count\t" + to_string(s[1]))
+            println("stack_frame_count\t" + to_string(s[2]))
+            println("exception_record_count\t" + to_string(s[3]))
+            println("validation_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "fill-kind-name" {
+            if len(a) >= 4 {
+                println(fill_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_msvc_context_struct_fill.hexa fill-kind-name <int>")
+            return
+        }
+        if sub == "struct-kind-name" {
+            if len(a) >= 4 {
+                println(struct_kind_name(a[3]))
+                return
+            }
+            println("usage: hexa run pe_msvc_context_struct_fill.hexa struct-kind-name <str>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmcsf()
+            println("cleaned: " + pmcsf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmcsf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_msvc_context_struct_fill.hexa { self-test | stats | fill-kind-name <k> | struct-kind-name <s> | cleanup | dir }")
+}

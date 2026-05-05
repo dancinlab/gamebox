@@ -1,0 +1,377 @@
+// lib/loader/pe_ipc_mach_port.hexa — stage6 Mach port low-level IPC skeleton
+//
+// macOS kernel-level IPC primitive. send/receive rights. mach_msg syscall
+// 통한 byte msg + port copy. XPC backend.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 mach port tracker — 실 mach_msg() / mach_port_allocate() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// right_kind code:
+//   1 = send
+//   2 = receive
+//   3 = send_once
+//   4 = copy_send
+//
+// persist schema (TSV — port_records.tsv):
+//   port_id<int> \t right_kind<int> \t msg_count<int> \t total_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pimp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_mach_port"
+}
+
+fn pimp_ports_path() -> str {
+    return pimp_dir() + "/port_records.tsv"
+}
+
+fn pimp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pimp_dir() + "'")
+}
+
+fn cleanup_pimp() -> void {
+    pimp_ensure_dir()
+    let _ = exec("rm -f '" + pimp_ports_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pimp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pimp_append_row(path: str, row: str) -> void {
+    pimp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_port: mach port record 1 건 기록 ───
+fn record_port(port_id: int, right_kind: int, msg_count: int, total_bytes: int) -> void {
+    if port_id <= 0 {
+        panic("pe_ipc_mach_port FAIL [record_port] expected=port_id>0 got=" + to_string(port_id))
+    }
+    if right_kind < 1 {
+        panic("pe_ipc_mach_port FAIL [record_port] expected=right_kind>=1 got=" + to_string(right_kind))
+    }
+    if right_kind > 4 {
+        panic("pe_ipc_mach_port FAIL [record_port] expected=right_kind<=4 got=" + to_string(right_kind))
+    }
+    if msg_count < 0 {
+        panic("pe_ipc_mach_port FAIL [record_port] expected=msg_count>=0 got=" + to_string(msg_count))
+    }
+    if total_bytes < 0 {
+        panic("pe_ipc_mach_port FAIL [record_port] expected=total_bytes>=0 got=" + to_string(total_bytes))
+    }
+    let row = to_string(port_id) + "\t" + to_string(right_kind)
+        + "\t" + to_string(msg_count) + "\t" + to_string(total_bytes) + "\n"
+    pimp_append_row(pimp_ports_path(), row)
+}
+
+// ─── port_count: 전체 port 수 ───
+fn port_count() -> int {
+    let t = pimp_read_table(pimp_ports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_msgs: 모든 port msg_count 합 ───
+fn total_msgs() -> int {
+    let t = pimp_read_table(pimp_ports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_bytes: 모든 port total_bytes 합 ───
+fn total_bytes() -> int {
+    let t = pimp_read_table(pimp_ports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_right_kind: 특정 right_kind port 수 ───
+fn count_by_right_kind(kind: int) -> int {
+    let t = pimp_read_table(pimp_ports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── port_msg_count: 특정 port_id 의 msg_count (없으면 0) ───
+fn port_msg_count(port_id: int) -> int {
+    let t = pimp_read_table(pimp_ports_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == port_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pimp_stats: [port_count, total_msgs, total_bytes, count_by_right_kind(1)] ───
+fn pimp_stats() -> array {
+    let mut out = []
+    out.push(port_count())
+    out.push(total_msgs())
+    out.push(total_bytes())
+    out.push(count_by_right_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pimp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pimp()
+
+    // 2. record 4 mach ports (deterministic synthetic)
+    record_port(121001, 1, 240, 10240)
+    r0_emit("pe_ipc_mach_port_record",
+        "\"port_id\":121001,\"right_kind\":1,\"msg_count\":240,\"total_bytes\":10240,\"target\":\"send\"")
+
+    record_port(121002, 2, 240, 10240)
+    r0_emit("pe_ipc_mach_port_record",
+        "\"port_id\":121002,\"right_kind\":2,\"msg_count\":240,\"total_bytes\":10240,\"target\":\"receive\"")
+
+    record_port(121003, 1, 120, 4800)
+    r0_emit("pe_ipc_mach_port_record",
+        "\"port_id\":121003,\"right_kind\":1,\"msg_count\":120,\"total_bytes\":4800,\"target\":\"send\"")
+
+    record_port(121004, 3, 60, 2400)
+    r0_emit("pe_ipc_mach_port_record",
+        "\"port_id\":121004,\"right_kind\":3,\"msg_count\":60,\"total_bytes\":2400,\"target\":\"send_once\"")
+
+    // 3. port_count = 4
+    let pc = port_count()
+    if pc != 4 {
+        panic("pe_ipc_mach_port FAIL [port_count] expected=4 got=" + to_string(pc))
+    }
+
+    // 4. total_msgs = 660
+    let tm = total_msgs()
+    if tm != 660 {
+        panic("pe_ipc_mach_port FAIL [total_msgs] expected=660 got=" + to_string(tm))
+    }
+
+    // 5. total_bytes = 27680
+    let tb = total_bytes()
+    if tb != 27680 {
+        panic("pe_ipc_mach_port FAIL [total_bytes] expected=27680 got=" + to_string(tb))
+    }
+
+    // 6. count_by_right_kind sanity
+    let k1 = count_by_right_kind(1)
+    if k1 != 2 {
+        panic("pe_ipc_mach_port FAIL [count_by_right_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_right_kind(2)
+    if k2 != 1 {
+        panic("pe_ipc_mach_port FAIL [count_by_right_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_right_kind(3)
+    if k3 != 1 {
+        panic("pe_ipc_mach_port FAIL [count_by_right_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_right_kind(4)
+    if k4 != 0 {
+        panic("pe_ipc_mach_port FAIL [count_by_right_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k99 = count_by_right_kind(99)
+    if k99 != 0 {
+        panic("pe_ipc_mach_port FAIL [count_by_right_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. port_msg_count sanity
+    let m1 = port_msg_count(121001)
+    if m1 != 240 {
+        panic("pe_ipc_mach_port FAIL [port_msg_count(121001)] expected=240 got=" + to_string(m1))
+    }
+    let m4 = port_msg_count(121004)
+    if m4 != 60 {
+        panic("pe_ipc_mach_port FAIL [port_msg_count(121004)] expected=60 got=" + to_string(m4))
+    }
+    let m_miss = port_msg_count(9999)
+    if m_miss != 0 {
+        panic("pe_ipc_mach_port FAIL [port_msg_count(9999)] expected=0 got=" + to_string(m_miss))
+    }
+
+    // 8. pimp_stats() = [4, 660, 27680, 2]
+    let s = pimp_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_mach_port FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_ipc_mach_port FAIL [stats port_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 660 {
+        panic("pe_ipc_mach_port FAIL [stats total_msgs] expected=660 got=" + to_string(s[1]))
+    }
+    if s[2] != 27680 {
+        panic("pe_ipc_mach_port FAIL [stats total_bytes] expected=27680 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_ipc_mach_port FAIL [stats count_send] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_mach_port_stats",
+        "\"port_count\":" + to_string(s[0])
+        + ",\"total_msgs\":" + to_string(s[1])
+        + ",\"total_bytes\":" + to_string(s[2])
+        + ",\"kind_send\":" + to_string(s[3]))
+
+    // 10. emit count >= 5 (4 records + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_ipc_mach_port FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pimp()
+    let s2 = pimp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_mach_port FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_mach_port self_test PASS (ports=" + to_string(s[0])
+        + ", msgs=" + to_string(s[1]) + ", bytes=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pimp_stats()
+            println("port_count\t" + to_string(s[0]))
+            println("total_msgs\t" + to_string(s[1]))
+            println("total_bytes\t" + to_string(s[2]))
+            println("count_kind_send\t" + to_string(s[3]))
+            return
+        }
+        if sub == "msgs" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("port_msg_count\t" + to_string(port_msg_count(pid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_mach_port.hexa msgs <port_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_right_kind\t" + to_string(count_by_right_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_ipc_mach_port.hexa count <right_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pimp()
+            println("cleaned: " + pimp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pimp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_mach_port.hexa { self-test | stats | msgs <port_id> | count <right_kind> | cleanup | dir }")
+}

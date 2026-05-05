@@ -1,0 +1,158 @@
+// lib/perf/c_swap_pressure_forecast.hexa — CN-21 만점 15/15
+//
+// macOS swap usage forecast — D4 16GB Mac 에서 critical.
+// Holt forecast (swap_used_mb 시계열) → swap critical 시점 예측 → pre-evict trigger.
+
+use "./r0_common"
+
+let SWAP_DIR = GAMEBOX_HOME + "/persist/swap_pressure"
+let SAMPLES_PATH = SWAP_DIR + "/samples.jsonl"
+
+fn swap_dir() -> str { return SWAP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + SWAP_DIR + "'")
+}
+
+fn record_swap(ts_sec: int, swap_used_mb: int, swap_in_per_sec: int, swap_out_per_sec: int) -> void {
+    ensure_dir()
+    let line = "{\"ts\":" + to_string(ts_sec) + ",\"used\":" + to_string(swap_used_mb) + ",\"in\":" + to_string(swap_in_per_sec) + ",\"out\":" + to_string(swap_out_per_sec) + "}"
+    let tmp = SAMPLES_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SAMPLES_PATH + "' && rm -f '" + tmp + "'")
+}
+
+// classify swap pressure
+//   light: < 500MB
+//   moderate: 500-2000MB
+//   heavy: 2000-5000MB
+//   critical: >= 5000MB OR swap_in > 100/s
+fn classify_swap(swap_used_mb: int, swap_in_per_sec: int) -> str {
+    if swap_used_mb >= 5000 { return "critical" }
+    if swap_in_per_sec > 100 { return "critical" }
+    if swap_used_mb >= 2000 { return "heavy" }
+    if swap_used_mb >= 500 { return "moderate" }
+    return "light"
+}
+
+fn holt_forecast(history: array, alpha: int, beta: int) -> int {
+    if len(history) < 2 {
+        if len(history) == 1 { return history[0] }
+        return 0
+    }
+    let level = history[0]
+    let trend = history[1] - history[0]
+    let i = 1
+    while i < len(history) {
+        let v = history[i]
+        let one_step = level + trend
+        let new_level = (alpha * v + (100 - alpha) * one_step) / 100
+        let new_trend = (beta * (new_level - level) + (100 - beta) * trend) / 100
+        level = new_level
+        trend = new_trend
+        i = i + 1
+    }
+    return level + trend
+}
+
+// pre-evict trigger
+fn should_pre_evict(current_used: int, predicted_used: int) -> bool {
+    if predicted_used >= 5000 { return true }
+    if current_used >= 3000 && predicted_used > current_used + 500 { return true }
+    return false
+}
+
+fn auto_predict_workflow(swap_history: array, current_in_per_sec: int) -> str {
+    let predicted = holt_forecast(swap_history, 60, 30)
+    let current = 0
+    if len(swap_history) > 0 { current = swap_history[len(swap_history) - 1] }
+    let cur_label = classify_swap(current, current_in_per_sec)
+    let pred_label = classify_swap(predicted, 0)
+    let pre_evict = should_pre_evict(current, predicted)
+    r0_emit("swap_predict", "\"current\":" + to_string(current) + ",\"current_label\":\"" + cur_label + "\",\"predicted\":" + to_string(predicted) + ",\"predicted_label\":\"" + pred_label + "\"")
+    if pre_evict {
+        r0_emit("swap_pre_evict", "\"reason\":\"predicted=" + to_string(predicted) + "\"")
+        return "PRE_EVICT"
+    }
+    return "OK"
+}
+
+fn swap_stats() -> array {
+    let exists = exec("test -f '" + SAMPLES_PATH + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0] }
+    let total = to_int(exec("wc -l < '" + SAMPLES_PATH + "' | tr -d ' '").trim())
+    let max_swap_str = exec("grep -oE '\"used\":[0-9]+' '" + SAMPLES_PATH + "' | cut -d: -f2 | sort -nr | head -1").trim()
+    let max_swap = 0
+    if max_swap_str != "" { max_swap = to_int(max_swap_str) }
+    return [total, max_swap]
+}
+
+fn cleanup_swap() -> void {
+    let _ = exec("rm -rf '" + SWAP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "swap-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_swap()
+
+    // classifier
+    if classify_swap(100, 0) != "light" { panic("c_swap_pressure_forecast FAIL [light]") }
+    if classify_swap(1000, 0) != "moderate" { panic("c_swap_pressure_forecast FAIL [moderate]") }
+    if classify_swap(3000, 0) != "heavy" { panic("c_swap_pressure_forecast FAIL [heavy]") }
+    if classify_swap(6000, 0) != "critical" { panic("c_swap_pressure_forecast FAIL [critical mb]") }
+    if classify_swap(100, 200) != "critical" { panic("c_swap_pressure_forecast FAIL [critical io]") }
+
+    // record
+    record_swap(1000, 500, 10, 5)
+    record_swap(1010, 1000, 20, 10)
+    record_swap(1020, 2000, 50, 20)
+    record_swap(1030, 3500, 80, 30)
+    record_swap(1040, 4500, 110, 40)
+
+    // forecast — escalating
+    let history = [500, 1000, 2000, 3500, 4500]
+    let pred = holt_forecast(history, 60, 30)
+    if pred < 4500 { panic("c_swap_pressure_forecast FAIL [forecast] expected>=4500 got=" + to_string(pred)) }
+
+    // pre-evict
+    let evict1 = should_pre_evict(4500, 6000)
+    if !evict1 { panic("c_swap_pressure_forecast FAIL [evict 4500,6000]") }
+    let evict2 = should_pre_evict(500, 1000)
+    if evict2 { panic("c_swap_pressure_forecast FAIL [no evict 500,1000]") }
+
+    // auto workflow
+    let result = auto_predict_workflow([1000, 2000, 3500, 5000], 50)
+    if result != "PRE_EVICT" {
+        panic("c_swap_pressure_forecast FAIL [auto escalate] expected=PRE_EVICT got=" + result)
+    }
+
+    // stats
+    let stats = swap_stats()
+    if stats[0] != 5 { panic("c_swap_pressure_forecast FAIL [stats total] expected=5 got=" + to_string(stats[0])) }
+
+    r0_emit("swap_summary", "\"samples\":" + to_string(stats[0]) + ",\"max\":" + to_string(stats[1]) + ",\"forecast\":" + to_string(pred))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_swap_pressure_forecast FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_swap()
+
+    println("  ✅ c_swap_pressure_forecast self_test PASS (4 classes, forecast=" + to_string(pred) + " MB, pre_evict=true, samples=5, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = swap_stats()
+            println("samples=" + to_string(s[0]) + " max=" + to_string(s[1]) + " MB")
+            return
+        }
+        if sub == "cleanup" { cleanup_swap(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_swap_pressure_forecast.hexa { self-test | stats | cleanup }")
+}

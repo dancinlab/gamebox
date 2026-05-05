@@ -1,0 +1,378 @@
+// lib/loader/pe_ipc_mqueue.hexa — stage6 POSIX mqueue IPC skeleton
+//
+// mq_open + mq_send + mq_receive. kernel-managed priority queue. msg_prio
+// 별 delivery order.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 mqueue msg tracker — 실 mq_open() / mq_send() / mq_receive() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// priority range: 0 ~ 31 (POSIX MQ_PRIO_MAX 하한 보장).
+//
+// persist schema (TSV — mq_msgs.tsv):
+//   msg_id<int> \t priority<int 0-31> \t msg_size<int> \t success<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pimq_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_mqueue"
+}
+
+fn pimq_msgs_path() -> str {
+    return pimq_dir() + "/mq_msgs.tsv"
+}
+
+fn pimq_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pimq_dir() + "'")
+}
+
+fn cleanup_pimq() -> void {
+    pimq_ensure_dir()
+    let _ = exec("rm -f '" + pimq_msgs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pimq_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pimq_append_row(path: str, row: str) -> void {
+    pimq_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_mq_msg: mqueue msg 1 건 기록 ───
+fn record_mq_msg(msg_id: int, priority: int, msg_size: int, success: int) -> void {
+    if msg_id <= 0 {
+        panic("pe_ipc_mqueue FAIL [record_mq_msg] expected=msg_id>0 got=" + to_string(msg_id))
+    }
+    if priority < 0 {
+        panic("pe_ipc_mqueue FAIL [record_mq_msg] expected=priority>=0 got=" + to_string(priority))
+    }
+    if priority > 31 {
+        panic("pe_ipc_mqueue FAIL [record_mq_msg] expected=priority<=31 got=" + to_string(priority))
+    }
+    if msg_size < 0 {
+        panic("pe_ipc_mqueue FAIL [record_mq_msg] expected=msg_size>=0 got=" + to_string(msg_size))
+    }
+    if success < 0 {
+        panic("pe_ipc_mqueue FAIL [record_mq_msg] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_ipc_mqueue FAIL [record_mq_msg] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(msg_id) + "\t" + to_string(priority)
+        + "\t" + to_string(msg_size) + "\t" + to_string(success) + "\n"
+    pimq_append_row(pimq_msgs_path(), row)
+}
+
+// ─── mq_count: total msg 수 ───
+fn mq_count() -> int {
+    let t = pimq_read_table(pimq_msgs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size: 모든 msg msg_size 합 ───
+fn total_size() -> int {
+    let t = pimq_read_table(pimq_msgs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_priority: 특정 priority 의 msg 수 ───
+fn count_by_priority(prio: int) -> int {
+    let t = pimq_read_table(pimq_msgs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == prio {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: success=1 인 msg 수 ───
+fn success_count() -> int {
+    let t = pimq_read_table(pimq_msgs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── msg_size_at: 특정 msg_id 의 msg_size (없으면 0) ───
+fn msg_size_at(msg_id: int) -> int {
+    let t = pimq_read_table(pimq_msgs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == msg_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pimq_stats: [mq_count, total_size, success_count, count_by_priority(0)] ───
+fn pimq_stats() -> array {
+    let mut out = []
+    out.push(mq_count())
+    out.push(total_size())
+    out.push(success_count())
+    out.push(count_by_priority(0))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pimq-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pimq()
+
+    // 2. record 5 mqueue msgs (deterministic synthetic)
+    record_mq_msg(125001, 0, 512, 1)
+    r0_emit("pe_ipc_mqueue_record",
+        "\"msg_id\":125001,\"priority\":0,\"msg_size\":512,\"success\":1,\"target\":\"normal\"")
+
+    record_mq_msg(125002, 15, 1024, 1)
+    r0_emit("pe_ipc_mqueue_record",
+        "\"msg_id\":125002,\"priority\":15,\"msg_size\":1024,\"success\":1,\"target\":\"mid\"")
+
+    record_mq_msg(125003, 0, 256, 1)
+    r0_emit("pe_ipc_mqueue_record",
+        "\"msg_id\":125003,\"priority\":0,\"msg_size\":256,\"success\":1,\"target\":\"normal\"")
+
+    record_mq_msg(125004, 31, 2048, 1)
+    r0_emit("pe_ipc_mqueue_record",
+        "\"msg_id\":125004,\"priority\":31,\"msg_size\":2048,\"success\":1,\"target\":\"urgent\"")
+
+    record_mq_msg(125005, 0, 128, 0)
+    r0_emit("pe_ipc_mqueue_record",
+        "\"msg_id\":125005,\"priority\":0,\"msg_size\":128,\"success\":0,\"target\":\"normal\"")
+
+    // 3. mq_count = 5
+    let c = mq_count()
+    if c != 5 {
+        panic("pe_ipc_mqueue FAIL [mq_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_size = 3968
+    let ts = total_size()
+    if ts != 3968 {
+        panic("pe_ipc_mqueue FAIL [total_size] expected=3968 got=" + to_string(ts))
+    }
+
+    // 5. count_by_priority sanity
+    let p0 = count_by_priority(0)
+    if p0 != 3 {
+        panic("pe_ipc_mqueue FAIL [count_by_priority(0)] expected=3 got=" + to_string(p0))
+    }
+    let p15 = count_by_priority(15)
+    if p15 != 1 {
+        panic("pe_ipc_mqueue FAIL [count_by_priority(15)] expected=1 got=" + to_string(p15))
+    }
+    let p31 = count_by_priority(31)
+    if p31 != 1 {
+        panic("pe_ipc_mqueue FAIL [count_by_priority(31)] expected=1 got=" + to_string(p31))
+    }
+    let p99 = count_by_priority(99)
+    if p99 != 0 {
+        panic("pe_ipc_mqueue FAIL [count_by_priority(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 6. success_count = 4
+    let sc = success_count()
+    if sc != 4 {
+        panic("pe_ipc_mqueue FAIL [success_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 7. msg_size_at sanity
+    let s1 = msg_size_at(125001)
+    if s1 != 512 {
+        panic("pe_ipc_mqueue FAIL [msg_size_at(125001)] expected=512 got=" + to_string(s1))
+    }
+    let s4 = msg_size_at(125004)
+    if s4 != 2048 {
+        panic("pe_ipc_mqueue FAIL [msg_size_at(125004)] expected=2048 got=" + to_string(s4))
+    }
+    let s_miss = msg_size_at(9999)
+    if s_miss != 0 {
+        panic("pe_ipc_mqueue FAIL [msg_size_at(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pimq_stats() = [5, 3968, 4, 3]
+    let s = pimq_stats()
+    if len(s) != 4 {
+        panic("pe_ipc_mqueue FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ipc_mqueue FAIL [stats mq_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3968 {
+        panic("pe_ipc_mqueue FAIL [stats total_size] expected=3968 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_ipc_mqueue FAIL [stats success_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_ipc_mqueue FAIL [stats count_priority(0)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_ipc_mqueue_stats",
+        "\"mq_count\":" + to_string(s[0])
+        + ",\"total_size\":" + to_string(s[1])
+        + ",\"success_count\":" + to_string(s[2])
+        + ",\"priority_normal\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ipc_mqueue FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pimq()
+    let s2 = pimq_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ipc_mqueue FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ipc_mqueue self_test PASS (msgs=" + to_string(s[0])
+        + ", size=" + to_string(s[1]) + ", success=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pimq_stats()
+            println("mq_count\t" + to_string(s[0]))
+            println("total_size\t" + to_string(s[1]))
+            println("success_count\t" + to_string(s[2]))
+            println("count_priority_normal\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("msg_size_at\t" + to_string(msg_size_at(mid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_mqueue.hexa size <msg_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let prio = to_int(a[3])
+                println("count_by_priority\t" + to_string(count_by_priority(prio)))
+                return
+            }
+            println("usage: hexa run pe_ipc_mqueue.hexa count <priority>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pimq()
+            println("cleaned: " + pimq_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pimq_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ipc_mqueue.hexa { self-test | stats | size <msg_id> | count <priority> | cleanup | dir }")
+}

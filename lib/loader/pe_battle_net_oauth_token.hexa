@@ -1,0 +1,423 @@
+// lib/loader/pe_battle_net_oauth_token.hexa — cycle 82 bonus
+//
+// Battle.net OAuth2 token flow (own1 RFC6749 spec only):
+//   endpoints:
+//     - login.battle.net/oauth/authorize  → user consent + auth code (redirect)
+//     - login.battle.net/oauth/token      → POST exchange code → access_token + refresh_token
+//     - login.battle.net/oauth/token      → POST grant_type=refresh_token → new access_token
+//     - login.battle.net/oauth/revoke     → token revocation
+//     - login.battle.net/oauth/device     → device_code grant (CLI / agent)
+//   bearer:
+//     'Authorization: Bearer <access_token>' header
+//     consumed by:
+//       - us.api.blizzard.com/sc2/profile (StarCraft II)
+//       - us.api.blizzard.com/d3/data     (Diablo III)
+//       - us.api.blizzard.com/wow         (WoW)
+//       - eu.api.blizzard.com / kr.api.blizzard.com (region별 host)
+//   token lifetime:
+//     - access_token  ≈ 24h (86400s) 일반적
+//     - refresh_token 더 길거나 무기한 (revoke 시 invalidate)
+//   own1: Battle.net OAuth2 RFC6749 spec only — third-party Wine/CrossOver/Whisky 인용 X
+//
+// op_kind code:
+//   1 = oauth_authorize     — /oauth/authorize redirect (user consent)
+//   2 = token_exchange      — /oauth/token (code → access_token + refresh_token)
+//   3 = bearer_attach       — Authorization: Bearer <token> header attach (API call)
+//   4 = token_refresh       — /oauth/token grant_type=refresh_token
+//   5 = token_revoke        — /oauth/revoke
+//   6 = device_code_grant   — /oauth/device (device_code grant flow)
+//
+// 보안: credential / token 실값 작성 금지 — token_size_bytes 는 length only.
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t token_lifetime_sec<int> \t token_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pbnot_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_battle_net_oauth_token"
+}
+
+fn pbnot_ops_path() -> str {
+    return pbnot_dir() + "/ops.tsv"
+}
+
+fn pbnot_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pbnot_dir() + "'")
+}
+
+fn cleanup_pbnot() -> void {
+    pbnot_ensure_dir()
+    let _ = exec("rm -f '" + pbnot_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pbnot_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbnot_append_row(path: str, row: str) -> void {
+    pbnot_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: OAuth2 op 1 건 기록 (token 실값 X — length only) ───
+fn record_op(op_id: int, op_kind: int, token_lifetime_sec: int, token_size_bytes: int) -> void {
+    if op_id <= 0 {
+        panic("pe_battle_net_oauth_token FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_battle_net_oauth_token FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 6 {
+        panic("pe_battle_net_oauth_token FAIL [record_op] expected=op_kind<=6 got=" + to_string(op_kind))
+    }
+    if token_lifetime_sec < 0 {
+        panic("pe_battle_net_oauth_token FAIL [record_op] expected=token_lifetime_sec>=0 got=" + to_string(token_lifetime_sec))
+    }
+    if token_size_bytes < 0 {
+        panic("pe_battle_net_oauth_token FAIL [record_op] expected=token_size_bytes>=0 got=" + to_string(token_size_bytes))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(token_lifetime_sec) + "\t" + to_string(token_size_bytes) + "\n"
+    pbnot_append_row(pbnot_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pbnot_read_table(pbnot_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(op_kind: int) -> int {
+    let t = pbnot_read_table(pbnot_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == op_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_token_lifetime_sec: 모든 op token_lifetime_sec 합 ───
+fn total_token_lifetime_sec() -> int {
+    let t = pbnot_read_table(pbnot_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_token_size_bytes: 모든 op token_size_bytes 합 ───
+fn total_token_size_bytes() -> int {
+    let t = pbnot_read_table(pbnot_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── refresh_count: op_kind=4 (token_refresh) op 수 ───
+fn refresh_count() -> int {
+    return count_by_op_kind(4)
+}
+
+// ─── op_token_size: 특정 op_id 의 token_size_bytes (없으면 0) ───
+fn op_token_size(op_id: int) -> int {
+    let t = pbnot_read_table(pbnot_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pbnot_stats: [op_count, total_token_lifetime_sec, total_token_size_bytes, refresh_count] ───
+fn pbnot_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_token_lifetime_sec())
+    out.push(total_token_size_bytes())
+    out.push(refresh_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pbnot-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pbnot()
+
+    // 2. record 6 OAuth2 ops covering ≥4 op_kinds
+    //    op_kinds: oauth_authorize(1), token_exchange(2), bearer_attach(3),
+    //              token_refresh(4), token_revoke(5), device_code_grant(6)
+    //    NOTE: token 실값 작성 금지 — token_size_bytes 는 length only.
+    record_op(820101, 1, 0, 0)              // /oauth/authorize redirect (no token yet)
+    r0_emit("pe_battle_net_oauth_token_record",
+        "\"op_id\":820101,\"op_kind\":1,\"token_lifetime_sec\":0,\"token_size_bytes\":0,\"target\":\"oauth_authorize\"")
+
+    record_op(820102, 2, 86400, 1024)       // /oauth/token exchange → 24h access_token
+    r0_emit("pe_battle_net_oauth_token_record",
+        "\"op_id\":820102,\"op_kind\":2,\"token_lifetime_sec\":86400,\"token_size_bytes\":1024,\"target\":\"token_exchange\"")
+
+    record_op(820103, 3, 86400, 1024)       // Bearer attach → us.api.blizzard.com/sc2/profile
+    r0_emit("pe_battle_net_oauth_token_record",
+        "\"op_id\":820103,\"op_kind\":3,\"token_lifetime_sec\":86400,\"token_size_bytes\":1024,\"target\":\"bearer_attach/sc2_profile\"")
+
+    record_op(820104, 4, 86400, 1024)       // token_refresh #1
+    r0_emit("pe_battle_net_oauth_token_record",
+        "\"op_id\":820104,\"op_kind\":4,\"token_lifetime_sec\":86400,\"token_size_bytes\":1024,\"target\":\"token_refresh\"")
+
+    record_op(820105, 4, 86400, 1024)       // token_refresh #2
+    r0_emit("pe_battle_net_oauth_token_record",
+        "\"op_id\":820105,\"op_kind\":4,\"token_lifetime_sec\":86400,\"token_size_bytes\":1024,\"target\":\"token_refresh\"")
+
+    record_op(820106, 5, 0, 1024)           // /oauth/revoke
+    r0_emit("pe_battle_net_oauth_token_record",
+        "\"op_id\":820106,\"op_kind\":5,\"token_lifetime_sec\":0,\"token_size_bytes\":1024,\"target\":\"token_revoke\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_battle_net_oauth_token FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_token_lifetime_sec = 0 + 86400 + 86400 + 86400 + 86400 + 0 = 345600
+    let tl = total_token_lifetime_sec()
+    if tl != 345600 {
+        panic("pe_battle_net_oauth_token FAIL [total_token_lifetime_sec] expected=345600 got=" + to_string(tl))
+    }
+
+    // 5. total_token_size_bytes = 0 + 1024 + 1024 + 1024 + 1024 + 1024 = 5120
+    let ts = total_token_size_bytes()
+    if ts != 5120 {
+        panic("pe_battle_net_oauth_token FAIL [total_token_size_bytes] expected=5120 got=" + to_string(ts))
+    }
+
+    // 6. count_by_op_kind sanity (≥4 distinct kinds: 1,2,3,4,5)
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 2 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(4)] expected=2 got=" + to_string(k4))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 1 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_op_kind(6)
+    if k6 != 0 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(6)] expected=0 got=" + to_string(k6))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_battle_net_oauth_token FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. refresh_count = 2
+    let rc = refresh_count()
+    if rc != 2 {
+        panic("pe_battle_net_oauth_token FAIL [refresh_count] expected=2 got=" + to_string(rc))
+    }
+
+    // 8. op_token_size sanity
+    let sz_103 = op_token_size(820103)
+    if sz_103 != 1024 {
+        panic("pe_battle_net_oauth_token FAIL [op_token_size(820103)] expected=1024 got=" + to_string(sz_103))
+    }
+    let sz_101 = op_token_size(820101)
+    if sz_101 != 0 {
+        panic("pe_battle_net_oauth_token FAIL [op_token_size(820101)] expected=0 got=" + to_string(sz_101))
+    }
+    let sz_miss = op_token_size(9999)
+    if sz_miss != 0 {
+        panic("pe_battle_net_oauth_token FAIL [op_token_size(9999)] expected=0 got=" + to_string(sz_miss))
+    }
+
+    // 9. pbnot_stats() = [6, 345600, 5120, 2]
+    let s = pbnot_stats()
+    if len(s) != 4 {
+        panic("pe_battle_net_oauth_token FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_battle_net_oauth_token FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 345600 {
+        panic("pe_battle_net_oauth_token FAIL [stats total_token_lifetime_sec] expected=345600 got=" + to_string(s[1]))
+    }
+    if s[2] != 5120 {
+        panic("pe_battle_net_oauth_token FAIL [stats total_token_size_bytes] expected=5120 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_battle_net_oauth_token FAIL [stats refresh_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_battle_net_oauth_token_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_token_lifetime_sec\":" + to_string(s[1])
+        + ",\"total_token_size_bytes\":" + to_string(s[2])
+        + ",\"refresh_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_battle_net_oauth_token FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pbnot()
+    let s2 = pbnot_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_battle_net_oauth_token FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battle_net_oauth_token self_test PASS (ops=" + to_string(s[0])
+        + ", token_lifetime_sec=" + to_string(s[1]) + ", token_size_bytes=" + to_string(s[2])
+        + ", refresh=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pbnot_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_token_lifetime_sec\t" + to_string(s[1]))
+            println("total_token_size_bytes\t" + to_string(s[2]))
+            println("refresh_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "token-size" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_token_size\t" + to_string(op_token_size(oid)))
+                return
+            }
+            println("usage: hexa run pe_battle_net_oauth_token.hexa token-size <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let val = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                return
+            }
+            println("usage: hexa run pe_battle_net_oauth_token.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pbnot()
+            println("cleaned: " + pbnot_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pbnot_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_battle_net_oauth_token.hexa { self-test | stats | token-size <op_id> | count <op_kind> | cleanup | dir }")
+}

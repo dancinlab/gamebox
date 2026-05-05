@@ -1,0 +1,404 @@
+// lib/loader/pe_message_table.hexa — cycle 79 Win32 FormatMessageW system message resource lookup tracker
+//
+// Win32 FormatMessageW: NTSTATUS / Win32 error code → human-readable string
+// (system message table 또는 module 의 message resource 에서 lookup). own helper
+// 가 dwFlags + lpSource + dwMessageId + buffer 를 받아 result_chars(LPWSTR len)
+// 를 회신 — 본 module 은 그 lookup metric 을 telemetry 로 기록.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 lookup tracker — 실 FormatMessageW() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// source_kind code (FormatMessageW dwFlags 주요 source bit):
+//   1 = system           (FORMAT_MESSAGE_FROM_SYSTEM)
+//   2 = hmodule          (FORMAT_MESSAGE_FROM_HMODULE)
+//   3 = string           (FORMAT_MESSAGE_FROM_STRING)
+//   4 = allocate_buffer  (FORMAT_MESSAGE_ALLOCATE_BUFFER)
+//   5 = ignore_inserts   (FORMAT_MESSAGE_IGNORE_INSERTS)
+//
+// persist schema (TSV — lookups.tsv):
+//   lookup_id<int> \t source_kind<int> \t message_id<int> \t result_chars<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_message_table"
+}
+
+fn pmt_lookups_path() -> str {
+    return pmt_dir() + "/lookups.tsv"
+}
+
+fn pmt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmt_dir() + "'")
+}
+
+fn cleanup_pmt() -> void {
+    pmt_ensure_dir()
+    let _ = exec("rm -f '" + pmt_lookups_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmt_append_row(path: str, row: str) -> void {
+    pmt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_lookup: FormatMessageW lookup 1 건 기록 ───
+fn record_lookup(lookup_id: int, source_kind: int, message_id: int, result_chars: int) -> void {
+    if lookup_id <= 0 {
+        panic("pe_message_table FAIL [record_lookup] expected=lookup_id>0 got=" + to_string(lookup_id))
+    }
+    if source_kind < 1 {
+        panic("pe_message_table FAIL [record_lookup] expected=source_kind>=1 got=" + to_string(source_kind))
+    }
+    if source_kind > 5 {
+        panic("pe_message_table FAIL [record_lookup] expected=source_kind<=5 got=" + to_string(source_kind))
+    }
+    if message_id < 0 {
+        panic("pe_message_table FAIL [record_lookup] expected=message_id>=0 got=" + to_string(message_id))
+    }
+    if result_chars < 0 {
+        panic("pe_message_table FAIL [record_lookup] expected=result_chars>=0 got=" + to_string(result_chars))
+    }
+    let row = to_string(lookup_id) + "\t" + to_string(source_kind)
+        + "\t" + to_string(message_id) + "\t" + to_string(result_chars) + "\n"
+    pmt_append_row(pmt_lookups_path(), row)
+}
+
+// ─── lookup_count: total lookup 수 ───
+fn lookup_count() -> int {
+    let t = pmt_read_table(pmt_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_result_chars: 모든 lookup result_chars 합 ───
+fn total_result_chars() -> int {
+    let t = pmt_read_table(pmt_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_source_kind: 특정 source_kind 의 lookup 수 ───
+fn count_by_source_kind(kind: int) -> int {
+    let t = pmt_read_table(pmt_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_message_ids: 고유 message_id 수 ───
+fn distinct_message_ids() -> int {
+    let t = pmt_read_table(pmt_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let mid = to_int(parts[2])
+                let mut found = false
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == mid {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if found == false {
+                    seen.push(mid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── lookup_result_chars: 특정 lookup_id 의 result_chars (없으면 0) ───
+fn lookup_result_chars(lookup_id: int) -> int {
+    let t = pmt_read_table(pmt_lookups_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == lookup_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pmt_stats: [lookup_count, total_result_chars, distinct_message_ids, count_by_source_kind(1)] ───
+fn pmt_stats() -> array {
+    let mut out = []
+    out.push(lookup_count())
+    out.push(total_result_chars())
+    out.push(distinct_message_ids())
+    out.push(count_by_source_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmt()
+
+    // 2. record 5 lookups across ≥3 source_kinds (deterministic synthetic)
+    //    NTSTATUS 0xC0000005 (ACCESS_VIOLATION) → "Invalid access to memory location." (≈33 chars)
+    record_lookup(120001, 1, 3221225477, 33)
+    r0_emit("pe_message_table_record",
+        "\"lookup_id\":120001,\"source_kind\":1,\"message_id\":3221225477,\"result_chars\":33,\"target\":\"system\"")
+
+    //    Win32 ERROR_FILE_NOT_FOUND (2) → "The system cannot find the file specified." (≈42)
+    record_lookup(120002, 1, 2, 42)
+    r0_emit("pe_message_table_record",
+        "\"lookup_id\":120002,\"source_kind\":1,\"message_id\":2,\"result_chars\":42,\"target\":\"system\"")
+
+    //    HMODULE custom resource lookup (e.g., kernel32.dll message id 1234)
+    record_lookup(120003, 2, 1234, 80)
+    r0_emit("pe_message_table_record",
+        "\"lookup_id\":120003,\"source_kind\":2,\"message_id\":1234,\"result_chars\":80,\"target\":\"hmodule\"")
+
+    //    inline string format (no resource), message_id ignored
+    record_lookup(120004, 3, 0, 16)
+    r0_emit("pe_message_table_record",
+        "\"lookup_id\":120004,\"source_kind\":3,\"message_id\":0,\"result_chars\":16,\"target\":\"string\"")
+
+    //    allocate_buffer + ignore_inserts combined → category 5 (ignore_inserts) tracked
+    record_lookup(120005, 5, 2, 42)
+    r0_emit("pe_message_table_record",
+        "\"lookup_id\":120005,\"source_kind\":5,\"message_id\":2,\"result_chars\":42,\"target\":\"ignore_inserts\"")
+
+    // 3. lookup_count = 5
+    let c = lookup_count()
+    if c != 5 {
+        panic("pe_message_table FAIL [lookup_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_result_chars = 33 + 42 + 80 + 16 + 42 = 213
+    let trc = total_result_chars()
+    if trc != 213 {
+        panic("pe_message_table FAIL [total_result_chars] expected=213 got=" + to_string(trc))
+    }
+
+    // 5. count_by_source_kind sanity
+    let k1 = count_by_source_kind(1)
+    if k1 != 2 {
+        panic("pe_message_table FAIL [count_by_source_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_source_kind(2)
+    if k2 != 1 {
+        panic("pe_message_table FAIL [count_by_source_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_source_kind(3)
+    if k3 != 1 {
+        panic("pe_message_table FAIL [count_by_source_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_source_kind(4)
+    if k4 != 0 {
+        panic("pe_message_table FAIL [count_by_source_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k5 = count_by_source_kind(5)
+    if k5 != 1 {
+        panic("pe_message_table FAIL [count_by_source_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_source_kind(99)
+    if k99 != 0 {
+        panic("pe_message_table FAIL [count_by_source_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. distinct_message_ids = {3221225477, 2, 1234, 0} = 4 (120002 + 120005 share id=2)
+    let dm = distinct_message_ids()
+    if dm != 4 {
+        panic("pe_message_table FAIL [distinct_message_ids] expected=4 got=" + to_string(dm))
+    }
+
+    // 7. lookup_result_chars sanity
+    let r3 = lookup_result_chars(120003)
+    if r3 != 80 {
+        panic("pe_message_table FAIL [lookup_result_chars(120003)] expected=80 got=" + to_string(r3))
+    }
+    let r4 = lookup_result_chars(120004)
+    if r4 != 16 {
+        panic("pe_message_table FAIL [lookup_result_chars(120004)] expected=16 got=" + to_string(r4))
+    }
+    let r_miss = lookup_result_chars(9999)
+    if r_miss != 0 {
+        panic("pe_message_table FAIL [lookup_result_chars(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 8. pmt_stats() = [5, 213, 4, 2]
+    let s = pmt_stats()
+    if len(s) != 4 {
+        panic("pe_message_table FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_message_table FAIL [stats lookup_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 213 {
+        panic("pe_message_table FAIL [stats total_result_chars] expected=213 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_message_table FAIL [stats distinct_message_ids] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_message_table FAIL [stats count_kind(system)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_message_table_stats",
+        "\"lookup_count\":" + to_string(s[0])
+        + ",\"total_result_chars\":" + to_string(s[1])
+        + ",\"distinct_message_ids\":" + to_string(s[2])
+        + ",\"kind_system\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_message_table FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pmt()
+    let s2 = pmt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_message_table FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_message_table self_test PASS (lookups=" + to_string(s[0])
+        + ", chars=" + to_string(s[1]) + ", distinct_msg=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmt_stats()
+            println("lookup_count\t" + to_string(s[0]))
+            println("total_result_chars\t" + to_string(s[1]))
+            println("distinct_message_ids\t" + to_string(s[2]))
+            println("count_kind_system\t" + to_string(s[3]))
+            return
+        }
+        if sub == "chars" {
+            if len(a) >= 4 {
+                let lid = to_int(a[3])
+                println("lookup_result_chars\t" + to_string(lookup_result_chars(lid)))
+                return
+            }
+            println("usage: hexa run pe_message_table.hexa chars <lookup_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_source_kind\t" + to_string(count_by_source_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_message_table.hexa count <source_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmt()
+            println("cleaned: " + pmt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_message_table.hexa { self-test | stats | chars <lookup_id> | count <source_kind> | cleanup | dir }")
+}

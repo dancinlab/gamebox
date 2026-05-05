@@ -1,0 +1,406 @@
+// lib/loader/pe_iphlpapi_adapter.hexa — Win32 IPHLPAPI adapter enumeration bridge
+//
+// Win32 IPHLPAPI GetAdaptersAddresses / GetIfTable → BSD getifaddrs telemetry
+// bridge. Game/anticheat code paths frequently enumerate network adapters for
+// fingerprint binding (MAC, IPv4 set, link kind, operational state). 본 module
+// 은 query 단위 metadata 만 기록 — 실 PE → BSD 변환 호출은 stage6.
+//
+// own 1 enforcement: Wine / CrossOver / Whisky / community shim 0 줄.
+//   본 module 은 adapter enumeration tracker — 실 GetAdaptersAddresses /
+//   getifaddrs 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe
+//   + panic 형식 (pe_iphlpapi_adapter FAIL [section] expected=... got=...).
+//
+// interface_kind code:
+//   1 = ethernet
+//   2 = wifi
+//   3 = loopback
+//   4 = ppp
+//   5 = tunnel
+//
+// operational_status code:
+//   1 = up
+//   2 = down
+//   3 = testing
+//   4 = unknown
+//
+// persist schema (TSV — queries.tsv):
+//   query_id<int> \t interface_kind<int> \t operational_status<int> \t ipv4_address_count<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pia_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_iphlpapi_adapter"
+}
+
+fn pia_queries_path() -> str {
+    return pia_dir() + "/queries.tsv"
+}
+
+fn pia_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pia_dir() + "'")
+}
+
+fn cleanup_pia() -> void {
+    pia_ensure_dir()
+    let _ = exec("rm -f '" + pia_queries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pia_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pia_append_row(path: str, row: str) -> void {
+    pia_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_query: adapter enumeration query 1 건 기록 ───
+fn record_query(query_id: int, interface_kind: int, operational_status: int, ipv4_address_count: int) -> void {
+    if query_id <= 0 {
+        panic("pe_iphlpapi_adapter FAIL [record_query] expected=query_id>0 got=" + to_string(query_id))
+    }
+    if interface_kind < 1 {
+        panic("pe_iphlpapi_adapter FAIL [record_query] expected=interface_kind>=1 got=" + to_string(interface_kind))
+    }
+    if interface_kind > 5 {
+        panic("pe_iphlpapi_adapter FAIL [record_query] expected=interface_kind<=5 got=" + to_string(interface_kind))
+    }
+    if operational_status < 1 {
+        panic("pe_iphlpapi_adapter FAIL [record_query] expected=operational_status>=1 got=" + to_string(operational_status))
+    }
+    if operational_status > 4 {
+        panic("pe_iphlpapi_adapter FAIL [record_query] expected=operational_status<=4 got=" + to_string(operational_status))
+    }
+    if ipv4_address_count < 0 {
+        panic("pe_iphlpapi_adapter FAIL [record_query] expected=ipv4_address_count>=0 got=" + to_string(ipv4_address_count))
+    }
+    let row = to_string(query_id) + "\t" + to_string(interface_kind)
+        + "\t" + to_string(operational_status) + "\t" + to_string(ipv4_address_count) + "\n"
+    pia_append_row(pia_queries_path(), row)
+}
+
+// ─── query_count: total query 수 ───
+fn query_count() -> int {
+    let t = pia_read_table(pia_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_ipv4_addresses: 모든 query ipv4_address_count 합 ───
+fn total_ipv4_addresses() -> int {
+    let t = pia_read_table(pia_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_interface_kind: 특정 interface_kind 의 query 수 ───
+fn count_by_interface_kind(kind: int) -> int {
+    let t = pia_read_table(pia_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── up_count: operational_status == 1 인 query 수 ───
+fn up_count() -> int {
+    let t = pia_read_table(pia_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── query_ipv4_count: 특정 query_id 의 ipv4_address_count (없으면 0) ───
+fn query_ipv4_count(query_id: int) -> int {
+    let t = pia_read_table(pia_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == query_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pia_stats: [query_count, total_ipv4_addresses, up_count, count_by_interface_kind(1)] ───
+fn pia_stats() -> array {
+    let mut out = []
+    out.push(query_count())
+    out.push(total_ipv4_addresses())
+    out.push(up_count())
+    out.push(count_by_interface_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pia-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pia()
+
+    // 2. record 5 queries — ≥3 interface_kinds, ≥3 up
+    //    q1 ethernet up   2 ipv4
+    //    q2 wifi     up   1 ipv4
+    //    q3 loopback up   1 ipv4
+    //    q4 ethernet down 0 ipv4
+    //    q5 tunnel   unknown 1 ipv4
+    record_query(120001, 1, 1, 2)
+    r0_emit("pe_iphlpapi_adapter_record",
+        "\"query_id\":120001,\"interface_kind\":1,\"operational_status\":1,\"ipv4_address_count\":2,\"target\":\"ethernet_up\"")
+
+    record_query(120002, 2, 1, 1)
+    r0_emit("pe_iphlpapi_adapter_record",
+        "\"query_id\":120002,\"interface_kind\":2,\"operational_status\":1,\"ipv4_address_count\":1,\"target\":\"wifi_up\"")
+
+    record_query(120003, 3, 1, 1)
+    r0_emit("pe_iphlpapi_adapter_record",
+        "\"query_id\":120003,\"interface_kind\":3,\"operational_status\":1,\"ipv4_address_count\":1,\"target\":\"loopback_up\"")
+
+    record_query(120004, 1, 2, 0)
+    r0_emit("pe_iphlpapi_adapter_record",
+        "\"query_id\":120004,\"interface_kind\":1,\"operational_status\":2,\"ipv4_address_count\":0,\"target\":\"ethernet_down\"")
+
+    record_query(120005, 5, 4, 1)
+    r0_emit("pe_iphlpapi_adapter_record",
+        "\"query_id\":120005,\"interface_kind\":5,\"operational_status\":4,\"ipv4_address_count\":1,\"target\":\"tunnel_unknown\"")
+
+    // 3. query_count = 5
+    let c = query_count()
+    if c != 5 {
+        panic("pe_iphlpapi_adapter FAIL [query_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_ipv4_addresses = 5 (2+1+1+0+1)
+    let tip = total_ipv4_addresses()
+    if tip != 5 {
+        panic("pe_iphlpapi_adapter FAIL [total_ipv4_addresses] expected=5 got=" + to_string(tip))
+    }
+
+    // 5. count_by_interface_kind sanity — ethernet=2, wifi=1, loopback=1, ppp=0, tunnel=1
+    let k1 = count_by_interface_kind(1)
+    if k1 != 2 {
+        panic("pe_iphlpapi_adapter FAIL [count_by_interface_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_interface_kind(2)
+    if k2 != 1 {
+        panic("pe_iphlpapi_adapter FAIL [count_by_interface_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_interface_kind(3)
+    if k3 != 1 {
+        panic("pe_iphlpapi_adapter FAIL [count_by_interface_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_interface_kind(4)
+    if k4 != 0 {
+        panic("pe_iphlpapi_adapter FAIL [count_by_interface_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k5 = count_by_interface_kind(5)
+    if k5 != 1 {
+        panic("pe_iphlpapi_adapter FAIL [count_by_interface_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_interface_kind(99)
+    if k99 != 0 {
+        panic("pe_iphlpapi_adapter FAIL [count_by_interface_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. up_count = 3 (q1, q2, q3)
+    let uc = up_count()
+    if uc != 3 {
+        panic("pe_iphlpapi_adapter FAIL [up_count] expected=3 got=" + to_string(uc))
+    }
+
+    // 7. query_ipv4_count sanity
+    let q1 = query_ipv4_count(120001)
+    if q1 != 2 {
+        panic("pe_iphlpapi_adapter FAIL [query_ipv4_count(120001)] expected=2 got=" + to_string(q1))
+    }
+    let q4 = query_ipv4_count(120004)
+    if q4 != 0 {
+        panic("pe_iphlpapi_adapter FAIL [query_ipv4_count(120004)] expected=0 got=" + to_string(q4))
+    }
+    let q_miss = query_ipv4_count(9999)
+    if q_miss != 0 {
+        panic("pe_iphlpapi_adapter FAIL [query_ipv4_count(9999)] expected=0 got=" + to_string(q_miss))
+    }
+
+    // 8. pia_stats() = [5, 5, 3, 2]
+    let s = pia_stats()
+    if len(s) != 4 {
+        panic("pe_iphlpapi_adapter FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_iphlpapi_adapter FAIL [stats query_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 5 {
+        panic("pe_iphlpapi_adapter FAIL [stats total_ipv4_addresses] expected=5 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_iphlpapi_adapter FAIL [stats up_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_iphlpapi_adapter FAIL [stats kind_ethernet] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_iphlpapi_adapter_stats",
+        "\"query_count\":" + to_string(s[0])
+        + ",\"total_ipv4_addresses\":" + to_string(s[1])
+        + ",\"up_count\":" + to_string(s[2])
+        + ",\"kind_ethernet\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_iphlpapi_adapter FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pia()
+    let s2 = pia_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_iphlpapi_adapter FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_iphlpapi_adapter self_test PASS (queries=" + to_string(s[0])
+        + ", ipv4=" + to_string(s[1]) + ", up=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pia_stats()
+            println("query_count\t" + to_string(s[0]))
+            println("total_ipv4_addresses\t" + to_string(s[1]))
+            println("up_count\t" + to_string(s[2]))
+            println("kind_ethernet\t" + to_string(s[3]))
+            return
+        }
+        if sub == "ipv4" {
+            if len(a) >= 4 {
+                let qid = to_int(a[3])
+                println("query_ipv4_count\t" + to_string(query_ipv4_count(qid)))
+                return
+            }
+            println("usage: hexa run pe_iphlpapi_adapter.hexa ipv4 <query_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_interface_kind\t" + to_string(count_by_interface_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_iphlpapi_adapter.hexa count <interface_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pia()
+            println("cleaned: " + pia_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pia_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_iphlpapi_adapter.hexa { self-test | stats | ipv4 <query_id> | count <interface_kind> | cleanup | dir }")
+}

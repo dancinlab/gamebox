@@ -1,0 +1,486 @@
+// lib/loader/pe_d3d11_constant_buffer_real.hexa — D3D11 constant buffer Map/Unmap + VS/PSSetConstantBuffers tracker
+//
+// D3D11 constant buffer → Metal argument buffer / setVertexBytes:
+//   Map (D3D11_MAP_WRITE_DISCARD) → MTLBuffer contents + bridged write
+//   Map (D3D11_MAP_WRITE_NO_OVERWRITE) → MTLBuffer contents (manual sync)
+//   VSSetConstantBuffers / PSSetConstantBuffers → MTLRenderCommandEncoder setVertexBuffer/setFragmentBuffer
+//   slot_index 0..14 (D3D11 limit) → Metal binding index 0..30
+//   UpdateSubresource → didModifyRange: (Managed mode buffer)
+//   D4 의 PER_FRAME / PER_OBJECT / VIEWPROJ cb 매핑 hot path
+// own1: D3DMetal + MSDN + Metal SDK only
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 cb op tracker — 실 ID3D11DeviceContext::Map / VSSetConstantBuffers
+//   호출은 stage2 native helper(D3DMetal binary 위임) 에서 처리.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = map_write_discard       (D3D11_MAP_WRITE_DISCARD)
+//   2 = map_write_no_overwrite  (D3D11_MAP_WRITE_NO_OVERWRITE)
+//   3 = unmap                   (Unmap)
+//   4 = vs_set                  (VSSetConstantBuffers)
+//   5 = ps_set                  (PSSetConstantBuffers)
+//   6 = cs_set                  (CSSetConstantBuffers)
+//   7 = update_subresource      (UpdateSubresource)
+//
+// slot_index: 0..14 (D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t slot_index<int> \t size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdcb_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d11_constant_buffer_real"
+}
+
+fn pdcb_ops_path() -> str {
+    return pdcb_dir() + "/ops.tsv"
+}
+
+fn pdcb_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdcb_dir() + "'")
+}
+
+fn cleanup_pdcb() -> void {
+    pdcb_ensure_dir()
+    let _ = exec("rm -f '" + pdcb_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdcb_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdcb_append_row(path: str, row: str) -> void {
+    pdcb_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: cb op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, slot_index: int, size_bytes: int) -> void {
+    if op_id <= 0 {
+        panic("pe_d3d11_constant_buffer_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 7 {
+        panic("pe_d3d11_constant_buffer_real FAIL [record_op] expected=op_kind<=7 got=" + to_string(op_kind))
+    }
+    if slot_index < 0 {
+        panic("pe_d3d11_constant_buffer_real FAIL [record_op] expected=slot_index>=0 got=" + to_string(slot_index))
+    }
+    if slot_index > 14 {
+        panic("pe_d3d11_constant_buffer_real FAIL [record_op] expected=slot_index<=14 got=" + to_string(slot_index))
+    }
+    if size_bytes < 0 {
+        panic("pe_d3d11_constant_buffer_real FAIL [record_op] expected=size_bytes>=0 got=" + to_string(size_bytes))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(slot_index) + "\t" + to_string(size_bytes) + "\n"
+    pdcb_append_row(pdcb_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pdcb_read_table(pdcb_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pdcb_read_table(pdcb_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_bytes: 모든 op size_bytes 합 ───
+fn total_size_bytes() -> int {
+    let t = pdcb_read_table(pdcb_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── distinct_slots: 사용된 distinct slot_index 수 ───
+fn distinct_slots() -> int {
+    let t = pdcb_read_table(pdcb_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    // slot_index 0..14 → fixed 15 slots
+    let mut seen0 = 0
+    let mut seen1 = 0
+    let mut seen2 = 0
+    let mut seen3 = 0
+    let mut seen4 = 0
+    let mut seen5 = 0
+    let mut seen6 = 0
+    let mut seen7 = 0
+    let mut seen8 = 0
+    let mut seen9 = 0
+    let mut seen10 = 0
+    let mut seen11 = 0
+    let mut seen12 = 0
+    let mut seen13 = 0
+    let mut seen14 = 0
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let s = to_int(parts[2])
+                if s == 0 {
+                    seen0 = 1
+                }
+                if s == 1 {
+                    seen1 = 1
+                }
+                if s == 2 {
+                    seen2 = 1
+                }
+                if s == 3 {
+                    seen3 = 1
+                }
+                if s == 4 {
+                    seen4 = 1
+                }
+                if s == 5 {
+                    seen5 = 1
+                }
+                if s == 6 {
+                    seen6 = 1
+                }
+                if s == 7 {
+                    seen7 = 1
+                }
+                if s == 8 {
+                    seen8 = 1
+                }
+                if s == 9 {
+                    seen9 = 1
+                }
+                if s == 10 {
+                    seen10 = 1
+                }
+                if s == 11 {
+                    seen11 = 1
+                }
+                if s == 12 {
+                    seen12 = 1
+                }
+                if s == 13 {
+                    seen13 = 1
+                }
+                if s == 14 {
+                    seen14 = 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return seen0 + seen1 + seen2 + seen3 + seen4 + seen5 + seen6 + seen7
+        + seen8 + seen9 + seen10 + seen11 + seen12 + seen13 + seen14
+}
+
+// ─── map_unmap_balance: count(1) + count(2) - count(3) ───
+fn map_unmap_balance() -> int {
+    return count_by_op_kind(1) + count_by_op_kind(2) - count_by_op_kind(3)
+}
+
+// ─── op_size: 특정 op_id 의 size_bytes (없으면 0) ───
+fn op_size(op_id: int) -> int {
+    let t = pdcb_read_table(pdcb_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdcb_stats: [op_count, total_size_bytes, distinct_slots, map_unmap_balance] ───
+fn pdcb_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_size_bytes())
+    out.push(distinct_slots())
+    out.push(map_unmap_balance())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdcb-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdcb()
+
+    // 2. record 6 ops — 6 op_kinds (1,2,3,4,5,7), 3 distinct slots (0,1,2)
+    //    op1: map_write_discard slot=0 size=256 (PER_FRAME cb)
+    record_op(420001, 1, 0, 256)
+    r0_emit("pe_d3d11_constant_buffer_real_record",
+        "\"op_id\":420001,\"op_kind\":1,\"slot_index\":0,\"size_bytes\":256,\"target\":\"MTLBuffer.contents+memcpy\"")
+
+    //    op2: vs_set slot=0 size=256 (bind cb to vertex stage)
+    record_op(420002, 4, 0, 256)
+    r0_emit("pe_d3d11_constant_buffer_real_record",
+        "\"op_id\":420002,\"op_kind\":4,\"slot_index\":0,\"size_bytes\":256,\"target\":\"setVertexBuffer:offset:atIndex:\"")
+
+    //    op3: ps_set slot=1 size=512 (bind cb to fragment stage)
+    record_op(420003, 5, 1, 512)
+    r0_emit("pe_d3d11_constant_buffer_real_record",
+        "\"op_id\":420003,\"op_kind\":5,\"slot_index\":1,\"size_bytes\":512,\"target\":\"setFragmentBuffer:offset:atIndex:\"")
+
+    //    op4: map_write_no_overwrite slot=2 size=128 (PER_OBJECT cb)
+    record_op(420004, 2, 2, 128)
+    r0_emit("pe_d3d11_constant_buffer_real_record",
+        "\"op_id\":420004,\"op_kind\":2,\"slot_index\":2,\"size_bytes\":128,\"target\":\"MTLBuffer.contents+manual_sync\"")
+
+    //    op5: unmap slot=0 size=256 (close map session)
+    record_op(420005, 3, 0, 256)
+    r0_emit("pe_d3d11_constant_buffer_real_record",
+        "\"op_id\":420005,\"op_kind\":3,\"slot_index\":0,\"size_bytes\":256,\"target\":\"unmap_noop_metal\"")
+
+    //    op6: update_subresource slot=1 size=512 (VIEWPROJ cb full update)
+    record_op(420006, 7, 1, 512)
+    r0_emit("pe_d3d11_constant_buffer_real_record",
+        "\"op_id\":420006,\"op_kind\":7,\"slot_index\":1,\"size_bytes\":512,\"target\":\"didModifyRange:\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_d3d11_constant_buffer_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_size_bytes = 256+256+512+128+256+512 = 1920
+    let tb = total_size_bytes()
+    if tb != 1920 {
+        panic("pe_d3d11_constant_buffer_real FAIL [total_size_bytes] expected=1920 got=" + to_string(tb))
+    }
+
+    // 5. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_op_kind(5)
+    if k5 != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_op_kind(6)
+    if k6 != 0 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(6)] expected=0 got=" + to_string(k6))
+    }
+    let k7 = count_by_op_kind(7)
+    if k7 != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [count_by_op_kind(7)] expected=1 got=" + to_string(k7))
+    }
+
+    // 6. distinct_slots = 3 (slots 0,1,2)
+    let ds = distinct_slots()
+    if ds != 3 {
+        panic("pe_d3d11_constant_buffer_real FAIL [distinct_slots] expected=3 got=" + to_string(ds))
+    }
+
+    // 7. map_unmap_balance = 1 + 1 - 1 = 1
+    let mub = map_unmap_balance()
+    if mub != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [map_unmap_balance] expected=1 got=" + to_string(mub))
+    }
+
+    // 8. op_size sanity
+    let sz3 = op_size(420003)
+    if sz3 != 512 {
+        panic("pe_d3d11_constant_buffer_real FAIL [op_size(420003)] expected=512 got=" + to_string(sz3))
+    }
+    let sz4 = op_size(420004)
+    if sz4 != 128 {
+        panic("pe_d3d11_constant_buffer_real FAIL [op_size(420004)] expected=128 got=" + to_string(sz4))
+    }
+    let sz_miss = op_size(99999)
+    if sz_miss != 0 {
+        panic("pe_d3d11_constant_buffer_real FAIL [op_size(99999)] expected=0 got=" + to_string(sz_miss))
+    }
+
+    // 9. pdcb_stats() = [6, 1920, 3, 1]
+    let s = pdcb_stats()
+    if len(s) != 4 {
+        panic("pe_d3d11_constant_buffer_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d11_constant_buffer_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 1920 {
+        panic("pe_d3d11_constant_buffer_real FAIL [stats total_size_bytes] expected=1920 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_d3d11_constant_buffer_real FAIL [stats distinct_slots] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_d3d11_constant_buffer_real FAIL [stats map_unmap_balance] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d11_constant_buffer_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_size_bytes\":" + to_string(s[1])
+        + ",\"distinct_slots\":" + to_string(s[2])
+        + ",\"map_unmap_balance\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d11_constant_buffer_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdcb()
+    let s2 = pdcb_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d11_constant_buffer_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d11_constant_buffer_real self_test PASS (ops=" + to_string(s[0])
+        + ", bytes=" + to_string(s[1]) + ", slots=" + to_string(s[2])
+        + ", balance=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdcb_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_size_bytes\t" + to_string(s[1]))
+            println("distinct_slots\t" + to_string(s[2]))
+            println("map_unmap_balance\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_size\t" + to_string(op_size(oid)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_constant_buffer_real.hexa size <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_d3d11_constant_buffer_real.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdcb()
+            println("cleaned: " + pdcb_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdcb_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d11_constant_buffer_real.hexa { self-test | stats | size <op_id> | count <op_kind> | cleanup | dir }")
+}

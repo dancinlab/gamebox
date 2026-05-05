@@ -1,0 +1,495 @@
+// lib/loader/pe_d2r_specific_track.hexa — Diablo 2 Resurrected 전용 entry/loader 추적.
+//
+// D2R-specific launch chain (own2 자체 추적):
+//   process_attach     — D2R.exe entry, NT TLS_CALLBACK array fire
+//   d2_dll_load        — D2.dll, D2Game.dll, D2Common.dll, D2Win.dll, D2Multi.dll, D2Sound.dll
+//   mpq_init           — MPQ archive 로드 (Storm.dll, MPQ Archive Wrapper)
+//   net_layer_init     — Battle.net D2R Service IPC + DRM token
+//   ui_layer_init      — D2Win.dll resource decode + cinematic
+//   savegame_load      — character.d2s file 매핑
+//   first_frame        — D3D11 swapchain Present 첫 호출
+//   각 phase 가 R1/R2/R3/R5 의 sub-system 의존
+// own1: D2R 공개 정보 + binary observation 만. Wine D2R wrapper / community fix 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 D2R-specific phase tracker — 실 D2R.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 8 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = process_attach   (D2R.exe entry + TLS_CALLBACK)
+//   2 = d2_dll_load      (D2*.dll family load)
+//   3 = mpq_init         (Storm.dll MPQ archive init)
+//   4 = net_layer_init   (Battle.net IPC + DRM token)
+//   5 = ui_layer_init    (D2Win.dll resource + cinematic)
+//   6 = savegame_load    (character.d2s mmap)
+//   7 = first_frame      (D3D11 Present first call)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t dll_loaded<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdst_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d2r_specific_track"
+}
+
+fn pdst_steps_path() -> str {
+    return pdst_dir() + "/steps.tsv"
+}
+
+fn pdst_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdst_dir() + "'")
+}
+
+fn cleanup_pdst() -> void {
+    pdst_ensure_dir()
+    let _ = exec("rm -f '" + pdst_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdst_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdst_append_row(path: str, row: str) -> void {
+    pdst_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: D2R launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, dll_loaded: int, elevated: int) -> void {
+    if step_id <= 0 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 7 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=phase_kind<=7 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if elevated < 0 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_d2r_specific_track FAIL [record_step] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(elevated) + "\n"
+    pdst_append_row(pdst_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = pdst_read_table(pdst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pdst_read_table(pdst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = pdst_read_table(pdst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── elevated_count: elevated=1 인 step 수 ───
+fn elevated_count() -> int {
+    let t = pdst_read_table(pdst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── first_frame_reached: phase_kind=7 step 수 (≥1 이면 첫 프레임 도달) ───
+fn first_frame_reached() -> int {
+    return count_by_phase_kind(7)
+}
+
+// ─── step_dll_loaded: 특정 step_id 의 dll_loaded (없으면 0) ───
+fn step_dll_loaded(step_id: int) -> int {
+    let t = pdst_read_table(pdst_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdst_stats: [step_count, loaded_count, elevated_count, first_frame_reached, count_by_phase_kind(2)] ───
+fn pdst_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(elevated_count())
+    out.push(first_frame_reached())
+    out.push(count_by_phase_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdst-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdst()
+
+    // 2. record 7 steps — D2R launch chain 전체, phase_kind 1..7 각 1건
+    //   id 130001: phase 1 process_attach   dll=0 elev=1  (entry, TLS_CALLBACK fire)
+    //   id 130002: phase 2 d2_dll_load      dll=1 elev=0  (D2.dll family)
+    //   id 130003: phase 3 mpq_init         dll=1 elev=0  (Storm.dll MPQ wrapper)
+    //   id 130004: phase 4 net_layer_init   dll=1 elev=0  (Battle.net D2R IPC)
+    //   id 130005: phase 5 ui_layer_init    dll=1 elev=0  (D2Win resource decode)
+    //   id 130006: phase 6 savegame_load    dll=0 elev=0  (character.d2s mmap)
+    //   id 130007: phase 7 first_frame      dll=0 elev=0  (D3D11 Present first)
+    //   sums: steps=7, loaded=4, elevated=1, first_frame=1, count_kind(2)=1
+    record_step(130001, 1, 0, 1)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130001,\"phase_kind\":1,\"dll_loaded\":0,\"elevated\":1,\"target\":\"process_attach\"")
+
+    record_step(130002, 2, 1, 0)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130002,\"phase_kind\":2,\"dll_loaded\":1,\"elevated\":0,\"target\":\"d2_dll_load\"")
+
+    record_step(130003, 3, 1, 0)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130003,\"phase_kind\":3,\"dll_loaded\":1,\"elevated\":0,\"target\":\"mpq_init\"")
+
+    record_step(130004, 4, 1, 0)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130004,\"phase_kind\":4,\"dll_loaded\":1,\"elevated\":0,\"target\":\"net_layer_init\"")
+
+    record_step(130005, 5, 1, 0)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130005,\"phase_kind\":5,\"dll_loaded\":1,\"elevated\":0,\"target\":\"ui_layer_init\"")
+
+    record_step(130006, 6, 0, 0)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130006,\"phase_kind\":6,\"dll_loaded\":0,\"elevated\":0,\"target\":\"savegame_load\"")
+
+    record_step(130007, 7, 0, 0)
+    r0_emit("pe_d2r_specific_track_record",
+        "\"step_id\":130007,\"phase_kind\":7,\"dll_loaded\":0,\"elevated\":0,\"target\":\"first_frame\"")
+
+    // 3. step_count = 7
+    let c = step_count()
+    if c != 7 {
+        panic("pe_d2r_specific_track FAIL [step_count] expected=7 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..7 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_d2r_specific_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (130002..130005)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_d2r_specific_track FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. elevated_count = 1 (130001)
+    let ec = elevated_count()
+    if ec != 1 {
+        panic("pe_d2r_specific_track FAIL [elevated_count] expected=1 got=" + to_string(ec))
+    }
+
+    // 7. first_frame_reached = 1
+    let ff = first_frame_reached()
+    if ff != 1 {
+        panic("pe_d2r_specific_track FAIL [first_frame_reached] expected=1 got=" + to_string(ff))
+    }
+
+    // 8. step_dll_loaded sanity
+    let d2 = step_dll_loaded(130002)
+    if d2 != 1 {
+        panic("pe_d2r_specific_track FAIL [step_dll_loaded(130002)] expected=1 got=" + to_string(d2))
+    }
+    let d6 = step_dll_loaded(130006)
+    if d6 != 0 {
+        panic("pe_d2r_specific_track FAIL [step_dll_loaded(130006)] expected=0 got=" + to_string(d6))
+    }
+    let d_miss = step_dll_loaded(9999)
+    if d_miss != 0 {
+        panic("pe_d2r_specific_track FAIL [step_dll_loaded(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 9. pdst_stats() = [7, 4, 1, 1, 1]
+    let s = pdst_stats()
+    if len(s) != 5 {
+        panic("pe_d2r_specific_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 7 {
+        panic("pe_d2r_specific_track FAIL [stats step_count] expected=7 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_d2r_specific_track FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_d2r_specific_track FAIL [stats elevated_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_d2r_specific_track FAIL [stats first_frame_reached] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_d2r_specific_track FAIL [stats count_phase(2)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d2r_specific_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"elevated_count\":" + to_string(s[2])
+        + ",\"first_frame_reached\":" + to_string(s[3])
+        + ",\"count_d2_dll_load\":" + to_string(s[4]))
+
+    // 11. emit count >= 8 (7 records + 1 stats = 8)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 8 {
+        panic("pe_d2r_specific_track FAIL [r0 emit count] expected=>=8 got=" + to_string(emit_n))
+    }
+
+    // ─── synthetic D2R-specific surface tracker round-trip (cond.1 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track A 측 cond.2 round-trip 동급 patterning (synthetic only). cond.1 측 D2R.exe
+    // production binary smoke 는 Battle.net launcher install 측 외부 의존 — status `met`
+    // 승격 X (영구 partial). 본 surface tracker 는 evidence augment 만, 실 D2R.exe 비교 X.
+    //
+    // (a) D2R Battle.net agent detection markers — D2R.exe 측 Battle.net Agent 측 IPC marker:
+    //     bnet_agent_pipe_pattern  "\\\\.\\pipe\\Battle.net-*"
+    //     bnet_agent_port_lo       1120                  (Battle.net Agent localhost REST low)
+    //     bnet_agent_port_hi       1124                  (Battle.net Agent localhost REST hi)
+    //     bnet_token_marker_off    0x140050000           (synthetic D2R.exe RVA — DRM token slot)
+    //     marker_count             4
+    //
+    // (b) D2R-specific exception handlers — D2R.exe 측 .pdata SEH unwind / VEH:
+    //     pdata_section_off  0x14005A000                 (synthetic .pdata RVA)
+    //     runtime_function_count 12                       (RUNTIME_FUNCTION entries — synthetic)
+    //     veh_handler_count   2                            (AddVectoredExceptionHandler call sites)
+    //     seh_unwind_codes    8                            (UNWIND_CODE op count)
+    //
+    // (c) D2R-specific version stamp via VS_VERSIONINFO offset:
+    //     vs_versioninfo_rsrc_off 0x14006C000             (synthetic .rsrc → VS_VERSIONINFO)
+    //     vs_struct_signature     "0xFEEF04BD"            (VS_FFI_SIGNATURE marker)
+    //     d2r_file_version        "1.6.78327.0"            (synthetic D2R version string)
+    //     d2r_product_name        "Diablo II: Resurrected" (FileDescription / ProductName)
+    //
+    // round-trip = parse_surface(synthetic_bytes) → emit markers → re-serialize → byte-equal.
+    // hexa-native loop only — 실 D2R.exe 측 mmap X.
+    //
+    // 11-A. synthetic Battle.net agent detection markers emit
+    r0_emit("pe_d2r_specific_track_synthetic_bnet_marker",
+        "\"stage\":\"bnet_marker\",\"bnet_agent_pipe_pattern\":\"\\\\\\\\.\\\\pipe\\\\Battle.net-*\",\"bnet_agent_port_lo\":1120,\"bnet_agent_port_hi\":1124,\"bnet_token_marker_off\":\"0x140050000\",\"marker_count\":4,\"shim_kind\":\"synthetic_inline\",\"verdict\":\"marker_walk_simulated\",\"real_binary_gap\":\"D2R.exe Battle.net agent surface 실 검출 pending Battle.net install\"")
+    println("__D2R_TRACK__ PARTIAL bnet_marker")
+
+    // 11-B. synthetic D2R-specific exception handlers emit
+    r0_emit("pe_d2r_specific_track_synthetic_exception_handler",
+        "\"stage\":\"exception_handler\",\"pdata_section_off\":\"0x14005A000\",\"runtime_function_count\":12,\"veh_handler_count\":2,\"seh_unwind_codes\":8,\"shim_kind\":\"synthetic_inline\",\"verdict\":\"unwind_code_walk_simulated\",\"real_binary_gap\":\"D2R.exe .pdata 실 walk pending Battle.net install\"")
+    println("__D2R_TRACK__ PARTIAL exception_handler")
+
+    // 11-C. synthetic D2R-specific version stamp emit (VS_VERSIONINFO offset)
+    r0_emit("pe_d2r_specific_track_synthetic_version_stamp",
+        "\"stage\":\"version_stamp\",\"vs_versioninfo_rsrc_off\":\"0x14006C000\",\"vs_struct_signature\":\"0xFEEF04BD\",\"d2r_file_version\":\"1.6.78327.0\",\"d2r_product_name\":\"Diablo II: Resurrected\",\"shim_kind\":\"synthetic_inline\",\"verdict\":\"version_stamp_extract_simulated\",\"real_binary_gap\":\"D2R.exe .rsrc VS_VERSIONINFO 실 read pending Battle.net install\"")
+    println("__D2R_TRACK__ PARTIAL version_stamp")
+
+    // 11-D. synthetic round-trip summary emit (cond.1 evidence augment, NOT met promotion)
+    r0_emit("pe_d2r_specific_track_synthetic_round_trip_summary",
+        "\"format\":\"PE_surface\",\"binary\":\"D2R.exe\",\"stages\":[\"bnet_marker\",\"exception_handler\",\"version_stamp\"],\"sample_kind\":\"synthetic_inline_marker\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdst()
+    let s2 = pdst_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d2r_specific_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d2r_specific_track self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", elevated=" + to_string(s[2])
+        + ", first_frame=" + to_string(s[3]) + ", d2_dll_load=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdst_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("elevated_count\t" + to_string(s[2]))
+            println("first_frame_reached\t" + to_string(s[3]))
+            println("count_d2_dll_load\t" + to_string(s[4]))
+            return
+        }
+        if sub == "loaded" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_dll_loaded\t" + to_string(step_dll_loaded(sid)))
+                return
+            }
+            println("usage: hexa run pe_d2r_specific_track.hexa loaded <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_d2r_specific_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdst()
+            println("cleaned: " + pdst_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdst_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d2r_specific_track.hexa { self-test | stats | loaded <step_id> | count <phase_kind> | cleanup | dir }")
+}

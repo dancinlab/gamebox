@@ -1,0 +1,441 @@
+// lib/loader/pe_ntdll_symbolic_link_object.hexa — NTDLL Symbolic Link Object 추적
+//
+// NT Object Manager 의 Symbolic Link 는 namespace 내 path → path alias.
+//   NtCreateSymbolicLinkObject(out LinkHandle, DesiredAccess, OBJECT_ATTRIBUTES*, TargetName*)
+//   NtOpenSymbolicLinkObject(out LinkHandle, DesiredAccess, OBJECT_ATTRIBUTES*)
+//   NtQuerySymbolicLinkObject(LinkHandle, out LinkTarget, out ReturnedLength)
+//
+// DOS device path mapping 의 핵심 mechanism:
+//   \\??\\C:                  → \\Device\\HarddiskVolume2  (DOS device link)
+//   \\??\\PIPE                → \\Device\\NamedPipe         (named pipe namespace)
+//   \\KnownDlls\\ntdll.dll    → section object alias        (KnownDlls namespace)
+//   \\Sessions\\1\\DosDevices → per-session DOS device dir
+//
+// Apple-native bridge — 가짜 path mapping table:
+//   \\??\\C:                  → "/Volumes/Macintosh HD" or current working volume
+//   \\Device\\NamedPipe\\Foo  → POSIX FIFO under $GAMEBOX_HOME/persist/pipes/Foo
+//   \\KnownDlls\\<name>       → in-memory PE section table (loader cache)
+//   real NT NtCreateSymbolicLinkObject 실 호출 X — table-driven simulation only
+//
+// own1: NT object manager spec + Apple Foundation. Wine 인용 X
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = NtCreateSymbolicLinkObject
+//   2 = NtOpenSymbolicLinkObject
+//   3 = NtQuerySymbolicLinkObject
+//   4 = NtClose (delete)
+//
+// link_kind code:
+//   1 = dos_device       (\\??\\C:, \\??\\PIPE, ...)
+//   2 = device           (\\Device\\HarddiskVolumeN, \\Device\\NamedPipe)
+//   3 = session          (\\Sessions\\<id>\\DosDevices)
+//   4 = knownDlls        (\\KnownDlls\\<dll>)
+//   5 = user_namespace   (\\BaseNamedObjects\\<name>, \\GLOBAL??\\<name>)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t link_kind<int> \t target_chars<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnslo_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_symbolic_link_object"
+}
+
+fn pnslo_ops_path() -> str {
+    return pnslo_dir() + "/ops.tsv"
+}
+
+fn pnslo_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnslo_dir() + "'")
+}
+
+fn cleanup_pnslo() -> void {
+    pnslo_ensure_dir()
+    let _ = exec("rm -f '" + pnslo_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnslo_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnslo_append_row(path: str, row: str) -> void {
+    pnslo_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: symlink op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, link_kind: int, target_chars: int) -> void {
+    if op_id <= 0 {
+        panic("pe_ntdll_symbolic_link_object FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_ntdll_symbolic_link_object FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if link_kind < 1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [record_op] expected=link_kind>=1 got=" + to_string(link_kind))
+    }
+    if link_kind > 5 {
+        panic("pe_ntdll_symbolic_link_object FAIL [record_op] expected=link_kind<=5 got=" + to_string(link_kind))
+    }
+    if target_chars < 0 {
+        panic("pe_ntdll_symbolic_link_object FAIL [record_op] expected=target_chars>=0 got=" + to_string(target_chars))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(link_kind) + "\t" + to_string(target_chars) + "\n"
+    pnslo_append_row(pnslo_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pnslo_read_table(pnslo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pnslo_read_table(pnslo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_link_kind: 특정 link_kind 의 op 수 ───
+fn count_by_link_kind(kind: int) -> int {
+    let t = pnslo_read_table(pnslo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_target_chars: 모든 op 의 target_chars 합 ───
+fn total_target_chars() -> int {
+    let t = pnslo_read_table(pnslo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── dos_device_count: link_kind == 1 (DOS device) op 수 ───
+fn dos_device_count() -> int {
+    return count_by_link_kind(1)
+}
+
+// ─── op_target_chars: 특정 op_id 의 target_chars (없으면 -1) ───
+fn op_target_chars(op_id: int) -> int {
+    let t = pnslo_read_table(pnslo_ops_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnslo_stats: [op_count, dos_device_count, count_by_op_kind(1), total_target_chars] ───
+fn pnslo_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(dos_device_count())
+    out.push(count_by_op_kind(1))
+    out.push(total_target_chars())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnslo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnslo()
+
+    // 2. record 5 ops — covers ≥3 op_kinds (1,2,3,4) and ≥3 link_kinds (1,2,4)
+    //    NtCreateSymbolicLinkObject \\??\\C: → \\Device\\HarddiskVolume2 (dos_device, target=27 chars)
+    record_op(140001, 1, 1, 27)
+    r0_emit("pe_ntdll_symbolic_link_object_record",
+        "\"op_id\":140001,\"op_kind\":1,\"link_kind\":1,\"target_chars\":27,\"target\":\"\\\\??\\\\C:\"")
+
+    //    NtOpenSymbolicLinkObject \\??\\PIPE (dos_device, target=8 chars)
+    record_op(140002, 2, 1, 8)
+    r0_emit("pe_ntdll_symbolic_link_object_record",
+        "\"op_id\":140002,\"op_kind\":2,\"link_kind\":1,\"target_chars\":8,\"target\":\"\\\\??\\\\PIPE\"")
+
+    //    NtQuerySymbolicLinkObject \\Device\\NamedPipe\\Foo (device, target=22 chars)
+    record_op(140003, 3, 2, 22)
+    r0_emit("pe_ntdll_symbolic_link_object_record",
+        "\"op_id\":140003,\"op_kind\":3,\"link_kind\":2,\"target_chars\":22,\"target\":\"\\\\Device\\\\NamedPipe\\\\Foo\"")
+
+    //    NtCreateSymbolicLinkObject \\KnownDlls\\ntdll.dll (knownDlls, target=20 chars)
+    record_op(140004, 1, 4, 20)
+    r0_emit("pe_ntdll_symbolic_link_object_record",
+        "\"op_id\":140004,\"op_kind\":1,\"link_kind\":4,\"target_chars\":20,\"target\":\"\\\\KnownDlls\\\\ntdll.dll\"")
+
+    //    NtClose (delete) — link handle close (knownDlls, target=0)
+    record_op(140005, 4, 4, 0)
+    r0_emit("pe_ntdll_symbolic_link_object_record",
+        "\"op_id\":140005,\"op_kind\":4,\"link_kind\":4,\"target_chars\":0,\"target\":\"close\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_ntdll_symbolic_link_object FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (≥3 op_kinds covered: 1,2,3,4)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. count_by_link_kind sanity (≥3 link_kinds covered: 1,2,4)
+    let l1 = count_by_link_kind(1)
+    if l1 != 2 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_link_kind(1)] expected=2 got=" + to_string(l1))
+    }
+    let l2 = count_by_link_kind(2)
+    if l2 != 1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_link_kind(2)] expected=1 got=" + to_string(l2))
+    }
+    let l4 = count_by_link_kind(4)
+    if l4 != 2 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_link_kind(4)] expected=2 got=" + to_string(l4))
+    }
+    let l3 = count_by_link_kind(3)
+    if l3 != 0 {
+        panic("pe_ntdll_symbolic_link_object FAIL [count_by_link_kind(3)] expected=0 got=" + to_string(l3))
+    }
+
+    // 6. dos_device_count == count_by_link_kind(1) == 2
+    let dd = dos_device_count()
+    if dd != 2 {
+        panic("pe_ntdll_symbolic_link_object FAIL [dos_device_count] expected=2 got=" + to_string(dd))
+    }
+
+    // 7. total_target_chars = 27 + 8 + 22 + 20 + 0 = 77
+    let tc = total_target_chars()
+    if tc != 77 {
+        panic("pe_ntdll_symbolic_link_object FAIL [total_target_chars] expected=77 got=" + to_string(tc))
+    }
+
+    // 8. op_target_chars sanity
+    let oc1 = op_target_chars(140001)
+    if oc1 != 27 {
+        panic("pe_ntdll_symbolic_link_object FAIL [op_target_chars(140001)] expected=27 got=" + to_string(oc1))
+    }
+    let oc4 = op_target_chars(140004)
+    if oc4 != 20 {
+        panic("pe_ntdll_symbolic_link_object FAIL [op_target_chars(140004)] expected=20 got=" + to_string(oc4))
+    }
+    let oc_miss = op_target_chars(9999)
+    if oc_miss != -1 {
+        panic("pe_ntdll_symbolic_link_object FAIL [op_target_chars(9999)] expected=-1 got=" + to_string(oc_miss))
+    }
+
+    // 9. pnslo_stats() = [5, 2, 2, 77]
+    let s = pnslo_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_symbolic_link_object FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ntdll_symbolic_link_object FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_ntdll_symbolic_link_object FAIL [stats dos_device_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_ntdll_symbolic_link_object FAIL [stats op_kind(1)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 77 {
+        panic("pe_ntdll_symbolic_link_object FAIL [stats total_target_chars] expected=77 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (6th r0_emit)
+    r0_emit("pe_ntdll_symbolic_link_object_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"dos_device_count\":" + to_string(s[1])
+        + ",\"op_kind_create\":" + to_string(s[2])
+        + ",\"total_target_chars\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ntdll_symbolic_link_object FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pnslo()
+    let s2 = pnslo_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_symbolic_link_object FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_symbolic_link_object self_test PASS (ops=" + to_string(s[0])
+        + ", dos_device=" + to_string(s[1]) + ", create=" + to_string(s[2])
+        + ", target_chars=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnslo_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("dos_device_count\t" + to_string(s[1]))
+            println("count_op_kind_create\t" + to_string(s[2]))
+            println("total_target_chars\t" + to_string(s[3]))
+            return
+        }
+        if sub == "target" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_target_chars\t" + to_string(op_target_chars(oid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_symbolic_link_object.hexa target <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "op" {
+                    println("count_by_op_kind\t" + to_string(count_by_op_kind(val)))
+                    return
+                }
+                if what == "link" {
+                    println("count_by_link_kind\t" + to_string(count_by_link_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_symbolic_link_object.hexa count { op <op_kind> | link <link_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnslo()
+            println("cleaned: " + pnslo_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnslo_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_symbolic_link_object.hexa { self-test | stats | target <op_id> | count op <op_kind> | count link <link_kind> | cleanup | dir }")
+}

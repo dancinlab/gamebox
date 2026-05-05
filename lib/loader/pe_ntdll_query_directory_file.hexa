@@ -1,0 +1,439 @@
+// lib/loader/pe_ntdll_query_directory_file.hexa — NTDLL NtQueryDirectoryFile/Ex 추적 (cycle 84)
+//
+// NTDLL NtQueryDirectoryFile / NtQueryDirectoryFileEx → POSIX readdir bridge:
+//   NtQueryDirectoryFile(FileHandle, ..., FileInformation, Length, FileInformationClass,
+//                        ReturnSingleEntry, FileName, RestartScan)
+//     → opendir(utf8_path) + per-entry readdir() loop + struct fill
+//   info_class 별 다른 struct (FILE_*_INFORMATION) 채움:
+//     1 = FileBothDirectoryInformation     → FILE_BOTH_DIR_INFORMATION
+//     2 = FileFullDirectoryInformation     → FILE_FULL_DIR_INFORMATION
+//     3 = FileIdBothDirectoryInformation   → FILE_ID_BOTH_DIR_INFORMATION
+//     4 = FileIdFullDirectoryInformation   → FILE_ID_FULL_DIR_INFORMATION
+//     5 = FileNamesInformation             → FILE_NAMES_INFORMATION
+//   D2R/D4 의 install dir scan (Save/, Mods/, data/) 시 호출 — bnet patch loader 도 sweep.
+// own1: NTDLL spec + Apple readdir(opendir) only. Wine ntdll/directory.c 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NT API call tracker — 실 NtQueryDirectoryFile / readdir() 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// info_class code:
+//   1 = FileBothDirectoryInformation
+//   2 = FileFullDirectoryInformation
+//   3 = FileIdBothDirectoryInformation
+//   4 = FileIdFullDirectoryInformation
+//   5 = FileNamesInformation
+//
+// persist schema (TSV — queries.tsv):
+//   query_id<int> \t info_class<int> \t entries_returned<int> \t data_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnqdf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_query_directory_file"
+}
+
+fn pnqdf_queries_path() -> str {
+    return pnqdf_dir() + "/queries.tsv"
+}
+
+fn pnqdf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnqdf_dir() + "'")
+}
+
+fn cleanup_pnqdf() -> void {
+    pnqdf_ensure_dir()
+    let _ = exec("rm -f '" + pnqdf_queries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnqdf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnqdf_append_row(path: str, row: str) -> void {
+    pnqdf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_query: NtQueryDirectoryFile 1 건 기록 ───
+fn record_query(query_id: int, info_class: int, entries_returned: int, data_bytes: int) -> void {
+    if query_id <= 0 {
+        panic("pe_ntdll_query_directory_file FAIL [record_query] expected=query_id>0 got=" + to_string(query_id))
+    }
+    if info_class < 1 {
+        panic("pe_ntdll_query_directory_file FAIL [record_query] expected=info_class>=1 got=" + to_string(info_class))
+    }
+    if info_class > 5 {
+        panic("pe_ntdll_query_directory_file FAIL [record_query] expected=info_class<=5 got=" + to_string(info_class))
+    }
+    if entries_returned < 0 {
+        panic("pe_ntdll_query_directory_file FAIL [record_query] expected=entries_returned>=0 got=" + to_string(entries_returned))
+    }
+    if data_bytes < 0 {
+        panic("pe_ntdll_query_directory_file FAIL [record_query] expected=data_bytes>=0 got=" + to_string(data_bytes))
+    }
+    let row = to_string(query_id) + "\t" + to_string(info_class)
+        + "\t" + to_string(entries_returned) + "\t" + to_string(data_bytes) + "\n"
+    pnqdf_append_row(pnqdf_queries_path(), row)
+}
+
+// ─── query_count: total query 수 ───
+fn query_count() -> int {
+    let t = pnqdf_read_table(pnqdf_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_info_class: 특정 info_class 의 query 수 ───
+fn count_by_info_class(ic: int) -> int {
+    let t = pnqdf_read_table(pnqdf_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == ic {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_entries: entries_returned 합 ───
+fn total_entries() -> int {
+    let t = pnqdf_read_table(pnqdf_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_data_bytes: data_bytes 합 ───
+fn total_data_bytes() -> int {
+    let t = pnqdf_read_table(pnqdf_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── largest_query: entries_returned 최대인 query_id (없으면 -1) ───
+fn largest_query() -> int {
+    let t = pnqdf_read_table(pnqdf_queries_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut best_id = -1
+    let mut best_e = -1
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let qid = to_int(parts[0])
+                let er = to_int(parts[2])
+                if er > best_e {
+                    best_e = er
+                    best_id = qid
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best_id
+}
+
+// ─── query_entries: 특정 query_id 의 entries_returned (없으면 -1) ───
+fn query_entries(query_id: int) -> int {
+    let t = pnqdf_read_table(pnqdf_queries_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == query_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnqdf_stats: [query_count, total_entries, total_data_bytes, largest_query] ───
+fn pnqdf_stats() -> array {
+    let mut out = []
+    out.push(query_count())
+    out.push(total_entries())
+    out.push(total_data_bytes())
+    out.push(largest_query())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnqdf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnqdf()
+
+    // 2. record 5 queries — covers ≥3 info_classes (1, 2, 3, 5)
+    //    FileBothDirectoryInformation — D2R Save/ scan (24 entries, 4096 bytes)
+    record_query(140001, 1, 24, 4096)
+    r0_emit("pe_ntdll_query_directory_file_record",
+        "\"query_id\":140001,\"info_class\":1,\"entries_returned\":24,\"data_bytes\":4096,\"target\":\"FileBothDirectoryInformation\"")
+
+    //    FileFullDirectoryInformation — Mods/ scan (12 entries, 1536 bytes)
+    record_query(140002, 2, 12, 1536)
+    r0_emit("pe_ntdll_query_directory_file_record",
+        "\"query_id\":140002,\"info_class\":2,\"entries_returned\":12,\"data_bytes\":1536,\"target\":\"FileFullDirectoryInformation\"")
+
+    //    FileIdBothDirectoryInformation — data/ sweep (largest — 80 entries, 16384 bytes)
+    record_query(140003, 3, 80, 16384)
+    r0_emit("pe_ntdll_query_directory_file_record",
+        "\"query_id\":140003,\"info_class\":3,\"entries_returned\":80,\"data_bytes\":16384,\"target\":\"FileIdBothDirectoryInformation\"")
+
+    //    FileBothDirectoryInformation again (empty dir — 0 entries, 0 bytes)
+    record_query(140004, 1, 0, 0)
+    r0_emit("pe_ntdll_query_directory_file_record",
+        "\"query_id\":140004,\"info_class\":1,\"entries_returned\":0,\"data_bytes\":0,\"target\":\"FileBothDirectoryInformation\"")
+
+    //    FileNamesInformation — bnet patch listing (40 entries, 2048 bytes)
+    record_query(140005, 5, 40, 2048)
+    r0_emit("pe_ntdll_query_directory_file_record",
+        "\"query_id\":140005,\"info_class\":5,\"entries_returned\":40,\"data_bytes\":2048,\"target\":\"FileNamesInformation\"")
+
+    // 3. query_count = 5
+    let c = query_count()
+    if c != 5 {
+        panic("pe_ntdll_query_directory_file FAIL [query_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_info_class sanity (≥3 info_classes covered: 1, 2, 3, 5)
+    let i1 = count_by_info_class(1)
+    if i1 != 2 {
+        panic("pe_ntdll_query_directory_file FAIL [count_by_info_class(1)] expected=2 got=" + to_string(i1))
+    }
+    let i2 = count_by_info_class(2)
+    if i2 != 1 {
+        panic("pe_ntdll_query_directory_file FAIL [count_by_info_class(2)] expected=1 got=" + to_string(i2))
+    }
+    let i3 = count_by_info_class(3)
+    if i3 != 1 {
+        panic("pe_ntdll_query_directory_file FAIL [count_by_info_class(3)] expected=1 got=" + to_string(i3))
+    }
+    let i4 = count_by_info_class(4)
+    if i4 != 0 {
+        panic("pe_ntdll_query_directory_file FAIL [count_by_info_class(4)] expected=0 got=" + to_string(i4))
+    }
+    let i5 = count_by_info_class(5)
+    if i5 != 1 {
+        panic("pe_ntdll_query_directory_file FAIL [count_by_info_class(5)] expected=1 got=" + to_string(i5))
+    }
+
+    // 5. total_entries = 24+12+80+0+40 = 156
+    let te = total_entries()
+    if te != 156 {
+        panic("pe_ntdll_query_directory_file FAIL [total_entries] expected=156 got=" + to_string(te))
+    }
+
+    // 6. total_data_bytes = 4096+1536+16384+0+2048 = 24064
+    let tb = total_data_bytes()
+    if tb != 24064 {
+        panic("pe_ntdll_query_directory_file FAIL [total_data_bytes] expected=24064 got=" + to_string(tb))
+    }
+
+    // 7. largest_query = 140003 (80 entries)
+    let lq = largest_query()
+    if lq != 140003 {
+        panic("pe_ntdll_query_directory_file FAIL [largest_query] expected=140003 got=" + to_string(lq))
+    }
+
+    // 8. query_entries sanity
+    let qe1 = query_entries(140001)
+    if qe1 != 24 {
+        panic("pe_ntdll_query_directory_file FAIL [query_entries(140001)] expected=24 got=" + to_string(qe1))
+    }
+    let qe3 = query_entries(140003)
+    if qe3 != 80 {
+        panic("pe_ntdll_query_directory_file FAIL [query_entries(140003)] expected=80 got=" + to_string(qe3))
+    }
+    let qe_miss = query_entries(9999)
+    if qe_miss != -1 {
+        panic("pe_ntdll_query_directory_file FAIL [query_entries(9999)] expected=-1 got=" + to_string(qe_miss))
+    }
+
+    // 9. pnqdf_stats() = [5, 156, 24064, 140003]
+    let s = pnqdf_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_query_directory_file FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_ntdll_query_directory_file FAIL [stats query_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 156 {
+        panic("pe_ntdll_query_directory_file FAIL [stats total_entries] expected=156 got=" + to_string(s[1]))
+    }
+    if s[2] != 24064 {
+        panic("pe_ntdll_query_directory_file FAIL [stats total_data_bytes] expected=24064 got=" + to_string(s[2]))
+    }
+    if s[3] != 140003 {
+        panic("pe_ntdll_query_directory_file FAIL [stats largest_query] expected=140003 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (6th r0_emit)
+    r0_emit("pe_ntdll_query_directory_file_stats",
+        "\"query_count\":" + to_string(s[0])
+        + ",\"total_entries\":" + to_string(s[1])
+        + ",\"total_data_bytes\":" + to_string(s[2])
+        + ",\"largest_query\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_ntdll_query_directory_file FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0/-1 (post-cleanup zero)
+    cleanup_pnqdf()
+    let s2 = pnqdf_stats()
+    if s2[0] != 0 {
+        panic("pe_ntdll_query_directory_file FAIL [cleanup query_count] expected=0 got=" + to_string(s2[0]))
+    }
+    if s2[1] != 0 {
+        panic("pe_ntdll_query_directory_file FAIL [cleanup total_entries] expected=0 got=" + to_string(s2[1]))
+    }
+    if s2[2] != 0 {
+        panic("pe_ntdll_query_directory_file FAIL [cleanup total_data_bytes] expected=0 got=" + to_string(s2[2]))
+    }
+    if s2[3] != -1 {
+        panic("pe_ntdll_query_directory_file FAIL [cleanup largest_query] expected=-1 got=" + to_string(s2[3]))
+    }
+
+    println("  ✅ pe_ntdll_query_directory_file self_test PASS (queries=" + to_string(s[0])
+        + ", entries=" + to_string(s[1]) + ", bytes=" + to_string(s[2])
+        + ", largest=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnqdf_stats()
+            println("query_count\t" + to_string(s[0]))
+            println("total_entries\t" + to_string(s[1]))
+            println("total_data_bytes\t" + to_string(s[2]))
+            println("largest_query\t" + to_string(s[3]))
+            return
+        }
+        if sub == "entries" {
+            if len(a) >= 4 {
+                let qid = to_int(a[3])
+                println("query_entries\t" + to_string(query_entries(qid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_query_directory_file.hexa entries <query_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let what = a[3]
+                let val = to_int(a[4])
+                if what == "info" {
+                    println("count_by_info_class\t" + to_string(count_by_info_class(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_ntdll_query_directory_file.hexa count info <info_class>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnqdf()
+            println("cleaned: " + pnqdf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnqdf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_query_directory_file.hexa { self-test | stats | entries <query_id> | count info <info_class> | cleanup | dir }")
+}

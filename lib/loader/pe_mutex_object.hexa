@@ -1,0 +1,395 @@
+// lib/loader/pe_mutex_object.hexa — Win32 Mutex (CreateMutex / ReleaseMutex) bridge skeleton
+//
+// Win32 named/anonymous mutex → pthread_mutex (PTHREAD_MUTEX_RECURSIVE) bridge.
+// Named mutex 는 cross-process IPC sync 용 — `Global\\<name>` namespace 를
+// host filesystem path 로 mapping (stage6). 본 module 은 mutex op tracker 만 담당.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 op kind tracker — 실 pthread_mutex_lock() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = create        (CreateMutex / CreateMutexEx)
+//   2 = acquire       (WaitForSingleObject success → lock)
+//   3 = release       (ReleaseMutex)
+//   4 = abandoned     (owning thread died w/o release — WAIT_ABANDONED)
+//
+// persist schema (TSV — ops.tsv):
+//   mutex_id<int> \t op_kind<int> \t named<int 0|1> \t recursion_depth<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmo_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_mutex_object"
+}
+
+fn pmo_ops_path() -> str {
+    return pmo_dir() + "/ops.tsv"
+}
+
+fn pmo_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmo_dir() + "'")
+}
+
+fn cleanup_pmo() -> void {
+    pmo_ensure_dir()
+    let _ = exec("rm -f '" + pmo_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmo_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmo_append_row(path: str, row: str) -> void {
+    pmo_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: mutex op 1 건 기록 ───
+fn record_op(mutex_id: int, op_kind: int, named: int, recursion_depth: int) -> void {
+    if mutex_id <= 0 {
+        panic("pe_mutex_object FAIL [record_op] expected=mutex_id>0 got=" + to_string(mutex_id))
+    }
+    if op_kind < 1 {
+        panic("pe_mutex_object FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_mutex_object FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if named < 0 {
+        panic("pe_mutex_object FAIL [record_op] expected=named>=0 got=" + to_string(named))
+    }
+    if named > 1 {
+        panic("pe_mutex_object FAIL [record_op] expected=named<=1 got=" + to_string(named))
+    }
+    if recursion_depth < 0 {
+        panic("pe_mutex_object FAIL [record_op] expected=recursion_depth>=0 got=" + to_string(recursion_depth))
+    }
+    let row = to_string(mutex_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(named) + "\t" + to_string(recursion_depth) + "\n"
+    pmo_append_row(pmo_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pmo_read_table(pmo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── named_count: named=1 인 op 수 ───
+fn named_count() -> int {
+    let t = pmo_read_table(pmo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_recursion_depth: 모든 op recursion_depth 합 ───
+fn total_recursion_depth() -> int {
+    let t = pmo_read_table(pmo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pmo_read_table(pmo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── mutex_recursion_depth: 특정 mutex_id 의 max recursion_depth (없으면 0) ───
+fn mutex_recursion_depth(mutex_id: int) -> int {
+    let t = pmo_read_table(pmo_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut best = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == mutex_id {
+                    let d = to_int(parts[3])
+                    if d > best {
+                        best = d
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── pmo_stats: [op_count, named_count, total_recursion_depth, count_by_op_kind(2)] ───
+fn pmo_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(named_count())
+    out.push(total_recursion_depth())
+    out.push(count_by_op_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmo-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmo()
+
+    // 2. record 6 mutex ops (3 op_kinds, 2 named — Global\\D2RInstance, Global\\D4Sync)
+    record_op(310001, 1, 1, 0)
+    r0_emit("pe_mutex_object_record",
+        "\"mutex_id\":310001,\"op_kind\":1,\"named\":1,\"recursion_depth\":0,\"target\":\"create_named\"")
+
+    record_op(310001, 2, 1, 1)
+    r0_emit("pe_mutex_object_record",
+        "\"mutex_id\":310001,\"op_kind\":2,\"named\":1,\"recursion_depth\":1,\"target\":\"acquire\"")
+
+    record_op(310001, 2, 1, 2)
+    r0_emit("pe_mutex_object_record",
+        "\"mutex_id\":310001,\"op_kind\":2,\"named\":1,\"recursion_depth\":2,\"target\":\"acquire_recursive\"")
+
+    record_op(310001, 3, 1, 1)
+    r0_emit("pe_mutex_object_record",
+        "\"mutex_id\":310001,\"op_kind\":3,\"named\":1,\"recursion_depth\":1,\"target\":\"release\"")
+
+    record_op(310002, 1, 0, 0)
+    r0_emit("pe_mutex_object_record",
+        "\"mutex_id\":310002,\"op_kind\":1,\"named\":0,\"recursion_depth\":0,\"target\":\"create_anonymous\"")
+
+    record_op(310002, 2, 0, 1)
+    r0_emit("pe_mutex_object_record",
+        "\"mutex_id\":310002,\"op_kind\":2,\"named\":0,\"recursion_depth\":1,\"target\":\"acquire\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_mutex_object FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. named_count = 4 (310001 × 4 ops, all named)
+    let nc = named_count()
+    if nc != 4 {
+        panic("pe_mutex_object FAIL [named_count] expected=4 got=" + to_string(nc))
+    }
+
+    // 5. total_recursion_depth = 0+1+2+1+0+1 = 5
+    let trd = total_recursion_depth()
+    if trd != 5 {
+        panic("pe_mutex_object FAIL [total_recursion_depth] expected=5 got=" + to_string(trd))
+    }
+
+    // 6. count_by_op_kind sanity (3 op_kinds covered)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_mutex_object FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 3 {
+        panic("pe_mutex_object FAIL [count_by_op_kind(2)] expected=3 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_mutex_object FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 0 {
+        panic("pe_mutex_object FAIL [count_by_op_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_mutex_object FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. mutex_recursion_depth sanity
+    let d1 = mutex_recursion_depth(310001)
+    if d1 != 2 {
+        panic("pe_mutex_object FAIL [mutex_recursion_depth(310001)] expected=2 got=" + to_string(d1))
+    }
+    let d2 = mutex_recursion_depth(310002)
+    if d2 != 1 {
+        panic("pe_mutex_object FAIL [mutex_recursion_depth(310002)] expected=1 got=" + to_string(d2))
+    }
+    let d_miss = mutex_recursion_depth(9999)
+    if d_miss != 0 {
+        panic("pe_mutex_object FAIL [mutex_recursion_depth(9999)] expected=0 got=" + to_string(d_miss))
+    }
+
+    // 8. pmo_stats() = [6, 4, 5, 3]
+    let s = pmo_stats()
+    if len(s) != 4 {
+        panic("pe_mutex_object FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_mutex_object FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_mutex_object FAIL [stats named_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_mutex_object FAIL [stats total_recursion_depth] expected=5 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_mutex_object FAIL [stats count_kind(2)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_mutex_object_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"named_count\":" + to_string(s[1])
+        + ",\"total_recursion_depth\":" + to_string(s[2])
+        + ",\"kind_acquire\":" + to_string(s[3]))
+
+    // 10. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_mutex_object FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pmo()
+    let s2 = pmo_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_mutex_object FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_mutex_object self_test PASS (ops=" + to_string(s[0])
+        + ", named=" + to_string(s[1]) + ", depth=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmo_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("named_count\t" + to_string(s[1]))
+            println("total_recursion_depth\t" + to_string(s[2]))
+            println("count_kind_acquire\t" + to_string(s[3]))
+            return
+        }
+        if sub == "depth" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("mutex_recursion_depth\t" + to_string(mutex_recursion_depth(mid)))
+                return
+            }
+            println("usage: hexa run pe_mutex_object.hexa depth <mutex_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_mutex_object.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmo()
+            println("cleaned: " + pmo_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmo_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_mutex_object.hexa { self-test | stats | depth <mutex_id> | count <op_kind> | cleanup | dir }")
+}

@@ -1,0 +1,480 @@
+// lib/loader/pe_wow_retail_track.hexa — World of Warcraft Retail (Blizzard, current — Dragonflight/War Within) 전용 entry/loader 추적.
+//
+// WoW Retail (Dragonflight/War Within) = DX12 + Lua addon system (50-200+ user addons).
+// Battle.net Agent + Warden 동일.
+// own1: WoW Retail 공개 정보 + addon API spec. Wine 인용 X.
+//
+// WoW Retail launch chain (own2 자체 추적):
+//   process_attach           — Wow.exe (x86_64 PE32+) entry
+//   blizz_engine             — Blizzard internal engine (DX12 ID3D12Device + IDXGISwapChain)
+//                              → Apple Metal 변환 path (R5 D3D12→Metal router)
+//   warden_init              — Warden anti-cheat (kernel-mode polling)
+//   bnet_token               — Battle.net Agent token validate (online required)
+//   realid_social            — RealID + BattleTag friend graph init
+//   character_select         — character roster + realm select
+//   addon_load               — Lua addon system load (50-200+ user addons, AddOns/<Name>/<Name>.lua)
+//   world_load               — world / map mmap (Azeroth zone load)
+//   first_frame              — DX12 swapchain Present 첫 호출
+//   combat_log_init          — COMBAT_LOG_EVENT_UNFILTERED ring buffer 초기화 (addon API)
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 WoW Retail-specific phase tracker — 실 Wow.exe 실행 X.
+// own 2 mandate: r0_emit ≥ 11 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//    1 = process_attach        (Wow.exe x86_64 PE32+ entry)
+//    2 = blizz_engine          (Blizzard engine + DX12 device init)
+//    3 = warden_init           (Warden anti-cheat init)
+//    4 = bnet_token            (Battle.net Agent token validate)
+//    5 = realid_social         (RealID / BattleTag social graph init)
+//    6 = character_select      (character roster + realm select)
+//    7 = addon_load            (Lua addon load — 50-200+ user addons)
+//    8 = world_load            (world / map mmap — Azeroth zone load)
+//    9 = first_frame           (DX12 swapchain Present 첫 호출)
+//   10 = combat_log_init       (COMBAT_LOG_EVENT_UNFILTERED ring buffer 초기화)
+//
+// persist schema (TSV — steps.tsv):
+//   step_id<int> \t phase_kind<int> \t dll_loaded<int> \t addons_loaded<int>
+//   addons_loaded: addon count, 0..200+
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwrt_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_wow_retail_track"
+}
+
+fn pwrt_steps_path() -> str {
+    return pwrt_dir() + "/steps.tsv"
+}
+
+fn pwrt_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwrt_dir() + "'")
+}
+
+fn cleanup_pwrt() -> void {
+    pwrt_ensure_dir()
+    let _ = exec("rm -f '" + pwrt_steps_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwrt_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwrt_append_row(path: str, row: str) -> void {
+    pwrt_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_step: WoW Retail launch step 1 건 기록 ───
+fn record_step(step_id: int, phase_kind: int, dll_loaded: int, addons_loaded: int) -> void {
+    if step_id <= 0 {
+        panic("pe_wow_retail_track FAIL [record_step] expected=step_id>0 got=" + to_string(step_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_wow_retail_track FAIL [record_step] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 10 {
+        panic("pe_wow_retail_track FAIL [record_step] expected=phase_kind<=10 got=" + to_string(phase_kind))
+    }
+    if dll_loaded < 0 {
+        panic("pe_wow_retail_track FAIL [record_step] expected=dll_loaded>=0 got=" + to_string(dll_loaded))
+    }
+    if dll_loaded > 1 {
+        panic("pe_wow_retail_track FAIL [record_step] expected=dll_loaded<=1 got=" + to_string(dll_loaded))
+    }
+    if addons_loaded < 0 {
+        panic("pe_wow_retail_track FAIL [record_step] expected=addons_loaded>=0 got=" + to_string(addons_loaded))
+    }
+    let row = to_string(step_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(dll_loaded) + "\t" + to_string(addons_loaded) + "\n"
+    pwrt_append_row(pwrt_steps_path(), row)
+}
+
+// ─── step_count: total step 수 ───
+fn step_count() -> int {
+    let t = pwrt_read_table(pwrt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 step 수 ───
+fn count_by_phase_kind(phase_kind: int) -> int {
+    let t = pwrt_read_table(pwrt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == phase_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── loaded_count: dll_loaded=1 인 step 수 ───
+fn loaded_count() -> int {
+    let t = pwrt_read_table(pwrt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_addons_loaded: 모든 step addons_loaded 합 ───
+fn total_addons_loaded() -> int {
+    let t = pwrt_read_table(pwrt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── addon_load_count: addon_load (phase_kind=7) step 수 ───
+fn addon_load_count() -> int {
+    return count_by_phase_kind(7)
+}
+
+// ─── step_addons: 특정 step_id 의 addons_loaded (없으면 0) ───
+fn step_addons(step_id: int) -> int {
+    let t = pwrt_read_table(pwrt_steps_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == step_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pwrt_stats: [step_count, loaded_count, total_addons_loaded, addon_load_count, count_by_phase_kind(10)] ───
+fn pwrt_stats() -> array {
+    let mut out = []
+    out.push(step_count())
+    out.push(loaded_count())
+    out.push(total_addons_loaded())
+    out.push(addon_load_count())
+    out.push(count_by_phase_kind(10))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pwrt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pwrt()
+
+    // 2. record 10 steps — WoW Retail launch chain 전체, phase_kind 1..10 각 1건
+    //   id 920001: phase  1 process_attach     dll=0 addons=0    (Wow.exe entry)
+    //   id 920002: phase  2 blizz_engine       dll=1 addons=0    (DX12 device init, d3d12.dll)
+    //   id 920003: phase  3 warden_init        dll=1 addons=0    (Warden kernel polling driver)
+    //   id 920004: phase  4 bnet_token         dll=0 addons=0    (Battle.net Agent token validate)
+    //   id 920005: phase  5 realid_social      dll=0 addons=0    (RealID + BattleTag init)
+    //   id 920006: phase  6 character_select   dll=0 addons=0    (character roster)
+    //   id 920007: phase  7 addon_load         dll=1 addons=128  (Lua addon load, 128 user addons)
+    //   id 920008: phase  8 world_load         dll=1 addons=0    (world / map mmap)
+    //   id 920009: phase  9 first_frame        dll=0 addons=0    (DX12 swapchain Present 첫 호출)
+    //   id 920010: phase 10 combat_log_init    dll=0 addons=0    (COMBAT_LOG_EVENT ring buffer)
+    //   sums: steps=10, loaded=4, total_addons=128, addon_load=1, count_kind(10)=1
+    record_step(920001, 1, 0, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920001,\"phase_kind\":1,\"dll_loaded\":0,\"addons_loaded\":0,\"target\":\"process_attach\"")
+
+    record_step(920002, 2, 1, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920002,\"phase_kind\":2,\"dll_loaded\":1,\"addons_loaded\":0,\"target\":\"blizz_engine\"")
+
+    record_step(920003, 3, 1, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920003,\"phase_kind\":3,\"dll_loaded\":1,\"addons_loaded\":0,\"target\":\"warden_init\"")
+
+    record_step(920004, 4, 0, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920004,\"phase_kind\":4,\"dll_loaded\":0,\"addons_loaded\":0,\"target\":\"bnet_token\"")
+
+    record_step(920005, 5, 0, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920005,\"phase_kind\":5,\"dll_loaded\":0,\"addons_loaded\":0,\"target\":\"realid_social\"")
+
+    record_step(920006, 6, 0, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920006,\"phase_kind\":6,\"dll_loaded\":0,\"addons_loaded\":0,\"target\":\"character_select\"")
+
+    record_step(920007, 7, 1, 128)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920007,\"phase_kind\":7,\"dll_loaded\":1,\"addons_loaded\":128,\"target\":\"addon_load\"")
+
+    record_step(920008, 8, 1, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920008,\"phase_kind\":8,\"dll_loaded\":1,\"addons_loaded\":0,\"target\":\"world_load\"")
+
+    record_step(920009, 9, 0, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920009,\"phase_kind\":9,\"dll_loaded\":0,\"addons_loaded\":0,\"target\":\"first_frame\"")
+
+    record_step(920010, 10, 0, 0)
+    r0_emit("pe_wow_retail_track_record",
+        "\"step_id\":920010,\"phase_kind\":10,\"dll_loaded\":0,\"addons_loaded\":0,\"target\":\"combat_log_init\"")
+
+    // 3. step_count = 10
+    let c = step_count()
+    if c != 10 {
+        panic("pe_wow_retail_track FAIL [step_count] expected=10 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity — 1..10 각 1건, 99 = 0
+    let p1 = count_by_phase_kind(1)
+    if p1 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_phase_kind(2)
+    if p2 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(p2))
+    }
+    let p3 = count_by_phase_kind(3)
+    if p3 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_phase_kind(4)
+    if p4 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(p4))
+    }
+    let p5 = count_by_phase_kind(5)
+    if p5 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(p5))
+    }
+    let p6 = count_by_phase_kind(6)
+    if p6 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(p6))
+    }
+    let p7 = count_by_phase_kind(7)
+    if p7 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(7)] expected=1 got=" + to_string(p7))
+    }
+    let p8 = count_by_phase_kind(8)
+    if p8 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(8)] expected=1 got=" + to_string(p8))
+    }
+    let p9 = count_by_phase_kind(9)
+    if p9 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(9)] expected=1 got=" + to_string(p9))
+    }
+    let p10 = count_by_phase_kind(10)
+    if p10 != 1 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(10)] expected=1 got=" + to_string(p10))
+    }
+    let p99 = count_by_phase_kind(99)
+    if p99 != 0 {
+        panic("pe_wow_retail_track FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 5. loaded_count = 4 (920002, 920003, 920007, 920008)
+    let lc = loaded_count()
+    if lc != 4 {
+        panic("pe_wow_retail_track FAIL [loaded_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 6. total_addons_loaded = 128 (920007 only)
+    let ta = total_addons_loaded()
+    if ta != 128 {
+        panic("pe_wow_retail_track FAIL [total_addons_loaded] expected=128 got=" + to_string(ta))
+    }
+
+    // 7. addon_load_count = 1 (phase_kind=7, 920007)
+    let al = addon_load_count()
+    if al != 1 {
+        panic("pe_wow_retail_track FAIL [addon_load_count] expected=1 got=" + to_string(al))
+    }
+
+    // 8. step_addons sanity
+    let a7 = step_addons(920007)
+    if a7 != 128 {
+        panic("pe_wow_retail_track FAIL [step_addons(920007)] expected=128 got=" + to_string(a7))
+    }
+    let a3 = step_addons(920003)
+    if a3 != 0 {
+        panic("pe_wow_retail_track FAIL [step_addons(920003)] expected=0 got=" + to_string(a3))
+    }
+    let a_miss = step_addons(9999)
+    if a_miss != 0 {
+        panic("pe_wow_retail_track FAIL [step_addons(9999)] expected=0 got=" + to_string(a_miss))
+    }
+
+    // 9. pwrt_stats() = [10, 4, 128, 1, 1]
+    let s = pwrt_stats()
+    if len(s) != 5 {
+        panic("pe_wow_retail_track FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 10 {
+        panic("pe_wow_retail_track FAIL [stats step_count] expected=10 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_wow_retail_track FAIL [stats loaded_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 128 {
+        panic("pe_wow_retail_track FAIL [stats total_addons_loaded] expected=128 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_wow_retail_track FAIL [stats addon_load_count] expected=1 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_wow_retail_track FAIL [stats count_combat_log] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_wow_retail_track_stats",
+        "\"step_count\":" + to_string(s[0])
+        + ",\"loaded_count\":" + to_string(s[1])
+        + ",\"total_addons_loaded\":" + to_string(s[2])
+        + ",\"addon_load_count\":" + to_string(s[3])
+        + ",\"count_combat_log\":" + to_string(s[4]))
+
+    // 11. emit count >= 11 (10 records + 1 stats = 11)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 11 {
+        panic("pe_wow_retail_track FAIL [r0 emit count] expected=>=11 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pwrt()
+    let s2 = pwrt_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_wow_retail_track FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_wow_retail_track self_test PASS (steps=" + to_string(s[0])
+        + ", loaded=" + to_string(s[1]) + ", total_addons=" + to_string(s[2])
+        + ", addon_load=" + to_string(s[3]) + ", combat_log=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwrt_stats()
+            println("step_count\t" + to_string(s[0]))
+            println("loaded_count\t" + to_string(s[1]))
+            println("total_addons_loaded\t" + to_string(s[2]))
+            println("addon_load_count\t" + to_string(s[3]))
+            println("count_combat_log\t" + to_string(s[4]))
+            return
+        }
+        if sub == "addons" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("step_addons\t" + to_string(step_addons(sid)))
+                return
+            }
+            println("usage: hexa run pe_wow_retail_track.hexa addons <step_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let pk = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(pk)))
+                return
+            }
+            println("usage: hexa run pe_wow_retail_track.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwrt()
+            println("cleaned: " + pwrt_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwrt_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_wow_retail_track.hexa { self-test | stats | addons <step_id> | count <phase_kind> | cleanup | dir }")
+}

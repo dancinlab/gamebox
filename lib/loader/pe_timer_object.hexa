@@ -1,0 +1,426 @@
+// lib/loader/pe_timer_object.hexa — cycle 71 Win32 Waitable Timer skeleton
+//
+// Win32 CreateWaitableTimer / SetWaitableTimer → kqueue EVFILT_TIMER bridge.
+// docker hexa 측에서는 timer object 의 lifecycle (id, kind, due_time, period)
+// 만 추적 — 실제 kqueue() / kevent() 호출은 host native helper (stage6) 담당.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 timer object tracker — 실 kqueue 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// timer_kind code:
+//   1 = manual_reset       (수동 reset, signal 후 wait 풀림 유지)
+//   2 = synchronization    (auto reset, wait 1 회 풀고 non-signaled)
+//   3 = high_resolution    (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)
+//
+// persist schema (TSV — timers.tsv):
+//   timer_id<int> \t timer_kind<int> \t due_time_us<int> \t period_us<int>
+//   period_us = 0 → one-shot timer
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pto_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_timer_object"
+}
+
+fn pto_timers_path() -> str {
+    return pto_dir() + "/timers.tsv"
+}
+
+fn pto_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pto_dir() + "'")
+}
+
+fn cleanup_pto() -> void {
+    pto_ensure_dir()
+    let _ = exec("rm -f '" + pto_timers_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pto_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pto_append_row(path: str, row: str) -> void {
+    pto_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_timer: timer object 1 건 기록 ───
+fn record_timer(timer_id: int, timer_kind: int, due_time_us: int, period_us: int) -> void {
+    if timer_id <= 0 {
+        panic("pe_timer_object FAIL [record_timer] expected=timer_id>0 got=" + to_string(timer_id))
+    }
+    if timer_kind < 1 {
+        panic("pe_timer_object FAIL [record_timer] expected=timer_kind>=1 got=" + to_string(timer_kind))
+    }
+    if timer_kind > 3 {
+        panic("pe_timer_object FAIL [record_timer] expected=timer_kind<=3 got=" + to_string(timer_kind))
+    }
+    if due_time_us < 0 {
+        panic("pe_timer_object FAIL [record_timer] expected=due_time_us>=0 got=" + to_string(due_time_us))
+    }
+    if period_us < 0 {
+        panic("pe_timer_object FAIL [record_timer] expected=period_us>=0 got=" + to_string(period_us))
+    }
+    let row = to_string(timer_id) + "\t" + to_string(timer_kind)
+        + "\t" + to_string(due_time_us) + "\t" + to_string(period_us) + "\n"
+    pto_append_row(pto_timers_path(), row)
+}
+
+// ─── timer_count: total timer 수 ───
+fn timer_count() -> int {
+    let t = pto_read_table(pto_timers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_timer_kind: 특정 timer_kind 의 timer 수 ───
+fn count_by_timer_kind(kind: int) -> int {
+    let t = pto_read_table(pto_timers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_due_time_us: 모든 timer due_time_us 합 ───
+fn total_due_time_us() -> int {
+    let t = pto_read_table(pto_timers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_period_us: 모든 timer period_us 합 ───
+fn total_period_us() -> int {
+    let t = pto_read_table(pto_timers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── periodic_count: period_us > 0 인 timer 수 ───
+fn periodic_count() -> int {
+    let t = pto_read_table(pto_timers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) > 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── timer_period_us: 특정 timer_id 의 period_us (없으면 0) ───
+fn timer_period_us(timer_id: int) -> int {
+    let t = pto_read_table(pto_timers_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == timer_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pto_stats: [timer_count, total_due_time_us, total_period_us, periodic_count] ───
+fn pto_stats() -> array {
+    let mut out = []
+    out.push(timer_count())
+    out.push(total_due_time_us())
+    out.push(total_period_us())
+    out.push(periodic_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pto-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pto()
+
+    // 2. record 6 timers across 3 kinds, 2 periodic
+    //    kind 1 (manual_reset)    : 2 timers — one-shot, periodic
+    //    kind 2 (synchronization) : 2 timers — one-shot, periodic
+    //    kind 3 (high_resolution) : 2 timers — both one-shot
+    record_timer(710001, 1, 1000000, 0)
+    r0_emit("pe_timer_object_record",
+        "\"timer_id\":710001,\"timer_kind\":1,\"due_time_us\":1000000,\"period_us\":0,\"target\":\"manual_reset_oneshot\"")
+
+    record_timer(710002, 1, 500000, 250000)
+    r0_emit("pe_timer_object_record",
+        "\"timer_id\":710002,\"timer_kind\":1,\"due_time_us\":500000,\"period_us\":250000,\"target\":\"manual_reset_periodic\"")
+
+    record_timer(710003, 2, 2000000, 0)
+    r0_emit("pe_timer_object_record",
+        "\"timer_id\":710003,\"timer_kind\":2,\"due_time_us\":2000000,\"period_us\":0,\"target\":\"synchronization_oneshot\"")
+
+    record_timer(710004, 2, 100000, 100000)
+    r0_emit("pe_timer_object_record",
+        "\"timer_id\":710004,\"timer_kind\":2,\"due_time_us\":100000,\"period_us\":100000,\"target\":\"synchronization_periodic\"")
+
+    record_timer(710005, 3, 50000, 0)
+    r0_emit("pe_timer_object_record",
+        "\"timer_id\":710005,\"timer_kind\":3,\"due_time_us\":50000,\"period_us\":0,\"target\":\"high_resolution_oneshot\"")
+
+    record_timer(710006, 3, 25000, 0)
+    r0_emit("pe_timer_object_record",
+        "\"timer_id\":710006,\"timer_kind\":3,\"due_time_us\":25000,\"period_us\":0,\"target\":\"high_resolution_oneshot\"")
+
+    // 3. timer_count = 6
+    let c = timer_count()
+    if c != 6 {
+        panic("pe_timer_object FAIL [timer_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_timer_kind sanity
+    let k1 = count_by_timer_kind(1)
+    if k1 != 2 {
+        panic("pe_timer_object FAIL [count_by_timer_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_timer_kind(2)
+    if k2 != 2 {
+        panic("pe_timer_object FAIL [count_by_timer_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_timer_kind(3)
+    if k3 != 2 {
+        panic("pe_timer_object FAIL [count_by_timer_kind(3)] expected=2 got=" + to_string(k3))
+    }
+    let k99 = count_by_timer_kind(99)
+    if k99 != 0 {
+        panic("pe_timer_object FAIL [count_by_timer_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. total_due_time_us = 1000000+500000+2000000+100000+50000+25000 = 3675000
+    let td = total_due_time_us()
+    if td != 3675000 {
+        panic("pe_timer_object FAIL [total_due_time_us] expected=3675000 got=" + to_string(td))
+    }
+
+    // 6. total_period_us = 250000 + 100000 = 350000
+    let tp = total_period_us()
+    if tp != 350000 {
+        panic("pe_timer_object FAIL [total_period_us] expected=350000 got=" + to_string(tp))
+    }
+
+    // 7. periodic_count = 2
+    let pc = periodic_count()
+    if pc != 2 {
+        panic("pe_timer_object FAIL [periodic_count] expected=2 got=" + to_string(pc))
+    }
+
+    // 8. timer_period_us sanity
+    let p2 = timer_period_us(710002)
+    if p2 != 250000 {
+        panic("pe_timer_object FAIL [timer_period_us(710002)] expected=250000 got=" + to_string(p2))
+    }
+    let p4 = timer_period_us(710004)
+    if p4 != 100000 {
+        panic("pe_timer_object FAIL [timer_period_us(710004)] expected=100000 got=" + to_string(p4))
+    }
+    let p1 = timer_period_us(710001)
+    if p1 != 0 {
+        panic("pe_timer_object FAIL [timer_period_us(710001)] expected=0 got=" + to_string(p1))
+    }
+    let p_miss = timer_period_us(9999)
+    if p_miss != 0 {
+        panic("pe_timer_object FAIL [timer_period_us(9999)] expected=0 got=" + to_string(p_miss))
+    }
+
+    // 9. pto_stats() = [6, 3675000, 350000, 2]
+    let s = pto_stats()
+    if len(s) != 4 {
+        panic("pe_timer_object FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_timer_object FAIL [stats timer_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 3675000 {
+        panic("pe_timer_object FAIL [stats total_due_time_us] expected=3675000 got=" + to_string(s[1]))
+    }
+    if s[2] != 350000 {
+        panic("pe_timer_object FAIL [stats total_period_us] expected=350000 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_timer_object FAIL [stats periodic_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_timer_object_stats",
+        "\"timer_count\":" + to_string(s[0])
+        + ",\"total_due_time_us\":" + to_string(s[1])
+        + ",\"total_period_us\":" + to_string(s[2])
+        + ",\"periodic_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_timer_object FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pto()
+    let s2 = pto_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_timer_object FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_timer_object self_test PASS (timers=" + to_string(s[0])
+        + ", due_us=" + to_string(s[1]) + ", period_us=" + to_string(s[2])
+        + ", periodic=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pto_stats()
+            println("timer_count\t" + to_string(s[0]))
+            println("total_due_time_us\t" + to_string(s[1]))
+            println("total_period_us\t" + to_string(s[2]))
+            println("periodic_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "period" {
+            if len(a) >= 4 {
+                let tid = to_int(a[3])
+                println("timer_period_us\t" + to_string(timer_period_us(tid)))
+                return
+            }
+            println("usage: hexa run pe_timer_object.hexa period <timer_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let arg2 = a[3]
+                if arg2 == "periodic" {
+                    println("periodic_count\t" + to_string(periodic_count()))
+                    return
+                }
+                let kind = to_int(arg2)
+                println("count_by_timer_kind\t" + to_string(count_by_timer_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_timer_object.hexa count <timer_kind|periodic>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pto()
+            println("cleaned: " + pto_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pto_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_timer_object.hexa { self-test | stats | period <timer_id> | count <timer_kind|periodic> | cleanup | dir }")
+}

@@ -1,0 +1,127 @@
+// lib/perf/c_live_telemetry_pulse.hexa — CN-77 skeleton manjeom 15/15
+//
+// Phase 6 live telemetry pulse — 60s heartbeat 으로 KPI snapshot.
+// 매 pulse 마다 fps/heap/pso/emit-count 4 KPI capture → trend.
+//
+// 무기: ring buffer (60 pulse window) + columnar (KPI per pulse).
+// 효과: live regression 즉시 검출 — 60s 이내 fps drop / heap leak 알림.
+
+use "./r0_common"
+
+let LTP_DIR = GAMEBOX_HOME + "/persist/live_telemetry_pulse"
+let PULSE_LOG = LTP_DIR + "/pulses.tsv"
+
+fn ltp_dir() -> str { return LTP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + LTP_DIR + "'")
+}
+
+fn record_pulse(fps: int, heap_mb: int, pso_count: int, emits: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = ts + "\t" + to_string(fps) + "\t" + to_string(heap_mb) + "\t" + to_string(pso_count) + "\t" + to_string(emits)
+    let tmp = PULSE_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PULSE_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("live_pulse", "\"fps\":" + to_string(fps) + ",\"heap\":" + to_string(heap_mb) + ",\"psos\":" + to_string(pso_count))
+}
+
+fn pulse_count() -> int {
+    let exists = exec("test -f '" + PULSE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    return to_int(exec("wc -l < '" + PULSE_LOG + "' | tr -d ' '").trim())
+}
+
+fn avg_fps() -> int {
+    let exists = exec("test -f '" + PULSE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$2; n++} END{if(n>0) print int(s/n); else print 0}' '" + PULSE_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// regression: 최근 5 pulse avg < 직전 5 pulse avg * 0.9 → drop 알림
+fn fps_regression() -> bool {
+    let n = pulse_count()
+    if n < 10 { return false }
+    let recent = exec("awk -F'\\t' '{a[NR]=$2} END{s=0; for(i=NR-4;i<=NR;i++) s+=a[i]; print int(s/5)}' '" + PULSE_LOG + "'").trim()
+    let prev = exec("awk -F'\\t' '{a[NR]=$2} END{s=0; for(i=NR-9;i<=NR-5;i++) s+=a[i]; print int(s/5)}' '" + PULSE_LOG + "'").trim()
+    if recent == "" || prev == "" { return false }
+    let r = to_int(recent)
+    let p = to_int(prev)
+    return r * 100 < p * 90
+}
+
+fn heap_growth() -> int {
+    let n = pulse_count()
+    if n < 2 { return 0 }
+    let r = exec("awk -F'\\t' 'NR==1{first=$3} END{print $3 - first}' '" + PULSE_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn cleanup_ltp() -> void {
+    let _ = exec("rm -rf '" + LTP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "ltp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_ltp()
+
+    // simulate 10 pulses — 5 healthy then 5 dropped
+    let i = 0
+    while i < 5 {
+        record_pulse(60, 100 + i, 50, 100 + i * 10)
+        i = i + 1
+    }
+    let j = 0
+    while j < 5 {
+        record_pulse(40, 105 + j, 50, 200 + j * 10)
+        j = j + 1
+    }
+
+    let n = pulse_count()
+    if n != 10 { panic("c_live_telemetry_pulse FAIL [count] expected=10 got=" + to_string(n)) }
+
+    let avg = avg_fps()
+    if avg != 50 { panic("c_live_telemetry_pulse FAIL [avg fps] expected=50 got=" + to_string(avg)) }
+
+    let regr = fps_regression()
+    if !regr { panic("c_live_telemetry_pulse FAIL [regression] expected=true (60→40)") }
+
+    let growth = heap_growth()
+    if growth != 9 { panic("c_live_telemetry_pulse FAIL [heap growth] expected=9 got=" + to_string(growth)) }
+
+    r0_emit("live_pulse_summary", "\"pulses\":" + to_string(n) + ",\"avg_fps\":" + to_string(avg) + ",\"regr\":1,\"heap_growth\":" + to_string(growth))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 10 { panic("c_live_telemetry_pulse FAIL [emit] got=" + to_string(cnt)) }
+
+    cleanup_ltp()
+
+    println("  ✅ c_live_telemetry_pulse self_test PASS (10 pulses, fps avg=50, regression detected, heap +9MB, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "pulse" && len(a) >= 7 {
+            record_pulse(to_int(a[3]), to_int(a[4]), to_int(a[5]), to_int(a[6]))
+            println("recorded")
+            return
+        }
+        if sub == "stats" {
+            let r = "no"
+            if fps_regression() { r = "YES" }
+            println("pulses=" + to_string(pulse_count()) + " avg_fps=" + to_string(avg_fps()) + " regression=" + r + " heap_growth=" + to_string(heap_growth()))
+            return
+        }
+        if sub == "cleanup" { cleanup_ltp(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_live_telemetry_pulse.hexa { self-test | pulse <fps> <heap_mb> <psos> <emits> | stats | cleanup }")
+}

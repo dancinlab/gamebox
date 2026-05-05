@@ -1,0 +1,140 @@
+// lib/perf/r0_cache_watch.hexa — D3DMetal shader/PSO cache 디렉토리 mtime 모니터
+//
+// Apple D3DMetal cache 위치 (~/Library/Caches/com.apple.metal/) 와 GPTK prefix 안의
+// shader cache 를 inventory snapshot → 신규/제거/변경 파일 detection.
+//
+// upstream candidate: native readdir / fs_walk / fs_stat (현재 find/stat exec 우회).
+//
+// 모드:
+//   once    — 모든 location scan, snap 갱신
+//   diff    — 두 snap 비교, JSONL emit
+//   self-test
+
+use "./r0_common"
+
+let CACHE_PATH_1 = HOME + "/Library/Caches/com.apple.metal"
+let CACHE_PATH_2 = GAMEBOX_HOME + "/prefixes"
+let CACHE_PATH_3 = HOME + "/Library/Containers/com.isaacmarovitz.Whisky/Bottles"
+
+// snap 파일 경로 (path 의 / → _ 치환, exec)
+fn snap_file(path: str) -> str {
+    let safe = exec("printf '%s' '" + path + "' | tr '/' '_' | tr -d ' '").trim()
+    return R0_CACHE_INDEX + "/" + safe + ".snap"
+}
+
+// 단일 디렉토리 inventory: TSV (path \t size \t mtime)
+fn inventory(root: str) -> str {
+    let _check = exec("test -d '" + root + "' && echo ok").trim()
+    if _check != "ok" {
+        return ""
+    }
+    // shader cache 후보 확장자
+    let cmd = "find '" + root + "' -type f \\( -name '*.bin' -o -name '*.metal' -o -name '*.dxil' -o -name '*.air' -o -name '*.shdrcache' \\) 2>/dev/null | while read f; do printf '%s\\t%s\\t%s\\n' \"$f\" \"$(stat -f %z \"$f\" 2>/dev/null)\" \"$(stat -f %m \"$f\" 2>/dev/null)\"; done | sort"
+    return exec(cmd)
+}
+
+// 한번 스캔 — 모든 location → snap 파일
+fn scan_once() -> int {
+    r0_ensure_dirs()
+    let total = 0
+    let paths = [CACHE_PATH_1, CACHE_PATH_2, CACHE_PATH_3]
+    let i = 0
+    while i < len(paths) {
+        let p = paths[i]
+        let snap = snap_file(p)
+        let inv = inventory(p)
+        write_file(snap, inv)
+        let cnt_str = exec("printf '%s' '" + inv + "' | grep -c . 2>/dev/null").trim()
+        let cnt = 0
+        if cnt_str != "" { cnt = to_int(cnt_str) }
+        total = total + cnt
+        r0_emit("cache_scan", "\"path\":\"" + p + "\",\"file_count\":" + to_string(cnt))
+        i = i + 1
+    }
+    return total
+}
+
+// 두 snap 비교 → added/removed/modified emit
+fn diff_snaps(old_path: str, new_path: str) -> int {
+    let _ = exec("test -f '" + old_path + "' -a -f '" + new_path + "' && echo ok").trim()
+    if _ != "ok" {
+        panic("diff_snaps: snap file missing")
+    }
+
+    // awk one-shot: NR==FNR 일 땐 old, 아니면 new — added/removed/modified count
+    let cmd = "awk -F'\\t' 'NR==FNR{old[$1]=$2\"\\t\"$3;next} {if($1 in old){split(old[$1],v,\"\\t\");if(v[1]!=$2||v[2]!=$3)m++;delete old[$1]}else{a++}} END{for(k in old)r++;printf \"%d %d %d\",a+0,r+0,m+0}' '" + old_path + "' '" + new_path + "'"
+    let result = exec(cmd).trim()
+    let parts = result.split(" ")
+    let a = 0
+    let r = 0
+    let m = 0
+    if len(parts) >= 3 {
+        a = to_int(parts[0])
+        r = to_int(parts[1])
+        m = to_int(parts[2])
+    }
+
+    // 각 파일 path 별로 emit (간단화 — count 만 기록)
+    if a > 0 {
+        r0_emit("cache_added_batch", "\"count\":" + to_string(a))
+    }
+    if r > 0 {
+        r0_emit("cache_removed_batch", "\"count\":" + to_string(r))
+    }
+    if m > 0 {
+        r0_emit("cache_modified_batch", "\"count\":" + to_string(m))
+    }
+    return a + r + m
+}
+
+fn self_test() -> void {
+    let sid = "r0cache-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 합성: 임시 두 snap 파일
+    let tmp = "/tmp/r0_cache_test_" + exec("date +%s").trim()
+    let _ = exec("mkdir -p " + tmp)
+    let old_snap = tmp + "/old.snap"
+    let new_snap = tmp + "/new.snap"
+
+    // old: a.bin (100, mtime=1000), b.bin (200, mtime=2000)
+    write_file(old_snap, "/x/a.bin\t100\t1000\n/x/b.bin\t200\t2000\n")
+    // new: a.bin (150, mtime=1500) modified, c.bin (300, mtime=3000) added, b.bin removed
+    write_file(new_snap, "/x/a.bin\t150\t1500\n/x/c.bin\t300\t3000\n")
+
+    let total_changes = diff_snaps(old_snap, new_snap)
+    let _rm = exec("rm -rf '" + tmp + "'")
+
+    if total_changes != 3 {
+        panic("r0_cache_watch FAIL [diff total] expected=3 got=" + to_string(total_changes))
+    }
+    let cnt = r0_session_count(sid)
+    if cnt != 3 {
+        panic("r0_cache_watch FAIL [emit count] expected=3 got=" + to_string(cnt))
+    }
+    println("  ✅ r0_cache_watch self_test PASS (3 changes: 1 added, 1 removed, 1 modified, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "once" {
+            let n = scan_once()
+            println("scanned: " + to_string(n))
+            return
+        }
+        if sub == "diff" {
+            if len(a) >= 5 {
+                let n = diff_snaps(a[3], a[4])
+                println("changes: " + to_string(n))
+                return
+            }
+        }
+    }
+    println("usage: hexa run r0_cache_watch.hexa { self-test | once | diff <old> <new> }")
+}

@@ -1,0 +1,553 @@
+// lib/loader/pe_i386_0f_prefix_extra_real.hexa — i386 0F escape extra instruction tracker
+//
+// Phase 후속 interpreter 가 i386 32-bit PE 의 0F escape opcode (two-byte prefix) 중
+// XADD / CMOVcc / SETcc / BT-family / BSF/BSR 를 디코드한 결과를 hexa side 가 받아
+// extra-prefix instruction coverage 를 추적한다. 기존 pe_i386_x87_fpu_inst_real
+// (D8-DF FPU) / pe_i386_xchg_lock_inst (atomic) 와 직교한 0F escape 추가 추적기.
+//
+// 추적 대상 (Intel SDM Vol 2A — two-byte opcode map):
+//   - 0F C0 / 0F C1 XADD r/m, r — exchange-and-add (LOCK 가능)
+//     * pe_i386_xchg_lock_inst.record_xadd 와는 다른 schema (lock_prefix/condition 포함)
+//   - 0F 40-4F CMOVcc r, r/m — conditional move (16 condition codes)
+//     condition 0=O / 1=NO / 2=B/NAE/C / 3=AE/NB/NC / 4=E/Z / 5=NE/NZ
+//                6=BE/NA / 7=A/NBE / 8=S / 9=NS / A=P/PE / B=NP/PO
+//                C=L/NGE / D=GE/NL / E=LE/NG / F=G/NLE
+//   - 0F 90-9F SETcc r/m8 — conditional set byte (16 condition codes)
+//     * set_byte_kind 0 = mem8 target / 1 = reg8 target
+//   - 0F A3 BT / 0F AB BTS / 0F B3 BTR / 0F BB BTC — bit test family (LOCK valid)
+//     * op_kind 0=BT / 1=BTS / 2=BTR / 3=BTC
+//   - 0F BC BSF / 0F BD BSR — bit scan forward / reverse
+//     * scan_dir 0=forward / 1=reverse
+//
+// own 1 enforcement: Wine / Box86 / CrossOver / Whisky / community 0 줄.
+//   - Wine wine/dlls/ntdll/x86_64/* 인용 X
+//   - Box86 dynarec_arm64/dynarec_arm64_0f.c 인용 X
+//   - QEMU target/i386/translate.c 인용 X
+//   - Intel SDM Vol 2 (two-byte opcode map / CMOVcc / SETcc / BT / BSF/BSR) 자체 구현만 OK
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종 — xadd.tsv + cmovcc.tsv + setcc.tsv + bit_op.tsv + bit_scan.tsv):
+//   xadd.tsv     : xadd_id<int>   \t opcode_byte<str> \t lhs_reg_idx<int> \t rhs_reg_idx<int> \t lock_prefix<int>
+//   cmovcc.tsv   : cmov_id<int>   \t opcode_byte<str> \t condition_kind<int> \t taken<int>
+//   setcc.tsv    : setcc_id<int>  \t opcode_byte<str> \t condition_kind<int> \t set_byte_kind<int>
+//   bit_op.tsv   : bt_id<int>     \t opcode_byte<str> \t op_kind<int> \t bit_offset<int>
+//   bit_scan.tsv : bs_id<int>     \t opcode_byte<str> \t scan_dir<int> \t source_reg_idx<int>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지.
+//   식별자: opcode_byte / lhs_reg_idx / rhs_reg_idx / lock_prefix
+//           cmov_id / condition_kind / taken
+//           setcc_id / set_byte_kind
+//           bt_id / op_kind / bit_offset
+//           bs_id / scan_dir / source_reg_idx
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn p0fx_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_0f_prefix_extra_real"
+}
+
+fn p0fx_xadd_path() -> str {
+    return p0fx_dir() + "/xadd.tsv"
+}
+
+fn p0fx_cmovcc_path() -> str {
+    return p0fx_dir() + "/cmovcc.tsv"
+}
+
+fn p0fx_setcc_path() -> str {
+    return p0fx_dir() + "/setcc.tsv"
+}
+
+fn p0fx_bit_op_path() -> str {
+    return p0fx_dir() + "/bit_op.tsv"
+}
+
+fn p0fx_bit_scan_path() -> str {
+    return p0fx_dir() + "/bit_scan.tsv"
+}
+
+fn p0fx_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + p0fx_dir() + "'")
+}
+
+fn cleanup_p0fx() -> void {
+    p0fx_ensure_dir()
+    let _ = exec("rm -f '" + p0fx_xadd_path()
+        + "' '" + p0fx_cmovcc_path()
+        + "' '" + p0fx_setcc_path()
+        + "' '" + p0fx_bit_op_path()
+        + "' '" + p0fx_bit_scan_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn p0fx_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn p0fx_append_row(path: str, row: str) -> void {
+    p0fx_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── condition_name: 0..15 → "O".."G" (Intel SDM Vol 2 §B.1.4.7 condition codes) ───
+fn condition_name(k: int) -> str {
+    if k == 0  { return "O"  }
+    if k == 1  { return "NO" }
+    if k == 2  { return "B"  }
+    if k == 3  { return "AE" }
+    if k == 4  { return "E"  }
+    if k == 5  { return "NE" }
+    if k == 6  { return "BE" }
+    if k == 7  { return "A"  }
+    if k == 8  { return "S"  }
+    if k == 9  { return "NS" }
+    if k == 10 { return "P"  }
+    if k == 11 { return "NP" }
+    if k == 12 { return "L"  }
+    if k == 13 { return "GE" }
+    if k == 14 { return "LE" }
+    if k == 15 { return "G"  }
+    return ""
+}
+
+// ─── bit_op_name: 0..3 → "BT"/"BTS"/"BTR"/"BTC" ───
+fn bit_op_name(k: int) -> str {
+    if k == 0 { return "BT"  }
+    if k == 1 { return "BTS" }
+    if k == 2 { return "BTR" }
+    if k == 3 { return "BTC" }
+    return ""
+}
+
+// ─── record_xadd: 0F C0 r/m8 r8 / 0F C1 r/m32 r32 ───
+//   lock_prefix 0 = LOCK 없음 / 1 = F0 LOCK prefix 동반 (atomic)
+fn record_xadd(xadd_id: int, opcode_byte: str, lhs_reg_idx: int, rhs_reg_idx: int, lock_prefix: int) -> void {
+    if xadd_id < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=xadd_id>=0 got=" + to_string(xadd_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=opcode_byte!=empty got=empty")
+    }
+    if lhs_reg_idx < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=lhs_reg_idx>=0 got=" + to_string(lhs_reg_idx))
+    }
+    if lhs_reg_idx > 7 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=lhs_reg_idx<=7 got=" + to_string(lhs_reg_idx))
+    }
+    if rhs_reg_idx < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=rhs_reg_idx>=0 got=" + to_string(rhs_reg_idx))
+    }
+    if rhs_reg_idx > 7 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=rhs_reg_idx<=7 got=" + to_string(rhs_reg_idx))
+    }
+    if lock_prefix < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=lock_prefix>=0 got=" + to_string(lock_prefix))
+    }
+    if lock_prefix > 1 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_xadd] expected=lock_prefix<=1 got=" + to_string(lock_prefix))
+    }
+    let row = to_string(xadd_id) + "\t" + opcode_byte + "\t"
+        + to_string(lhs_reg_idx) + "\t" + to_string(rhs_reg_idx) + "\t"
+        + to_string(lock_prefix) + "\n"
+    p0fx_append_row(p0fx_xadd_path(), row)
+}
+
+// ─── record_cmovcc: 0F 40..4F CMOVcc r, r/m ───
+//   taken 0 = condition false (ignore source) / 1 = condition true (write dest)
+fn record_cmovcc(cmov_id: int, opcode_byte: str, condition_kind: int, taken: int) -> void {
+    if cmov_id < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_cmovcc] expected=cmov_id>=0 got=" + to_string(cmov_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_cmovcc] expected=opcode_byte!=empty got=empty")
+    }
+    if condition_kind < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_cmovcc] expected=condition_kind>=0 got=" + to_string(condition_kind))
+    }
+    if condition_kind > 15 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_cmovcc] expected=condition_kind<=15 got=" + to_string(condition_kind))
+    }
+    if taken < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_cmovcc] expected=taken>=0 got=" + to_string(taken))
+    }
+    if taken > 1 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_cmovcc] expected=taken<=1 got=" + to_string(taken))
+    }
+    let row = to_string(cmov_id) + "\t" + opcode_byte + "\t"
+        + to_string(condition_kind) + "\t" + to_string(taken) + "\n"
+    p0fx_append_row(p0fx_cmovcc_path(), row)
+}
+
+// ─── record_setcc: 0F 90..9F SETcc r/m8 ───
+//   set_byte_kind 0 = mem8 target / 1 = reg8 target (AL/CL/DL/BL/AH/CH/DH/BH)
+fn record_setcc(setcc_id: int, opcode_byte: str, condition_kind: int, set_byte_kind: int) -> void {
+    if setcc_id < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_setcc] expected=setcc_id>=0 got=" + to_string(setcc_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_setcc] expected=opcode_byte!=empty got=empty")
+    }
+    if condition_kind < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_setcc] expected=condition_kind>=0 got=" + to_string(condition_kind))
+    }
+    if condition_kind > 15 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_setcc] expected=condition_kind<=15 got=" + to_string(condition_kind))
+    }
+    if set_byte_kind < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_setcc] expected=set_byte_kind>=0 got=" + to_string(set_byte_kind))
+    }
+    if set_byte_kind > 1 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_setcc] expected=set_byte_kind<=1 got=" + to_string(set_byte_kind))
+    }
+    let row = to_string(setcc_id) + "\t" + opcode_byte + "\t"
+        + to_string(condition_kind) + "\t" + to_string(set_byte_kind) + "\n"
+    p0fx_append_row(p0fx_setcc_path(), row)
+}
+
+// ─── record_bit_op: BT-family (0F A3 BT / 0F AB BTS / 0F B3 BTR / 0F BB BTC) ───
+//   bit_offset = base 로부터 비트 오프셋 (mod 32 or mod 64)
+fn record_bit_op(bt_id: int, opcode_byte: str, op_kind: int, bit_offset: int) -> void {
+    if bt_id < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_op] expected=bt_id>=0 got=" + to_string(bt_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_op] expected=opcode_byte!=empty got=empty")
+    }
+    if op_kind < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_op] expected=op_kind>=0 got=" + to_string(op_kind))
+    }
+    if op_kind > 3 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_op] expected=op_kind<=3 got=" + to_string(op_kind))
+    }
+    if bit_offset < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_op] expected=bit_offset>=0 got=" + to_string(bit_offset))
+    }
+    let row = to_string(bt_id) + "\t" + opcode_byte + "\t"
+        + to_string(op_kind) + "\t" + to_string(bit_offset) + "\n"
+    p0fx_append_row(p0fx_bit_op_path(), row)
+}
+
+// ─── record_bit_scan: 0F BC BSF / 0F BD BSR ───
+//   scan_dir 0 = forward (BSF, low → high) / 1 = reverse (BSR, high → low)
+fn record_bit_scan(bs_id: int, opcode_byte: str, scan_dir: int, source_reg_idx: int) -> void {
+    if bs_id < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_scan] expected=bs_id>=0 got=" + to_string(bs_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_scan] expected=opcode_byte!=empty got=empty")
+    }
+    if scan_dir < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_scan] expected=scan_dir>=0 got=" + to_string(scan_dir))
+    }
+    if scan_dir > 1 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_scan] expected=scan_dir<=1 got=" + to_string(scan_dir))
+    }
+    if source_reg_idx < 0 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_scan] expected=source_reg_idx>=0 got=" + to_string(source_reg_idx))
+    }
+    if source_reg_idx > 7 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [record_bit_scan] expected=source_reg_idx<=7 got=" + to_string(source_reg_idx))
+    }
+    let row = to_string(bs_id) + "\t" + opcode_byte + "\t"
+        + to_string(scan_dir) + "\t" + to_string(source_reg_idx) + "\n"
+    p0fx_append_row(p0fx_bit_scan_path(), row)
+}
+
+// ─── 통계 헬퍼 ───
+fn p0fx_count_rows(path: str, min_cols: int) -> int {
+    let t = p0fx_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn xadd_count() -> int {
+    return p0fx_count_rows(p0fx_xadd_path(), 5)
+}
+
+fn cmovcc_count() -> int {
+    return p0fx_count_rows(p0fx_cmovcc_path(), 4)
+}
+
+fn setcc_count() -> int {
+    return p0fx_count_rows(p0fx_setcc_path(), 4)
+}
+
+fn bit_op_count() -> int {
+    return p0fx_count_rows(p0fx_bit_op_path(), 4)
+}
+
+fn bit_scan_count() -> int {
+    return p0fx_count_rows(p0fx_bit_scan_path(), 4)
+}
+
+// ─── p0fx_stats: [xadd, cmovcc, setcc, bit_op, bit_scan] ───
+fn p0fx_stats() -> array {
+    let mut out = []
+    out.push(xadd_count())
+    out.push(cmovcc_count())
+    out.push(setcc_count())
+    out.push(bit_op_count())
+    out.push(bit_scan_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "p0fx-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_p0fx()
+
+    // 2. record_xadd 2종 — 0F C0 reg-reg / 0F C1 reg-mem with LOCK
+    record_xadd(0, "C0", 3, 1, 0)  // XADD bl, cl (reg-reg, no LOCK)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_xadd",
+        "\"xadd_id\":0,\"opcode_byte\":\"C0\",\"lhs_reg_idx\":3,\"rhs_reg_idx\":1,\"lock_prefix\":0,\"target\":\"XADD.r8.no_lock\"")
+
+    record_xadd(1, "C1", 6, 2, 1)  // LOCK XADD esi, edx (reg-reg with LOCK)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_xadd",
+        "\"xadd_id\":1,\"opcode_byte\":\"C1\",\"lhs_reg_idx\":6,\"rhs_reg_idx\":2,\"lock_prefix\":1,\"target\":\"XADD.r32.lock\"")
+
+    // 3. record_cmovcc 4종 — CMOVE / CMOVNE / CMOVL / CMOVGE
+    //    CMOVE  = 0F 44 (cond 4 E/Z) / CMOVNE = 0F 45 (cond 5 NE/NZ)
+    //    CMOVL  = 0F 4C (cond 12 L)  / CMOVGE = 0F 4D (cond 13 GE)
+    record_cmovcc(0, "44", 4, 1)   // CMOVE  taken (ZF=1)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_cmovcc",
+        "\"cmov_id\":0,\"opcode_byte\":\"44\",\"condition_kind\":4,\"taken\":1,\"target\":\"CMOVE.taken\"")
+
+    record_cmovcc(1, "45", 5, 0)   // CMOVNE not-taken (ZF=1)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_cmovcc",
+        "\"cmov_id\":1,\"opcode_byte\":\"45\",\"condition_kind\":5,\"taken\":0,\"target\":\"CMOVNE.not_taken\"")
+
+    record_cmovcc(2, "4C", 12, 1)  // CMOVL  taken (SF != OF)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_cmovcc",
+        "\"cmov_id\":2,\"opcode_byte\":\"4C\",\"condition_kind\":12,\"taken\":1,\"target\":\"CMOVL.taken\"")
+
+    record_cmovcc(3, "4D", 13, 1)  // CMOVGE taken (SF == OF)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_cmovcc",
+        "\"cmov_id\":3,\"opcode_byte\":\"4D\",\"condition_kind\":13,\"taken\":1,\"target\":\"CMOVGE.taken\"")
+
+    // 4. record_setcc 4종 — SETE / SETNE / SETL / SETGE
+    //    SETE  = 0F 94 / SETNE = 0F 95 / SETL  = 0F 9C / SETGE = 0F 9D
+    //    set_byte_kind 0 = mem8, 1 = reg8
+    record_setcc(0, "94", 4, 1)    // SETE  AL (reg8)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_setcc",
+        "\"setcc_id\":0,\"opcode_byte\":\"94\",\"condition_kind\":4,\"set_byte_kind\":1,\"target\":\"SETE.al.reg\"")
+
+    record_setcc(1, "95", 5, 0)    // SETNE [mem]
+    r0_emit("pe_i386_0f_prefix_extra_real_record_setcc",
+        "\"setcc_id\":1,\"opcode_byte\":\"95\",\"condition_kind\":5,\"set_byte_kind\":0,\"target\":\"SETNE.mem\"")
+
+    record_setcc(2, "9C", 12, 1)   // SETL  CL (reg8)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_setcc",
+        "\"setcc_id\":2,\"opcode_byte\":\"9C\",\"condition_kind\":12,\"set_byte_kind\":1,\"target\":\"SETL.cl.reg\"")
+
+    record_setcc(3, "9D", 13, 0)   // SETGE [mem]
+    r0_emit("pe_i386_0f_prefix_extra_real_record_setcc",
+        "\"setcc_id\":3,\"opcode_byte\":\"9D\",\"condition_kind\":13,\"set_byte_kind\":0,\"target\":\"SETGE.mem\"")
+
+    // 5. record_bit_op 4종 — BT / BTS / BTR / BTC
+    //    BT  = 0F A3 (op_kind 0) / BTS = 0F AB (op_kind 1)
+    //    BTR = 0F B3 (op_kind 2) / BTC = 0F BB (op_kind 3)
+    record_bit_op(0, "A3", 0, 5)   // BT  base, 5
+    r0_emit("pe_i386_0f_prefix_extra_real_record_bit_op",
+        "\"bt_id\":0,\"opcode_byte\":\"A3\",\"op_kind\":0,\"bit_offset\":5,\"target\":\"BT.bit5\"")
+
+    record_bit_op(1, "AB", 1, 13)  // BTS base, 13
+    r0_emit("pe_i386_0f_prefix_extra_real_record_bit_op",
+        "\"bt_id\":1,\"opcode_byte\":\"AB\",\"op_kind\":1,\"bit_offset\":13,\"target\":\"BTS.bit13\"")
+
+    record_bit_op(2, "B3", 2, 21)  // BTR base, 21
+    r0_emit("pe_i386_0f_prefix_extra_real_record_bit_op",
+        "\"bt_id\":2,\"opcode_byte\":\"B3\",\"op_kind\":2,\"bit_offset\":21,\"target\":\"BTR.bit21\"")
+
+    record_bit_op(3, "BB", 3, 31)  // BTC base, 31
+    r0_emit("pe_i386_0f_prefix_extra_real_record_bit_op",
+        "\"bt_id\":3,\"opcode_byte\":\"BB\",\"op_kind\":3,\"bit_offset\":31,\"target\":\"BTC.bit31\"")
+
+    // 6. record_bit_scan 2종 — BSF forward / BSR reverse
+    //    BSF = 0F BC (scan_dir 0) / BSR = 0F BD (scan_dir 1)
+    record_bit_scan(0, "BC", 0, 1)  // BSF eax, ecx (forward, source=ecx)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_bit_scan",
+        "\"bs_id\":0,\"opcode_byte\":\"BC\",\"scan_dir\":0,\"source_reg_idx\":1,\"target\":\"BSF.ecx.forward\"")
+
+    record_bit_scan(1, "BD", 1, 6)  // BSR edx, esi (reverse, source=esi)
+    r0_emit("pe_i386_0f_prefix_extra_real_record_bit_scan",
+        "\"bs_id\":1,\"opcode_byte\":\"BD\",\"scan_dir\":1,\"source_reg_idx\":6,\"target\":\"BSR.esi.reverse\"")
+
+    // 7. assertion: xadd == 2
+    let xc = xadd_count()
+    if xc != 2 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [xadd_count] expected=2 got=" + to_string(xc))
+    }
+
+    // 8. assertion: cmovcc == 4
+    let cc = cmovcc_count()
+    if cc != 4 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [cmovcc_count] expected=4 got=" + to_string(cc))
+    }
+
+    // 9. assertion: setcc == 4
+    let sc = setcc_count()
+    if sc != 4 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [setcc_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 10. assertion: bit_op == 4
+    let bc = bit_op_count()
+    if bc != 4 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_op_count] expected=4 got=" + to_string(bc))
+    }
+
+    // 11. assertion: bit_scan == 2
+    let bsc = bit_scan_count()
+    if bsc != 2 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_scan_count] expected=2 got=" + to_string(bsc))
+    }
+
+    // 12. condition_name sanity (0..15 + invalid)
+    if condition_name(0) != "O" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(0)] expected=O got=" + condition_name(0))
+    }
+    if condition_name(4) != "E" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(4)] expected=E got=" + condition_name(4))
+    }
+    if condition_name(5) != "NE" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(5)] expected=NE got=" + condition_name(5))
+    }
+    if condition_name(12) != "L" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(12)] expected=L got=" + condition_name(12))
+    }
+    if condition_name(13) != "GE" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(13)] expected=GE got=" + condition_name(13))
+    }
+    if condition_name(15) != "G" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(15)] expected=G got=" + condition_name(15))
+    }
+    if condition_name(16) != "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [condition_name(16)] expected=empty got=" + condition_name(16))
+    }
+
+    // 13. bit_op_name sanity (0..3 + invalid)
+    if bit_op_name(0) != "BT" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_op_name(0)] expected=BT got=" + bit_op_name(0))
+    }
+    if bit_op_name(1) != "BTS" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_op_name(1)] expected=BTS got=" + bit_op_name(1))
+    }
+    if bit_op_name(2) != "BTR" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_op_name(2)] expected=BTR got=" + bit_op_name(2))
+    }
+    if bit_op_name(3) != "BTC" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_op_name(3)] expected=BTC got=" + bit_op_name(3))
+    }
+    if bit_op_name(4) != "" {
+        panic("pe_i386_0f_prefix_extra_real FAIL [bit_op_name(4)] expected=empty got=" + bit_op_name(4))
+    }
+
+    // 14. p0fx_stats() = [2, 4, 4, 4, 2]
+    let s = p0fx_stats()
+    if len(s) != 5 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [stats xadd_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [stats cmovcc_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [stats setcc_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [stats bit_op_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [stats bit_scan_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_i386_0f_prefix_extra_real_stats",
+        "\"xadd_count\":" + to_string(s[0])
+        + ",\"cmovcc_count\":" + to_string(s[1])
+        + ",\"setcc_count\":" + to_string(s[2])
+        + ",\"bit_op_count\":" + to_string(s[3])
+        + ",\"bit_scan_count\":" + to_string(s[4]))
+
+    // 16. r0 emit count assertion (≥ 14)
+    //     실제 emit: 2 xadd + 4 cmovcc + 4 setcc + 4 bit_op + 2 bit_scan + 1 stats = 17
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_0f_prefix_extra_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_p0fx()
+    let s2 = p0fx_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_0f_prefix_extra_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_0f_prefix_extra_real self_test PASS (xadd=" + to_string(s[0])
+        + ", cmovcc=" + to_string(s[1]) + ", setcc=" + to_string(s[2])
+        + ", bit_op=" + to_string(s[3]) + ", bit_scan=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = p0fx_stats()
+            println("xadd_count\t" + to_string(s[0]))
+            println("cmovcc_count\t" + to_string(s[1]))
+            println("setcc_count\t" + to_string(s[2]))
+            println("bit_op_count\t" + to_string(s[3]))
+            println("bit_scan_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_p0fx()
+            println("cleaned: " + p0fx_dir())
+            return
+        }
+        if sub == "dir" {
+            println(p0fx_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_0f_prefix_extra_real.hexa { self-test | stats | cleanup | dir }")
+}

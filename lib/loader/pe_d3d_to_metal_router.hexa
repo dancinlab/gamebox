@@ -1,0 +1,424 @@
+// lib/loader/pe_d3d_to_metal_router.hexa — cycle 80 R5 phase 1 router skeleton
+//
+// D3D11/12 → Metal routing 매트릭스:
+//   ID3D11Device::CreateBuffer       → MTLDevice newBufferWithLength (d3dmetal_delegate)
+//   ID3D11Device::CreateTexture2D    → MTLDevice newTextureWithDescriptor (d3dmetal_delegate)
+//   ID3D11DeviceContext::Draw        → MTLRenderCommandEncoder drawPrimitives (d3dmetal_delegate)
+//   ID3D11DeviceContext::Dispatch    → MTLComputeCommandEncoder dispatchThreadgroups (d3dmetal_delegate)
+//   ID3D12CommandQueue::ExecuteCmdLists → MTLCommandQueue commit (d3dmetal_delegate)
+//   ID3D12Device::CreatePipelineState → metal_shaderconverter (DXIL → MSL → AIR)
+//   D3D11 ID3D11Buffer::Map / D3D12 GetCpuDescriptorHandleForHeapStart → diy_hexa_fallback
+//   d3dmetal binary 위임 가능 method ~85%, fallback ~15%
+// own1 § A: D3DMetal binary 명시 허용 — MoltenVK / DXVK / VKD3D 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 routing decision tracker — 실 Metal API 호출 X (later phase).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// source_api code:
+//   11 = d3d11
+//   12 = d3d12
+//
+// route_kind code:
+//   1 = d3dmetal_delegate         (Apple D3DMetal binary 위임)
+//   2 = metal_shaderconverter     (DXIL → MSL → AIR via Metal Shader Converter)
+//   3 = diy_hexa_fallback         (delegate 불가 method — DIY hexa stub)
+//   4 = passthrough               (no-op / state mirror only)
+//
+// persist schema (TSV — routes.tsv):
+//   route_id<int> \t source_api<int> \t route_kind<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdmr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_d3d_to_metal_router"
+}
+
+fn pdmr_routes_path() -> str {
+    return pdmr_dir() + "/routes.tsv"
+}
+
+fn pdmr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdmr_dir() + "'")
+}
+
+fn cleanup_pdmr() -> void {
+    pdmr_ensure_dir()
+    let _ = exec("rm -f '" + pdmr_routes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdmr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdmr_append_row(path: str, row: str) -> void {
+    pdmr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_route: routing decision 1 건 기록 ───
+fn record_route(route_id: int, source_api: int, route_kind: int, elevated: int) -> void {
+    if route_id <= 0 {
+        panic("pe_d3d_to_metal_router FAIL [record_route] expected=route_id>0 got=" + to_string(route_id))
+    }
+    if source_api != 11 {
+        if source_api != 12 {
+            panic("pe_d3d_to_metal_router FAIL [record_route] expected=source_api in {11,12} got=" + to_string(source_api))
+        }
+    }
+    if route_kind < 1 {
+        panic("pe_d3d_to_metal_router FAIL [record_route] expected=route_kind>=1 got=" + to_string(route_kind))
+    }
+    if route_kind > 4 {
+        panic("pe_d3d_to_metal_router FAIL [record_route] expected=route_kind<=4 got=" + to_string(route_kind))
+    }
+    if elevated < 0 {
+        panic("pe_d3d_to_metal_router FAIL [record_route] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_d3d_to_metal_router FAIL [record_route] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(route_id) + "\t" + to_string(source_api)
+        + "\t" + to_string(route_kind) + "\t" + to_string(elevated) + "\n"
+    pdmr_append_row(pdmr_routes_path(), row)
+}
+
+// ─── route_count: total route 수 ───
+fn route_count() -> int {
+    let t = pdmr_read_table(pdmr_routes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_source_api: 특정 source_api 의 route 수 ───
+fn count_by_source_api(api: int) -> int {
+    let t = pdmr_read_table(pdmr_routes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == api {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_route_kind: 특정 route_kind 의 route 수 ───
+fn count_by_route_kind(kind: int) -> int {
+    let t = pdmr_read_table(pdmr_routes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── delegate_count: kind 1 (d3dmetal_delegate) + kind 2 (metal_shaderconverter) ───
+fn delegate_count() -> int {
+    return count_by_route_kind(1) + count_by_route_kind(2)
+}
+
+// ─── fallback_count: kind 3 (diy_hexa_fallback) ───
+fn fallback_count() -> int {
+    return count_by_route_kind(3)
+}
+
+// ─── route_elevated: 특정 route_id 의 elevated flag (없으면 0) ───
+fn route_elevated(route_id: int) -> int {
+    let t = pdmr_read_table(pdmr_routes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == route_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pdmr_stats: [route_count, delegate_count, fallback_count, count_by_source_api(11), count_by_source_api(12)] ───
+fn pdmr_stats() -> array {
+    let mut out = []
+    out.push(route_count())
+    out.push(delegate_count())
+    out.push(fallback_count())
+    out.push(count_by_source_api(11))
+    out.push(count_by_source_api(12))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdmr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdmr()
+
+    // 2. record 6 routes — both source_apis, ≥3 kinds, ≥4 delegate
+    //    d3d11 CreateBuffer → d3dmetal_delegate (hot path, elevated)
+    record_route(710001, 11, 1, 1)
+    r0_emit("pe_d3d_to_metal_router_record",
+        "\"route_id\":710001,\"source_api\":11,\"route_kind\":1,\"elevated\":1,\"target\":\"d3d11_CreateBuffer→MTLDevice_newBufferWithLength\"")
+
+    //    d3d11 CreateTexture2D → d3dmetal_delegate
+    record_route(710002, 11, 1, 1)
+    r0_emit("pe_d3d_to_metal_router_record",
+        "\"route_id\":710002,\"source_api\":11,\"route_kind\":1,\"elevated\":1,\"target\":\"d3d11_CreateTexture2D→MTLDevice_newTextureWithDescriptor\"")
+
+    //    d3d11 Draw → d3dmetal_delegate (hot path)
+    record_route(710003, 11, 1, 1)
+    r0_emit("pe_d3d_to_metal_router_record",
+        "\"route_id\":710003,\"source_api\":11,\"route_kind\":1,\"elevated\":1,\"target\":\"d3d11_Draw→MTLRenderCommandEncoder_drawPrimitives\"")
+
+    //    d3d12 ExecuteCmdLists → d3dmetal_delegate (hot path)
+    record_route(710004, 12, 1, 1)
+    r0_emit("pe_d3d_to_metal_router_record",
+        "\"route_id\":710004,\"source_api\":12,\"route_kind\":1,\"elevated\":1,\"target\":\"d3d12_ExecuteCmdLists→MTLCommandQueue_commit\"")
+
+    //    d3d12 CreatePipelineState → metal_shaderconverter
+    record_route(710005, 12, 2, 0)
+    r0_emit("pe_d3d_to_metal_router_record",
+        "\"route_id\":710005,\"source_api\":12,\"route_kind\":2,\"elevated\":0,\"target\":\"d3d12_CreatePipelineState→DXIL_to_MSL_to_AIR\"")
+
+    //    d3d11 Buffer::Map → diy_hexa_fallback
+    record_route(710006, 11, 3, 0)
+    r0_emit("pe_d3d_to_metal_router_record",
+        "\"route_id\":710006,\"source_api\":11,\"route_kind\":3,\"elevated\":0,\"target\":\"d3d11_Buffer_Map→diy_hexa_stub\"")
+
+    // 3. route_count = 6
+    let c = route_count()
+    if c != 6 {
+        panic("pe_d3d_to_metal_router FAIL [route_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_source_api sanity
+    let a11 = count_by_source_api(11)
+    if a11 != 4 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_source_api(11)] expected=4 got=" + to_string(a11))
+    }
+    let a12 = count_by_source_api(12)
+    if a12 != 2 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_source_api(12)] expected=2 got=" + to_string(a12))
+    }
+
+    // 5. count_by_route_kind sanity — kind 1 ≥4, kind 2 ≥1, kind 3 ≥1
+    let k1 = count_by_route_kind(1)
+    if k1 != 4 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_route_kind(1)] expected=4 got=" + to_string(k1))
+    }
+    let k2 = count_by_route_kind(2)
+    if k2 != 1 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_route_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_route_kind(3)
+    if k3 != 1 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_route_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_route_kind(4)
+    if k4 != 0 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_route_kind(4)] expected=0 got=" + to_string(k4))
+    }
+    let k99 = count_by_route_kind(99)
+    if k99 != 0 {
+        panic("pe_d3d_to_metal_router FAIL [count_by_route_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. delegate_count = k1 + k2 = 5 (≥4)
+    let dc = delegate_count()
+    if dc != 5 {
+        panic("pe_d3d_to_metal_router FAIL [delegate_count] expected=5 got=" + to_string(dc))
+    }
+    if dc < 4 {
+        panic("pe_d3d_to_metal_router FAIL [delegate_count >=4] got=" + to_string(dc))
+    }
+
+    // 7. fallback_count = k3 = 1
+    let fc = fallback_count()
+    if fc != 1 {
+        panic("pe_d3d_to_metal_router FAIL [fallback_count] expected=1 got=" + to_string(fc))
+    }
+
+    // 8. route_elevated sanity
+    let e1 = route_elevated(710001)
+    if e1 != 1 {
+        panic("pe_d3d_to_metal_router FAIL [route_elevated(710001)] expected=1 got=" + to_string(e1))
+    }
+    let e5 = route_elevated(710005)
+    if e5 != 0 {
+        panic("pe_d3d_to_metal_router FAIL [route_elevated(710005)] expected=0 got=" + to_string(e5))
+    }
+    let e_miss = route_elevated(9999)
+    if e_miss != 0 {
+        panic("pe_d3d_to_metal_router FAIL [route_elevated(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 9. pdmr_stats() = [6, 5, 1, 4, 2]
+    let s = pdmr_stats()
+    if len(s) != 5 {
+        panic("pe_d3d_to_metal_router FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_d3d_to_metal_router FAIL [stats route_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 5 {
+        panic("pe_d3d_to_metal_router FAIL [stats delegate_count] expected=5 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_d3d_to_metal_router FAIL [stats fallback_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_d3d_to_metal_router FAIL [stats d3d11_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_d3d_to_metal_router FAIL [stats d3d12_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_d3d_to_metal_router_stats",
+        "\"route_count\":" + to_string(s[0])
+        + ",\"delegate_count\":" + to_string(s[1])
+        + ",\"fallback_count\":" + to_string(s[2])
+        + ",\"d3d11_count\":" + to_string(s[3])
+        + ",\"d3d12_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_d3d_to_metal_router FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdmr()
+    let s2 = pdmr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_d3d_to_metal_router FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_d3d_to_metal_router self_test PASS (routes=" + to_string(s[0])
+        + ", delegate=" + to_string(s[1]) + ", fallback=" + to_string(s[2])
+        + ", d3d11=" + to_string(s[3]) + ", d3d12=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdmr_stats()
+            println("route_count\t" + to_string(s[0]))
+            println("delegate_count\t" + to_string(s[1]))
+            println("fallback_count\t" + to_string(s[2]))
+            println("d3d11_count\t" + to_string(s[3]))
+            println("d3d12_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "elevated" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("route_elevated\t" + to_string(route_elevated(rid)))
+                return
+            }
+            println("usage: hexa run pe_d3d_to_metal_router.hexa elevated <route_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let target = a[3]
+                let val = to_int(a[4])
+                if target == "api" {
+                    println("count_by_source_api\t" + to_string(count_by_source_api(val)))
+                    return
+                }
+                if target == "route" {
+                    println("count_by_route_kind\t" + to_string(count_by_route_kind(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_d3d_to_metal_router.hexa count { api <source_api> | route <route_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdmr()
+            println("cleaned: " + pdmr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdmr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_d3d_to_metal_router.hexa { self-test | stats | elevated <route_id> | count api <source_api> | count route <route_kind> | cleanup | dir }")
+}

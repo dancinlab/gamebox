@@ -1,0 +1,217 @@
+// lib/perf/c_cascade_label.hexa — CN-15 PSB-3 sketch (만점 15/15)
+//
+// 원인-결과 사슬 추적 (시간 거꾸로). M14 C-CORRELATE 의 진화.
+// stutter 발생 시 직전 N ms 안의 anomaly chain 을 시간순으로 추적.
+//
+// 무기: label fusion + temporal sliding window + causal chain detection.
+// 효과: M14 가 "동시 발생" 이라면, 이건 *순서까지* 추적.
+//
+// own 1 + own 2 mandate.
+
+use "./r0_common"
+
+let CASCADE_DIR = GAMEBOX_HOME + "/persist/cascade_label"
+let CHAIN_STORE = CASCADE_DIR + "/chains.jsonl"
+
+fn cascade_dir() -> str { return CASCADE_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CASCADE_DIR + "'")
+}
+
+// ─── event 등록 (label + ts) ───
+//   sources = array of [ts_us, kind, label]
+//   kind: "stutter" | "pso" | "heap" | "frame" | "input"
+fn record_event(ts_us: int, kind: str, label: str) -> void {
+    ensure_dir()
+    let line = "{\"ts_us\":" + to_string(ts_us) + ",\"kind\":\"" + kind + "\",\"label\":\"" + label + "\"}"
+    let tmp = CHAIN_STORE + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + CHAIN_STORE + "' && rm -f '" + tmp + "'")
+    r0_emit("cascade_event", "\"ts\":" + to_string(ts_us) + ",\"kind\":\"" + kind + "\",\"label\":\"" + label + "\"")
+}
+
+// ─── 시간순 chain 추출 — anchor event (보통 stutter) 기준 ─N us 안의 모든 event ───
+fn trace_chain(anchor_ts: int, lookback_us: int, sources: array) -> array {
+    let result = []
+    let i = 0
+    while i < len(sources) {
+        let s = sources[i]
+        let s_ts = s[0]
+        let dt = anchor_ts - s_ts
+        if dt >= 0 {
+            if dt <= lookback_us {
+                result = result + [s]
+            }
+        }
+        i = i + 1
+    }
+    // sort by ts (insertion sort)
+    let n = len(result)
+    let i2 = 1
+    while i2 < n {
+        let key = result[i2]
+        let j = i2 - 1
+        while j >= 0 {
+            if result[j][0] > key[0] {
+                result[j+1] = result[j]
+                j = j - 1
+            } else {
+                j = -1
+            }
+        }
+        result[j+1] = key
+        i2 = i2 + 1
+    }
+    return result
+}
+
+// ─── causal chain — anchor 가 stutter 면 chain 의 시간순 (원인 → 중간 → 결과) ───
+fn causal_score(chain: array) -> int {
+    if len(chain) < 2 { return 0 }
+    // 단순 score: chain length × event diversity
+    let kinds = []
+    let i = 0
+    while i < len(chain) {
+        let k = chain[i][1]
+        let exists = false
+        let j = 0
+        while j < len(kinds) {
+            if kinds[j] == k { exists = true }
+            j = j + 1
+        }
+        if !exists { kinds = kinds + [k] }
+        i = i + 1
+    }
+    return len(chain) * len(kinds)
+}
+
+// ─── chain 분석 — 가장 자주 보는 cascade pattern ───
+//   sources 에서 stutter 마다 chain 추출 → kind sequence string 으로 카운트
+fn cascade_patterns(sources: array, lookback_us: int) -> array {
+    let patterns = []
+    let counts = []
+    let i = 0
+    while i < len(sources) {
+        let s = sources[i]
+        if s[1] == "stutter" {
+            let chain = trace_chain(s[0], lookback_us, sources)
+            // pattern key: kind1,kind2,kind3,...
+            let key = ""
+            let j = 0
+            while j < len(chain) {
+                if j > 0 { key = key + "," }
+                key = key + chain[j][1]
+                j = j + 1
+            }
+            // count
+            let found = -1
+            let k = 0
+            while k < len(patterns) {
+                if patterns[k] == key { found = k }
+                k = k + 1
+            }
+            if found < 0 {
+                patterns = patterns + [key]
+                counts = counts + [1]
+            } else {
+                counts[found] = counts[found] + 1
+            }
+        }
+        i = i + 1
+    }
+    let result = []
+    let m = 0
+    while m < len(patterns) {
+        result = result + [[patterns[m], counts[m]]]
+        m = m + 1
+    }
+    return result
+}
+
+fn cleanup_cascade() -> void {
+    let _ = exec("rm -rf '" + CASCADE_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cascade-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cascade()
+
+    // 합성 시퀀스 — boss fight 패턴
+    let sources = [
+        [1000000, "pso", "compile_peak"],       // -100ms
+        [1050000, "heap", "OOM_imminent"],       // -50ms
+        [1100000, "stutter", "spike"],           // anchor
+        [2000000, "pso", "compile_peak"],
+        [2050000, "heap", "OOM_imminent"],
+        [2100000, "stutter", "spike"],
+        [3000000, "frame", "draw_burst"],
+        [3050000, "stutter", "sustained_drop"]
+    ]
+
+    // chain 추적 (lookback 200ms)
+    let chain1 = trace_chain(1100000, 200000, sources)
+    if len(chain1) != 3 {
+        panic("c_cascade_label FAIL [chain1] expected=3 got=" + to_string(len(chain1)))
+    }
+
+    let chain2 = trace_chain(3050000, 200000, sources)
+    if len(chain2) != 2 {
+        panic("c_cascade_label FAIL [chain2] expected=2 got=" + to_string(len(chain2)))
+    }
+
+    // causal score — chain1 의 kinds 수 × len(chain)
+    //   trace_chain 가 sort + duplicate event 가능성 — 실제 score 따라 검증
+    let score1 = causal_score(chain1)
+    if score1 < 6 {
+        panic("c_cascade_label FAIL [score1 too small] expected>=6 got=" + to_string(score1))
+    }
+
+    // pattern 분석 — anchor 시점에서 lookback 200ms 안의 시퀀스
+    let patterns = cascade_patterns(sources, 200000)
+    // 3 stutter event:
+    //   1 anchor: pso,heap,stutter (chain 3)
+    //   2 anchor: pso,heap,stutter (chain 3) — same pattern
+    //   3 anchor: frame,stutter (chain 2)
+    // → 2 distinct patterns
+    if len(patterns) != 2 {
+        panic("c_cascade_label FAIL [pattern count] expected=2 got=" + to_string(len(patterns)))
+    }
+    // 가장 자주 보는 pattern: pso,heap,stutter (count 2)
+    let max_count = 0
+    let i = 0
+    while i < len(patterns) {
+        if patterns[i][1] > max_count { max_count = patterns[i][1] }
+        i = i + 1
+    }
+    if max_count != 2 {
+        panic("c_cascade_label FAIL [max pattern count] expected=2 got=" + to_string(max_count))
+    }
+
+    r0_emit("cascade_pattern_summary", "\"distinct\":" + to_string(len(patterns)) + ",\"top_count\":" + to_string(max_count))
+
+    // record_event (file write 검증)
+    record_event(1000000, "pso", "compile_peak")
+    record_event(1100000, "stutter", "spike")
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 {
+        panic("c_cascade_label FAIL [emit count] expected>=3 got=" + to_string(cnt))
+    }
+
+    cleanup_cascade()
+
+    println("  ✅ c_cascade_label self_test PASS (chain1=3 events score=" + to_string(score1) + ", patterns=" + to_string(len(patterns)) + " distinct, top=" + to_string(max_count) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "cleanup" { cleanup_cascade(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_cascade_label.hexa { self-test | cleanup }")
+}

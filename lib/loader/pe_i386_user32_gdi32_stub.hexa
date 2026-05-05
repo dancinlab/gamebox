@@ -1,0 +1,484 @@
+// lib/loader/pe_i386_user32_gdi32_stub.hexa — Win32 GUI API (USER32 + GDI32)
+// stub coverage tracker.
+//
+// 본 module 은 Wine USER32/GDI32 implementation 0 줄, Apple SDK 호출 0 줄, pure
+// Hexa instrumentation skeleton. Microsoft Win32 API doc(WindowsAndMessages,
+// WindowClasses, GDI Reference) spec 만 참조한다. 실제 GUI rendering / message
+// pump 은 본 module 의 책임이 아니며, 어떤 Win32 GUI 함수가 호출됐는지를
+// 추적/통계만 제공한다.
+//
+// Phase 후속 interpreter 가 PE i386 binary (예: Battle.net Setup.exe) 를 돌릴
+// 때 first dialog 도달까지 사용하는 USER32/GDI32 호출을 5 종 record API 로
+// 적층하여 coverage 를 시각화한다.
+//
+// own 1: 타사 Wine/CrossOver/community USER32/GDI32 implementation 0 줄.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — 5 separate tables):
+//   window_class.tsv  : class_id<int>  \t class_name<str> \t wndproc_va_hex<str> \t style_hex<str>
+//   window_create.tsv : window_id<int> \t hwnd_hex<str>   \t class_name<str>     \t title<str> \t x<int> \t y<int> \t w<int> \t h<int>
+//   message.tsv       : msg_id<int>    \t hwnd_hex<str>   \t message_code_hex<str> \t wparam_hex<str> \t lparam_hex<str>
+//   gdi_op.tsv        : op_id<int>     \t op_kind<int>    \t hdc_hex<str>        \t target_hex<str>
+//   api_call.tsv      : call_id<int>   \t dll_name<str>   \t fn_name<str>        \t arg_count<int> \t return_value_hex<str>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piug_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_user32_gdi32_stub"
+}
+
+fn piug_window_class_path() -> str {
+    return piug_dir() + "/window_class.tsv"
+}
+
+fn piug_window_create_path() -> str {
+    return piug_dir() + "/window_create.tsv"
+}
+
+fn piug_message_path() -> str {
+    return piug_dir() + "/message.tsv"
+}
+
+fn piug_gdi_op_path() -> str {
+    return piug_dir() + "/gdi_op.tsv"
+}
+
+fn piug_calls_path() -> str {
+    return piug_dir() + "/api_call.tsv"
+}
+
+fn piug_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piug_dir() + "'")
+}
+
+fn cleanup_piug() -> void {
+    piug_ensure_dir()
+    let _ = exec("rm -f '" + piug_window_class_path()
+        + "' '" + piug_window_create_path()
+        + "' '" + piug_message_path()
+        + "' '" + piug_gdi_op_path()
+        + "' '" + piug_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piug_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piug_append_row(path: str, row: str) -> void {
+    piug_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn piug_count_rows(path: str, min_cols: int) -> int {
+    let t = piug_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+// Microsoft docs Window Notifications/winuser.h — message_code → name
+fn msg_name(code: int) -> str {
+    if code == 1     { return "WM_CREATE" }       // 0x0001
+    if code == 2     { return "WM_DESTROY" }      // 0x0002
+    if code == 15    { return "WM_PAINT" }        // 0x000F
+    if code == 18    { return "WM_QUIT" }         // 0x0012
+    if code == 256   { return "WM_KEYDOWN" }      // 0x0100
+    if code == 513   { return "WM_LBUTTONDOWN" }  // 0x0201
+    return "?"
+}
+
+// op_kind → GDI op short name
+fn gdi_op_name(k: int) -> str {
+    if k == 0 { return "BitBlt" }
+    if k == 1 { return "TextOut" }
+    if k == 2 { return "CreateDC" }
+    if k == 3 { return "GetStockObject" }
+    if k == 4 { return "CreateSolidBrush" }
+    return "?"
+}
+
+// ─── record_window_class: RegisterClassEx{A,W} 호출 추적 ───
+fn record_window_class(class_id: int, class_name: str,
+                       wndproc_va_hex: str, style_hex: str) -> void {
+    if class_id <= 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_class] expected=class_id>0 got=" + to_string(class_id))
+    }
+    if class_name == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_class] expected=class_name!=empty got=empty")
+    }
+    if wndproc_va_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_class] expected=wndproc_va_hex!=empty got=empty")
+    }
+    if style_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_class] expected=style_hex!=empty got=empty")
+    }
+    let row = to_string(class_id) + "\t" + class_name + "\t"
+        + wndproc_va_hex + "\t" + style_hex + "\n"
+    piug_append_row(piug_window_class_path(), row)
+}
+
+// ─── record_window_create: CreateWindowEx{A,W} 호출 추적 ───
+fn record_window_create(window_id: int, hwnd_hex: str, class_name: str,
+                        title: str, x: int, y: int, w: int, h: int) -> void {
+    if window_id <= 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_create] expected=window_id>0 got=" + to_string(window_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_create] expected=hwnd_hex!=empty got=empty")
+    }
+    if class_name == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_create] expected=class_name!=empty got=empty")
+    }
+    if w < 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_create] expected=w>=0 got=" + to_string(w))
+    }
+    if h < 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_window_create] expected=h>=0 got=" + to_string(h))
+    }
+    let row = to_string(window_id) + "\t" + hwnd_hex + "\t" + class_name + "\t"
+        + title + "\t" + to_string(x) + "\t" + to_string(y) + "\t"
+        + to_string(w) + "\t" + to_string(h) + "\n"
+    piug_append_row(piug_window_create_path(), row)
+}
+
+// ─── record_message: window message dispatch 추적 ───
+fn record_message(msg_id: int, hwnd_hex: str, message_code_hex: str,
+                  wparam_hex: str, lparam_hex: str) -> void {
+    if msg_id <= 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_message] expected=msg_id>0 got=" + to_string(msg_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_message] expected=hwnd_hex!=empty got=empty")
+    }
+    if message_code_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_message] expected=message_code_hex!=empty got=empty")
+    }
+    if wparam_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_message] expected=wparam_hex!=empty got=empty")
+    }
+    if lparam_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_message] expected=lparam_hex!=empty got=empty")
+    }
+    let row = to_string(msg_id) + "\t" + hwnd_hex + "\t" + message_code_hex
+        + "\t" + wparam_hex + "\t" + lparam_hex + "\n"
+    piug_append_row(piug_message_path(), row)
+}
+
+// ─── record_gdi_op: GDI32 operation 추적 ───
+fn record_gdi_op(op_id: int, op_kind: int, hdc_hex: str, target_hex: str) -> void {
+    if op_id <= 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_gdi_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_gdi_op] expected=op_kind>=0 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_gdi_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if hdc_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_gdi_op] expected=hdc_hex!=empty got=empty")
+    }
+    if target_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_gdi_op] expected=target_hex!=empty got=empty")
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind) + "\t"
+        + hdc_hex + "\t" + target_hex + "\n"
+    piug_append_row(piug_gdi_op_path(), row)
+}
+
+// ─── record_api_call: 일반 USER32/GDI32 API call 추적 ───
+fn record_api_call(call_id: int, dll_name: str, fn_name: str,
+                   arg_count: int, return_value_hex: str) -> void {
+    if call_id <= 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_api_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if dll_name == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_api_call] expected=dll_name!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_api_call] expected=fn_name!=empty got=empty")
+    }
+    if arg_count < 0 {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_api_call] expected=arg_count>=0 got=" + to_string(arg_count))
+    }
+    if return_value_hex == "" {
+        panic("pe_i386_user32_gdi32_stub FAIL [record_api_call] expected=return_value_hex!=empty got=empty")
+    }
+    let row = to_string(call_id) + "\t" + dll_name + "\t" + fn_name
+        + "\t" + to_string(arg_count) + "\t" + return_value_hex + "\n"
+    piug_append_row(piug_calls_path(), row)
+}
+
+// ─── statistics ───
+fn window_class_count() -> int {
+    return piug_count_rows(piug_window_class_path(), 4)
+}
+
+fn window_create_count() -> int {
+    return piug_count_rows(piug_window_create_path(), 8)
+}
+
+fn message_count() -> int {
+    return piug_count_rows(piug_message_path(), 5)
+}
+
+fn gdi_op_count() -> int {
+    return piug_count_rows(piug_gdi_op_path(), 4)
+}
+
+fn api_call_count() -> int {
+    return piug_count_rows(piug_calls_path(), 5)
+}
+
+fn piug_stats() -> array {
+    let mut out = []
+    out.push(window_class_count())
+    out.push(window_create_count())
+    out.push(message_count())
+    out.push(gdi_op_count())
+    out.push(api_call_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 + assertions ───
+fn self_test() -> void {
+    let sid = "piug-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_piug()
+
+    // 1. window_class × 2 — RegisterClassExA 등록
+    record_window_class(1, "BattleNetMainClass", "0x00401000", "0x000B0203")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"window_class\",\"class_id\":1,\"class_name\":\"BattleNetMainClass\",\"wndproc_va\":\"0x00401000\",\"style\":\"0x000B0203\"")
+
+    record_window_class(2, "BattleNetDlgClass", "0x00402000", "0x00080000")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"window_class\",\"class_id\":2,\"class_name\":\"BattleNetDlgClass\",\"wndproc_va\":\"0x00402000\",\"style\":\"0x00080000\"")
+
+    // 2. window_create × 1 — CreateWindowExA "Battle.net Setup"
+    record_window_create(1, "0x0001", "BattleNetMainClass",
+        "Battle.net Setup", 0, 0, 800, 600)
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"window_create\",\"window_id\":1,\"hwnd\":\"0x0001\",\"class_name\":\"BattleNetMainClass\",\"title\":\"Battle.net Setup\",\"x\":0,\"y\":0,\"w\":800,\"h\":600")
+
+    // 3. message × 4 — WM_CREATE / WM_PAINT / WM_KEYDOWN / WM_DESTROY
+    record_message(1, "0x0001", "0x0001", "0x00000000", "0x00000000")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"message\",\"msg_id\":1,\"hwnd\":\"0x0001\",\"code\":\"0x0001\",\"name\":\"WM_CREATE\"")
+
+    record_message(2, "0x0001", "0x000F", "0x00000000", "0x00000000")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"message\",\"msg_id\":2,\"hwnd\":\"0x0001\",\"code\":\"0x000F\",\"name\":\"WM_PAINT\"")
+
+    record_message(3, "0x0001", "0x0100", "0x0000000D", "0x001E0001")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"message\",\"msg_id\":3,\"hwnd\":\"0x0001\",\"code\":\"0x0100\",\"name\":\"WM_KEYDOWN\"")
+
+    record_message(4, "0x0001", "0x0002", "0x00000000", "0x00000000")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"message\",\"msg_id\":4,\"hwnd\":\"0x0001\",\"code\":\"0x0002\",\"name\":\"WM_DESTROY\"")
+
+    // 4. gdi_op × 3 — TextOut / BitBlt / GetStockObject
+    record_gdi_op(1, 1, "0x00000001", "0x0001")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"gdi_op\",\"op_id\":1,\"op_kind\":1,\"name\":\"TextOut\",\"hdc\":\"0x00000001\",\"target\":\"0x0001\"")
+
+    record_gdi_op(2, 0, "0x00000002", "0x00000003")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"gdi_op\",\"op_id\":2,\"op_kind\":0,\"name\":\"BitBlt\",\"hdc\":\"0x00000002\",\"target\":\"0x00000003\"")
+
+    record_gdi_op(3, 3, "0x00000000", "0x00000011")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"gdi_op\",\"op_id\":3,\"op_kind\":3,\"name\":\"GetStockObject\",\"hdc\":\"0x00000000\",\"target\":\"0x00000011\"")
+
+    // 5. api_call × 4 — RegisterClassExA / CreateWindowExA / ShowWindow / GetMessageA
+    record_api_call(1, "USER32", "RegisterClassExA", 1, "0x00000001")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"api_call\",\"call_id\":1,\"dll\":\"USER32\",\"fn\":\"RegisterClassExA\",\"args\":1,\"ret\":\"0x00000001\"")
+
+    record_api_call(2, "USER32", "CreateWindowExA", 12, "0x0001")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"api_call\",\"call_id\":2,\"dll\":\"USER32\",\"fn\":\"CreateWindowExA\",\"args\":12,\"ret\":\"0x0001\"")
+
+    record_api_call(3, "USER32", "ShowWindow", 2, "0x00000000")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"api_call\",\"call_id\":3,\"dll\":\"USER32\",\"fn\":\"ShowWindow\",\"args\":2,\"ret\":\"0x00000000\"")
+
+    record_api_call(4, "USER32", "GetMessageA", 4, "0x00000001")
+    r0_emit("pe_i386_user32_gdi32_stub_record",
+        "\"kind\":\"api_call\",\"call_id\":4,\"dll\":\"USER32\",\"fn\":\"GetMessageA\",\"args\":4,\"ret\":\"0x00000001\"")
+
+    // ─── assertions ───
+    let wc = window_class_count()
+    if wc != 2 {
+        panic("pe_i386_user32_gdi32_stub FAIL [window_class_count] expected=2 got=" + to_string(wc))
+    }
+    let wcr = window_create_count()
+    if wcr != 1 {
+        panic("pe_i386_user32_gdi32_stub FAIL [window_create_count] expected=1 got=" + to_string(wcr))
+    }
+    let mc = message_count()
+    if mc != 4 {
+        panic("pe_i386_user32_gdi32_stub FAIL [message_count] expected=4 got=" + to_string(mc))
+    }
+    let gc = gdi_op_count()
+    if gc != 3 {
+        panic("pe_i386_user32_gdi32_stub FAIL [gdi_op_count] expected=3 got=" + to_string(gc))
+    }
+    let ac = api_call_count()
+    if ac != 4 {
+        panic("pe_i386_user32_gdi32_stub FAIL [api_call_count] expected=4 got=" + to_string(ac))
+    }
+
+    // ─── name lookup assertions ───
+    let n_create = msg_name(1)
+    if n_create != "WM_CREATE" {
+        panic("pe_i386_user32_gdi32_stub FAIL [msg_name(1)] expected=WM_CREATE got=" + n_create)
+    }
+    let n_destroy = msg_name(2)
+    if n_destroy != "WM_DESTROY" {
+        panic("pe_i386_user32_gdi32_stub FAIL [msg_name(2)] expected=WM_DESTROY got=" + n_destroy)
+    }
+    let n_paint = msg_name(15)
+    if n_paint != "WM_PAINT" {
+        panic("pe_i386_user32_gdi32_stub FAIL [msg_name(15)] expected=WM_PAINT got=" + n_paint)
+    }
+    let n_quit = msg_name(18)
+    if n_quit != "WM_QUIT" {
+        panic("pe_i386_user32_gdi32_stub FAIL [msg_name(18)] expected=WM_QUIT got=" + n_quit)
+    }
+    let n_kd = msg_name(256)
+    if n_kd != "WM_KEYDOWN" {
+        panic("pe_i386_user32_gdi32_stub FAIL [msg_name(256)] expected=WM_KEYDOWN got=" + n_kd)
+    }
+    let n_lbd = msg_name(513)
+    if n_lbd != "WM_LBUTTONDOWN" {
+        panic("pe_i386_user32_gdi32_stub FAIL [msg_name(513)] expected=WM_LBUTTONDOWN got=" + n_lbd)
+    }
+    let g0 = gdi_op_name(0)
+    if g0 != "BitBlt" {
+        panic("pe_i386_user32_gdi32_stub FAIL [gdi_op_name(0)] expected=BitBlt got=" + g0)
+    }
+    let g1 = gdi_op_name(1)
+    if g1 != "TextOut" {
+        panic("pe_i386_user32_gdi32_stub FAIL [gdi_op_name(1)] expected=TextOut got=" + g1)
+    }
+    let g2 = gdi_op_name(2)
+    if g2 != "CreateDC" {
+        panic("pe_i386_user32_gdi32_stub FAIL [gdi_op_name(2)] expected=CreateDC got=" + g2)
+    }
+    let g3 = gdi_op_name(3)
+    if g3 != "GetStockObject" {
+        panic("pe_i386_user32_gdi32_stub FAIL [gdi_op_name(3)] expected=GetStockObject got=" + g3)
+    }
+    let g4 = gdi_op_name(4)
+    if g4 != "CreateSolidBrush" {
+        panic("pe_i386_user32_gdi32_stub FAIL [gdi_op_name(4)] expected=CreateSolidBrush got=" + g4)
+    }
+
+    // ─── stats sanity ───
+    let s = piug_stats()
+    if len(s) != 5 {
+        panic("pe_i386_user32_gdi32_stub FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_i386_user32_gdi32_stub FAIL [stats window_class] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_i386_user32_gdi32_stub FAIL [stats window_create] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_i386_user32_gdi32_stub FAIL [stats message] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_i386_user32_gdi32_stub FAIL [stats gdi_op] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_i386_user32_gdi32_stub FAIL [stats api_call] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (record 14 + 이 1 = 15 ≥ 14) ───
+    r0_emit("pe_i386_user32_gdi32_stub_stats",
+        "\"window_class_count\":" + to_string(s[0])
+        + ",\"window_create_count\":" + to_string(s[1])
+        + ",\"message_count\":" + to_string(s[2])
+        + ",\"gdi_op_count\":" + to_string(s[3])
+        + ",\"api_call_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_user32_gdi32_stub FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_piug()
+    let s2 = piug_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_user32_gdi32_stub FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_user32_gdi32_stub self_test PASS (window_class=" + to_string(s[0])
+        + ", window_create=" + to_string(s[1]) + ", message=" + to_string(s[2])
+        + ", gdi_op=" + to_string(s[3]) + ", api_call=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piug_stats()
+            println("window_class_count\t" + to_string(s[0]))
+            println("window_create_count\t" + to_string(s[1]))
+            println("message_count\t" + to_string(s[2]))
+            println("gdi_op_count\t" + to_string(s[3]))
+            println("api_call_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piug()
+            println("cleaned: " + piug_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piug_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_user32_gdi32_stub.hexa { self-test | stats | cleanup | dir }")
+}

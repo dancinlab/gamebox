@@ -1,0 +1,381 @@
+// lib/loader/pe_mailslot_create.hexa — Win32 Mailslot → POSIX mqueue bridge skeleton
+//
+// Win32 CreateMailslot / GetMailslotInfo 1방향 IPC primitive 를 POSIX
+// message queue (mq_open / mq_send / mq_receive) 로 매핑한다. 본 module 은
+// mailslot op tracker — 실 mq_open() / mq_send() 호출 X (stage6).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = create        (CreateMailslot)
+//   2 = write         (WriteFile → mailslot)
+//   3 = read          (ReadFile  ← mailslot)
+//   4 = info_query    (GetMailslotInfo)
+//
+// persist schema (TSV — ops.tsv):
+//   slot_id<int> \t op_kind<int> \t max_msg_size<int> \t next_msg_size<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmc_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_mailslot_create"
+}
+
+fn pmc_ops_path() -> str {
+    return pmc_dir() + "/ops.tsv"
+}
+
+fn pmc_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmc_dir() + "'")
+}
+
+fn cleanup_pmc() -> void {
+    pmc_ensure_dir()
+    let _ = exec("rm -f '" + pmc_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmc_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmc_append_row(path: str, row: str) -> void {
+    pmc_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: mailslot op 1 건 기록 ───
+fn record_op(slot_id: int, op_kind: int, max_msg_size: int, next_msg_size: int) -> void {
+    if slot_id <= 0 {
+        panic("pe_mailslot_create FAIL [record_op] expected=slot_id>0 got=" + to_string(slot_id))
+    }
+    if op_kind < 1 {
+        panic("pe_mailslot_create FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_mailslot_create FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if max_msg_size < 0 {
+        panic("pe_mailslot_create FAIL [record_op] expected=max_msg_size>=0 got=" + to_string(max_msg_size))
+    }
+    if next_msg_size < 0 {
+        panic("pe_mailslot_create FAIL [record_op] expected=next_msg_size>=0 got=" + to_string(next_msg_size))
+    }
+    let row = to_string(slot_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(max_msg_size) + "\t" + to_string(next_msg_size) + "\n"
+    pmc_append_row(pmc_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = pmc_read_table(pmc_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_max_msg_size: 모든 op max_msg_size 합 ───
+fn total_max_msg_size() -> int {
+    let t = pmc_read_table(pmc_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_next_msg_size: 모든 op next_msg_size 합 ───
+fn total_next_msg_size() -> int {
+    let t = pmc_read_table(pmc_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = pmc_read_table(pmc_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── slot_next_msg_size: 특정 slot_id 의 first match next_msg_size (없으면 0) ───
+fn slot_next_msg_size(slot_id: int) -> int {
+    let t = pmc_read_table(pmc_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == slot_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pmc_stats: [op_count, total_max_msg_size, total_next_msg_size, count_by_op_kind(2)] ───
+fn pmc_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_max_msg_size())
+    out.push(total_next_msg_size())
+    out.push(count_by_op_kind(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmc-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmc()
+
+    // 2. record 5 mailslot ops across ≥3 op_kinds (1=create, 2=write, 3=read, 4=info_query)
+    record_op(220001, 1, 512, 0)
+    r0_emit("pe_mailslot_create_record",
+        "\"slot_id\":220001,\"op_kind\":1,\"max_msg_size\":512,\"next_msg_size\":0,\"target\":\"create\"")
+
+    record_op(220001, 2, 512, 64)
+    r0_emit("pe_mailslot_create_record",
+        "\"slot_id\":220001,\"op_kind\":2,\"max_msg_size\":512,\"next_msg_size\":64,\"target\":\"write\"")
+
+    record_op(220001, 2, 512, 128)
+    r0_emit("pe_mailslot_create_record",
+        "\"slot_id\":220001,\"op_kind\":2,\"max_msg_size\":512,\"next_msg_size\":128,\"target\":\"write\"")
+
+    record_op(220002, 4, 256, 32)
+    r0_emit("pe_mailslot_create_record",
+        "\"slot_id\":220002,\"op_kind\":4,\"max_msg_size\":256,\"next_msg_size\":32,\"target\":\"info_query\"")
+
+    record_op(220002, 3, 256, 32)
+    r0_emit("pe_mailslot_create_record",
+        "\"slot_id\":220002,\"op_kind\":3,\"max_msg_size\":256,\"next_msg_size\":32,\"target\":\"read\"")
+
+    // 3. op_count = 5
+    let c = op_count()
+    if c != 5 {
+        panic("pe_mailslot_create FAIL [op_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_max_msg_size = 512+512+512+256+256 = 2048
+    let tm = total_max_msg_size()
+    if tm != 2048 {
+        panic("pe_mailslot_create FAIL [total_max_msg_size] expected=2048 got=" + to_string(tm))
+    }
+
+    // 5. total_next_msg_size = 0+64+128+32+32 = 256
+    let tn = total_next_msg_size()
+    if tn != 256 {
+        panic("pe_mailslot_create FAIL [total_next_msg_size] expected=256 got=" + to_string(tn))
+    }
+
+    // 6. count_by_op_kind sanity
+    let k1 = count_by_op_kind(1)
+    if k1 != 1 {
+        panic("pe_mailslot_create FAIL [count_by_op_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 2 {
+        panic("pe_mailslot_create FAIL [count_by_op_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_mailslot_create FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 1 {
+        panic("pe_mailslot_create FAIL [count_by_op_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_mailslot_create FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. slot_next_msg_size sanity (first match — slot 220001 first row = 0, slot 220002 first row = 32)
+    let n1 = slot_next_msg_size(220001)
+    if n1 != 0 {
+        panic("pe_mailslot_create FAIL [slot_next_msg_size(220001)] expected=0 got=" + to_string(n1))
+    }
+    let n2 = slot_next_msg_size(220002)
+    if n2 != 32 {
+        panic("pe_mailslot_create FAIL [slot_next_msg_size(220002)] expected=32 got=" + to_string(n2))
+    }
+    let n_miss = slot_next_msg_size(9999)
+    if n_miss != 0 {
+        panic("pe_mailslot_create FAIL [slot_next_msg_size(9999)] expected=0 got=" + to_string(n_miss))
+    }
+
+    // 8. pmc_stats() = [5, 2048, 256, 2]
+    let s = pmc_stats()
+    if len(s) != 4 {
+        panic("pe_mailslot_create FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_mailslot_create FAIL [stats op_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 2048 {
+        panic("pe_mailslot_create FAIL [stats total_max] expected=2048 got=" + to_string(s[1]))
+    }
+    if s[2] != 256 {
+        panic("pe_mailslot_create FAIL [stats total_next] expected=256 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_mailslot_create FAIL [stats count_kind(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_mailslot_create_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_max_msg_size\":" + to_string(s[1])
+        + ",\"total_next_msg_size\":" + to_string(s[2])
+        + ",\"kind_write\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_mailslot_create FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pmc()
+    let s2 = pmc_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_mailslot_create FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_mailslot_create self_test PASS (ops=" + to_string(s[0])
+        + ", max=" + to_string(s[1]) + ", next=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmc_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_max_msg_size\t" + to_string(s[1]))
+            println("total_next_msg_size\t" + to_string(s[2]))
+            println("count_kind_write\t" + to_string(s[3]))
+            return
+        }
+        if sub == "next" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("slot_next_msg_size\t" + to_string(slot_next_msg_size(sid)))
+                return
+            }
+            println("usage: hexa run pe_mailslot_create.hexa next <slot_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_mailslot_create.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmc()
+            println("cleaned: " + pmc_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmc_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_mailslot_create.hexa { self-test | stats | next <slot_id> | count <op_kind> | cleanup | dir }")
+}

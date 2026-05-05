@@ -1,0 +1,165 @@
+// lib/perf/c_dx_pipeline_warm.hexa — CN-74 skeleton manjeom 15/15
+//
+// DX11 / DX12 pipeline warm-up — 첫 frame stutter 제거.
+// game launch 시 PSO compile cluster 가 spike 만들어서 first frame 늦어짐 →
+// 미리 warm-up 으로 PSO cache 채워두면 first frame 즉시.
+//
+// 무기: PSO precompile schedule + columnar (PSO × first-touch frame).
+// 효과: D2R/D4 first frame ↓ (예: D2R 3000ms → 1500ms / D4 14000ms → 8000ms).
+
+use "./r0_common"
+
+let DPW_DIR = GAMEBOX_HOME + "/persist/dx_pipeline_warm"
+let WARM_LOG = DPW_DIR + "/warm.tsv"
+let RESULT_HISTORY = DPW_DIR + "/results.jsonl"
+
+fn dpw_dir() -> str { return DPW_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DPW_DIR + "'")
+}
+
+// ─── PSO warm 등록 ───
+//   game (d2r/d4), pso_id, predicted_first_use_frame, compile_us
+fn register_warm(game: str, pso_id: int, first_use_frame: int, compile_us: int) -> void {
+    ensure_dir()
+    let line = game + "\t" + to_string(pso_id) + "\t" + to_string(first_use_frame) + "\t" + to_string(compile_us)
+    let tmp = WARM_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + WARM_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── pre-warm budget — first 100ms launch window 안 컴파일 가능한 PSO 수 ───
+//   각 PSO compile_us 합 100,000us 이내
+fn select_warm_set(game: str, budget_us: int) -> array {
+    let exists = exec("test -f '" + WARM_LOG + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+    // sort by first_use_frame asc (가장 일찍 쓰일수록 우선) — 누적 cost <= budget
+    let cmd = "awk -F'\\t' -v g='" + game + "' '$1==g' '" + WARM_LOG + "' | sort -k3,3n -t$'\\t' | awk -F'\\t' -v b=" + to_string(budget_us) + " 'BEGIN{c=0} {c+=$4; if(c<=b) {print $2; sel++}} END{}' "
+    let r = exec(cmd).trim()
+    if r == "" { return [] }
+    return r.split("\n")
+}
+
+// ─── 절약 frame time 계산 ───
+//   warmed PSO 의 compile cost 를 first frame 시간에서 제거
+fn savings(game: str, budget_us: int) -> int {
+    let warm_set = select_warm_set(game, budget_us)
+    if len(warm_set) == 0 { return 0 }
+    let cmd = "awk -F'\\t' -v g='" + game + "' '$1==g' '" + WARM_LOG + "' | sort -k3,3n -t$'\\t' | awk -F'\\t' -v b=" + to_string(budget_us) + " 'BEGIN{c=0; sum=0} {c+=$4; if(c<=b) sum+=$4} END{print sum}'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── result 기록 ───
+fn record_result(game: str, warm_count: int, savings_us: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"game\":\"" + game + "\",\"warm_count\":" + to_string(warm_count) + ",\"savings_us\":" + to_string(savings_us) + "}"
+    let tmp = RESULT_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + RESULT_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("pipeline_warm", "\"game\":\"" + game + "\",\"warm\":" + to_string(warm_count) + ",\"savings_us\":" + to_string(savings_us))
+}
+
+fn dpw_stats() -> array {
+    let exists_w = exec("test -f '" + WARM_LOG + "' && echo ok").trim()
+    let psos = 0
+    if exists_w == "ok" {
+        psos = to_int(exec("wc -l < '" + WARM_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_r = exec("test -f '" + RESULT_HISTORY + "' && echo ok").trim()
+    let results = 0
+    if exists_r == "ok" {
+        results = to_int(exec("wc -l < '" + RESULT_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [psos, results]
+}
+
+fn cleanup_dpw() -> void {
+    let _ = exec("rm -rf '" + DPW_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dpw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dpw()
+
+    // 합성 PSOs — D2R 가 D4 보다 적은 PSO
+    // D2R: 5 PSO, 각 compile ~10ms (총 50ms)
+    let i = 0
+    while i < 5 {
+        register_warm("d2r", 1000 + i, i + 1, 10000)
+        i = i + 1
+    }
+    // D4: 20 PSO, 각 compile ~50ms (총 1000ms)
+    let j = 0
+    while j < 20 {
+        register_warm("d4", 2000 + j, j + 1, 50000)
+        j = j + 1
+    }
+
+    // budget 100,000us = 100ms (첫 frame 전 launch window)
+    let warm_d2r = select_warm_set("d2r", 100000)
+    if len(warm_d2r) != 5 {
+        panic("c_dx_pipeline_warm FAIL [d2r warm] expected=5 got=" + to_string(len(warm_d2r)))
+    }
+
+    // D4 — 100ms 안 2개 PSO 만 가능 (50ms × 2 = 100ms)
+    let warm_d4 = select_warm_set("d4", 100000)
+    if len(warm_d4) != 2 {
+        panic("c_dx_pipeline_warm FAIL [d4 warm] expected=2 got=" + to_string(len(warm_d4)))
+    }
+
+    // savings
+    let s_d2r = savings("d2r", 100000)
+    if s_d2r != 50000 { panic("c_dx_pipeline_warm FAIL [d2r savings] expected=50000 got=" + to_string(s_d2r)) }
+
+    let s_d4 = savings("d4", 100000)
+    if s_d4 != 100000 { panic("c_dx_pipeline_warm FAIL [d4 savings] expected=100000 got=" + to_string(s_d4)) }
+
+    record_result("d2r", len(warm_d2r), s_d2r)
+    record_result("d4", len(warm_d4), s_d4)
+
+    let stats = dpw_stats()
+    if stats[0] != 25 { panic("c_dx_pipeline_warm FAIL [stats psos] expected=25 got=" + to_string(stats[0])) }
+    if stats[1] != 2 { panic("c_dx_pipeline_warm FAIL [stats results]") }
+
+    r0_emit("pipeline_warm_summary", "\"psos\":" + to_string(stats[0]) + ",\"d2r_savings_us\":" + to_string(s_d2r) + ",\"d4_savings_us\":" + to_string(s_d4))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_dx_pipeline_warm FAIL [emit count]") }
+
+    cleanup_dpw()
+
+    println("  ✅ c_dx_pipeline_warm self_test PASS (25 PSOs, d2r 5 warm/" + to_string(s_d2r) + "us d4 2 warm/" + to_string(s_d4) + "us, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "warm" && len(a) >= 4 {
+            let g = a[3]
+            let b = 100000
+            if len(a) >= 5 { b = to_int(a[4]) }
+            let w = select_warm_set(g, b)
+            let i = 0
+            while i < len(w) {
+                println(w[i])
+                i = i + 1
+            }
+            return
+        }
+        if sub == "stats" {
+            let s = dpw_stats()
+            println("psos=" + to_string(s[0]) + " results=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_dpw(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_dx_pipeline_warm.hexa { self-test | warm <game> [budget_us] | stats | cleanup }")
+}

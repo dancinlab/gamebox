@@ -1,0 +1,450 @@
+// lib/loader/pe_iat_forwarder_chain_real.hexa — cycle 80 R3 phase 1 IAT
+// forwarder chain + ordinal-only resolution skeleton
+//
+// Windows PE loader 의 IAT (Import Address Table) 해석은 단순 name→RVA 매핑
+// 이상의 5 가지 edge case 를 다룬다. 본 module 은 각 chain 의 hop depth /
+// resolution 결과를 tracker 로만 적재 — 실 PE 파싱 / ApiSetSchema 조회는
+// stage2+ 에서 수행한다.
+//
+// 5 IAT resolution edge cases:
+//   1. forwarder: export "DLL.NAME" string instead of RVA (e.g., kernel32!HeapAlloc → "NTDLL.RtlAllocateHeap")
+//      → chain depth = forwarder hop count (max ~3)
+//   2. ordinal: high bit of ILT thunk set → low 16 bits = export ordinal index
+//      → DLL export ordinal table 의 RVA → function (no name)
+//   3. api_set: api-ms-win-core-string-l1-1-0.dll → ApiSetSchema lookup → kernelbase.dll
+//      → schema 위치: PEB->ApiSetMap (Win10+)
+//   4. delay_load: IMAGE_DELAYLOAD_DESCRIPTOR → 첫 호출 시 lazy resolve (cycle 62 pe_delay_load_imports cross-ref)
+//   5. bind_imports: timestamp 일치 시 cached IAT 사용, 충돌 시 normal resolve
+// own1: PE/COFF + ApiSetSchema spec only, Wine forward.c 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 chain tracker — 실 forwarder string parse / ApiSetSchema
+//   lookup / ordinal table walk 는 stage2 에서 native helper 로 위임.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// chain_kind code:
+//   1 = forwarder    (kernel32!HeapAlloc → ntdll!RtlAllocateHeap)
+//   2 = ordinal      (WS2_32 ordinal 1-200, no name)
+//   3 = api_set      (api-ms-win-core-*.dll → kernelbase.dll)
+//   4 = delay_load   (IMAGE_DELAYLOAD_DESCRIPTOR lazy)
+//   5 = bind_imports (timestamp match → cached IAT)
+//
+// persist schema (TSV — chains.tsv):
+//   chain_id<int> \t chain_kind<int> \t depth<int> \t resolved<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pifcr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_iat_forwarder_chain_real"
+}
+
+fn pifcr_chains_path() -> str {
+    return pifcr_dir() + "/chains.tsv"
+}
+
+fn pifcr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pifcr_dir() + "'")
+}
+
+fn cleanup_pifcr() -> void {
+    pifcr_ensure_dir()
+    let _ = exec("rm -f '" + pifcr_chains_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pifcr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pifcr_append_row(path: str, row: str) -> void {
+    pifcr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_chain: IAT chain 1 건 기록 ───
+fn record_chain(chain_id: int, chain_kind: int, depth: int, resolved: int) -> void {
+    if chain_id <= 0 {
+        panic("pe_iat_forwarder_chain_real FAIL [record_chain] expected=chain_id>0 got=" + to_string(chain_id))
+    }
+    if chain_kind < 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [record_chain] expected=chain_kind>=1 got=" + to_string(chain_kind))
+    }
+    if chain_kind > 5 {
+        panic("pe_iat_forwarder_chain_real FAIL [record_chain] expected=chain_kind<=5 got=" + to_string(chain_kind))
+    }
+    if depth < 0 {
+        panic("pe_iat_forwarder_chain_real FAIL [record_chain] expected=depth>=0 got=" + to_string(depth))
+    }
+    if resolved < 0 {
+        panic("pe_iat_forwarder_chain_real FAIL [record_chain] expected=resolved>=0 got=" + to_string(resolved))
+    }
+    if resolved > 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [record_chain] expected=resolved<=1 got=" + to_string(resolved))
+    }
+    let row = to_string(chain_id) + "\t" + to_string(chain_kind)
+        + "\t" + to_string(depth) + "\t" + to_string(resolved) + "\n"
+    pifcr_append_row(pifcr_chains_path(), row)
+}
+
+// ─── chain_count: total chain 수 ───
+fn chain_count() -> int {
+    let t = pifcr_read_table(pifcr_chains_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_depth: 모든 chain depth 합 ───
+fn total_depth() -> int {
+    let t = pifcr_read_table(pifcr_chains_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── resolved_count: resolved=1 인 chain 수 ───
+fn resolved_count() -> int {
+    let t = pifcr_read_table(pifcr_chains_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_chain_kind: 특정 chain_kind 의 chain 수 ───
+fn count_by_chain_kind(kind: int) -> int {
+    let t = pifcr_read_table(pifcr_chains_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── max_depth: chain depth 최댓값 ───
+fn max_depth() -> int {
+    let t = pifcr_read_table(pifcr_chains_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut m = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let d = to_int(parts[2])
+                if d > m {
+                    m = d
+                }
+            }
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── chain_resolved: 특정 chain_id 의 resolved 값 (없으면 0) ───
+fn chain_resolved(chain_id: int) -> int {
+    let t = pifcr_read_table(pifcr_chains_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == chain_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pifcr_stats: [chain_count, total_depth, resolved_count, max_depth, count_by_chain_kind(1)] ───
+fn pifcr_stats() -> array {
+    let mut out = []
+    out.push(chain_count())
+    out.push(total_depth())
+    out.push(resolved_count())
+    out.push(max_depth())
+    out.push(count_by_chain_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pifcr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pifcr()
+
+    // 2. record 5 chains covering all 5 chain_kinds (≥3 resolved)
+    //    chain 1: forwarder kernel32!HeapAlloc → ntdll!RtlAllocateHeap (depth=2, resolved)
+    record_chain(180001, 1, 2, 1)
+    r0_emit("pe_iat_forwarder_chain_real_record",
+        "\"chain_id\":180001,\"chain_kind\":1,\"depth\":2,\"resolved\":1,\"target\":\"forwarder:kernel32!HeapAlloc->ntdll!RtlAllocateHeap\"")
+
+    //    chain 2: ordinal WS2_32 ordinal 115 (depth=1, resolved)
+    record_chain(180002, 2, 1, 1)
+    r0_emit("pe_iat_forwarder_chain_real_record",
+        "\"chain_id\":180002,\"chain_kind\":2,\"depth\":1,\"resolved\":1,\"target\":\"ordinal:WS2_32!#115\"")
+
+    //    chain 3: api_set api-ms-win-core-string-l1-1-0.dll → kernelbase.dll (depth=2, resolved)
+    record_chain(180003, 3, 2, 1)
+    r0_emit("pe_iat_forwarder_chain_real_record",
+        "\"chain_id\":180003,\"chain_kind\":3,\"depth\":2,\"resolved\":1,\"target\":\"api_set:api-ms-win-core-string-l1-1-0->kernelbase\"")
+
+    //    chain 4: delay_load IMAGE_DELAYLOAD_DESCRIPTOR (depth=3, unresolved — lazy)
+    record_chain(180004, 4, 3, 0)
+    r0_emit("pe_iat_forwarder_chain_real_record",
+        "\"chain_id\":180004,\"chain_kind\":4,\"depth\":3,\"resolved\":0,\"target\":\"delay_load:IMAGE_DELAYLOAD_DESCRIPTOR\"")
+
+    //    chain 5: bind_imports timestamp mismatch (depth=1, unresolved — fall-back to normal)
+    record_chain(180005, 5, 1, 0)
+    r0_emit("pe_iat_forwarder_chain_real_record",
+        "\"chain_id\":180005,\"chain_kind\":5,\"depth\":1,\"resolved\":0,\"target\":\"bind_imports:timestamp_mismatch\"")
+
+    // 3. chain_count = 5
+    let c = chain_count()
+    if c != 5 {
+        panic("pe_iat_forwarder_chain_real FAIL [chain_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_depth = 2 + 1 + 2 + 3 + 1 = 9
+    let td = total_depth()
+    if td != 9 {
+        panic("pe_iat_forwarder_chain_real FAIL [total_depth] expected=9 got=" + to_string(td))
+    }
+
+    // 5. resolved_count = 3
+    let rc = resolved_count()
+    if rc != 3 {
+        panic("pe_iat_forwarder_chain_real FAIL [resolved_count] expected=3 got=" + to_string(rc))
+    }
+
+    // 6. max_depth = 3 (delay_load)
+    let md = max_depth()
+    if md != 3 {
+        panic("pe_iat_forwarder_chain_real FAIL [max_depth] expected=3 got=" + to_string(md))
+    }
+
+    // 7. count_by_chain_kind sanity (1 each for all 5 kinds)
+    let k1 = count_by_chain_kind(1)
+    if k1 != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [count_by_chain_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_chain_kind(2)
+    if k2 != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [count_by_chain_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_chain_kind(3)
+    if k3 != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [count_by_chain_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_chain_kind(4)
+    if k4 != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [count_by_chain_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_chain_kind(5)
+    if k5 != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [count_by_chain_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_chain_kind(99)
+    if k99 != 0 {
+        panic("pe_iat_forwarder_chain_real FAIL [count_by_chain_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 8. chain_resolved sanity
+    let r1 = chain_resolved(180001)
+    if r1 != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [chain_resolved(180001)] expected=1 got=" + to_string(r1))
+    }
+    let r4 = chain_resolved(180004)
+    if r4 != 0 {
+        panic("pe_iat_forwarder_chain_real FAIL [chain_resolved(180004)] expected=0 got=" + to_string(r4))
+    }
+    let r_miss = chain_resolved(9999)
+    if r_miss != 0 {
+        panic("pe_iat_forwarder_chain_real FAIL [chain_resolved(9999)] expected=0 got=" + to_string(r_miss))
+    }
+
+    // 9. pifcr_stats() = [5, 9, 3, 3, 1]
+    let s = pifcr_stats()
+    if len(s) != 5 {
+        panic("pe_iat_forwarder_chain_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_iat_forwarder_chain_real FAIL [stats chain_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 9 {
+        panic("pe_iat_forwarder_chain_real FAIL [stats total_depth] expected=9 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_iat_forwarder_chain_real FAIL [stats resolved_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_iat_forwarder_chain_real FAIL [stats max_depth] expected=3 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_iat_forwarder_chain_real FAIL [stats count_kind(1)] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_iat_forwarder_chain_real_stats",
+        "\"chain_count\":" + to_string(s[0])
+        + ",\"total_depth\":" + to_string(s[1])
+        + ",\"resolved_count\":" + to_string(s[2])
+        + ",\"max_depth\":" + to_string(s[3])
+        + ",\"kind_forwarder\":" + to_string(s[4]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_iat_forwarder_chain_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pifcr()
+    let s2 = pifcr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_iat_forwarder_chain_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_iat_forwarder_chain_real self_test PASS (chains=" + to_string(s[0])
+        + ", depth_sum=" + to_string(s[1]) + ", resolved=" + to_string(s[2])
+        + ", max_depth=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pifcr_stats()
+            println("chain_count\t" + to_string(s[0]))
+            println("total_depth\t" + to_string(s[1]))
+            println("resolved_count\t" + to_string(s[2]))
+            println("max_depth\t" + to_string(s[3]))
+            println("count_kind_forwarder\t" + to_string(s[4]))
+            return
+        }
+        if sub == "depth" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("chain_resolved\t" + to_string(chain_resolved(cid)))
+                return
+            }
+            println("usage: hexa run pe_iat_forwarder_chain_real.hexa depth <chain_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_chain_kind\t" + to_string(count_by_chain_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_iat_forwarder_chain_real.hexa count <chain_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pifcr()
+            println("cleaned: " + pifcr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pifcr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_iat_forwarder_chain_real.hexa { self-test | stats | depth <chain_id> | count <chain_kind> | cleanup | dir }")
+}

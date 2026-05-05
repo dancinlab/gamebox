@@ -1,0 +1,223 @@
+// lib/perf/c_wows_port_warmup.hexa — CN-178 skeleton manjeom 15/15
+//
+// WoWS port (항만, lobby UI) warm-up 추적 — battle 진입 X (multiplayer 거부
+// directive 정합). WoWS 의 port 는 lobby UI — ship 선택, captain 관리,
+// modernization 장착, signal 적용 등을 담당하며 battle 진입은 일절 다루지
+// 않으므로 multiplayer 보류 directive 와 100% 정합한다. 본 모듈은 port session
+// 단위 (session_id × ship_count × port_load_us × asset_load_mb) 의 4-key
+// columnar 로그와 cold→warm 전환 정량화만 담당 — 실제 port UI render 는 host
+// 측 책임. WoT garage warmup (CN-177) 과 동형 stack.
+//
+// 무기: session × ship × port_load × asset_mb 4-key columnar log + sum/avg.
+// 효과: WoWS port UI cold→warm 전환 정량화, battle 진입 0.
+
+use "./r0_common"
+
+let WPW_DIR = GAMEBOX_HOME + "/persist/wows_port_warmup"
+let SESSION_LOG = WPW_DIR + "/sessions.tsv"
+
+fn wpw_dir() -> str { return WPW_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + WPW_DIR + "'")
+}
+
+// ─── port session 등록 ───
+//   session_id (port open 단위 id),
+//   ship_count (port 에 표시된 ship 수),
+//   port_load_us (lobby UI 로드 누적 시간 µs — host 측 측정),
+//   asset_load_mb (asset (texture / model) 로드 누적 크기 MB).
+fn record_session(session_id: int, ship_count: int, port_load_us: int, asset_load_mb: int) -> void {
+    ensure_dir()
+    let line = to_string(session_id) + "\t" + to_string(ship_count) + "\t" + to_string(port_load_us) + "\t" + to_string(asset_load_mb)
+    let tmp = SESSION_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SESSION_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("wows_port_record", "\"session\":" + to_string(session_id) + ",\"ships\":" + to_string(ship_count) + ",\"port_us\":" + to_string(port_load_us) + ",\"asset_mb\":" + to_string(asset_load_mb))
+}
+
+// ─── session_count — 등록된 port session 행 수 ───
+fn session_count() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + SESSION_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_ships — 모든 session ship_count 합 ───
+fn total_ships() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_port_load_us — 모든 session port_load_us 합 ───
+fn total_port_load_us() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_asset_load_mb — 모든 session asset_load_mb 합 (MB) ───
+fn total_asset_load_mb() -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_port_load_us — total_port_load_us / session_count ───
+//   stage1 float X → 정수 나눗셈으로 안정화.
+//   session 0 이면 0 반환 (divide-by-zero guard).
+fn avg_port_load_us() -> int {
+    let sc = session_count()
+    if sc == 0 { return 0 }
+    let tp = total_port_load_us()
+    return tp / sc
+}
+
+// ─── session_ships — 특정 session_id 의 ship_count ───
+//   session_id 미등록이면 0.
+fn session_ships(session_id: int) -> int {
+    let exists = exec("test -f '" + SESSION_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v a=" + to_string(session_id) + " '$1==a {s+=$2} END{print s+0}' '" + SESSION_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── wpw_stats — [session_count, total_ships, total_port_load_us, total_asset_load_mb] ───
+fn wpw_stats() -> array {
+    return [session_count(), total_ships(), total_port_load_us(), total_asset_load_mb()]
+}
+
+fn cleanup_wpw() -> void {
+    let _ = exec("rm -rf '" + WPW_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "wpw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_wpw()
+
+    // 합성 port session 3 종 (battle 진입 X — lobby UI only):
+    //   33001 (cold first launch, full port)    — 42 ship / 580000 µs / 420 MB
+    //   33002 (warm, asset cache hit)           — 42 ship / 140000 µs / 100 MB
+    //   33003 (hot, only ship reselect)         — 10 ship /  28000 µs /  14 MB
+    record_session(33001, 42, 580000, 420)
+    record_session(33002, 42, 140000, 100)
+    record_session(33003, 10, 28000, 14)
+
+    // session_count = 3
+    let sc = session_count()
+    if sc != 3 { panic("c_wows_port_warmup FAIL [session_count] expected=3 got=" + to_string(sc)) }
+
+    // total_ships = 42+42+10 = 94
+    let ts = total_ships()
+    if ts != 94 { panic("c_wows_port_warmup FAIL [total_ships] expected=94 got=" + to_string(ts)) }
+
+    // total_port_load_us = 580000+140000+28000 = 748000
+    let tp = total_port_load_us()
+    if tp != 748000 { panic("c_wows_port_warmup FAIL [total_port_load_us] expected=748000 got=" + to_string(tp)) }
+
+    // total_asset_load_mb = 420+100+14 = 534
+    let ta = total_asset_load_mb()
+    if ta != 534 { panic("c_wows_port_warmup FAIL [total_asset_load_mb] expected=534 got=" + to_string(ta)) }
+
+    // avg_port_load_us = 748000 / 3 = 249333 (int trunc)
+    let avg = avg_port_load_us()
+    if avg != 249333 { panic("c_wows_port_warmup FAIL [avg_port_load_us] expected=249333 got=" + to_string(avg)) }
+
+    // session_ships:
+    //   33001 → 42, 33002 → 42, 33003 → 10, 9999 → 0 (미등록)
+    let s1 = session_ships(33001)
+    if s1 != 42 { panic("c_wows_port_warmup FAIL [ships 33001] expected=42 got=" + to_string(s1)) }
+    let s2 = session_ships(33002)
+    if s2 != 42 { panic("c_wows_port_warmup FAIL [ships 33002] expected=42 got=" + to_string(s2)) }
+    let s3 = session_ships(33003)
+    if s3 != 10 { panic("c_wows_port_warmup FAIL [ships 33003] expected=10 got=" + to_string(s3)) }
+    let s4 = session_ships(9999)
+    if s4 != 0 { panic("c_wows_port_warmup FAIL [ships unknown] expected=0 got=" + to_string(s4)) }
+
+    let stats = wpw_stats()
+    if stats[0] != 3 { panic("c_wows_port_warmup FAIL [stats sessions] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 94 { panic("c_wows_port_warmup FAIL [stats ships] expected=94 got=" + to_string(stats[1])) }
+    if stats[2] != 748000 { panic("c_wows_port_warmup FAIL [stats port_us] expected=748000 got=" + to_string(stats[2])) }
+    if stats[3] != 534 { panic("c_wows_port_warmup FAIL [stats asset_mb] expected=534 got=" + to_string(stats[3])) }
+
+    r0_emit("wows_port_summary", "\"sessions\":" + to_string(stats[0]) + ",\"ships\":" + to_string(stats[1]) + ",\"port_us\":" + to_string(stats[2]) + ",\"asset_mb\":" + to_string(stats[3]) + ",\"avg_port_us\":" + to_string(avg))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_wows_port_warmup FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic WoWS port warmup round-trip (Track BM — c_wows_* family inventory v2 — partial 유지) ───
+    //
+    // Track BM mission: c_wows_* family inventory v2 — c_wows_port_warmup
+    // 측 World of Warships port UI warmup synthetic round-trip. Warmup lifecycle
+    // (probe_port_xml → load_ship_pkg → warm_camo_atlas → audit_port_us)
+    // 측 spec freeze. BigWorld engine binary licence transitive (long-horizon production
+    // smoke gate), Wargaming network production smoke long-horizon, met 승격 X.
+    //
+    // (a) synthetic 4-phase WoWS port warmup pipeline —
+    //     probe_port_xml → load_ship_pkg → warm_camo_atlas → audit_port_us:
+    //     phase_count               4
+    //     wows_port_off             0x140168000         (synthetic WoWS port warmup RVA)
+    //     pipeline_kind             "synthetic_inline"  (실 BigWorld pkg load 호출 X)
+    //
+    // (b) synthetic ship_class × warmup_stage 16-slot warmup matrix —
+    //     4 ship_class (destroyer/cruiser/battleship/carrier) × 4 warmup_stage
+    //     (xml/pkg/camo/audit) = 16 slots:
+    //     slot_total                16
+    //     hot_slot_count            4                   (warmup_stage = camo, hot atlas)
+    //     cold_slot_count           12                  (xml/pkg/audit cold)
+    //     matrix_kind               "synthetic_inline"
+    //
+    // round-trip = synthesize_warmup_phase(scaffold) → walk_warmup_matrix(scaffold).
+    //              hexa-native loop only — 실 BigWorld pkg disk read 0,
+    //              real Wargaming launcher network 0.
+    //
+    // synthetic WoWS port warmup phase emit
+    r0_emit("c_wows_port_warmup_synthetic_phase",
+        "\"stage\":\"port_warmup_phase\",\"phase_count\":4,\"wows_port_off\":\"0x140168000\",\"pipeline_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"engine_gap\":\"BigWorld engine binary licence transitive — long-horizon Wargaming production smoke gate\"")
+    println("__WOWS_PORT__ PARTIAL port_warmup_phase")
+
+    // synthetic ship × warmup matrix emit
+    r0_emit("c_wows_port_warmup_synthetic_matrix",
+        "\"stage\":\"warmup_matrix\",\"slot_total\":16,\"hot_slot_count\":4,\"cold_slot_count\":12,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"battlenet.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"engine_gap\":\"BigWorld engine binary licence transitive — long-horizon Wargaming production smoke gate\"")
+    println("__WOWS_PORT__ PARTIAL warmup_matrix")
+
+    cleanup_wpw()
+
+    println("  ✅ c_wows_port_warmup self_test PASS (3 sessions, 94 ships, port_us=748000, asset_mb=534, avg_port_us=249333, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = wpw_stats()
+            println("sessions=" + to_string(s[0]) + " ships=" + to_string(s[1]) + " port_us=" + to_string(s[2]) + " asset_mb=" + to_string(s[3]))
+            return
+        }
+        if sub == "ships" {
+            if len(a) >= 4 {
+                let sid_q = to_int(a[3])
+                let sc = session_ships(sid_q)
+                println(to_string(sc))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_wpw(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_wows_port_warmup.hexa { self-test | stats | ships <session_id> | cleanup }")
+}

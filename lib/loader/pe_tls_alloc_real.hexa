@@ -1,0 +1,427 @@
+// lib/loader/pe_tls_alloc_real.hexa — cycle 82 R6 Tier 5 Win32 TlsAlloc/Free/Get/Set 실 추적 skeleton
+//
+// Win32 TLS API (R6 Tier 5):
+//   TlsAlloc()       → DWORD index (sequential 0..1087, recycled after TlsFree)
+//   TlsFree(index)   → mark slot reusable
+//   TlsGetValue(idx) → fs:[0x0E10 + idx*8] (i386) or gs:[0x1480 + idx*8] (x64) → value
+//   TlsSetValue(idx, value) → fs/gs:[...] = value
+//   Apple-native 매핑:
+//     index pool: 자체 bitmap (own2)
+//     value array: per-thread pthread_key_create 또는 fake TEB segment 합성
+//   D2R/Battle.net 같은 게임이 TLS 의존도 매우 큼 (per-thread state)
+// own1: Apple pthread_key_create + MSDN TLS spec. Wine kernel32/thread.c 인용 X
+//
+// cross-ref: cycle 80 pe_tls_init_real — PE IMAGE_TLS_DIRECTORY 초기화 (정적 TLS).
+// 본 module 은 동적 TlsAlloc/TlsFree 슬롯 풀을 추적 — 두 layer 가 합쳐져 TEB
+// (gs:[0x58] TLS array + gs:[0x1480] expansion) 전체를 모방한다.
+//
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// op_kind code:
+//   1 = alloc   (TlsAlloc)
+//   2 = free    (TlsFree)
+//   3 = get     (TlsGetValue)
+//   4 = set     (TlsSetValue)
+//
+// persist schema (TSV — ops.tsv):
+//   op_id<int> \t op_kind<int> \t tls_index<int> \t value_size_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ptar_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_tls_alloc_real"
+}
+
+fn ptar_ops_path() -> str {
+    return ptar_dir() + "/ops.tsv"
+}
+
+fn ptar_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ptar_dir() + "'")
+}
+
+fn cleanup_ptar() -> void {
+    ptar_ensure_dir()
+    let _ = exec("rm -f '" + ptar_ops_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ptar_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ptar_append_row(path: str, row: str) -> void {
+    ptar_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_op: TLS op 1 건 기록 ───
+fn record_op(op_id: int, op_kind: int, tls_index: int, value_size_bytes: int) -> void {
+    if op_id <= 0 {
+        panic("pe_tls_alloc_real FAIL [record_op] expected=op_id>0 got=" + to_string(op_id))
+    }
+    if op_kind < 1 {
+        panic("pe_tls_alloc_real FAIL [record_op] expected=op_kind>=1 got=" + to_string(op_kind))
+    }
+    if op_kind > 4 {
+        panic("pe_tls_alloc_real FAIL [record_op] expected=op_kind<=4 got=" + to_string(op_kind))
+    }
+    if tls_index < 0 {
+        panic("pe_tls_alloc_real FAIL [record_op] expected=tls_index>=0 got=" + to_string(tls_index))
+    }
+    if tls_index > 1087 {
+        panic("pe_tls_alloc_real FAIL [record_op] expected=tls_index<=1087 got=" + to_string(tls_index))
+    }
+    if value_size_bytes < 0 {
+        panic("pe_tls_alloc_real FAIL [record_op] expected=value_size_bytes>=0 got=" + to_string(value_size_bytes))
+    }
+    let row = to_string(op_id) + "\t" + to_string(op_kind)
+        + "\t" + to_string(tls_index) + "\t" + to_string(value_size_bytes) + "\n"
+    ptar_append_row(ptar_ops_path(), row)
+}
+
+// ─── op_count: total op 수 ───
+fn op_count() -> int {
+    let t = ptar_read_table(ptar_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_op_kind: 특정 op_kind 의 op 수 ───
+fn count_by_op_kind(kind: int) -> int {
+    let t = ptar_read_table(ptar_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_value_size_bytes: 모든 op value_size_bytes 합 ───
+fn total_value_size_bytes() -> int {
+    let t = ptar_read_table(ptar_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── distinct_indices: 등장한 tls_index 의 distinct 수 ───
+fn distinct_indices() -> int {
+    let t = ptar_read_table(ptar_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut seen = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let idx = to_int(parts[2])
+                let mut found = false
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == idx {
+                        found = true
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    seen.push(idx)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── alloc_free_balance: alloc - free (양수면 leak) ───
+fn alloc_free_balance() -> int {
+    return count_by_op_kind(1) - count_by_op_kind(2)
+}
+
+// ─── op_value_size: 특정 op_id 의 value_size_bytes (없으면 0) ───
+fn op_value_size(op_id: int) -> int {
+    let t = ptar_read_table(ptar_ops_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == op_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ptar_stats: [op_count, total_value_size_bytes, distinct_indices, alloc_free_balance] ───
+fn ptar_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_value_size_bytes())
+    out.push(distinct_indices())
+    out.push(alloc_free_balance())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ptar-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ptar()
+
+    // 2. record 6 ops across all 4 op_kinds with ≥2 distinct tls_indices
+    //    alloc index 7 (size 0)
+    record_op(820001, 1, 7, 0)
+    r0_emit("pe_tls_alloc_real_record",
+        "\"op_id\":820001,\"op_kind\":1,\"tls_index\":7,\"value_size_bytes\":0,\"target\":\"alloc\"")
+
+    //    set index 7 → 8 bytes (pointer)
+    record_op(820002, 4, 7, 8)
+    r0_emit("pe_tls_alloc_real_record",
+        "\"op_id\":820002,\"op_kind\":4,\"tls_index\":7,\"value_size_bytes\":8,\"target\":\"set\"")
+
+    //    get index 7 → 8 bytes (read back)
+    record_op(820003, 3, 7, 8)
+    r0_emit("pe_tls_alloc_real_record",
+        "\"op_id\":820003,\"op_kind\":3,\"tls_index\":7,\"value_size_bytes\":8,\"target\":\"get\"")
+
+    //    alloc index 42 (expansion slot)
+    record_op(820004, 1, 42, 0)
+    r0_emit("pe_tls_alloc_real_record",
+        "\"op_id\":820004,\"op_kind\":1,\"tls_index\":42,\"value_size_bytes\":0,\"target\":\"alloc\"")
+
+    //    set index 42 → 8 bytes
+    record_op(820005, 4, 42, 8)
+    r0_emit("pe_tls_alloc_real_record",
+        "\"op_id\":820005,\"op_kind\":4,\"tls_index\":42,\"value_size_bytes\":8,\"target\":\"set\"")
+
+    //    free index 7
+    record_op(820006, 2, 7, 0)
+    r0_emit("pe_tls_alloc_real_record",
+        "\"op_id\":820006,\"op_kind\":2,\"tls_index\":7,\"value_size_bytes\":0,\"target\":\"free\"")
+
+    // 3. op_count = 6
+    let c = op_count()
+    if c != 6 {
+        panic("pe_tls_alloc_real FAIL [op_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_op_kind sanity (alloc=2, free=1, get=1, set=2)
+    let k1 = count_by_op_kind(1)
+    if k1 != 2 {
+        panic("pe_tls_alloc_real FAIL [count_by_op_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_op_kind(2)
+    if k2 != 1 {
+        panic("pe_tls_alloc_real FAIL [count_by_op_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_op_kind(3)
+    if k3 != 1 {
+        panic("pe_tls_alloc_real FAIL [count_by_op_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_op_kind(4)
+    if k4 != 2 {
+        panic("pe_tls_alloc_real FAIL [count_by_op_kind(4)] expected=2 got=" + to_string(k4))
+    }
+    let k99 = count_by_op_kind(99)
+    if k99 != 0 {
+        panic("pe_tls_alloc_real FAIL [count_by_op_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. total_value_size_bytes = 0+8+8+0+8+0 = 24
+    let tv = total_value_size_bytes()
+    if tv != 24 {
+        panic("pe_tls_alloc_real FAIL [total_value_size_bytes] expected=24 got=" + to_string(tv))
+    }
+
+    // 6. distinct_indices = 2 (7, 42)
+    let di = distinct_indices()
+    if di != 2 {
+        panic("pe_tls_alloc_real FAIL [distinct_indices] expected=2 got=" + to_string(di))
+    }
+
+    // 7. alloc_free_balance = 2 - 1 = 1 (index 42 still allocated)
+    let bal = alloc_free_balance()
+    if bal != 1 {
+        panic("pe_tls_alloc_real FAIL [alloc_free_balance] expected=1 got=" + to_string(bal))
+    }
+
+    // 8. op_value_size sanity
+    let v2 = op_value_size(820002)
+    if v2 != 8 {
+        panic("pe_tls_alloc_real FAIL [op_value_size(820002)] expected=8 got=" + to_string(v2))
+    }
+    let v1 = op_value_size(820001)
+    if v1 != 0 {
+        panic("pe_tls_alloc_real FAIL [op_value_size(820001)] expected=0 got=" + to_string(v1))
+    }
+    let v_miss = op_value_size(9999)
+    if v_miss != 0 {
+        panic("pe_tls_alloc_real FAIL [op_value_size(9999)] expected=0 got=" + to_string(v_miss))
+    }
+
+    // 9. ptar_stats() = [6, 24, 2, 1]
+    let s = ptar_stats()
+    if len(s) != 4 {
+        panic("pe_tls_alloc_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_tls_alloc_real FAIL [stats op_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 24 {
+        panic("pe_tls_alloc_real FAIL [stats total_value_size_bytes] expected=24 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_tls_alloc_real FAIL [stats distinct_indices] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_tls_alloc_real FAIL [stats alloc_free_balance] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_tls_alloc_real_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_value_size_bytes\":" + to_string(s[1])
+        + ",\"distinct_indices\":" + to_string(s[2])
+        + ",\"alloc_free_balance\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_tls_alloc_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_ptar()
+    let s2 = ptar_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_tls_alloc_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_tls_alloc_real self_test PASS (ops=" + to_string(s[0])
+        + ", value_bytes=" + to_string(s[1]) + ", indices=" + to_string(s[2])
+        + ", balance=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ptar_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_value_size_bytes\t" + to_string(s[1]))
+            println("distinct_indices\t" + to_string(s[2]))
+            println("alloc_free_balance\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let oid = to_int(a[3])
+                println("op_value_size\t" + to_string(op_value_size(oid)))
+                return
+            }
+            println("usage: hexa run pe_tls_alloc_real.hexa size <op_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_op_kind\t" + to_string(count_by_op_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_tls_alloc_real.hexa count <op_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ptar()
+            println("cleaned: " + ptar_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ptar_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_tls_alloc_real.hexa { self-test | stats | size <op_id> | count <op_kind> | cleanup | dir }")
+}

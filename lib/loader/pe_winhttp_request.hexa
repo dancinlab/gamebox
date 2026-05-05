@@ -1,0 +1,391 @@
+// lib/loader/pe_winhttp_request.hexa — Win32 WinHTTP request telemetry skeleton
+//
+// docker hexa ↔ host native helper 통신 — Win32 WinHTTP API
+// (WinHttpOpen / WinHttpConnect / WinHttpSendRequest / WinHttpReceiveResponse).
+// 본 module 은 HTTP request tracker — 실 winhttp.dll 호출 X (cycle 76+).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// method_kind code:
+//   1 = GET
+//   2 = POST
+//   3 = PUT
+//   4 = DELETE
+//   5 = HEAD
+//
+// persist schema (TSV — requests.tsv):
+//   request_id<int> \t method_kind<int> \t status_code<int> \t body_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pwr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_winhttp_request"
+}
+
+fn pwr_requests_path() -> str {
+    return pwr_dir() + "/requests.tsv"
+}
+
+fn pwr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pwr_dir() + "'")
+}
+
+fn cleanup_pwr() -> void {
+    pwr_ensure_dir()
+    let _ = exec("rm -f '" + pwr_requests_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pwr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pwr_append_row(path: str, row: str) -> void {
+    pwr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_request: WinHTTP request 1 건 기록 ───
+fn record_request(request_id: int, method_kind: int, status_code: int, body_bytes: int) -> void {
+    if request_id <= 0 {
+        panic("pe_winhttp_request FAIL [record_request] expected=request_id>0 got=" + to_string(request_id))
+    }
+    if method_kind < 1 {
+        panic("pe_winhttp_request FAIL [record_request] expected=method_kind>=1 got=" + to_string(method_kind))
+    }
+    if method_kind > 5 {
+        panic("pe_winhttp_request FAIL [record_request] expected=method_kind<=5 got=" + to_string(method_kind))
+    }
+    if status_code < 0 {
+        panic("pe_winhttp_request FAIL [record_request] expected=status_code>=0 got=" + to_string(status_code))
+    }
+    if body_bytes < 0 {
+        panic("pe_winhttp_request FAIL [record_request] expected=body_bytes>=0 got=" + to_string(body_bytes))
+    }
+    let row = to_string(request_id) + "\t" + to_string(method_kind)
+        + "\t" + to_string(status_code) + "\t" + to_string(body_bytes) + "\n"
+    pwr_append_row(pwr_requests_path(), row)
+}
+
+// ─── request_count: total request 수 ───
+fn request_count() -> int {
+    let t = pwr_read_table(pwr_requests_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_body_bytes: 모든 request body_bytes 합 ───
+fn total_body_bytes() -> int {
+    let t = pwr_read_table(pwr_requests_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_method: 특정 method_kind 의 request 수 ───
+fn count_by_method(method_kind: int) -> int {
+    let t = pwr_read_table(pwr_requests_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == method_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_2xx_count: 200 <= status_code < 300 인 request 수 ───
+fn success_2xx_count() -> int {
+    let t = pwr_read_table(pwr_requests_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let sc = to_int(parts[2])
+                if sc >= 200 {
+                    if sc < 300 {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── request_status: 특정 request_id 의 status_code (없으면 0) ───
+fn request_status(request_id: int) -> int {
+    let t = pwr_read_table(pwr_requests_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == request_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pwr_stats: [request_count, total_body_bytes, success_2xx_count, count_by_method(1)] ───
+fn pwr_stats() -> array {
+    let mut out = []
+    out.push(request_count())
+    out.push(total_body_bytes())
+    out.push(success_2xx_count())
+    out.push(count_by_method(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pwr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pwr()
+
+    // 2. record 5 requests (deterministic synthetic, ≥3 method_kinds, 2xx/4xx/5xx mix)
+    record_request(750001, 1, 200, 1024)
+    r0_emit("pe_winhttp_request_record",
+        "\"request_id\":750001,\"method_kind\":1,\"status_code\":200,\"body_bytes\":1024,\"target\":\"GET\"")
+
+    record_request(750002, 2, 201, 256)
+    r0_emit("pe_winhttp_request_record",
+        "\"request_id\":750002,\"method_kind\":2,\"status_code\":201,\"body_bytes\":256,\"target\":\"POST\"")
+
+    record_request(750003, 1, 404, 0)
+    r0_emit("pe_winhttp_request_record",
+        "\"request_id\":750003,\"method_kind\":1,\"status_code\":404,\"body_bytes\":0,\"target\":\"GET\"")
+
+    record_request(750004, 3, 500, 128)
+    r0_emit("pe_winhttp_request_record",
+        "\"request_id\":750004,\"method_kind\":3,\"status_code\":500,\"body_bytes\":128,\"target\":\"PUT\"")
+
+    record_request(750005, 5, 200, 0)
+    r0_emit("pe_winhttp_request_record",
+        "\"request_id\":750005,\"method_kind\":5,\"status_code\":200,\"body_bytes\":0,\"target\":\"HEAD\"")
+
+    // 3. request_count = 5
+    let c = request_count()
+    if c != 5 {
+        panic("pe_winhttp_request FAIL [request_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_body_bytes = 1408
+    let tb = total_body_bytes()
+    if tb != 1408 {
+        panic("pe_winhttp_request FAIL [total_body_bytes] expected=1408 got=" + to_string(tb))
+    }
+
+    // 5. count_by_method sanity
+    let m1 = count_by_method(1)
+    if m1 != 2 {
+        panic("pe_winhttp_request FAIL [count_by_method(1)] expected=2 got=" + to_string(m1))
+    }
+    let m2 = count_by_method(2)
+    if m2 != 1 {
+        panic("pe_winhttp_request FAIL [count_by_method(2)] expected=1 got=" + to_string(m2))
+    }
+    let m3 = count_by_method(3)
+    if m3 != 1 {
+        panic("pe_winhttp_request FAIL [count_by_method(3)] expected=1 got=" + to_string(m3))
+    }
+    let m4 = count_by_method(4)
+    if m4 != 0 {
+        panic("pe_winhttp_request FAIL [count_by_method(4)] expected=0 got=" + to_string(m4))
+    }
+    let m5 = count_by_method(5)
+    if m5 != 1 {
+        panic("pe_winhttp_request FAIL [count_by_method(5)] expected=1 got=" + to_string(m5))
+    }
+    let m99 = count_by_method(99)
+    if m99 != 0 {
+        panic("pe_winhttp_request FAIL [count_by_method(99)] expected=0 got=" + to_string(m99))
+    }
+
+    // 6. success_2xx_count = 3 (200, 201, 200)
+    let sc = success_2xx_count()
+    if sc != 3 {
+        panic("pe_winhttp_request FAIL [success_2xx_count] expected=3 got=" + to_string(sc))
+    }
+
+    // 7. request_status sanity
+    let s2 = request_status(750002)
+    if s2 != 201 {
+        panic("pe_winhttp_request FAIL [request_status(750002)] expected=201 got=" + to_string(s2))
+    }
+    let s4 = request_status(750004)
+    if s4 != 500 {
+        panic("pe_winhttp_request FAIL [request_status(750004)] expected=500 got=" + to_string(s4))
+    }
+    let s_miss = request_status(9999)
+    if s_miss != 0 {
+        panic("pe_winhttp_request FAIL [request_status(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. pwr_stats() = [5, 1408, 3, 2]
+    let s = pwr_stats()
+    if len(s) != 4 {
+        panic("pe_winhttp_request FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_winhttp_request FAIL [stats request_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 1408 {
+        panic("pe_winhttp_request FAIL [stats total_body_bytes] expected=1408 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_winhttp_request FAIL [stats success_2xx_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_winhttp_request FAIL [stats count_method(GET)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_winhttp_request_stats",
+        "\"request_count\":" + to_string(s[0])
+        + ",\"total_body_bytes\":" + to_string(s[1])
+        + ",\"success_2xx_count\":" + to_string(s[2])
+        + ",\"method_get\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_winhttp_request FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pwr()
+    let s2c = pwr_stats()
+    let i = 0
+    while i < len(s2c) {
+        if s2c[i] != 0 {
+            panic("pe_winhttp_request FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2c[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_winhttp_request self_test PASS (requests=" + to_string(s[0])
+        + ", body_bytes=" + to_string(s[1]) + ", success_2xx=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pwr_stats()
+            println("request_count\t" + to_string(s[0]))
+            println("total_body_bytes\t" + to_string(s[1]))
+            println("success_2xx_count\t" + to_string(s[2]))
+            println("count_method_get\t" + to_string(s[3]))
+            return
+        }
+        if sub == "status" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("request_status\t" + to_string(request_status(rid)))
+                return
+            }
+            println("usage: hexa run pe_winhttp_request.hexa status <request_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let mk = to_int(a[3])
+                println("count_by_method\t" + to_string(count_by_method(mk)))
+                return
+            }
+            println("usage: hexa run pe_winhttp_request.hexa count <method_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pwr()
+            println("cleaned: " + pwr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pwr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_winhttp_request.hexa { self-test | stats | status <request_id> | count <method_kind> | cleanup | dir }")
+}

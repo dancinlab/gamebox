@@ -1,0 +1,440 @@
+// lib/loader/pe_i386_teb_fs_segment.hexa — i386 TEB FS:[0] segment access telemetry
+//
+// docstring: i386 TEB FS:[0x18]=Self, FS:[0x30]=PEB, FS:[0xE10]=TLS slots (low 64).
+//   x64 GS:[0x30]=Self, GS:[0x60]=PEB. Apple per-thread fake FS via pthread_self() +
+//   segment trampoline (or signal-based emulation). own1: NT TEB spec.
+//
+// i386 Win32 thread 는 FS:[0] 로 TEB 에 접근 (vs x64 GS:[0]). Apple-native 환경에선
+// FS segment register 가 다른 용도로 쓰이므로 host 측에서 pthread_self() 기반 fake
+// FS 합성 (segment trampoline / signal emulation) 으로 대신 — 본 module 은 그
+// trampoline 이 emit 하는 access 이벤트를 thread × field_kind 단위로 telemetry.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 i386 TEB FS:[0] access tracker — Apple 측 native fake-FS 합성만 참조.
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// field_kind code (i386 TEB layout):
+//   1 = Self                 (FS:[0x18])
+//   2 = PEB pointer          (FS:[0x30])
+//   3 = TlsArray (TLS slots) (FS:[0xE10])
+//   4 = LastErrorValue       (FS:[0x34])
+//   5 = StackBase            (FS:[0x04])
+//   6 = CurrentLocale        (FS:[0xC4])
+//
+// persist schema (TSV — accesses.tsv):
+//   access_id<int> \t field_offset<int> \t field_kind<int> \t thread_id<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pitfs_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_teb_fs_segment"
+}
+
+fn pitfs_accesses_path() -> str {
+    return pitfs_dir() + "/accesses.tsv"
+}
+
+fn pitfs_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pitfs_dir() + "'")
+}
+
+fn cleanup_pitfs() -> void {
+    pitfs_ensure_dir()
+    let _ = exec("rm -f '" + pitfs_accesses_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pitfs_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pitfs_append_row(path: str, row: str) -> void {
+    pitfs_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_access: i386 TEB FS:[offset] access 1 건 기록 ───
+fn record_access(access_id: int, field_offset: int, field_kind: int, thread_id: int) -> void {
+    if access_id <= 0 {
+        panic("pe_i386_teb_fs_segment FAIL [record_access] expected=access_id>0 got=" + to_string(access_id))
+    }
+    if field_offset < 0 {
+        panic("pe_i386_teb_fs_segment FAIL [record_access] expected=field_offset>=0 got=" + to_string(field_offset))
+    }
+    if field_kind < 1 {
+        panic("pe_i386_teb_fs_segment FAIL [record_access] expected=field_kind>=1 got=" + to_string(field_kind))
+    }
+    if field_kind > 6 {
+        panic("pe_i386_teb_fs_segment FAIL [record_access] expected=field_kind<=6 got=" + to_string(field_kind))
+    }
+    if thread_id <= 0 {
+        panic("pe_i386_teb_fs_segment FAIL [record_access] expected=thread_id>0 got=" + to_string(thread_id))
+    }
+    let row = to_string(access_id) + "\t" + to_string(field_offset)
+        + "\t" + to_string(field_kind) + "\t" + to_string(thread_id) + "\n"
+    pitfs_append_row(pitfs_accesses_path(), row)
+}
+
+// ─── access_count: total access 수 ───
+fn access_count() -> int {
+    let t = pitfs_read_table(pitfs_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_field_kind: 특정 field_kind 의 access 수 ───
+fn count_by_field_kind(field_kind: int) -> int {
+    let t = pitfs_read_table(pitfs_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == field_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_field_offset: 특정 field_offset 의 access 수 ───
+fn count_by_field_offset(field_offset: int) -> int {
+    let t = pitfs_read_table(pitfs_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == field_offset {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── distinct_threads: 등장한 thread_id 의 distinct count ───
+fn distinct_threads() -> int {
+    let t = pitfs_read_table(pitfs_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut seen = []
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let tid = to_int(parts[3])
+                let mut found = 0
+                let m = len(seen)
+                let mut k = 0
+                while k < m {
+                    if seen[k] == tid {
+                        found = 1
+                    }
+                    k = k + 1
+                }
+                if found == 0 {
+                    seen.push(tid)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// ─── peb_access_count: PEB pointer (field_kind=2) access 전용 alias ───
+fn peb_access_count() -> int {
+    return count_by_field_kind(2)
+}
+
+// ─── access_offset: 특정 access_id 의 field_offset (없으면 0) ───
+fn access_offset(access_id: int) -> int {
+    let t = pitfs_read_table(pitfs_accesses_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == access_id {
+                    return to_int(parts[1])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pitfs_stats: [access_count, peb_access_count, distinct_threads, count_by_field_kind(1)] ───
+fn pitfs_stats() -> array {
+    let mut out = []
+    out.push(access_count())
+    out.push(peb_access_count())
+    out.push(distinct_threads())
+    out.push(count_by_field_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pitfs-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pitfs()
+
+    // 2. record 6 accesses across ≥4 field_kinds + ≥2 threads (deterministic synthetic)
+    record_access(130001, 24, 1, 5001)
+    r0_emit("pe_i386_teb_fs_segment_record",
+        "\"access_id\":130001,\"field_offset\":24,\"field_kind\":1,\"thread_id\":5001,\"target\":\"FS:[0x18]/Self\"")
+
+    record_access(130002, 48, 2, 5001)
+    r0_emit("pe_i386_teb_fs_segment_record",
+        "\"access_id\":130002,\"field_offset\":48,\"field_kind\":2,\"thread_id\":5001,\"target\":\"FS:[0x30]/PEB\"")
+
+    record_access(130003, 3600, 3, 5002)
+    r0_emit("pe_i386_teb_fs_segment_record",
+        "\"access_id\":130003,\"field_offset\":3600,\"field_kind\":3,\"thread_id\":5002,\"target\":\"FS:[0xE10]/TlsArray\"")
+
+    record_access(130004, 52, 4, 5002)
+    r0_emit("pe_i386_teb_fs_segment_record",
+        "\"access_id\":130004,\"field_offset\":52,\"field_kind\":4,\"thread_id\":5002,\"target\":\"FS:[0x34]/LastError\"")
+
+    record_access(130005, 48, 2, 5002)
+    r0_emit("pe_i386_teb_fs_segment_record",
+        "\"access_id\":130005,\"field_offset\":48,\"field_kind\":2,\"thread_id\":5002,\"target\":\"FS:[0x30]/PEB\"")
+
+    record_access(130006, 24, 1, 5002)
+    r0_emit("pe_i386_teb_fs_segment_record",
+        "\"access_id\":130006,\"field_offset\":24,\"field_kind\":1,\"thread_id\":5002,\"target\":\"FS:[0x18]/Self\"")
+
+    // 3. access_count = 6
+    let c = access_count()
+    if c != 6 {
+        panic("pe_i386_teb_fs_segment FAIL [access_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_field_kind sanity
+    let k1 = count_by_field_kind(1)
+    if k1 != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_field_kind(2)
+    if k2 != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_field_kind(3)
+    if k3 != 1 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_field_kind(4)
+    if k4 != 1 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_field_kind(5)
+    if k5 != 0 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_kind(5)] expected=0 got=" + to_string(k5))
+    }
+    let k6 = count_by_field_kind(6)
+    if k6 != 0 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_kind(6)] expected=0 got=" + to_string(k6))
+    }
+
+    // 5. count_by_field_offset sanity
+    let o24 = count_by_field_offset(24)
+    if o24 != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_offset(24)] expected=2 got=" + to_string(o24))
+    }
+    let o48 = count_by_field_offset(48)
+    if o48 != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_offset(48)] expected=2 got=" + to_string(o48))
+    }
+    let o_miss = count_by_field_offset(9999)
+    if o_miss != 0 {
+        panic("pe_i386_teb_fs_segment FAIL [count_by_field_offset(9999)] expected=0 got=" + to_string(o_miss))
+    }
+
+    // 6. distinct_threads = 2
+    let dt = distinct_threads()
+    if dt != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [distinct_threads] expected=2 got=" + to_string(dt))
+    }
+
+    // 7. peb_access_count alias = count_by_field_kind(2) = 2
+    let pac = peb_access_count()
+    if pac != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [peb_access_count] expected=2 got=" + to_string(pac))
+    }
+
+    // 8. access_offset sanity
+    let a3 = access_offset(130003)
+    if a3 != 3600 {
+        panic("pe_i386_teb_fs_segment FAIL [access_offset(130003)] expected=3600 got=" + to_string(a3))
+    }
+    let a4 = access_offset(130004)
+    if a4 != 52 {
+        panic("pe_i386_teb_fs_segment FAIL [access_offset(130004)] expected=52 got=" + to_string(a4))
+    }
+    let a_miss = access_offset(99999)
+    if a_miss != 0 {
+        panic("pe_i386_teb_fs_segment FAIL [access_offset(99999)] expected=0 got=" + to_string(a_miss))
+    }
+
+    // 9. pitfs_stats() = [6, 2, 2, 2]
+    let s = pitfs_stats()
+    if len(s) != 4 {
+        panic("pe_i386_teb_fs_segment FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_i386_teb_fs_segment FAIL [stats access_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [stats peb_access_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [stats distinct_threads] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_i386_teb_fs_segment FAIL [stats count_field_kind(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_i386_teb_fs_segment_stats",
+        "\"access_count\":" + to_string(s[0])
+        + ",\"peb_access_count\":" + to_string(s[1])
+        + ",\"distinct_threads\":" + to_string(s[2])
+        + ",\"field_self_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_i386_teb_fs_segment FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pitfs()
+    let s2 = pitfs_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_teb_fs_segment FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_teb_fs_segment self_test PASS (accesses=" + to_string(s[0])
+        + ", peb=" + to_string(s[1]) + ", self=" + to_string(s[3])
+        + ", threads=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pitfs_stats()
+            println("access_count\t" + to_string(s[0]))
+            println("peb_access_count\t" + to_string(s[1]))
+            println("distinct_threads\t" + to_string(s[2]))
+            println("field_self_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "offset" {
+            if len(a) >= 4 {
+                let aid = to_int(a[3])
+                println("access_offset\t" + to_string(access_offset(aid)))
+                return
+            }
+            println("usage: hexa run pe_i386_teb_fs_segment.hexa offset <access_id>")
+            return
+        }
+        if sub == "count-kind" {
+            if len(a) >= 4 {
+                let fk = to_int(a[3])
+                println("count_by_field_kind\t" + to_string(count_by_field_kind(fk)))
+                return
+            }
+            println("usage: hexa run pe_i386_teb_fs_segment.hexa count-kind <field_kind>")
+            return
+        }
+        if sub == "count-offset" {
+            if len(a) >= 4 {
+                let fo = to_int(a[3])
+                println("count_by_field_offset\t" + to_string(count_by_field_offset(fo)))
+                return
+            }
+            println("usage: hexa run pe_i386_teb_fs_segment.hexa count-offset <field_offset>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pitfs()
+            println("cleaned: " + pitfs_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pitfs_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_teb_fs_segment.hexa { self-test | stats | offset <access_id> | count-kind <field_kind> | count-offset <field_offset> | cleanup | dir }")
+}

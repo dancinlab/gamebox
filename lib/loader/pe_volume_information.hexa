@@ -1,0 +1,413 @@
+// lib/loader/pe_volume_information.hexa — Win32 volume info bridge skeleton
+//
+// Battle.net installer 가 GetVolumeInformation / GetDriveType /
+// GetDiskFreeSpaceEx 등 Win32 volume API 를 호출하여 설치 대상 volume 의
+// serial / FS type / free space 를 검증한다. 본 module 은 query → APFS
+// volume info bridge 로 향하는 query event tracker — 실 syscall X (stage6).
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// drive_kind code:
+//   1 = fixed
+//   2 = removable
+//   3 = remote
+//   4 = cdrom
+//   5 = ramdisk
+//
+// query_kind code:
+//   1 = info        (GetVolumeInformation)
+//   2 = type        (GetDriveType)
+//   3 = free_space  (GetDiskFreeSpaceEx)
+//   4 = label       (GetVolumeInformation.lpVolumeNameBuffer)
+//
+// persist schema (TSV — queries.tsv):
+//   query_id<int> \t drive_kind<int> \t query_kind<int> \t free_kb<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pvi_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_volume_information"
+}
+
+fn pvi_queries_path() -> str {
+    return pvi_dir() + "/queries.tsv"
+}
+
+fn pvi_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pvi_dir() + "'")
+}
+
+fn cleanup_pvi() -> void {
+    pvi_ensure_dir()
+    let _ = exec("rm -f '" + pvi_queries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pvi_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pvi_append_row(path: str, row: str) -> void {
+    pvi_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_query: volume query 1 건 기록 ───
+fn record_query(query_id: int, drive_kind: int, query_kind: int, free_kb: int) -> void {
+    if query_id <= 0 {
+        panic("pe_volume_information FAIL [record_query] expected=query_id>0 got=" + to_string(query_id))
+    }
+    if drive_kind < 1 {
+        panic("pe_volume_information FAIL [record_query] expected=drive_kind>=1 got=" + to_string(drive_kind))
+    }
+    if drive_kind > 5 {
+        panic("pe_volume_information FAIL [record_query] expected=drive_kind<=5 got=" + to_string(drive_kind))
+    }
+    if query_kind < 1 {
+        panic("pe_volume_information FAIL [record_query] expected=query_kind>=1 got=" + to_string(query_kind))
+    }
+    if query_kind > 4 {
+        panic("pe_volume_information FAIL [record_query] expected=query_kind<=4 got=" + to_string(query_kind))
+    }
+    if free_kb < 0 {
+        panic("pe_volume_information FAIL [record_query] expected=free_kb>=0 got=" + to_string(free_kb))
+    }
+    let row = to_string(query_id) + "\t" + to_string(drive_kind)
+        + "\t" + to_string(query_kind) + "\t" + to_string(free_kb) + "\n"
+    pvi_append_row(pvi_queries_path(), row)
+}
+
+// ─── query_count: total query 수 ───
+fn query_count() -> int {
+    let t = pvi_read_table(pvi_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_free_kb: 모든 query free_kb 합 ───
+fn total_free_kb() -> int {
+    let t = pvi_read_table(pvi_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_drive_kind: 특정 drive_kind 의 query 수 ───
+fn count_by_drive_kind(drive_kind: int) -> int {
+    let t = pvi_read_table(pvi_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == drive_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_query_kind: 특정 query_kind 의 query 수 ───
+fn count_by_query_kind(query_kind: int) -> int {
+    let t = pvi_read_table(pvi_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == query_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── query_free_kb: 특정 query_id 의 free_kb (없으면 0) ───
+fn query_free_kb(query_id: int) -> int {
+    let t = pvi_read_table(pvi_queries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == query_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pvi_stats: [query_count, total_free_kb, count_by_drive_kind(1), count_by_query_kind(1)] ───
+fn pvi_stats() -> array {
+    let mut out = []
+    out.push(query_count())
+    out.push(total_free_kb())
+    out.push(count_by_drive_kind(1))
+    out.push(count_by_query_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pvi-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pvi()
+
+    // 2. record 5 queries — 3 drive_kinds (1,2,4), 2 query_kinds (1,3)
+    record_query(120001, 1, 1, 0)
+    r0_emit("pe_volume_information_record",
+        "\"query_id\":120001,\"drive_kind\":1,\"query_kind\":1,\"free_kb\":0,\"target\":\"GetVolumeInformation\"")
+
+    record_query(120002, 1, 3, 524288)
+    r0_emit("pe_volume_information_record",
+        "\"query_id\":120002,\"drive_kind\":1,\"query_kind\":3,\"free_kb\":524288,\"target\":\"GetDiskFreeSpaceEx\"")
+
+    record_query(120003, 2, 3, 16384)
+    r0_emit("pe_volume_information_record",
+        "\"query_id\":120003,\"drive_kind\":2,\"query_kind\":3,\"free_kb\":16384,\"target\":\"GetDiskFreeSpaceEx\"")
+
+    record_query(120004, 4, 1, 0)
+    r0_emit("pe_volume_information_record",
+        "\"query_id\":120004,\"drive_kind\":4,\"query_kind\":1,\"free_kb\":0,\"target\":\"GetVolumeInformation\"")
+
+    record_query(120005, 1, 3, 1048576)
+    r0_emit("pe_volume_information_record",
+        "\"query_id\":120005,\"drive_kind\":1,\"query_kind\":3,\"free_kb\":1048576,\"target\":\"GetDiskFreeSpaceEx\"")
+
+    // 3. query_count = 5
+    let c = query_count()
+    if c != 5 {
+        panic("pe_volume_information FAIL [query_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_free_kb = 0+524288+16384+0+1048576 = 1589248
+    let tf = total_free_kb()
+    if tf != 1589248 {
+        panic("pe_volume_information FAIL [total_free_kb] expected=1589248 got=" + to_string(tf))
+    }
+
+    // 5. count_by_drive_kind sanity
+    let d1 = count_by_drive_kind(1)
+    if d1 != 3 {
+        panic("pe_volume_information FAIL [count_by_drive_kind(1)] expected=3 got=" + to_string(d1))
+    }
+    let d2 = count_by_drive_kind(2)
+    if d2 != 1 {
+        panic("pe_volume_information FAIL [count_by_drive_kind(2)] expected=1 got=" + to_string(d2))
+    }
+    let d4 = count_by_drive_kind(4)
+    if d4 != 1 {
+        panic("pe_volume_information FAIL [count_by_drive_kind(4)] expected=1 got=" + to_string(d4))
+    }
+    let d3 = count_by_drive_kind(3)
+    if d3 != 0 {
+        panic("pe_volume_information FAIL [count_by_drive_kind(3)] expected=0 got=" + to_string(d3))
+    }
+    let d99 = count_by_drive_kind(5)
+    if d99 != 0 {
+        panic("pe_volume_information FAIL [count_by_drive_kind(5)] expected=0 got=" + to_string(d99))
+    }
+
+    // 6. count_by_query_kind sanity
+    let q1 = count_by_query_kind(1)
+    if q1 != 2 {
+        panic("pe_volume_information FAIL [count_by_query_kind(1)] expected=2 got=" + to_string(q1))
+    }
+    let q3 = count_by_query_kind(3)
+    if q3 != 3 {
+        panic("pe_volume_information FAIL [count_by_query_kind(3)] expected=3 got=" + to_string(q3))
+    }
+    let q2 = count_by_query_kind(2)
+    if q2 != 0 {
+        panic("pe_volume_information FAIL [count_by_query_kind(2)] expected=0 got=" + to_string(q2))
+    }
+    let q4 = count_by_query_kind(4)
+    if q4 != 0 {
+        panic("pe_volume_information FAIL [count_by_query_kind(4)] expected=0 got=" + to_string(q4))
+    }
+
+    // 7. query_free_kb sanity
+    let f2 = query_free_kb(120002)
+    if f2 != 524288 {
+        panic("pe_volume_information FAIL [query_free_kb(120002)] expected=524288 got=" + to_string(f2))
+    }
+    let f5 = query_free_kb(120005)
+    if f5 != 1048576 {
+        panic("pe_volume_information FAIL [query_free_kb(120005)] expected=1048576 got=" + to_string(f5))
+    }
+    let f_miss = query_free_kb(9999)
+    if f_miss != 0 {
+        panic("pe_volume_information FAIL [query_free_kb(9999)] expected=0 got=" + to_string(f_miss))
+    }
+
+    // 8. pvi_stats() = [5, 1589248, 3, 2]
+    let s = pvi_stats()
+    if len(s) != 4 {
+        panic("pe_volume_information FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_volume_information FAIL [stats query_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 1589248 {
+        panic("pe_volume_information FAIL [stats total_free_kb] expected=1589248 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_volume_information FAIL [stats drive_fixed] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_volume_information FAIL [stats query_info] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_volume_information_stats",
+        "\"query_count\":" + to_string(s[0])
+        + ",\"total_free_kb\":" + to_string(s[1])
+        + ",\"drive_fixed\":" + to_string(s[2])
+        + ",\"query_info\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_volume_information FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pvi()
+    let s2 = pvi_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_volume_information FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_volume_information self_test PASS (queries=" + to_string(s[0])
+        + ", free_kb=" + to_string(s[1]) + ", fixed=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pvi_stats()
+            println("query_count\t" + to_string(s[0]))
+            println("total_free_kb\t" + to_string(s[1]))
+            println("drive_fixed\t" + to_string(s[2]))
+            println("query_info\t" + to_string(s[3]))
+            return
+        }
+        if sub == "free" {
+            if len(a) >= 4 {
+                let qid = to_int(a[3])
+                println("query_free_kb\t" + to_string(query_free_kb(qid)))
+                return
+            }
+            println("usage: hexa run pe_volume_information.hexa free <query_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let dim = a[3]
+                let v = to_int(a[4])
+                if dim == "drive" {
+                    println("count_by_drive_kind\t" + to_string(count_by_drive_kind(v)))
+                    return
+                }
+                if dim == "query" {
+                    println("count_by_query_kind\t" + to_string(count_by_query_kind(v)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_volume_information.hexa count { drive <drive_kind> | query <query_kind> }")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pvi()
+            println("cleaned: " + pvi_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pvi_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_volume_information.hexa { self-test | stats | free <query_id> | count drive <drive_kind> | count query <query_kind> | cleanup | dir }")
+}

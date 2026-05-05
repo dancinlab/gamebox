@@ -1,0 +1,576 @@
+// lib/loader/pe_i386_iat_stub_value_real.hexa — IAT stub fake return value 정확도 tracker
+//
+// own1 정합: KERNEL32 / USER32 / MSVCR i386 IAT stub 의 fake return 값이 실제 caller 의
+//   분기 / 메모리 접근 / 후속 호출에 어떤 영향을 주는지 추적하는 instrumentation layer.
+//   Apple SDK / Wine / CrossOver / GPTK / Whisky / community wine 코드 0 줄.
+//   Microsoft KERNEL32 / USER32 / UCRT API contract (MSDN 공개 doc) 만 reference.
+//
+// 배경 — i386 interpreter (R3-1~11) 가 IAT thunk 호출 시 dispatch table 의 stub 함수가
+//   고정 fake return 값을 EAX 에 적재. 이 값이 다음과 같은 caller path 영향을 줌:
+//     - GetSystemTimeAsFileTime → out-FILETIME ptr 에 zero 쓰기 → caller 가 cmp 후 분기
+//     - GetCurrentThreadId → 1234 → caller 가 LocalAlloc(LMEM_FIXED, tid) 등에 활용
+//     - GetProcessHeap → fake handle 0x60000000 → 후속 HeapAlloc 에 invalid mem 접근
+//     - LoadLibraryExW → fake hmodule (e.g. 0x10000000) → caller 의 GetProcAddress 체인
+//     - GetProcAddress → fake fnptr → call dword ptr [eax] 시 invalid code path
+//     - GetCommandLineA → fake string ptr 0x80000800 → strlen / strchr loop
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 stub return value 의 caller 측 영향만 기록 — 실 Win32 호출 X.
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// expected_class code (stub return value 의 의미론적 분류):
+//   0 = null         (NULL/0 — 명시적 null return 유효)
+//   1 = hmodule      (HMODULE / hinstance — LoadLibrary*, GetModuleHandle 류)
+//   2 = fnptr        (function pointer — GetProcAddress, *Hook* 류)
+//   3 = hwnd         (HWND — CreateWindow*, FindWindow* 류 USER32)
+//   4 = hdc          (HDC — GetDC, BeginPaint 류)
+//   5 = heap         (HANDLE heap — GetProcessHeap, HeapCreate)
+//   6 = string_ptr   (char*/wchar* — GetCommandLine*, GetEnvironmentStrings)
+//   7 = int          (DWORD/integer 의미 — GetCurrentThreadId, GetTickCount)
+//   8 = bool         (BOOL 0/1 — IsDebuggerPresent, *Exists* 류)
+//
+// branch_taken_kind code (caller 가 stub return 후 어디로 가는지):
+//   0 = fallthrough     (분기 없이 다음 inst — return 값 unused)
+//   1 = null_fallback   (return 값이 NULL 검사 후 fallback path)
+//   2 = success         (return 값이 valid 검사 통과 후 success path)
+//
+// register_corrupted: stub 호출 후 caller 가 의존하는 register 가 invalid mem 또는
+//   wrong VSA (value set abstraction) 로 인해 corrupt 되는 경우. e.g. GetProcessHeap
+//   의 fake handle 0x60000000 을 HeapAlloc 에 넘겼다가 mov [eax+offset], ecx 에서 SEGV.
+//
+// dispatch_table: 사전 등록된 stub 의 schema 재현 — DLL × fn × arg_count × return_kind.
+//
+// persist schema (TSV 5 종):
+//   stub_returns.tsv     : call_id<int>    \t dll_name<str>  \t fn_name<str>           \t returned_value_hex<str> \t expected_class<int>
+//   caller_paths.tsv     : path_id<int>    \t call_id<int>   \t branch_taken_kind<int> \t instructions_after<int>
+//   corruptions.tsv      : corrupt_id<int> \t call_id<int>   \t register_corrupted<str> \t vsa_or_register<str>
+//   dispatch_tables.tsv  : dt_id<int>      \t dll_name<str>  \t fn_name<str>           \t arg_count<int>          \t return_kind<int>
+//   value_validations.tsv: vv_id<int>      \t call_id<int>   \t valid<int>             \t reason<str>
+//
+// Hexa 예약어 회피: type/return/handle 단독 identifier 금지 → return_kind / kind 등.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pisv_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_iat_stub_value_real"
+}
+
+fn pisv_stub_returns_path() -> str {
+    return pisv_dir() + "/stub_returns.tsv"
+}
+
+fn pisv_caller_paths_path() -> str {
+    return pisv_dir() + "/caller_paths.tsv"
+}
+
+fn pisv_corruptions_path() -> str {
+    return pisv_dir() + "/corruptions.tsv"
+}
+
+fn pisv_dispatch_tables_path() -> str {
+    return pisv_dir() + "/dispatch_tables.tsv"
+}
+
+fn pisv_value_validations_path() -> str {
+    return pisv_dir() + "/value_validations.tsv"
+}
+
+fn pisv_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pisv_dir() + "'")
+}
+
+fn cleanup_pisv() -> void {
+    pisv_ensure_dir()
+    let _ = exec("rm -f '" + pisv_stub_returns_path() + "' '" + pisv_caller_paths_path()
+        + "' '" + pisv_corruptions_path() + "' '" + pisv_dispatch_tables_path()
+        + "' '" + pisv_value_validations_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pisv_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pisv_append_row(path: str, row: str) -> void {
+    pisv_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_stub_return: KERNEL32/USER32/MSVCR stub 의 fake return value 1 건 ───
+fn record_stub_return(call_id: int, dll_name: str, fn_name: str, returned_value_hex: str, expected_class: int) -> void {
+    if call_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_stub_return] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if dll_name == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_stub_return] expected=dll_name!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_stub_return] expected=fn_name!=empty got=empty")
+    }
+    if returned_value_hex == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_stub_return] expected=returned_value_hex!=empty got=empty")
+    }
+    if expected_class < 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_stub_return] expected=expected_class>=0 got=" + to_string(expected_class))
+    }
+    if expected_class > 8 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_stub_return] expected=expected_class<=8 got=" + to_string(expected_class))
+    }
+    let row = to_string(call_id) + "\t" + dll_name + "\t" + fn_name
+        + "\t" + returned_value_hex + "\t" + to_string(expected_class) + "\n"
+    pisv_append_row(pisv_stub_returns_path(), row)
+}
+
+// ─── record_caller_path: stub 호출 후 caller 가 어디로 가는지 1 건 ───
+fn record_caller_path(path_id: int, call_id: int, branch_taken_kind: int, instructions_after: int) -> void {
+    if path_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_caller_path] expected=path_id>0 got=" + to_string(path_id))
+    }
+    if call_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_caller_path] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if branch_taken_kind < 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_caller_path] expected=branch_taken_kind>=0 got=" + to_string(branch_taken_kind))
+    }
+    if branch_taken_kind > 2 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_caller_path] expected=branch_taken_kind<=2 got=" + to_string(branch_taken_kind))
+    }
+    if instructions_after < 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_caller_path] expected=instructions_after>=0 got=" + to_string(instructions_after))
+    }
+    let row = to_string(path_id) + "\t" + to_string(call_id)
+        + "\t" + to_string(branch_taken_kind) + "\t" + to_string(instructions_after) + "\n"
+    pisv_append_row(pisv_caller_paths_path(), row)
+}
+
+// ─── record_corruption: fake return 으로 인해 invalid 한 register/mem 상태 1 건 ───
+fn record_corruption(corrupt_id: int, call_id: int, register_corrupted: str, vsa_or_register: str) -> void {
+    if corrupt_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_corruption] expected=corrupt_id>0 got=" + to_string(corrupt_id))
+    }
+    if call_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_corruption] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if register_corrupted == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_corruption] expected=register_corrupted!=empty got=empty")
+    }
+    if vsa_or_register == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_corruption] expected=vsa_or_register!=empty got=empty")
+    }
+    let row = to_string(corrupt_id) + "\t" + to_string(call_id)
+        + "\t" + register_corrupted + "\t" + vsa_or_register + "\n"
+    pisv_append_row(pisv_corruptions_path(), row)
+}
+
+// ─── record_dispatch_table: pre-registered DLL × fn × arg_count × return_kind 1 건 ───
+fn record_dispatch_table(dt_id: int, dll_name: str, fn_name: str, arg_count: int, return_kind: int) -> void {
+    if dt_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_dispatch_table] expected=dt_id>0 got=" + to_string(dt_id))
+    }
+    if dll_name == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_dispatch_table] expected=dll_name!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_dispatch_table] expected=fn_name!=empty got=empty")
+    }
+    if arg_count < 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_dispatch_table] expected=arg_count>=0 got=" + to_string(arg_count))
+    }
+    if return_kind < 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_dispatch_table] expected=return_kind>=0 got=" + to_string(return_kind))
+    }
+    if return_kind > 8 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_dispatch_table] expected=return_kind<=8 got=" + to_string(return_kind))
+    }
+    let row = to_string(dt_id) + "\t" + dll_name + "\t" + fn_name
+        + "\t" + to_string(arg_count) + "\t" + to_string(return_kind) + "\n"
+    pisv_append_row(pisv_dispatch_tables_path(), row)
+}
+
+// ─── record_value_validation: stub return value 가 caller 에서 valid 검증 통과 1 건 ───
+fn record_value_validation(vv_id: int, call_id: int, valid: int, reason: str) -> void {
+    if vv_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_value_validation] expected=vv_id>0 got=" + to_string(vv_id))
+    }
+    if call_id <= 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_value_validation] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if valid < 0 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_value_validation] expected=valid>=0 got=" + to_string(valid))
+    }
+    if valid > 1 {
+        panic("pe_i386_iat_stub_value_real FAIL [record_value_validation] expected=valid<=1 got=" + to_string(valid))
+    }
+    if reason == "" {
+        panic("pe_i386_iat_stub_value_real FAIL [record_value_validation] expected=reason!=empty got=empty")
+    }
+    let row = to_string(vv_id) + "\t" + to_string(call_id)
+        + "\t" + to_string(valid) + "\t" + reason + "\n"
+    pisv_append_row(pisv_value_validations_path(), row)
+}
+
+// ─── 공통 row counter ───
+fn pisv_count_rows(path: str, min_fields: int) -> int {
+    let t = pisv_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_fields {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn stub_return_count() -> int {
+    return pisv_count_rows(pisv_stub_returns_path(), 5)
+}
+
+fn caller_path_count() -> int {
+    return pisv_count_rows(pisv_caller_paths_path(), 4)
+}
+
+fn corruption_count() -> int {
+    return pisv_count_rows(pisv_corruptions_path(), 4)
+}
+
+fn dispatch_table_count() -> int {
+    return pisv_count_rows(pisv_dispatch_tables_path(), 5)
+}
+
+fn vv_count() -> int {
+    return pisv_count_rows(pisv_value_validations_path(), 4)
+}
+
+// ─── expected_class_name: 0..8 → null/hmodule/fnptr/hwnd/hdc/heap/string_ptr/int/bool ───
+fn expected_class_name(k: int) -> str {
+    if k == 0 {
+        return "null"
+    }
+    if k == 1 {
+        return "hmodule"
+    }
+    if k == 2 {
+        return "fnptr"
+    }
+    if k == 3 {
+        return "hwnd"
+    }
+    if k == 4 {
+        return "hdc"
+    }
+    if k == 5 {
+        return "heap"
+    }
+    if k == 6 {
+        return "string_ptr"
+    }
+    if k == 7 {
+        return "int"
+    }
+    if k == 8 {
+        return "bool"
+    }
+    panic("pe_i386_iat_stub_value_real FAIL [expected_class_name] expected=0..8 got=" + to_string(k))
+}
+
+// ─── branch_kind_name: 0/1/2 → fallthrough/null_fallback/success ───
+fn branch_kind_name(k: int) -> str {
+    if k == 0 {
+        return "fallthrough"
+    }
+    if k == 1 {
+        return "null_fallback"
+    }
+    if k == 2 {
+        return "success"
+    }
+    panic("pe_i386_iat_stub_value_real FAIL [branch_kind_name] expected=0..2 got=" + to_string(k))
+}
+
+// ─── pisv_stats: [stub_return, caller_path, corruption, dispatch_table, vv] ───
+fn pisv_stats() -> array {
+    let mut out = []
+    out.push(stub_return_count())
+    out.push(caller_path_count())
+    out.push(corruption_count())
+    out.push(dispatch_table_count())
+    out.push(vv_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pisv-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pisv()
+
+    // 2. record_stub_return x6 — KERNEL32/USER32/MSVCR i386 stub fake return
+    //    GetSystemTimeAsFileTime → 0x0       (out-FILETIME, return void → eax 임의)
+    //    GetCurrentThreadId      → 0x4d2     (1234 — int)
+    //    GetProcessHeap          → 0x60000000 (heap handle — fake invalid)
+    //    LoadLibraryExW          → 0x10000000 (hmodule — fake)
+    //    GetProcAddress          → 0x10001000 (fnptr — fake)
+    //    GetCommandLineA         → 0x80000800 (string_ptr — fake)
+    record_stub_return(7001, "KERNEL32", "GetSystemTimeAsFileTime", "0x0", 0)
+    r0_emit("pe_i386_iat_stub_value_real_record_stub_return",
+        "\"call_id\":7001,\"dll\":\"KERNEL32\",\"fn\":\"GetSystemTimeAsFileTime\",\"ret\":\"0x0\",\"class\":\"" + expected_class_name(0) + "\"")
+
+    record_stub_return(7002, "KERNEL32", "GetCurrentThreadId", "0x4d2", 7)
+    r0_emit("pe_i386_iat_stub_value_real_record_stub_return",
+        "\"call_id\":7002,\"dll\":\"KERNEL32\",\"fn\":\"GetCurrentThreadId\",\"ret\":\"0x4d2\",\"class\":\"" + expected_class_name(7) + "\"")
+
+    record_stub_return(7003, "KERNEL32", "GetProcessHeap", "0x60000000", 5)
+    r0_emit("pe_i386_iat_stub_value_real_record_stub_return",
+        "\"call_id\":7003,\"dll\":\"KERNEL32\",\"fn\":\"GetProcessHeap\",\"ret\":\"0x60000000\",\"class\":\"" + expected_class_name(5) + "\"")
+
+    record_stub_return(7004, "KERNEL32", "LoadLibraryExW", "0x10000000", 1)
+    r0_emit("pe_i386_iat_stub_value_real_record_stub_return",
+        "\"call_id\":7004,\"dll\":\"KERNEL32\",\"fn\":\"LoadLibraryExW\",\"ret\":\"0x10000000\",\"class\":\"" + expected_class_name(1) + "\"")
+
+    record_stub_return(7005, "KERNEL32", "GetProcAddress", "0x10001000", 2)
+    r0_emit("pe_i386_iat_stub_value_real_record_stub_return",
+        "\"call_id\":7005,\"dll\":\"KERNEL32\",\"fn\":\"GetProcAddress\",\"ret\":\"0x10001000\",\"class\":\"" + expected_class_name(2) + "\"")
+
+    record_stub_return(7006, "KERNEL32", "GetCommandLineA", "0x80000800", 6)
+    r0_emit("pe_i386_iat_stub_value_real_record_stub_return",
+        "\"call_id\":7006,\"dll\":\"KERNEL32\",\"fn\":\"GetCommandLineA\",\"ret\":\"0x80000800\",\"class\":\"" + expected_class_name(6) + "\"")
+
+    // 3. record_caller_path x4 — 각 stub 호출 후 caller 분기
+    //    7001 GetSystemTimeAsFileTime → fallthrough (return value unused — out-ptr 만 사용)
+    //    7002 GetCurrentThreadId      → success (TID 가 LocalAlloc 인자로 활용)
+    //    7004 LoadLibraryExW          → success (hmodule 검증 통과 → GetProcAddress 호출)
+    //    7005 GetProcAddress          → null_fallback (fnptr 0x10001000 검증 후 fallback path)
+    record_caller_path(8001, 7001, 0, 6)
+    r0_emit("pe_i386_iat_stub_value_real_record_caller_path",
+        "\"path_id\":8001,\"call_id\":7001,\"branch\":\"" + branch_kind_name(0) + "\",\"inst_after\":6")
+
+    record_caller_path(8002, 7002, 2, 12)
+    r0_emit("pe_i386_iat_stub_value_real_record_caller_path",
+        "\"path_id\":8002,\"call_id\":7002,\"branch\":\"" + branch_kind_name(2) + "\",\"inst_after\":12")
+
+    record_caller_path(8003, 7004, 2, 18)
+    r0_emit("pe_i386_iat_stub_value_real_record_caller_path",
+        "\"path_id\":8003,\"call_id\":7004,\"branch\":\"" + branch_kind_name(2) + "\",\"inst_after\":18")
+
+    record_caller_path(8004, 7005, 1, 4)
+    r0_emit("pe_i386_iat_stub_value_real_record_caller_path",
+        "\"path_id\":8004,\"call_id\":7005,\"branch\":\"" + branch_kind_name(1) + "\",\"inst_after\":4")
+
+    // 4. record_corruption x1 — GetProcessHeap 의 0x60000000 → HeapAlloc 시 invalid mem
+    //    caller pseudo: push size; push 0; push eax(=0x60000000); call HeapAlloc
+    //    HeapAlloc 내부 mov [eax+0x18], ecx 시 0x60000018 invalid → eax/ecx 후속 무효
+    record_corruption(9001, 7003, "eax", "0x60000018_invalid_mem_after_HeapAlloc_deref")
+    r0_emit("pe_i386_iat_stub_value_real_record_corruption",
+        "\"corrupt_id\":9001,\"call_id\":7003,\"reg\":\"eax\",\"vsa\":\"0x60000018_invalid_mem_after_HeapAlloc_deref\"")
+
+    // 5. record_dispatch_table x6 — KERNEL32 4 + USER32 1 + MSVCR 1
+    //    return_kind = expected_class scheme 그대로 사용
+    record_dispatch_table(1, "KERNEL32", "GetSystemTimeAsFileTime", 1, 0)
+    r0_emit("pe_i386_iat_stub_value_real_record_dispatch_table",
+        "\"dt_id\":1,\"dll\":\"KERNEL32\",\"fn\":\"GetSystemTimeAsFileTime\",\"argc\":1,\"return_kind\":\"" + expected_class_name(0) + "\"")
+
+    record_dispatch_table(2, "KERNEL32", "GetCurrentThreadId", 0, 7)
+    r0_emit("pe_i386_iat_stub_value_real_record_dispatch_table",
+        "\"dt_id\":2,\"dll\":\"KERNEL32\",\"fn\":\"GetCurrentThreadId\",\"argc\":0,\"return_kind\":\"" + expected_class_name(7) + "\"")
+
+    record_dispatch_table(3, "KERNEL32", "GetProcessHeap", 0, 5)
+    r0_emit("pe_i386_iat_stub_value_real_record_dispatch_table",
+        "\"dt_id\":3,\"dll\":\"KERNEL32\",\"fn\":\"GetProcessHeap\",\"argc\":0,\"return_kind\":\"" + expected_class_name(5) + "\"")
+
+    record_dispatch_table(4, "KERNEL32", "LoadLibraryExW", 3, 1)
+    r0_emit("pe_i386_iat_stub_value_real_record_dispatch_table",
+        "\"dt_id\":4,\"dll\":\"KERNEL32\",\"fn\":\"LoadLibraryExW\",\"argc\":3,\"return_kind\":\"" + expected_class_name(1) + "\"")
+
+    record_dispatch_table(5, "USER32", "MessageBoxW", 4, 7)
+    r0_emit("pe_i386_iat_stub_value_real_record_dispatch_table",
+        "\"dt_id\":5,\"dll\":\"USER32\",\"fn\":\"MessageBoxW\",\"argc\":4,\"return_kind\":\"" + expected_class_name(7) + "\"")
+
+    record_dispatch_table(6, "MSVCR120", "_initterm", 2, 0)
+    r0_emit("pe_i386_iat_stub_value_real_record_dispatch_table",
+        "\"dt_id\":6,\"dll\":\"MSVCR120\",\"fn\":\"_initterm\",\"argc\":2,\"return_kind\":\"" + expected_class_name(0) + "\"")
+
+    // 6. record_value_validation x4 — 4 valid (caller 가 stub return 을 valid 로 해석)
+    record_value_validation(1, 7001, 1, "void_return_eax_unused")
+    r0_emit("pe_i386_iat_stub_value_real_record_value_validation",
+        "\"vv_id\":1,\"call_id\":7001,\"valid\":1,\"reason\":\"void_return_eax_unused\"")
+
+    record_value_validation(2, 7002, 1, "tid_nonzero_passes_check")
+    r0_emit("pe_i386_iat_stub_value_real_record_value_validation",
+        "\"vv_id\":2,\"call_id\":7002,\"valid\":1,\"reason\":\"tid_nonzero_passes_check\"")
+
+    record_value_validation(3, 7004, 1, "hmodule_nonzero_passes_load_check")
+    r0_emit("pe_i386_iat_stub_value_real_record_value_validation",
+        "\"vv_id\":3,\"call_id\":7004,\"valid\":1,\"reason\":\"hmodule_nonzero_passes_load_check\"")
+
+    record_value_validation(4, 7006, 1, "string_ptr_nonzero_passes_strlen")
+    r0_emit("pe_i386_iat_stub_value_real_record_value_validation",
+        "\"vv_id\":4,\"call_id\":7006,\"valid\":1,\"reason\":\"string_ptr_nonzero_passes_strlen\"")
+
+    // 7. assertion: stub_return == 6
+    let sr = stub_return_count()
+    if sr != 6 {
+        panic("pe_i386_iat_stub_value_real FAIL [stub_return_count] expected=6 got=" + to_string(sr))
+    }
+
+    // 8. assertion: caller_path == 4
+    let cp = caller_path_count()
+    if cp != 4 {
+        panic("pe_i386_iat_stub_value_real FAIL [caller_path_count] expected=4 got=" + to_string(cp))
+    }
+
+    // 9. assertion: corruption == 1
+    let co = corruption_count()
+    if co != 1 {
+        panic("pe_i386_iat_stub_value_real FAIL [corruption_count] expected=1 got=" + to_string(co))
+    }
+
+    // 10. assertion: dispatch_table == 6
+    let dt = dispatch_table_count()
+    if dt != 6 {
+        panic("pe_i386_iat_stub_value_real FAIL [dispatch_table_count] expected=6 got=" + to_string(dt))
+    }
+
+    // 11. assertion: vv == 4
+    let vv = vv_count()
+    if vv != 4 {
+        panic("pe_i386_iat_stub_value_real FAIL [vv_count] expected=4 got=" + to_string(vv))
+    }
+
+    // 12. expected_class_name sanity (0..8)
+    let c0 = expected_class_name(0)
+    if c0 != "null" {
+        panic("pe_i386_iat_stub_value_real FAIL [expected_class_name(0)] expected=null got=" + c0)
+    }
+    let c1 = expected_class_name(1)
+    if c1 != "hmodule" {
+        panic("pe_i386_iat_stub_value_real FAIL [expected_class_name(1)] expected=hmodule got=" + c1)
+    }
+    let c2 = expected_class_name(2)
+    if c2 != "fnptr" {
+        panic("pe_i386_iat_stub_value_real FAIL [expected_class_name(2)] expected=fnptr got=" + c2)
+    }
+    let c5 = expected_class_name(5)
+    if c5 != "heap" {
+        panic("pe_i386_iat_stub_value_real FAIL [expected_class_name(5)] expected=heap got=" + c5)
+    }
+    let c8 = expected_class_name(8)
+    if c8 != "bool" {
+        panic("pe_i386_iat_stub_value_real FAIL [expected_class_name(8)] expected=bool got=" + c8)
+    }
+
+    // 13. branch_kind_name sanity (0/1/2)
+    let b0 = branch_kind_name(0)
+    if b0 != "fallthrough" {
+        panic("pe_i386_iat_stub_value_real FAIL [branch_kind_name(0)] expected=fallthrough got=" + b0)
+    }
+    let b1 = branch_kind_name(1)
+    if b1 != "null_fallback" {
+        panic("pe_i386_iat_stub_value_real FAIL [branch_kind_name(1)] expected=null_fallback got=" + b1)
+    }
+    let b2 = branch_kind_name(2)
+    if b2 != "success" {
+        panic("pe_i386_iat_stub_value_real FAIL [branch_kind_name(2)] expected=success got=" + b2)
+    }
+
+    // 14. pisv_stats() == [6, 4, 1, 6, 4]
+    let s = pisv_stats()
+    if len(s) != 5 {
+        panic("pe_i386_iat_stub_value_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_i386_iat_stub_value_real FAIL [stats stub_return] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_iat_stub_value_real FAIL [stats caller_path] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_i386_iat_stub_value_real FAIL [stats corruption] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 6 {
+        panic("pe_i386_iat_stub_value_real FAIL [stats dispatch_table] expected=6 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_i386_iat_stub_value_real FAIL [stats vv] expected=4 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_i386_iat_stub_value_real_stats",
+        "\"stub_return\":" + to_string(s[0])
+        + ",\"caller_path\":" + to_string(s[1])
+        + ",\"corruption\":" + to_string(s[2])
+        + ",\"dispatch_table\":" + to_string(s[3])
+        + ",\"vv\":" + to_string(s[4]))
+
+    // 16. emit count >= 14 (6 stub_return + 4 caller_path + 1 corruption + 6 dispatch + 4 vv + 1 stats = 22)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_iat_stub_value_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pisv()
+    let s2 = pisv_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_iat_stub_value_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_iat_stub_value_real self_test PASS (stub_return=" + to_string(s[0])
+        + ", caller_path=" + to_string(s[1]) + ", corruption=" + to_string(s[2])
+        + ", dispatch_table=" + to_string(s[3]) + ", vv=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pisv_stats()
+            println("stub_return_count\t" + to_string(s[0]))
+            println("caller_path_count\t" + to_string(s[1]))
+            println("corruption_count\t" + to_string(s[2]))
+            println("dispatch_table_count\t" + to_string(s[3]))
+            println("vv_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pisv()
+            println("cleaned: " + pisv_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pisv_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_iat_stub_value_real.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,215 @@
+// lib/perf/c_d4_world_event_calendar.hexa — CN-187 skeleton manjeom 15/15
+//
+// D4 world event calendar — Legion + Helltide + World Boss + Whisper 통합 timer.
+// D4 world event 들은 각자 다른 cycle 로 회전한다 — Legion 25min, Helltide 1h,
+// World Boss 6h, Whisper varied. 사용자가 다음 event 까지 ETA 정량화 + 어떤
+// event 가 동시 진행되는지 forecast 하려면 하나의 calendar 에 모아두는 것이
+// 효과적이다. 본 모듈은 event_id × period_us × next_eta_us × overlap_count 의
+// 4-key 컬럼 로그만 담당 — c_d4_helltide_event 와 별도, calendar 는 multi-event
+// 통합 view 이며 forecast (min ETA = 다음 발생) 가 강점.
+//
+// 무기: event × period × eta × overlap 4-key columnar log + sum/min.
+// 효과: D4 다음 event ETA forecast (multi-cycle 동시 추적 → overlap 가시화).
+
+use "./r0_common"
+
+let DWEC_DIR = GAMEBOX_HOME + "/persist/d4_world_event_calendar"
+let DWEC_LOG = DWEC_DIR + "/events.tsv"
+
+fn dwec_dir() -> str { return DWEC_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DWEC_DIR + "'")
+}
+
+// ─── event 등록 ───
+//   event_id (1=Legion, 2=Helltide, 3=WorldBoss, 4=Whisper),
+//   period_us (event cycle, microseconds),
+//   next_eta_us (다음 발생 까지 ETA, microseconds),
+//   overlap_count (동시 진행 중인 다른 event 수).
+fn record_event(event_id: int, period_us: int, next_eta_us: int, overlap_count: int) -> void {
+    ensure_dir()
+    let line = to_string(event_id) + "\t" + to_string(period_us) + "\t" + to_string(next_eta_us) + "\t" + to_string(overlap_count)
+    let tmp = DWEC_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + DWEC_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("d4_world_event_record", "\"event\":" + to_string(event_id) + ",\"period_us\":" + to_string(period_us) + ",\"eta_us\":" + to_string(next_eta_us) + ",\"overlaps\":" + to_string(overlap_count))
+}
+
+// ─── event_count — 등록된 event 행 수 ───
+fn event_count() -> int {
+    let exists = exec("test -f '" + DWEC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + DWEC_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_period_us — 모든 event period 합 ───
+fn total_period_us() -> int {
+    let exists = exec("test -f '" + DWEC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + DWEC_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_eta_us — 모든 event next_eta 합 ───
+fn total_eta_us() -> int {
+    let exists = exec("test -f '" + DWEC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + DWEC_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_overlaps — 모든 event overlap_count 합 ───
+fn total_overlaps() -> int {
+    let exists = exec("test -f '" + DWEC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + DWEC_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── min_eta_us — 가장 짧은 next_eta_us (= 다음 발생 event) ───
+//   row 가 없으면 0.
+fn min_eta_us() -> int {
+    let exists = exec("test -f '" + DWEC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' 'NR==1{m=$3} {if($3<m)m=$3} END{print m+0}' '" + DWEC_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── event_period_us — 특정 event_id 의 period_us ───
+//   미등록 event_id 는 0.
+fn event_period_us(event_id: int) -> int {
+    let exists = exec("test -f '" + DWEC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v e=" + to_string(event_id) + " '$1==e {p=$2} END{print p+0}' '" + DWEC_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── dwec_stats — [event_count, total_period_us, total_eta_us, min_eta_us] ───
+fn dwec_stats() -> array {
+    return [event_count(), total_period_us(), total_eta_us(), min_eta_us()]
+}
+
+fn cleanup_dwec() -> void {
+    let _ = exec("rm -rf '" + DWEC_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dwec-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dwec()
+
+    // 합성 event 4 종 (D4 world event calendar):
+    //   Legion    (id=1) — period 25min  / eta 10min / overlap 2
+    //   Helltide  (id=2) — period 1h     / eta 30min / overlap 1
+    //   WorldBoss (id=3) — period 6h     / eta 2h    / overlap 0
+    //   Whisper   (id=4) — period 10min  / eta 5min  / overlap 3
+    record_event(1, 1500000000, 600000000, 2)
+    record_event(2, 3600000000, 1800000000, 1)
+    record_event(3, 21600000000, 7200000000, 0)
+    record_event(4, 600000000, 300000000, 3)
+
+    // event_count = 4
+    let ec = event_count()
+    if ec != 4 { panic("c_d4_world_event_calendar FAIL [event_count] expected=4 got=" + to_string(ec)) }
+
+    // total_period_us = 1500000000+3600000000+21600000000+600000000 = 27300000000
+    let tp = total_period_us()
+    if tp != 27300000000 { panic("c_d4_world_event_calendar FAIL [total_period_us] expected=27300000000 got=" + to_string(tp)) }
+
+    // total_eta_us = 600000000+1800000000+7200000000+300000000 = 9900000000
+    let te = total_eta_us()
+    if te != 9900000000 { panic("c_d4_world_event_calendar FAIL [total_eta_us] expected=9900000000 got=" + to_string(te)) }
+
+    // total_overlaps = 2+1+0+3 = 6
+    let tov = total_overlaps()
+    if tov != 6 { panic("c_d4_world_event_calendar FAIL [total_overlaps] expected=6 got=" + to_string(tov)) }
+
+    // min_eta_us = 300000000 (Whisper — 다음 발생 event)
+    let me = min_eta_us()
+    if me != 300000000 { panic("c_d4_world_event_calendar FAIL [min_eta_us] expected=300000000 got=" + to_string(me)) }
+
+    // event_period_us: Legion=1500000000, Helltide=3600000000, WorldBoss=21600000000, Whisper=600000000
+    let p1 = event_period_us(1)
+    if p1 != 1500000000 { panic("c_d4_world_event_calendar FAIL [period 1] expected=1500000000 got=" + to_string(p1)) }
+    let p2 = event_period_us(2)
+    if p2 != 3600000000 { panic("c_d4_world_event_calendar FAIL [period 2] expected=3600000000 got=" + to_string(p2)) }
+    let p3 = event_period_us(3)
+    if p3 != 21600000000 { panic("c_d4_world_event_calendar FAIL [period 3] expected=21600000000 got=" + to_string(p3)) }
+    let p4 = event_period_us(4)
+    if p4 != 600000000 { panic("c_d4_world_event_calendar FAIL [period 4] expected=600000000 got=" + to_string(p4)) }
+    // 미등록 event_id 는 0
+    let p99 = event_period_us(99)
+    if p99 != 0 { panic("c_d4_world_event_calendar FAIL [period unknown] expected=0 got=" + to_string(p99)) }
+
+    let stats = dwec_stats()
+    if stats[0] != 4 { panic("c_d4_world_event_calendar FAIL [stats events] expected=4 got=" + to_string(stats[0])) }
+    if stats[1] != 27300000000 { panic("c_d4_world_event_calendar FAIL [stats period] expected=27300000000 got=" + to_string(stats[1])) }
+    if stats[2] != 9900000000 { panic("c_d4_world_event_calendar FAIL [stats eta] expected=9900000000 got=" + to_string(stats[2])) }
+    if stats[3] != 300000000 { panic("c_d4_world_event_calendar FAIL [stats min_eta] expected=300000000 got=" + to_string(stats[3])) }
+
+    r0_emit("d4_world_event_summary", "\"events\":" + to_string(stats[0]) + ",\"total_period_us\":" + to_string(stats[1]) + ",\"total_eta_us\":" + to_string(stats[2]) + ",\"min_eta_us\":" + to_string(stats[3]) + ",\"overlaps\":" + to_string(tov))
+
+    // record × 4 + summary × 1 = ≥ 5 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_d4_world_event_calendar FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    // ─── synthetic D4 economy retired_intentional posture annotation (Track BE) ───
+    //
+    // Track BE mission: final 2 c_d4_* completion cycle — Track V (7) + Track AJ (6)
+    // + Track AL (6) + Track BA (6) cumulative 25/27 → 27/27 100% terminal coverage.
+    // .roadmap.diablo4 blk.1 status_enum_adopted = retired_intentional (Track A2 land
+    // 2026-05-03). 본 module 측 4-event world calendar period + ETA forecast +
+    // overlap detection = synthetic build analyzer — production live game state 측정
+    // X (D4 always-online live session 진입 X, DRM bypass 0, Battle.net launcher 통과
+    // X). cond.3 status `partial` 영구 유지 (retired_intentional posture per blk.1
+    // 영구 lock). pattern reference: lib/perf/c_d4_xp_curve_predict.hexa
+    // (Track BA predecessor).
+    //
+    // synthetic posture row column header:
+    //     domain                "world_event_calendar"
+    //     posture               "retired_intentional"  (NOT pass / NOT partial / NOT fail)
+    //     production_smoke      "no_attempt"           (no live game state acquire)
+    //     drm_bypass            "0"                    (own1 Wine 0 / no evasion)
+    //     always_online_evade   "0"                    (own1 honest acknowledgment)
+    //     blocker_ref           "diablo4.blk.1"        (always_online_drm)
+    //     adoption_iso          "2026-05-03"           (Track A2 retired_intentional adopt)
+    r0_emit("c_d4_world_event_calendar_retired_intentional",
+        "\"stage\":\"d4_economy_synthetic\",\"domain\":\"world_event_calendar\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"always_online_evade\":0,\"blocker_ref\":\"diablo4.blk.1\",\"blocker_class\":\"always_online_drm\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"diablo4.cond.3\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\",\"track\":\"BE\"")
+    println("__D4_WORLD_EVENT__ RETIRED_INTENTIONAL d4_economy_synthetic")
+
+    cleanup_dwec()
+
+    println("  ✅ c_d4_world_event_calendar self_test PASS (4 events, total_period=27300000000 us, total_eta=9900000000 us, min_eta=300000000 us, overlaps=" + to_string(tov) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = dwec_stats()
+            println("events=" + to_string(s[0]) + " total_period_us=" + to_string(s[1]) + " total_eta_us=" + to_string(s[2]) + " min_eta_us=" + to_string(s[3]))
+            return
+        }
+        if sub == "period" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                let p = event_period_us(eid)
+                println(to_string(p))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_dwec(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_d4_world_event_calendar.hexa { self-test | stats | period <event_id> | cleanup }")
+}

@@ -1,0 +1,405 @@
+// lib/loader/pe_native_dlopen_wrapper.hexa — stage4 macOS dlopen wrapper skeleton
+//
+// Win32 LoadLibrary → macOS dlopen 의 wrapper. handle (void*) 반환, 추후
+// dlsym 의 input. Win32 DLL 이름을 macOS framework path 으로 translate.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Apple dlopen(3) man page 만 참조.
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// PE DLL → macOS framework translation (stage5 에서 실 dlopen):
+//   KERNEL32.dll  → /System/Library/Frameworks/CoreFoundation.framework
+//   USER32.dll    → /System/Library/Frameworks/AppKit.framework
+//   GDI32.dll     → /System/Library/Frameworks/CoreGraphics.framework
+//   D3D11.dll     → /System/Library/Frameworks/Metal.framework
+//
+// flags (조합 비트마스크):
+//   1 = RTLD_LAZY
+//   2 = RTLD_NOW
+//   4 = RTLD_LOCAL
+//   8 = RTLD_GLOBAL
+//
+// persist schema (TSV — dlopen_history.tsv):
+//   call_id<int> \t dll_id<int> \t flags<int> \t success<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pndw_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_dlopen_wrapper"
+}
+
+fn pndw_history_path() -> str {
+    return pndw_dir() + "/dlopen_history.tsv"
+}
+
+fn pndw_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pndw_dir() + "'")
+}
+
+fn cleanup_pndw() -> void {
+    pndw_ensure_dir()
+    let _ = exec("rm -f '" + pndw_history_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pndw_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pndw_append_row(path: str, row: str) -> void {
+    pndw_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_dlopen: Win32 LoadLibrary → macOS dlopen 1건 기록 ───
+//   stage5 에서 실 dlopen() syscall + handle 반환으로 교체.
+fn record_dlopen(call_id: int, dll_id: int, flags: int, success: int) -> void {
+    if call_id <= 0 {
+        panic("pe_native_dlopen_wrapper FAIL [record_dlopen] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if dll_id <= 0 {
+        panic("pe_native_dlopen_wrapper FAIL [record_dlopen] expected=dll_id>0 got=" + to_string(dll_id))
+    }
+    if flags < 1 {
+        panic("pe_native_dlopen_wrapper FAIL [record_dlopen] expected=flags>=1 got=" + to_string(flags))
+    }
+    if flags > 15 {
+        panic("pe_native_dlopen_wrapper FAIL [record_dlopen] expected=flags<=15 got=" + to_string(flags))
+    }
+    if success < 0 {
+        panic("pe_native_dlopen_wrapper FAIL [record_dlopen] expected=success>=0 got=" + to_string(success))
+    }
+    if success > 1 {
+        panic("pe_native_dlopen_wrapper FAIL [record_dlopen] expected=success<=1 got=" + to_string(success))
+    }
+    let row = to_string(call_id) + "\t" + to_string(dll_id)
+        + "\t" + to_string(flags) + "\t" + to_string(success) + "\n"
+    pndw_append_row(pndw_history_path(), row)
+}
+
+// ─── dlopen_count: 총 dlopen 호출 수 ───
+fn dlopen_count() -> int {
+    let mut cnt = 0
+    let t = pndw_read_table(pndw_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: success=1 의 개수 ───
+fn success_count() -> int {
+    let mut cnt = 0
+    let t = pndw_read_table(pndw_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── fail_count: success=0 의 개수 ───
+fn fail_count() -> int {
+    let mut cnt = 0
+    let t = pndw_read_table(pndw_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pndw_bit_and: pure hexa bit AND (flags 4비트 0..15 범위) ───
+//   awk and() 는 gawk extension — BSD awk 호환 위해 산술로 구현.
+//   bit_n(x,n) ≡ (x / 2^n) % 2  (pe_loader.hexa convention).
+fn pndw_bit_and(a: int, b: int) -> int {
+    let mut out = 0
+    let mut div = 1
+    let mut k = 0
+    while k < 16 {
+        let abit = (a / div) % 2
+        let bbit = (b / div) % 2
+        if abit == 1 {
+            if bbit == 1 {
+                out = out + div
+            }
+        }
+        div = div * 2
+        k = k + 1
+    }
+    return out
+}
+
+// ─── count_by_flag: 특정 flag 비트가 set 된 row 의 개수 ───
+//   flags 가 비트마스크 이므로 (row_flags AND flag) == flag 일 때 카운트.
+//   flag=0 또는 row 에 그 bit 가 set 되지 않은 경우 0.
+fn count_by_flag(flag: int) -> int {
+    if flag <= 0 {
+        return 0
+    }
+    let mut cnt = 0
+    let t = pndw_read_table(pndw_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let f = to_int(parts[2])
+                if pndw_bit_and(f, flag) == flag {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── dll_dlopen_count: 특정 dll_id 의 dlopen 호출 수 ───
+fn dll_dlopen_count(dll_id: int) -> int {
+    let mut cnt = 0
+    let t = pndw_read_table(pndw_history_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == dll_id {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pndw_stats: [dlopen_count, success_count, fail_count, count_by_flag(2)] ───
+fn pndw_stats() -> array {
+    let mut out = []
+    out.push(dlopen_count())
+    out.push(success_count())
+    out.push(fail_count())
+    out.push(count_by_flag(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pndw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pndw()
+
+    // 2. record 4 dlopen calls (KERNEL32 / USER32 / GDI32 / unknown)
+    record_dlopen(97001, 1, 2, 1)
+    r0_emit("pe_native_dlopen_wrapper_call",
+        "\"call_id\":97001,\"dll_id\":1,\"flags\":2,\"success\":1,\"dll\":\"KERNEL32\",\"flag_str\":\"RTLD_NOW\"")
+
+    record_dlopen(97002, 2, 2, 1)
+    r0_emit("pe_native_dlopen_wrapper_call",
+        "\"call_id\":97002,\"dll_id\":2,\"flags\":2,\"success\":1,\"dll\":\"USER32\",\"flag_str\":\"RTLD_NOW\"")
+
+    record_dlopen(97003, 3, 1, 1)
+    r0_emit("pe_native_dlopen_wrapper_call",
+        "\"call_id\":97003,\"dll_id\":3,\"flags\":1,\"success\":1,\"dll\":\"GDI32\",\"flag_str\":\"RTLD_LAZY\"")
+
+    record_dlopen(97004, 9, 2, 0)
+    r0_emit("pe_native_dlopen_wrapper_call",
+        "\"call_id\":97004,\"dll_id\":9,\"flags\":2,\"success\":0,\"dll\":\"UNKNOWN\",\"flag_str\":\"RTLD_NOW\"")
+
+    // 3. dlopen_count = 4
+    let dc = dlopen_count()
+    if dc != 4 {
+        panic("pe_native_dlopen_wrapper FAIL [dlopen_count] expected=4 got=" + to_string(dc))
+    }
+
+    // 4. success_count = 3, fail_count = 1
+    let sc = success_count()
+    if sc != 3 {
+        panic("pe_native_dlopen_wrapper FAIL [success_count] expected=3 got=" + to_string(sc))
+    }
+    let fc = fail_count()
+    if fc != 1 {
+        panic("pe_native_dlopen_wrapper FAIL [fail_count] expected=1 got=" + to_string(fc))
+    }
+
+    // 5. count_by_flag
+    let cf1 = count_by_flag(1)
+    if cf1 != 1 {
+        panic("pe_native_dlopen_wrapper FAIL [count_by_flag(1)] expected=1 got=" + to_string(cf1))
+    }
+    let cf2 = count_by_flag(2)
+    if cf2 != 3 {
+        panic("pe_native_dlopen_wrapper FAIL [count_by_flag(2)] expected=3 got=" + to_string(cf2))
+    }
+    let cf99 = count_by_flag(99)
+    if cf99 != 0 {
+        panic("pe_native_dlopen_wrapper FAIL [count_by_flag(99)] expected=0 got=" + to_string(cf99))
+    }
+
+    // 6. dll_dlopen_count
+    let d1 = dll_dlopen_count(1)
+    if d1 != 1 {
+        panic("pe_native_dlopen_wrapper FAIL [dll_dlopen_count(1)] expected=1 got=" + to_string(d1))
+    }
+    let d2 = dll_dlopen_count(2)
+    if d2 != 1 {
+        panic("pe_native_dlopen_wrapper FAIL [dll_dlopen_count(2)] expected=1 got=" + to_string(d2))
+    }
+    let d0 = dll_dlopen_count(9999)
+    if d0 != 0 {
+        panic("pe_native_dlopen_wrapper FAIL [dll_dlopen_count(9999)] expected=0 got=" + to_string(d0))
+    }
+
+    // 7. pndw_stats() = [4, 3, 1, 3]
+    let s = pndw_stats()
+    if len(s) != 4 {
+        panic("pe_native_dlopen_wrapper FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_native_dlopen_wrapper FAIL [stats dlopen_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_native_dlopen_wrapper FAIL [stats success_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_native_dlopen_wrapper FAIL [stats fail_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 3 {
+        panic("pe_native_dlopen_wrapper FAIL [stats count_by_flag(2)] expected=3 got=" + to_string(s[3]))
+    }
+
+    // 8. emit stats
+    r0_emit("pe_native_dlopen_wrapper_stats",
+        "\"dlopen_count\":" + to_string(s[0])
+        + ",\"success_count\":" + to_string(s[1])
+        + ",\"fail_count\":" + to_string(s[2])
+        + ",\"rtld_now_count\":" + to_string(s[3]))
+
+    // 9. emit count >= 5 (실제: 4 calls + 1 stats = 5)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_native_dlopen_wrapper FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 10. cleanup → stats 모두 0
+    cleanup_pndw()
+    let s2 = pndw_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_native_dlopen_wrapper FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_dlopen_wrapper self_test PASS (4 calls, ok=" + to_string(s[1])
+        + ", fail=" + to_string(s[2]) + ", rtld_now=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pndw_stats()
+            println("dlopen_count\t" + to_string(s[0]))
+            println("success_count\t" + to_string(s[1]))
+            println("fail_count\t" + to_string(s[2]))
+            println("count_by_flag(2)\t" + to_string(s[3]))
+            return
+        }
+        if sub == "success" {
+            println("success_count\t" + to_string(success_count()))
+            println("fail_count\t" + to_string(fail_count()))
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let f = to_int(a[3])
+                println("count_by_flag(" + to_string(f) + ")\t" + to_string(count_by_flag(f)))
+                return
+            }
+            println("usage: hexa run pe_native_dlopen_wrapper.hexa count <flag>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pndw()
+            println("cleaned: " + pndw_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pndw_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_dlopen_wrapper.hexa { self-test | stats | success | count <flag> | cleanup | dir }")
+}

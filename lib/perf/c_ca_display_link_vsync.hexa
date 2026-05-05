@@ -1,0 +1,194 @@
+// lib/perf/c_ca_display_link_vsync.hexa — CN-39 PSB-7 만점 15/15
+//
+// macOS CADisplayLink vsync timing → DX present 매핑.
+// D4 swapchain present 시점 CADisplayLink 정밀 timing 기반 frame pacing.
+//
+// 무기: CADisplayLink callback + Holt forecast (vsync interval).
+// 효과: tear-free + dropped frame ↓ + present latency 정확화.
+
+use "./r0_common"
+
+let CDL_DIR = GAMEBOX_HOME + "/persist/ca_display_link_vsync"
+let VSYNC_LOG = CDL_DIR + "/vsyncs.tsv"
+let PRESENT_HISTORY = CDL_DIR + "/presents.jsonl"
+
+fn cdl_dir() -> str { return CDL_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CDL_DIR + "'")
+}
+
+// ─── vsync timestamp 등록 (CADisplayLink callback 시점) ───
+fn record_vsync(ts_us: int) -> void {
+    ensure_dir()
+    let line = to_string(ts_us)
+    let tmp = VSYNC_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + VSYNC_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── Holt forecast — vsync interval ───
+fn holt_forecast_interval(history: array, alpha: int, beta: int) -> int {
+    if len(history) < 2 {
+        if len(history) == 1 { return history[0] }
+        return 0
+    }
+    let level = history[0]
+    let trend = history[1] - history[0]
+    let i = 1
+    while i < len(history) {
+        let v = history[i]
+        let one_step = level + trend
+        let new_level = (alpha * v + (100 - alpha) * one_step) / 100
+        let new_trend = (beta * (new_level - level) + (100 - beta) * trend) / 100
+        level = new_level
+        trend = new_trend
+        i = i + 1
+    }
+    let f = level + trend
+    if f < 0 { return 0 }
+    return f
+}
+
+// ─── 다음 vsync ts 예측 ───
+//   최근 N vsync 의 interval 평균 → 다음 ts 예측
+fn forecast_next_vsync() -> int {
+    let exists = exec("test -f '" + VSYNC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let count_str = exec("wc -l < '" + VSYNC_LOG + "' | tr -d ' '").trim()
+    let count = to_int(count_str)
+    if count < 2 { return 0 }
+    // 최근 5 ts → 4 interval
+    let intervals_str = exec("tail -5 '" + VSYNC_LOG + "' | awk 'NR>1 {print $1-prev} {prev=$1}'").trim()
+    if intervals_str == "" { return 0 }
+    let interval_lines = intervals_str.split("\n")
+    let history = []
+    let i = 0
+    while i < len(interval_lines) {
+        let v = to_int(interval_lines[i])
+        if v > 0 { history = history + [v] }
+        i = i + 1
+    }
+    if len(history) == 0 { return 0 }
+    let next_interval = holt_forecast_interval(history, 60, 30)
+    let last_ts = to_int(exec("tail -1 '" + VSYNC_LOG + "'").trim())
+    return last_ts + next_interval
+}
+
+// ─── present scheduling ───
+//   target_present_ts = next_vsync_ts (예측)
+//   현재 ts 와 target 사이 budget 계산
+fn schedule_present(current_ts: int) -> array {
+    let next = forecast_next_vsync()
+    if next == 0 { return [0, 0, 0] }
+    let budget = next - current_ts
+    if budget < 0 { budget = 0 }
+    return [next, budget, 1]
+}
+
+// ─── present 결과 기록 ───
+fn record_present(frame_id: int, target_ts: int, actual_ts: int, dropped: bool) -> void {
+    ensure_dir()
+    let drift = actual_ts - target_ts
+    let d = "false"
+    if dropped { d = "true" }
+    let line = "{\"frame\":" + to_string(frame_id) + ",\"target\":" + to_string(target_ts) + ",\"actual\":" + to_string(actual_ts) + ",\"drift\":" + to_string(drift) + ",\"dropped\":" + d + "}"
+    let tmp = PRESENT_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PRESENT_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("ca_display_present", "\"frame\":" + to_string(frame_id) + ",\"drift\":" + to_string(drift) + ",\"dropped\":" + d)
+}
+
+fn cdl_stats() -> array {
+    let exists_v = exec("test -f '" + VSYNC_LOG + "' && echo ok").trim()
+    let vsyncs = 0
+    if exists_v == "ok" {
+        vsyncs = to_int(exec("wc -l < '" + VSYNC_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_p = exec("test -f '" + PRESENT_HISTORY + "' && echo ok").trim()
+    let presents = 0
+    let dropped = 0
+    if exists_p == "ok" {
+        presents = to_int(exec("wc -l < '" + PRESENT_HISTORY + "' | tr -d ' '").trim())
+        let d_str = exec("grep -c '\"dropped\":true' '" + PRESENT_HISTORY + "' 2>/dev/null").trim()
+        if d_str != "" { dropped = to_int(d_str) }
+    }
+    return [vsyncs, presents, dropped]
+}
+
+fn cleanup_cdl() -> void {
+    let _ = exec("rm -rf '" + CDL_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cdl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cdl()
+
+    // forecast helper
+    let pred = holt_forecast_interval([16667, 16667, 16700, 16650, 16680], 60, 30)
+    if pred < 16500 || pred > 17000 {
+        panic("c_ca_display_link_vsync FAIL [forecast] expected ~16700 got=" + to_string(pred))
+    }
+
+    // 합성 vsync 60Hz (16667us interval)
+    let i = 0
+    while i < 10 {
+        let ts = 1000000 + i * 16667
+        record_vsync(ts)
+        i = i + 1
+    }
+
+    // forecast next vsync — 마지막 ts + ~16667
+    let next = forecast_next_vsync()
+    let last = 1000000 + 9 * 16667
+    let expected_next = last + 16667
+    if next < expected_next - 1000 || next > expected_next + 1000 {
+        panic("c_ca_display_link_vsync FAIL [next vsync] expected~" + to_string(expected_next) + " got=" + to_string(next))
+    }
+
+    // schedule present
+    let current_ts = last + 8000  // half-way through frame
+    let sched = schedule_present(current_ts)
+    if sched[2] != 1 { panic("c_ca_display_link_vsync FAIL [sched valid]") }
+    if sched[1] < 1 || sched[1] > 16667 {
+        panic("c_ca_display_link_vsync FAIL [budget] expected 1-16667 got=" + to_string(sched[1]))
+    }
+
+    // record present (on time)
+    record_present(1, sched[0], sched[0] + 100, false)
+
+    // record present (dropped)
+    record_present(2, sched[0] + 16667, sched[0] + 33000, true)
+
+    // stats
+    let stats = cdl_stats()
+    if stats[0] != 10 { panic("c_ca_display_link_vsync FAIL [stats vsyncs] expected=10 got=" + to_string(stats[0])) }
+    if stats[1] != 2 { panic("c_ca_display_link_vsync FAIL [stats presents] expected=2 got=" + to_string(stats[1])) }
+    if stats[2] != 1 { panic("c_ca_display_link_vsync FAIL [stats dropped] expected=1 got=" + to_string(stats[2])) }
+
+    r0_emit("ca_display_summary", "\"vsyncs\":" + to_string(stats[0]) + ",\"presents\":" + to_string(stats[1]) + ",\"dropped\":" + to_string(stats[2]) + ",\"interval_us\":" + to_string(pred))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_ca_display_link_vsync FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_cdl()
+
+    println("  ✅ c_ca_display_link_vsync self_test PASS (10 vsyncs, 2 presents, 1 dropped, interval=" + to_string(pred) + "us, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = cdl_stats()
+            println("vsyncs=" + to_string(s[0]) + " presents=" + to_string(s[1]) + " dropped=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_cdl(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_ca_display_link_vsync.hexa { self-test | stats | cleanup }")
+}

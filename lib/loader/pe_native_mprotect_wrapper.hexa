@@ -1,0 +1,156 @@
+// lib/loader/pe_native_mprotect_wrapper.hexa — stage4 macOS mprotect wrapper skeleton
+//
+// PE section 별 page protection 전환. mmap 후 .text section copy → mprotect
+// R+X. .data section → mprotect R+W. Apple Silicon W^X 정책 — 동시 W+X X.
+
+use "../perf/r0_common"
+
+let PNMPW_DIR = GAMEBOX_HOME + "/persist/pe_native_mprotect_wrapper"
+let PNMPW_TABLE = PNMPW_DIR + "/mprotect.tsv"
+
+fn pnmpw_dir() -> str { return PNMPW_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + PNMPW_DIR + "'")
+}
+
+fn append_row(row: str) -> void {
+    ensure_dir()
+    let tmp = PNMPW_TABLE + ".tmp"
+    write_file(tmp, row + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PNMPW_TABLE + "' && rm -f '" + tmp + "'")
+}
+
+fn prot_name(prot: int) -> str {
+    if prot == 1 { return "R" }
+    if prot == 2 { return "R+W" }
+    if prot == 4 { return "R+X" }
+    return "unknown"
+}
+
+// Schema (TSV): call_id<int> | region_id<int> | new_prot<int> | success<int>
+fn record_mprotect(call_id: int, region_id: int, new_prot: int, success: int) -> void {
+    append_row(to_string(call_id) + "\t" + to_string(region_id) + "\t" + to_string(new_prot) + "\t" + to_string(success))
+    r0_emit("pnmpw_mprotect", "\"call_id\":" + to_string(call_id) + ",\"region_id\":" + to_string(region_id) + ",\"new_prot\":\"" + prot_name(new_prot) + "\",\"success\":" + to_string(success))
+}
+
+fn table_exists() -> bool {
+    let r = exec("test -f '" + PNMPW_TABLE + "' && echo ok").trim()
+    return r == "ok"
+}
+
+fn mprotect_count() -> int {
+    if !table_exists() { return 0 }
+    return to_int(exec("wc -l < '" + PNMPW_TABLE + "' | tr -d ' '").trim())
+}
+
+fn success_count() -> int {
+    if !table_exists() { return 0 }
+    let s = exec("awk -F'\\t' '$4==1 {c++} END {print c+0}' '" + PNMPW_TABLE + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn count_by_prot(prot: int) -> int {
+    if !table_exists() { return 0 }
+    let s = exec("awk -F'\\t' -v p=" + to_string(prot) + " '$3==p {c++} END {print c+0}' '" + PNMPW_TABLE + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn region_protection_changes(region_id: int) -> int {
+    if !table_exists() { return 0 }
+    let s = exec("awk -F'\\t' -v r=" + to_string(region_id) + " '$2==r {c++} END {print c+0}' '" + PNMPW_TABLE + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn pnmpw_stats() -> array {
+    return [mprotect_count(), success_count(), count_by_prot(2), count_by_prot(4)]
+}
+
+fn cleanup_pnmpw() -> void {
+    let _ = exec("rm -rf '" + PNMPW_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "pnmpw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pnmpw()
+
+    // 5 mprotect calls synthesis
+    record_mprotect(100001, 1, 2, 1)   // region 1 → R+W (pre-copy)
+    record_mprotect(100002, 1, 4, 1)   // region 1 → R+X (after copy)
+    record_mprotect(100003, 2, 2, 1)   // region 2 → R+W (heap)
+    record_mprotect(100004, 3, 1, 1)   // region 3 → R only (.rdata)
+    record_mprotect(100005, 1, 4, 1)   // region 1 → R+X (re-flip after relocations)
+
+    // mprotect_count
+    let mc = mprotect_count()
+    if mc != 5 { panic("pe_native_mprotect_wrapper FAIL [mprotect_count] expected=5 got=" + to_string(mc)) }
+
+    // success_count
+    let sc = success_count()
+    if sc != 5 { panic("pe_native_mprotect_wrapper FAIL [success_count] expected=5 got=" + to_string(sc)) }
+
+    // count_by_prot
+    let c1 = count_by_prot(1)
+    if c1 != 1 { panic("pe_native_mprotect_wrapper FAIL [count_by_prot 1] expected=1 got=" + to_string(c1)) }
+    let c2 = count_by_prot(2)
+    if c2 != 2 { panic("pe_native_mprotect_wrapper FAIL [count_by_prot 2] expected=2 got=" + to_string(c2)) }
+    let c4 = count_by_prot(4)
+    if c4 != 2 { panic("pe_native_mprotect_wrapper FAIL [count_by_prot 4] expected=2 got=" + to_string(c4)) }
+    let c99 = count_by_prot(99)
+    if c99 != 0 { panic("pe_native_mprotect_wrapper FAIL [count_by_prot 99] expected=0 got=" + to_string(c99)) }
+
+    // region_protection_changes
+    let r1 = region_protection_changes(1)
+    if r1 != 3 { panic("pe_native_mprotect_wrapper FAIL [region_protection_changes 1] expected=3 got=" + to_string(r1)) }
+    let r2 = region_protection_changes(2)
+    if r2 != 1 { panic("pe_native_mprotect_wrapper FAIL [region_protection_changes 2] expected=1 got=" + to_string(r2)) }
+    let r3 = region_protection_changes(3)
+    if r3 != 1 { panic("pe_native_mprotect_wrapper FAIL [region_protection_changes 3] expected=1 got=" + to_string(r3)) }
+    let r_missing = region_protection_changes(9999)
+    if r_missing != 0 { panic("pe_native_mprotect_wrapper FAIL [region_protection_changes 9999] expected=0 got=" + to_string(r_missing)) }
+
+    // pnmpw_stats = [5, 5, 2, 2]
+    let st = pnmpw_stats()
+    if len(st) != 4 { panic("pe_native_mprotect_wrapper FAIL [pnmpw_stats len] expected=4 got=" + to_string(len(st))) }
+    if st[0] != 5 { panic("pe_native_mprotect_wrapper FAIL [pnmpw_stats[0]] expected=5 got=" + to_string(st[0])) }
+    if st[1] != 5 { panic("pe_native_mprotect_wrapper FAIL [pnmpw_stats[1]] expected=5 got=" + to_string(st[1])) }
+    if st[2] != 2 { panic("pe_native_mprotect_wrapper FAIL [pnmpw_stats[2]] expected=2 got=" + to_string(st[2])) }
+    if st[3] != 2 { panic("pe_native_mprotect_wrapper FAIL [pnmpw_stats[3]] expected=2 got=" + to_string(st[3])) }
+
+    // emit count >= 6 (5 mprotect + 1 summary)
+    r0_emit("pnmpw_self_test", "\"mprotect_count\":5,\"success_count\":5,\"rw_count\":2,\"rx_count\":2")
+    let cnt = r0_session_count(sid)
+    if cnt < 6 { panic("pe_native_mprotect_wrapper FAIL [emit count] expected>=6 got=" + to_string(cnt)) }
+
+    cleanup_pnmpw()
+
+    println("  ✅ pe_native_mprotect_wrapper self_test PASS (mprotect=5, success=5, R=1, R+W=2, R+X=2, region1=3, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let st = pnmpw_stats()
+            println("mprotect_count=" + to_string(st[0]) + " success_count=" + to_string(st[1]) + " rw=" + to_string(st[2]) + " rx=" + to_string(st[3]))
+            return
+        }
+        if sub == "changes" && len(a) >= 4 {
+            println(to_string(region_protection_changes(to_int(a[3]))))
+            return
+        }
+        if sub == "count" && len(a) >= 4 {
+            println(to_string(count_by_prot(to_int(a[3]))))
+            return
+        }
+        if sub == "cleanup" { cleanup_pnmpw(); println("cleaned"); return }
+    }
+    println("usage: hexa run pe_native_mprotect_wrapper.hexa { self-test | stats | changes <region_id> | count <new_prot> | cleanup }")
+}

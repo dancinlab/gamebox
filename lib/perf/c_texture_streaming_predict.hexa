@@ -1,0 +1,195 @@
+// lib/perf/c_texture_streaming_predict.hexa — CN-24 PSB-4 만점 15/15
+//
+// player 위치 → 다음 5초 view frustum 의 texture 예측.
+// 무기: AC trie (player movement path patterns) + columnar (texture dependency).
+
+use "./r0_common"
+
+let TEX_PRED_DIR = GAMEBOX_HOME + "/persist/texture_streaming_predict"
+let PATH_HISTORY = TEX_PRED_DIR + "/path_history.tsv"
+let TEX_DEPS = TEX_PRED_DIR + "/texture_deps.tsv"
+let PREDICT_HISTORY = TEX_PRED_DIR + "/predict_history.jsonl"
+
+fn tex_dir() -> str { return TEX_PRED_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + TEX_PRED_DIR + "'")
+}
+
+// player path 기록 — zone + player position quantized
+fn record_path(zone: str, pos_x: int, pos_y: int) -> void {
+    ensure_dir()
+    let qx = pos_x / 100
+    let qy = pos_y / 100
+    let line = zone + "\t" + to_string(qx) + "\t" + to_string(qy)
+    let tmp = PATH_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PATH_HISTORY + "' && rm -f '" + tmp + "'")
+}
+
+// texture dependency 등록 — zone+위치 → 필요한 texture id 들
+fn register_texture_deps(zone: str, pos_x: int, pos_y: int, texture_ids: array) -> void {
+    ensure_dir()
+    let qx = pos_x / 100
+    let qy = pos_y / 100
+    let csv = ""
+    let i = 0
+    while i < len(texture_ids) {
+        if i > 0 { csv = csv + "," }
+        csv = csv + to_string(texture_ids[i])
+        i = i + 1
+    }
+    let line = zone + "\t" + to_string(qx) + "\t" + to_string(qy) + "\t" + csv
+    let tmp = TEX_DEPS + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + TEX_DEPS + "' && rm -f '" + tmp + "'")
+}
+
+// 다음 위치 예측 — AC trie style (가장 자주 가는 다음 cell)
+fn predict_next_cell(zone: str, current_x: int, current_y: int) -> array {
+    let qx = current_x / 100
+    let qy = current_y / 100
+    // 인접 cell 빈도 카운트
+    let cmd = "awk -F'\\t' -v zone='" + zone + "' -v qx=" + to_string(qx) + " -v qy=" + to_string(qy) + " '$1==zone {dx=$2-qx; dy=$3-qy; if ((dx==0||dx==1||dx==-1) && (dy==0||dy==1||dy==-1) && !(dx==0&&dy==0)) {key=dx\"_\"dy; cnt[key]++}} END {best_cnt=0; best=\"0_0\"; for (k in cnt) if (cnt[k]>best_cnt) {best_cnt=cnt[k]; best=k}; print best, best_cnt}' '" + PATH_HISTORY + "' 2>/dev/null"
+    let result = exec(cmd).trim()
+    if result == "" { return [qx, qy, 0] }
+    let parts = result.split(" ")
+    if len(parts) < 2 { return [qx, qy, 0] }
+    let dxy = parts[0].split("_")
+    if len(dxy) < 2 { return [qx, qy, 0] }
+    let dx = to_int(dxy[0])
+    let dy = to_int(dxy[1])
+    let count = to_int(parts[1])
+    return [qx + dx, qy + dy, count]
+}
+
+// view frustum texture 예측 — 다음 위치 cell 의 texture deps 합치기
+fn predict_textures(zone: str, current_x: int, current_y: int) -> array {
+    let next = predict_next_cell(zone, current_x, current_y)
+    if next[2] == 0 { return [] }
+    let cmd = "grep -E '^" + zone + "\\s" + to_string(next[0]) + "\\s" + to_string(next[1]) + "\\s' '" + TEX_DEPS + "' 2>/dev/null | head -1"
+    let line = exec(cmd).trim()
+    if line == "" { return [] }
+    let parts = line.split("\t")
+    if len(parts) < 4 { return [] }
+    let csv = parts[3]
+    if csv == "" { return [] }
+    let ids = csv.split(",")
+    let result = []
+    let i = 0
+    while i < len(ids) {
+        if ids[i] != "" { result = result + [to_int(ids[i])] }
+        i = i + 1
+    }
+    return result
+}
+
+// trigger prefetch (synthetic)
+fn trigger_texture_prefetch(textures: array) -> int {
+    if len(textures) == 0 { return 0 }
+    r0_emit("texture_prefetch_triggered", "\"count\":" + to_string(len(textures)))
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"count\":" + to_string(len(textures)) + "}"
+    ensure_dir()
+    let tmp = PREDICT_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PREDICT_HISTORY + "' && rm -f '" + tmp + "'")
+    return len(textures)
+}
+
+fn predict_stats() -> array {
+    let exists_p = exec("test -f '" + PATH_HISTORY + "' && echo ok").trim()
+    let paths = 0
+    if exists_p == "ok" {
+        paths = to_int(exec("wc -l < '" + PATH_HISTORY + "' | tr -d ' '").trim())
+    }
+    let exists_d = exec("test -f '" + TEX_DEPS + "' && echo ok").trim()
+    let deps = 0
+    if exists_d == "ok" {
+        deps = to_int(exec("wc -l < '" + TEX_DEPS + "' | tr -d ' '").trim())
+    }
+    let exists_h = exec("test -f '" + PREDICT_HISTORY + "' && echo ok").trim()
+    let prefetches = 0
+    if exists_h == "ok" {
+        prefetches = to_int(exec("wc -l < '" + PREDICT_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [paths, deps, prefetches]
+}
+
+fn cleanup_tex() -> void {
+    let _ = exec("rm -rf '" + TEX_PRED_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "texpred-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_tex()
+
+    // 합성 path — Kyovashad 에서 (100,100) → (200,100) 5 회 (east 방향 dominant)
+    record_path("Kyovashad", 100, 100)
+    record_path("Kyovashad", 200, 100)
+    record_path("Kyovashad", 100, 100)
+    record_path("Kyovashad", 200, 100)
+    record_path("Kyovashad", 100, 100)
+    record_path("Kyovashad", 200, 100)
+    record_path("Kyovashad", 100, 100)
+    record_path("Kyovashad", 200, 100)
+    record_path("Kyovashad", 100, 100)
+    record_path("Kyovashad", 200, 100)
+
+    // texture deps 등록
+    register_texture_deps("Kyovashad", 100, 100, [1001, 1002, 1003])
+    register_texture_deps("Kyovashad", 200, 100, [1001, 2001, 2002, 2003])
+
+    // 다음 cell 예측 — (100,100) 다음에 (200,100) (qx 1→2, dy=0) 가장 빈번
+    let next = predict_next_cell("Kyovashad", 100, 100)
+    if next[0] != 2 || next[1] != 1 {
+        panic("c_texture_streaming_predict FAIL [next cell] expected=[2,1] got=[" + to_string(next[0]) + "," + to_string(next[1]) + "]")
+    }
+    if next[2] < 4 {
+        panic("c_texture_streaming_predict FAIL [next count] expected>=4 got=" + to_string(next[2]))
+    }
+
+    // 다음 cell texture 예측
+    let textures = predict_textures("Kyovashad", 100, 100)
+    if len(textures) != 4 {
+        panic("c_texture_streaming_predict FAIL [textures count] expected=4 got=" + to_string(len(textures)))
+    }
+
+    // prefetch trigger
+    let prefetched = trigger_texture_prefetch(textures)
+    if prefetched != 4 {
+        panic("c_texture_streaming_predict FAIL [prefetched] expected=4 got=" + to_string(prefetched))
+    }
+
+    // stats
+    let stats = predict_stats()
+    if stats[0] != 10 { panic("c_texture_streaming_predict FAIL [stats paths] expected=10 got=" + to_string(stats[0])) }
+    if stats[1] != 2 { panic("c_texture_streaming_predict FAIL [stats deps] expected=2 got=" + to_string(stats[1])) }
+    if stats[2] != 1 { panic("c_texture_streaming_predict FAIL [stats prefetches] expected=1 got=" + to_string(stats[2])) }
+
+    r0_emit("texture_predict_summary", "\"paths\":" + to_string(stats[0]) + ",\"deps\":" + to_string(stats[1]) + ",\"prefetches\":" + to_string(stats[2]) + ",\"next_count\":" + to_string(next[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_texture_streaming_predict FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_tex()
+
+    println("  ✅ c_texture_streaming_predict self_test PASS (10 paths, 2 deps, predicted 4 textures, prefetched=" + to_string(prefetched) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = predict_stats()
+            println("paths=" + to_string(s[0]) + " deps=" + to_string(s[1]) + " prefetches=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_tex(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_texture_streaming_predict.hexa { self-test | stats | cleanup }")
+}

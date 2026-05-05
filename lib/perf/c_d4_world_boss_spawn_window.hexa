@@ -1,0 +1,220 @@
+// lib/perf/c_d4_world_boss_spawn_window.hexa — CN-200 skeleton manjeom 15/15
+//
+// D4 world boss (Ashava the Pestilent / Avarice the Gold Cursed / Wandering
+// Death) spawn timer + active window 추적 — 3 종 boss 가 6h cycle 로 등장하고
+// spawn 후 15min 동안 active window 가 열린다. 본 모듈은 boss × cycle_us ×
+// window_us × spawn_count 4-key 컬럼 로그와 합계/조회만 담당 — 실제 ETA
+// dispatch 는 host scheduler 책임.
+//
+// 무기: boss × cycle × window × spawn 4-key columnar log + per-boss lookup.
+// 효과: D4 world boss farming 효율 정량화 → 다음 spawn ETA + 가장 효율적
+// kill 패턴 forecast.
+
+use "./r0_common"
+
+let DWBSW_DIR = GAMEBOX_HOME + "/persist/d4_world_boss_spawn_window"
+let BOSS_LOG = DWBSW_DIR + "/bosses.tsv"
+
+fn dwbsw_dir() -> str { return DWBSW_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + DWBSW_DIR + "'")
+}
+
+// ─── boss 등록 ───
+//   boss_id (1=Ashava, 2=Avarice, 3=Wandering_Death),
+//   cycle_us (boss spawn 주기, μs — D4 는 6h = 21,600,000,000 μs),
+//   window_us (active window 길이 μs — 15min = 900,000,000 μs),
+//   spawn_count (관측 cycle 안 누적 spawn 횟수).
+fn record_boss(boss_id: int, cycle_us: int, window_us: int, spawn_count: int) -> void {
+    ensure_dir()
+    let line = to_string(boss_id) + "\t" + to_string(cycle_us) + "\t" + to_string(window_us) + "\t" + to_string(spawn_count)
+    let tmp = BOSS_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + BOSS_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("d4_world_boss_record", "\"boss\":" + to_string(boss_id) + ",\"cycle_us\":" + to_string(cycle_us) + ",\"window_us\":" + to_string(window_us) + ",\"spawns\":" + to_string(spawn_count))
+}
+
+// ─── boss_record_count — 등록된 boss 행 수 ───
+fn boss_record_count() -> int {
+    let exists = exec("test -f '" + BOSS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + BOSS_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_cycle_us — 모든 boss cycle_us 합 ───
+fn total_cycle_us() -> int {
+    let exists = exec("test -f '" + BOSS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + BOSS_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_window_us — 모든 boss window_us 합 ───
+fn total_window_us() -> int {
+    let exists = exec("test -f '" + BOSS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + BOSS_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_spawns — 모든 boss spawn_count 합 ───
+fn total_spawns() -> int {
+    let exists = exec("test -f '" + BOSS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + BOSS_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── count_by_boss — 특정 boss_id 의 등록 행 수 ───
+fn count_by_boss(boss_id: int) -> int {
+    let exists = exec("test -f '" + BOSS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v b=" + to_string(boss_id) + " '$1==b {c++} END{print c+0}' '" + BOSS_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── boss_window_us — 특정 boss_id 의 window_us 합 ───
+//   미등록 boss_id 는 0.
+fn boss_window_us(boss_id: int) -> int {
+    let exists = exec("test -f '" + BOSS_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v b=" + to_string(boss_id) + " '$1==b {s+=$3} END{print s+0}' '" + BOSS_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── dwbsw_stats — [boss_record_count, total_cycle_us, total_window_us, total_spawns] ───
+fn dwbsw_stats() -> array {
+    return [boss_record_count(), total_cycle_us(), total_window_us(), total_spawns()]
+}
+
+fn cleanup_dwbsw() -> void {
+    let _ = exec("rm -rf '" + DWBSW_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "dwbsw-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_dwbsw()
+
+    // 합성 boss 3 종 (D4 6h cycle / 15min window / 4 spawn 관측):
+    //   Ashava the Pestilent       (id=1) — cycle 21.6e9 μs / window 9e8 μs / 4 spawn
+    //   Avarice the Gold Cursed    (id=2) — cycle 21.6e9 μs / window 9e8 μs / 4 spawn
+    //   Wandering Death            (id=3) — cycle 21.6e9 μs / window 9e8 μs / 4 spawn
+    record_boss(1, 21600000000, 900000000, 4)
+    record_boss(2, 21600000000, 900000000, 4)
+    record_boss(3, 21600000000, 900000000, 4)
+
+    // boss_record_count = 3
+    let brc = boss_record_count()
+    if brc != 3 { panic("c_d4_world_boss_spawn_window FAIL [boss_record_count] expected=3 got=" + to_string(brc)) }
+
+    // total_cycle_us = 21600000000 * 3 = 64800000000
+    let tcu = total_cycle_us()
+    if tcu != 64800000000 { panic("c_d4_world_boss_spawn_window FAIL [total_cycle_us] expected=64800000000 got=" + to_string(tcu)) }
+
+    // total_window_us = 900000000 * 3 = 2700000000
+    let twu = total_window_us()
+    if twu != 2700000000 { panic("c_d4_world_boss_spawn_window FAIL [total_window_us] expected=2700000000 got=" + to_string(twu)) }
+
+    // total_spawns = 4+4+4 = 12
+    let tsp = total_spawns()
+    if tsp != 12 { panic("c_d4_world_boss_spawn_window FAIL [total_spawns] expected=12 got=" + to_string(tsp)) }
+
+    // count_by_boss
+    let c1 = count_by_boss(1)
+    if c1 != 1 { panic("c_d4_world_boss_spawn_window FAIL [count_by_boss 1] expected=1 got=" + to_string(c1)) }
+    let c2 = count_by_boss(2)
+    if c2 != 1 { panic("c_d4_world_boss_spawn_window FAIL [count_by_boss 2] expected=1 got=" + to_string(c2)) }
+    let c3 = count_by_boss(3)
+    if c3 != 1 { panic("c_d4_world_boss_spawn_window FAIL [count_by_boss 3] expected=1 got=" + to_string(c3)) }
+    let c99 = count_by_boss(99)
+    if c99 != 0 { panic("c_d4_world_boss_spawn_window FAIL [count_by_boss 99] expected=0 got=" + to_string(c99)) }
+
+    // boss_window_us
+    let w1 = boss_window_us(1)
+    if w1 != 900000000 { panic("c_d4_world_boss_spawn_window FAIL [boss_window_us 1] expected=900000000 got=" + to_string(w1)) }
+    let w2 = boss_window_us(2)
+    if w2 != 900000000 { panic("c_d4_world_boss_spawn_window FAIL [boss_window_us 2] expected=900000000 got=" + to_string(w2)) }
+    let w3 = boss_window_us(3)
+    if w3 != 900000000 { panic("c_d4_world_boss_spawn_window FAIL [boss_window_us 3] expected=900000000 got=" + to_string(w3)) }
+    let w_unknown = boss_window_us(9999)
+    if w_unknown != 0 { panic("c_d4_world_boss_spawn_window FAIL [boss_window_us unknown] expected=0 got=" + to_string(w_unknown)) }
+
+    let stats = dwbsw_stats()
+    if stats[0] != 3 { panic("c_d4_world_boss_spawn_window FAIL [stats records] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 64800000000 { panic("c_d4_world_boss_spawn_window FAIL [stats cycle_us] expected=64800000000 got=" + to_string(stats[1])) }
+    if stats[2] != 2700000000 { panic("c_d4_world_boss_spawn_window FAIL [stats window_us] expected=2700000000 got=" + to_string(stats[2])) }
+    if stats[3] != 12 { panic("c_d4_world_boss_spawn_window FAIL [stats spawns] expected=12 got=" + to_string(stats[3])) }
+
+    r0_emit("d4_world_boss_summary", "\"bosses\":" + to_string(stats[0]) + ",\"cycle_us\":" + to_string(stats[1]) + ",\"window_us\":" + to_string(stats[2]) + ",\"spawns\":" + to_string(stats[3]))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_d4_world_boss_spawn_window FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic D4 world boss retired_intentional posture annotation (Track V) ───
+    //
+    // Track V mission: D4 always-online DRM honest spec freeze posture annotation.
+    // .roadmap.diablo4 blk.1 status_enum_adopted = retired_intentional (Track A2 land).
+    // 본 module 측 world boss spawn window = synthetic boss table + cycle / window
+    // — production live game state 측정 X (D4 always-online live session 진입 X, DRM
+    // bypass 0, Battle.net launcher 통과 X). 본 cycle 측 module self_test() 측 honest
+    // annotation row 추가 only — cond.3 status `partial` 영구 유지 (retired_intentional
+    // posture per blk.1 영구 lock).
+    //
+    // synthetic posture row column header:
+    //     domain                "world_boss_spawn_window"
+    //     posture               "retired_intentional"  (NOT pass / NOT partial / NOT fail)
+    //     production_smoke      "no_attempt"           (no live game state acquire)
+    //     drm_bypass            "0"                    (own1 Wine 0 / no evasion)
+    //     always_online_evade   "0"                    (own1 honest acknowledgment)
+    //     blocker_ref           "diablo4.blk.1"        (always_online_drm)
+    //     adoption_iso          "2026-05-03"           (Track A2 retired_intentional adopt)
+    r0_emit("c_d4_world_boss_spawn_window_retired_intentional",
+        "\"stage\":\"d4_economy_synthetic\",\"domain\":\"world_boss_spawn_window\",\"posture\":\"retired_intentional\",\"production_smoke\":\"no_attempt\",\"drm_bypass\":0,\"always_online_evade\":0,\"blocker_ref\":\"diablo4.blk.1\",\"blocker_class\":\"always_online_drm\",\"adoption_iso\":\"2026-05-03\",\"cond\":\"diablo4.cond.3\",\"verdict\":\"RETIRED_INTENTIONAL\",\"posture_kind\":\"block_acknowledged_pass_equivalent\"")
+    println("__D4_WORLD_BOSS__ RETIRED_INTENTIONAL d4_economy_synthetic")
+
+    cleanup_dwbsw()
+
+    println("  ✅ c_d4_world_boss_spawn_window self_test PASS (3 bosses, cycle_us=64800000000, window_us=2700000000, spawns=12, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = dwbsw_stats()
+            println("bosses=" + to_string(s[0]) + " cycle_us=" + to_string(s[1]) + " window_us=" + to_string(s[2]) + " spawns=" + to_string(s[3]))
+            return
+        }
+        if sub == "window" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                let wu = boss_window_us(bid)
+                println(to_string(wu))
+                return
+            }
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let bid = to_int(a[3])
+                let c = count_by_boss(bid)
+                println(to_string(c))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_dwbsw(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_d4_world_boss_spawn_window.hexa { self-test | stats | window <boss_id> | count <boss_id> | cleanup }")
+}

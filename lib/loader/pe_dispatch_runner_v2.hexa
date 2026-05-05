@@ -1,0 +1,440 @@
+// lib/loader/pe_dispatch_runner_v2.hexa — cycle 64-83 ~290 module dispatch loader array 실행기 (enhanced)
+//
+// dispatch.hexa cmd_loader 의 run_self_test_set 결과 집계 wrapper.
+// cycle 64-83 ~290 모듈 PASS/FAIL 추적 — loader array enhanced version.
+//
+//   module_kind:
+//     1=pe_loader       — pe_section_map / reloc / iat / tls 등 핵심 PE 로더
+//     2=win32_dll       — kernel32 / user32 / advapi32 등 win32 DLL stub
+//     3=dx              — d3d11 / d3d12 / dxgi 그래픽 stack
+//     4=ipc             — battle_net_agent_ipc / helper_subprocess pipe
+//     5=memory          — heap / virtual_alloc / page_protect
+//     6=perf            — r0_emit / perf_counter / harvest
+//     7=abi             — call_conv (cdecl/stdcall/fastcall/x64_ms/vectorcall)
+//     8=nt              — nt_status / ntdll syscall
+//     9=seh             — vectored / structured exception handler
+//    10=sync            — critical_section / event / semaphore / mutex
+//    11=runtime         — crt / msvcrt / vcruntime
+//    12=fs              — file_system / volume / registry
+//    13=net             — winsock / iphlp / dns
+//    14=com             — ole32 / oleaut32 / com_apartment
+//    15=game_specific   — d2r / d4 / battle_net_launcher 게임별 hook
+//    16=infra           — i386_call_frame / iat_runtime_bind / oss_validate 등 기반 infra
+//   passed = 0/1 (FAIL/PASS)
+//   elapsed_ms = run 소요 시간 (ms)
+//   skeleton: 실 실행 X — TSV 추적만, dispatch.hexa cmd_loader 호출 결과 집계 자리
+// own1: 자체 runner — third-party test framework 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 dispatch loader array 결과 집계 — 실 모듈 호출 X (dispatch.hexa 가 담당).
+// own 2 mandate: r0_emit ≥ 8 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// module_kind code:
+//   1=pe_loader  2=win32_dll  3=dx       4=ipc       5=memory  6=perf
+//   7=abi        8=nt         9=seh     10=sync     11=runtime 12=fs
+//  13=net       14=com       15=game_specific      16=infra
+//
+// persist schema (TSV — runs.tsv):
+//   run_id<int> \t module_kind<int> \t passed<int> \t elapsed_ms<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pdrv2_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_dispatch_runner_v2"
+}
+
+fn pdrv2_runs_path() -> str {
+    return pdrv2_dir() + "/runs.tsv"
+}
+
+fn pdrv2_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pdrv2_dir() + "'")
+}
+
+fn cleanup_pdrv2() -> void {
+    pdrv2_ensure_dir()
+    let _ = exec("rm -f '" + pdrv2_runs_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pdrv2_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pdrv2_append_row(path: str, row: str) -> void {
+    pdrv2_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_run: dispatch loader 1 건 결과 기록 ───
+fn record_run(run_id: int, module_kind: int, passed: int, elapsed_ms: int) -> void {
+    if run_id <= 0 {
+        panic("pe_dispatch_runner_v2 FAIL [record_run] expected=run_id>0 got=" + to_string(run_id))
+    }
+    if module_kind < 1 {
+        panic("pe_dispatch_runner_v2 FAIL [record_run] expected=module_kind>=1 got=" + to_string(module_kind))
+    }
+    if module_kind > 16 {
+        panic("pe_dispatch_runner_v2 FAIL [record_run] expected=module_kind<=16 got=" + to_string(module_kind))
+    }
+    if passed < 0 {
+        panic("pe_dispatch_runner_v2 FAIL [record_run] expected=passed>=0 got=" + to_string(passed))
+    }
+    if passed > 1 {
+        panic("pe_dispatch_runner_v2 FAIL [record_run] expected=passed<=1 got=" + to_string(passed))
+    }
+    if elapsed_ms < 0 {
+        panic("pe_dispatch_runner_v2 FAIL [record_run] expected=elapsed_ms>=0 got=" + to_string(elapsed_ms))
+    }
+    let row = to_string(run_id) + "\t" + to_string(module_kind)
+        + "\t" + to_string(passed) + "\t" + to_string(elapsed_ms) + "\n"
+    pdrv2_append_row(pdrv2_runs_path(), row)
+}
+
+// ─── run_count: total run 수 ───
+fn run_count() -> int {
+    let t = pdrv2_read_table(pdrv2_runs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── passed_count: passed=1 인 run 수 ───
+fn passed_count() -> int {
+    let t = pdrv2_read_table(pdrv2_runs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_elapsed_ms: 모든 run 의 elapsed_ms 합 ───
+fn total_elapsed_ms() -> int {
+    let t = pdrv2_read_table(pdrv2_runs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_module_kind: 특정 module_kind 의 run 수 ───
+fn count_by_module_kind(module_kind: int) -> int {
+    let t = pdrv2_read_table(pdrv2_runs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == module_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── pass_rate_pct: passed_count * 100 / run_count (0-guard) ───
+fn pass_rate_pct() -> int {
+    let rc = run_count()
+    if rc <= 0 {
+        return 0
+    }
+    return (passed_count() * 100) / rc
+}
+
+// ─── slowest_module: max elapsed_ms 인 run_id (없으면 0) ───
+fn slowest_module() -> int {
+    let t = pdrv2_read_table(pdrv2_runs_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut best_id = 0
+    let mut best_ms = -1
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let ms = to_int(parts[3])
+                if ms > best_ms {
+                    best_ms = ms
+                    best_id = to_int(parts[0])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best_id
+}
+
+// ─── pdrv2_stats: [run_count, passed_count, total_elapsed_ms, pass_rate_pct, slowest_module] ───
+fn pdrv2_stats() -> array {
+    let mut out = []
+    out.push(run_count())
+    out.push(passed_count())
+    out.push(total_elapsed_ms())
+    out.push(pass_rate_pct())
+    out.push(slowest_module())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pdrv2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pdrv2()
+
+    // 2. record 7 runs covering ≥5 module_kinds with ≥6 passed
+    //    module_kinds: 1, 2, 3, 6, 7, 11, 16  (7 distinct)
+    //    passed:       1, 1, 1, 1, 0, 1, 1   → passed_count=6, pass_rate=85
+    //    elapsed_ms:  120, 80, 250, 60, 30, 410, 90  → total=1040, slowest=640006 (410ms)
+    record_run(640001, 1, 1, 120)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640001,\"module_kind\":1,\"passed\":1,\"elapsed_ms\":120,\"target\":\"pe_loader\"")
+
+    record_run(640002, 2, 1, 80)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640002,\"module_kind\":2,\"passed\":1,\"elapsed_ms\":80,\"target\":\"win32_dll\"")
+
+    record_run(640003, 3, 1, 250)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640003,\"module_kind\":3,\"passed\":1,\"elapsed_ms\":250,\"target\":\"dx\"")
+
+    record_run(640004, 6, 1, 60)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640004,\"module_kind\":6,\"passed\":1,\"elapsed_ms\":60,\"target\":\"perf\"")
+
+    record_run(640005, 7, 0, 30)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640005,\"module_kind\":7,\"passed\":0,\"elapsed_ms\":30,\"target\":\"abi\"")
+
+    record_run(640006, 11, 1, 410)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640006,\"module_kind\":11,\"passed\":1,\"elapsed_ms\":410,\"target\":\"runtime\"")
+
+    record_run(640007, 16, 1, 90)
+    r0_emit("pe_dispatch_runner_v2_record",
+        "\"run_id\":640007,\"module_kind\":16,\"passed\":1,\"elapsed_ms\":90,\"target\":\"infra\"")
+
+    // 3. run_count = 7
+    let c = run_count()
+    if c != 7 {
+        panic("pe_dispatch_runner_v2 FAIL [run_count] expected=7 got=" + to_string(c))
+    }
+
+    // 4. passed_count = 6
+    let pc = passed_count()
+    if pc != 6 {
+        panic("pe_dispatch_runner_v2 FAIL [passed_count] expected=6 got=" + to_string(pc))
+    }
+
+    // 5. total_elapsed_ms = 120+80+250+60+30+410+90 = 1040
+    let te = total_elapsed_ms()
+    if te != 1040 {
+        panic("pe_dispatch_runner_v2 FAIL [total_elapsed_ms] expected=1040 got=" + to_string(te))
+    }
+
+    // 6. count_by_module_kind sanity (각 kind 1 건씩, 5 개 kind 검증)
+    let k1 = count_by_module_kind(1)
+    if k1 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_module_kind(2)
+    if k2 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_module_kind(3)
+    if k3 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k6 = count_by_module_kind(6)
+    if k6 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k7 = count_by_module_kind(7)
+    if k7 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(7)] expected=1 got=" + to_string(k7))
+    }
+    let k11 = count_by_module_kind(11)
+    if k11 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(11)] expected=1 got=" + to_string(k11))
+    }
+    let k16 = count_by_module_kind(16)
+    if k16 != 1 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(16)] expected=1 got=" + to_string(k16))
+    }
+    let k99 = count_by_module_kind(99)
+    if k99 != 0 {
+        panic("pe_dispatch_runner_v2 FAIL [count_by_module_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. pass_rate_pct = 6 * 100 / 7 = 85
+    let pr = pass_rate_pct()
+    if pr != 85 {
+        panic("pe_dispatch_runner_v2 FAIL [pass_rate_pct] expected=85 got=" + to_string(pr))
+    }
+
+    // 8. slowest_module = 640006 (410ms)
+    let sm = slowest_module()
+    if sm != 640006 {
+        panic("pe_dispatch_runner_v2 FAIL [slowest_module] expected=640006 got=" + to_string(sm))
+    }
+
+    // 9. pdrv2_stats() = [7, 6, 1040, 85, 640006]
+    let s = pdrv2_stats()
+    if len(s) != 5 {
+        panic("pe_dispatch_runner_v2 FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 7 {
+        panic("pe_dispatch_runner_v2 FAIL [stats run_count] expected=7 got=" + to_string(s[0]))
+    }
+    if s[1] != 6 {
+        panic("pe_dispatch_runner_v2 FAIL [stats passed_count] expected=6 got=" + to_string(s[1]))
+    }
+    if s[2] != 1040 {
+        panic("pe_dispatch_runner_v2 FAIL [stats total_elapsed_ms] expected=1040 got=" + to_string(s[2]))
+    }
+    if s[3] != 85 {
+        panic("pe_dispatch_runner_v2 FAIL [stats pass_rate_pct] expected=85 got=" + to_string(s[3]))
+    }
+    if s[4] != 640006 {
+        panic("pe_dispatch_runner_v2 FAIL [stats slowest_module] expected=640006 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_dispatch_runner_v2_stats",
+        "\"run_count\":" + to_string(s[0])
+        + ",\"passed_count\":" + to_string(s[1])
+        + ",\"total_elapsed_ms\":" + to_string(s[2])
+        + ",\"pass_rate_pct\":" + to_string(s[3])
+        + ",\"slowest_module\":" + to_string(s[4]))
+
+    // 11. emit count >= 8 (7 records + 1 stats = 8)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 8 {
+        panic("pe_dispatch_runner_v2 FAIL [r0 emit count] expected=>=8 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pdrv2()
+    let s2 = pdrv2_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_dispatch_runner_v2 FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_dispatch_runner_v2 self_test PASS (runs=" + to_string(s[0])
+        + ", passed=" + to_string(s[1]) + ", elapsed_ms=" + to_string(s[2])
+        + ", pass_rate=" + to_string(s[3]) + "%"
+        + ", slowest=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pdrv2_stats()
+            println("run_count\t" + to_string(s[0]))
+            println("passed_count\t" + to_string(s[1]))
+            println("total_elapsed_ms\t" + to_string(s[2]))
+            println("pass_rate_pct\t" + to_string(s[3]))
+            println("slowest_module\t" + to_string(s[4]))
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_module_kind\t" + to_string(count_by_module_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_dispatch_runner_v2.hexa count <module_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pdrv2()
+            println("cleaned: " + pdrv2_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pdrv2_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_dispatch_runner_v2.hexa { self-test | stats | count <module_kind> | cleanup | dir }")
+}

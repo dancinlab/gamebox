@@ -1,0 +1,426 @@
+// lib/loader/pe_ntdll_fs_control_file.hexa — NTDLL NtFsControlFile FSCTL_* 추적 (cycle 84)
+//
+// NTDLL NtFsControlFile FSCTL_* → Apple BSD ioctl bridge:
+//   NtFsControlFile(FileHandle, ..., IoControlCode, InputBuffer, InputBufferLength, ...)
+//   FSCTL → Apple BSD bridge mapping:
+//     FSCTL_GET_REPARSE_POINT       → readlink(2) (symlink) or APFS clonefile metadata
+//     FSCTL_SET_REPARSE_POINT       → symlink(2) (NTFS symlink emulation)
+//     FSCTL_DELETE_REPARSE_POINT    → unlink(2) on symlink target
+//     FSCTL_SET_SPARSE              → fcntl(F_PREALLOCATE) — APFS sparse file hint
+//     FSCTL_QUERY_ALLOCATED_RANGES  → fcntl(F_LOG2PHYS_EXT) range probe
+//     FSCTL_GET_COMPRESSION         → APFS clonefile / decmpfs xattr query
+//     FSCTL_SET_COMPRESSION         → decmpfs xattr write (compression hint)
+//   D2R/D4 의 .lnk symlink + sparse SaveData (.d2s/.d4s) 가 이 path 사용
+// own1: NTDLL spec + Apple BSD. Wine ntdll/file.c 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 NtFsControlFile call tracker — 실 ioctl/fcntl 호출 X (native bridge stage).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// fsctl_kind code:
+//   1 = FSCTL_GET_REPARSE_POINT
+//   2 = FSCTL_SET_REPARSE_POINT
+//   3 = FSCTL_DELETE_REPARSE_POINT
+//   4 = FSCTL_SET_SPARSE
+//   5 = FSCTL_QUERY_ALLOCATED_RANGES
+//   6 = FSCTL_GET_COMPRESSION
+//   7 = FSCTL_SET_COMPRESSION
+//
+// nt_status code (decimal — stored as int):
+//   0          = STATUS_SUCCESS
+//   3221225506 = 0xC0000022 = STATUS_ACCESS_DENIED
+//   3221225524 = 0xC0000034 = STATUS_OBJECT_NAME_NOT_FOUND
+//
+// persist schema (TSV — calls.tsv):
+//   call_id<int> \t fsctl_kind<int> \t input_bytes<int> \t nt_status<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnfcf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ntdll_fs_control_file"
+}
+
+fn pnfcf_calls_path() -> str {
+    return pnfcf_dir() + "/calls.tsv"
+}
+
+fn pnfcf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnfcf_dir() + "'")
+}
+
+fn cleanup_pnfcf() -> void {
+    pnfcf_ensure_dir()
+    let _ = exec("rm -f '" + pnfcf_calls_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnfcf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnfcf_append_row(path: str, row: str) -> void {
+    pnfcf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_call: NtFsControlFile call 1 건 기록 ───
+fn record_call(call_id: int, fsctl_kind: int, input_bytes: int, nt_status: int) -> void {
+    if call_id <= 0 {
+        panic("pe_ntdll_fs_control_file FAIL [record_call] expected=call_id>0 got=" + to_string(call_id))
+    }
+    if fsctl_kind < 1 {
+        panic("pe_ntdll_fs_control_file FAIL [record_call] expected=fsctl_kind>=1 got=" + to_string(fsctl_kind))
+    }
+    if fsctl_kind > 7 {
+        panic("pe_ntdll_fs_control_file FAIL [record_call] expected=fsctl_kind<=7 got=" + to_string(fsctl_kind))
+    }
+    if input_bytes < 0 {
+        panic("pe_ntdll_fs_control_file FAIL [record_call] expected=input_bytes>=0 got=" + to_string(input_bytes))
+    }
+    if nt_status < 0 {
+        panic("pe_ntdll_fs_control_file FAIL [record_call] expected=nt_status>=0 got=" + to_string(nt_status))
+    }
+    let row = to_string(call_id) + "\t" + to_string(fsctl_kind)
+        + "\t" + to_string(input_bytes) + "\t" + to_string(nt_status) + "\n"
+    pnfcf_append_row(pnfcf_calls_path(), row)
+}
+
+// ─── call_count: total call 수 ───
+fn call_count() -> int {
+    let t = pnfcf_read_table(pnfcf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_fsctl_kind: 특정 fsctl_kind 의 call 수 ───
+fn count_by_fsctl_kind(kind: int) -> int {
+    let t = pnfcf_read_table(pnfcf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── success_count: nt_status == 0 (STATUS_SUCCESS) call 수 ───
+fn success_count() -> int {
+    let t = pnfcf_read_table(pnfcf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 0 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_input_bytes: 전체 input_bytes 합 ───
+fn total_input_bytes() -> int {
+    let t = pnfcf_read_table(pnfcf_calls_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── reparse_count: GET/SET/DELETE_REPARSE_POINT (kinds 1+2+3) 합 ───
+fn reparse_count() -> int {
+    return count_by_fsctl_kind(1) + count_by_fsctl_kind(2) + count_by_fsctl_kind(3)
+}
+
+// ─── call_input_bytes: 특정 call_id 의 input_bytes (없으면 -1) ───
+fn call_input_bytes(call_id: int) -> int {
+    let t = pnfcf_read_table(pnfcf_calls_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == call_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── pnfcf_stats: [call_count, success_count, reparse_count, total_input_bytes] ───
+fn pnfcf_stats() -> array {
+    let mut out = []
+    out.push(call_count())
+    out.push(success_count())
+    out.push(reparse_count())
+    out.push(total_input_bytes())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnfcf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnfcf()
+
+    // 2. record 6 calls — covers ≥4 fsctl_kinds, mix of success/fail nt_status
+    //    FSCTL_GET_REPARSE_POINT SUCCESS (D2R .lnk symlink resolve, 16 bytes header)
+    record_call(140001, 1, 16, 0)
+    r0_emit("pe_ntdll_fs_control_file_record",
+        "\"call_id\":140001,\"fsctl_kind\":1,\"input_bytes\":16,\"nt_status\":0,\"target\":\"FSCTL_GET_REPARSE_POINT\"")
+
+    //    FSCTL_SET_REPARSE_POINT SUCCESS (symlink create, 64 bytes payload)
+    record_call(140002, 2, 64, 0)
+    r0_emit("pe_ntdll_fs_control_file_record",
+        "\"call_id\":140002,\"fsctl_kind\":2,\"input_bytes\":64,\"nt_status\":0,\"target\":\"FSCTL_SET_REPARSE_POINT\"")
+
+    //    FSCTL_DELETE_REPARSE_POINT SUCCESS (8 bytes tag)
+    record_call(140003, 3, 8, 0)
+    r0_emit("pe_ntdll_fs_control_file_record",
+        "\"call_id\":140003,\"fsctl_kind\":3,\"input_bytes\":8,\"nt_status\":0,\"target\":\"FSCTL_DELETE_REPARSE_POINT\"")
+
+    //    FSCTL_SET_SPARSE SUCCESS (D4 .d4s sparse SaveData, 0 bytes input)
+    record_call(140004, 4, 0, 0)
+    r0_emit("pe_ntdll_fs_control_file_record",
+        "\"call_id\":140004,\"fsctl_kind\":4,\"input_bytes\":0,\"nt_status\":0,\"target\":\"FSCTL_SET_SPARSE\"")
+
+    //    FSCTL_QUERY_ALLOCATED_RANGES → ACCESS_DENIED (0xC0000022 = 3221225506), 32 bytes range buffer
+    record_call(140005, 5, 32, 3221225506)
+    r0_emit("pe_ntdll_fs_control_file_record",
+        "\"call_id\":140005,\"fsctl_kind\":5,\"input_bytes\":32,\"nt_status\":3221225506,\"target\":\"FSCTL_QUERY_ALLOCATED_RANGES\"")
+
+    //    FSCTL_GET_REPARSE_POINT → OBJECT_NAME_NOT_FOUND (0xC0000034 = 3221225524), 16 bytes
+    record_call(140006, 1, 16, 3221225524)
+    r0_emit("pe_ntdll_fs_control_file_record",
+        "\"call_id\":140006,\"fsctl_kind\":1,\"input_bytes\":16,\"nt_status\":3221225524,\"target\":\"FSCTL_GET_REPARSE_POINT\"")
+
+    // 3. call_count = 6
+    let c = call_count()
+    if c != 6 {
+        panic("pe_ntdll_fs_control_file FAIL [call_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_fsctl_kind sanity (≥4 fsctl_kinds covered: 1,2,3,4,5)
+    let k1 = count_by_fsctl_kind(1)
+    if k1 != 2 {
+        panic("pe_ntdll_fs_control_file FAIL [count_by_fsctl_kind(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_fsctl_kind(2)
+    if k2 != 1 {
+        panic("pe_ntdll_fs_control_file FAIL [count_by_fsctl_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_fsctl_kind(3)
+    if k3 != 1 {
+        panic("pe_ntdll_fs_control_file FAIL [count_by_fsctl_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_fsctl_kind(4)
+    if k4 != 1 {
+        panic("pe_ntdll_fs_control_file FAIL [count_by_fsctl_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_fsctl_kind(5)
+    if k5 != 1 {
+        panic("pe_ntdll_fs_control_file FAIL [count_by_fsctl_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_fsctl_kind(7)
+    if k99 != 0 {
+        panic("pe_ntdll_fs_control_file FAIL [count_by_fsctl_kind(7)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. success_count = 4 (140001, 140002, 140003, 140004)
+    let sc = success_count()
+    if sc != 4 {
+        panic("pe_ntdll_fs_control_file FAIL [success_count] expected=4 got=" + to_string(sc))
+    }
+
+    // 6. reparse_count = kinds 1+2+3 = 2+1+1 = 4
+    let rc = reparse_count()
+    if rc != 4 {
+        panic("pe_ntdll_fs_control_file FAIL [reparse_count] expected=4 got=" + to_string(rc))
+    }
+
+    // 7. total_input_bytes = 16+64+8+0+32+16 = 136
+    let tib = total_input_bytes()
+    if tib != 136 {
+        panic("pe_ntdll_fs_control_file FAIL [total_input_bytes] expected=136 got=" + to_string(tib))
+    }
+
+    // 8. call_input_bytes sanity
+    let ib2 = call_input_bytes(140002)
+    if ib2 != 64 {
+        panic("pe_ntdll_fs_control_file FAIL [call_input_bytes(140002)] expected=64 got=" + to_string(ib2))
+    }
+    let ib4 = call_input_bytes(140004)
+    if ib4 != 0 {
+        panic("pe_ntdll_fs_control_file FAIL [call_input_bytes(140004)] expected=0 got=" + to_string(ib4))
+    }
+    let ib_miss = call_input_bytes(9999)
+    if ib_miss != -1 {
+        panic("pe_ntdll_fs_control_file FAIL [call_input_bytes(9999)] expected=-1 got=" + to_string(ib_miss))
+    }
+
+    // 9. pnfcf_stats() = [6, 4, 4, 136]
+    let s = pnfcf_stats()
+    if len(s) != 4 {
+        panic("pe_ntdll_fs_control_file FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_ntdll_fs_control_file FAIL [stats call_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_ntdll_fs_control_file FAIL [stats success_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_ntdll_fs_control_file FAIL [stats reparse_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 136 {
+        panic("pe_ntdll_fs_control_file FAIL [stats total_input_bytes] expected=136 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats (7th r0_emit)
+    r0_emit("pe_ntdll_fs_control_file_stats",
+        "\"call_count\":" + to_string(s[0])
+        + ",\"success_count\":" + to_string(s[1])
+        + ",\"reparse_count\":" + to_string(s[2])
+        + ",\"total_input_bytes\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_ntdll_fs_control_file FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0 (post-cleanup zero)
+    cleanup_pnfcf()
+    let s2 = pnfcf_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_ntdll_fs_control_file FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_ntdll_fs_control_file self_test PASS (calls=" + to_string(s[0])
+        + ", success=" + to_string(s[1]) + ", reparse=" + to_string(s[2])
+        + ", input_bytes=" + to_string(s[3]) + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnfcf_stats()
+            println("call_count\t" + to_string(s[0]))
+            println("success_count\t" + to_string(s[1]))
+            println("reparse_count\t" + to_string(s[2]))
+            println("total_input_bytes\t" + to_string(s[3]))
+            return
+        }
+        if sub == "input-bytes" {
+            if len(a) >= 4 {
+                let cid = to_int(a[3])
+                println("call_input_bytes\t" + to_string(call_input_bytes(cid)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_fs_control_file.hexa input-bytes <call_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_fsctl_kind\t" + to_string(count_by_fsctl_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_ntdll_fs_control_file.hexa count <fsctl_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnfcf()
+            println("cleaned: " + pnfcf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnfcf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_ntdll_fs_control_file.hexa { self-test | stats | input-bytes <call_id> | count <fsctl_kind> | cleanup | dir }")
+}

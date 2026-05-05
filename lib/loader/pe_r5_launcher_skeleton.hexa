@@ -1,0 +1,513 @@
+// lib/loader/pe_r5_launcher_skeleton.hexa — R5 cycle Battle.net launcher 실행 추적기.
+//
+// own 1: Battle.net 공식 RFC6749 OAuth + 공개 protocol observation 만 reference.
+//        Wine / CrossOver / Whisky / Box86 / GPTk / community 인용 0 줄.
+// own 2: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// R5 closure 정의:
+//   "Battle.net Setup install 완료 후 launcher (Battle.net.exe) 실행 시점부터
+//    OAuth login → game_select → game_launch → game_running 도달까지 단계 추적"
+//   Setup install (R4 단계, pe_battle_net_setup_install_phase) 직후 시작되는
+//   launcher 자체 lifecycle — D2R / D4 / WoW / Overwatch2 launch path 포함.
+//
+// launcher event_kind:
+//    0 = launcher_start         (Battle.net.exe entry)
+//    1 = splash                 (splash screen first paint)
+//    2 = login_screen           (login UI shown)
+//    3 = oauth_redirect         (login.battle.net/oauth/authorize redirect)
+//    4 = token_received         (access_token received via /oauth/token)
+//    5 = main_screen            (account home view)
+//    6 = game_select            (game tile selected — D2R / D4 / WoW / Overwatch2)
+//    7 = game_launch_request    (Play button pressed)
+//    8 = game_running           (game process spawned + Window first paint)
+//    9 = launcher_exit          (Battle.net.exe terminated)
+//
+// oauth provider: 0 = blizzard (login.battle.net) / 1 = microsoft (Activision MS account)
+//
+// game_name allowed: "D2R" / "D4" / "WoW" / "Overwatch2"
+// launch_status: 0 = pending, 1 = launched, 2 = failed
+//
+// DXGI_FORMAT (swapchain_format) 주요값:
+//   28  = DXGI_FORMAT_R8G8B8A8_UNORM
+//   87  = DXGI_FORMAT_B8G8R8A8_UNORM
+//   91  = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+// Metal target_pixel_format: "BGRA8Unorm" / "RGBA8Unorm" / "BGRA8Unorm_sRGB"
+//
+// 식별자 주의: type/mod/resume/handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: event_id / event_kind / ts_ns / oauth_id / provider / status_code /
+// game_id / game_name / exe_path / launch_status / d3d_id / hwnd_hex /
+// swapchain_format / translate_id / target_pixel_format.
+//
+// persist schema (TSV — 5 separate tables):
+//   launcher_event.tsv    : event_id<int>     \t event_kind<int>      \t ts_ns<int>
+//   oauth.tsv             : oauth_id<int>     \t provider<int>        \t status_code<int>
+//   game_launch.tsv       : game_id<int>      \t game_name<str>       \t exe_path<str>          \t launch_status<int>
+//   d3d11_init.tsv        : d3d_id<int>       \t hwnd_hex<str>        \t swapchain_format<int>
+//   metal_translation.tsv : translate_id<int> \t d3d_id<int>          \t target_pixel_format<str>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pr5l_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_r5_launcher_skeleton"
+}
+
+fn pr5l_launcher_path() -> str {
+    return pr5l_dir() + "/launcher_event.tsv"
+}
+
+fn pr5l_oauth_path() -> str {
+    return pr5l_dir() + "/oauth.tsv"
+}
+
+fn pr5l_game_path() -> str {
+    return pr5l_dir() + "/game_launch.tsv"
+}
+
+fn pr5l_d3d_path() -> str {
+    return pr5l_dir() + "/d3d11_init.tsv"
+}
+
+fn pr5l_metal_path() -> str {
+    return pr5l_dir() + "/metal_translation.tsv"
+}
+
+fn pr5l_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pr5l_dir() + "'")
+}
+
+fn cleanup_pr5l() -> void {
+    pr5l_ensure_dir()
+    let _ = exec("rm -f '" + pr5l_launcher_path() + "' '" + pr5l_oauth_path()
+        + "' '" + pr5l_game_path() + "' '" + pr5l_d3d_path()
+        + "' '" + pr5l_metal_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pr5l_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pr5l_append_row(path: str, row: str) -> void {
+    pr5l_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pr5l_count_rows(path: str, min_cols: int) -> int {
+    let t = pr5l_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookups ───
+fn event_kind_name(k: int) -> str {
+    if k == 0 { return "launcher_start" }
+    if k == 1 { return "splash" }
+    if k == 2 { return "login_screen" }
+    if k == 3 { return "oauth_redirect" }
+    if k == 4 { return "token_received" }
+    if k == 5 { return "main_screen" }
+    if k == 6 { return "game_select" }
+    if k == 7 { return "game_launch_request" }
+    if k == 8 { return "game_running" }
+    if k == 9 { return "launcher_exit" }
+    return "?"
+}
+
+fn provider_name(p: int) -> str {
+    if p == 0 { return "blizzard" }
+    if p == 1 { return "microsoft" }
+    return "?"
+}
+
+// ─── record_launcher_event: launcher lifecycle event 1 건 기록 ───
+fn record_launcher_event(event_id: int, event_kind: int, ts_ns: int) -> void {
+    if event_id <= 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_launcher_event] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if event_kind < 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_launcher_event] expected=event_kind>=0 got=" + to_string(event_kind))
+    }
+    if event_kind > 9 {
+        panic("pe_r5_launcher_skeleton FAIL [record_launcher_event] expected=event_kind<=9 got=" + to_string(event_kind))
+    }
+    if ts_ns < 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_launcher_event] expected=ts_ns>=0 got=" + to_string(ts_ns))
+    }
+    let row = to_string(event_id) + "\t" + to_string(event_kind)
+        + "\t" + to_string(ts_ns) + "\n"
+    pr5l_append_row(pr5l_launcher_path(), row)
+}
+
+// ─── record_oauth: OAuth login 결과 기록 (token 실값 X — status_code only) ───
+fn record_oauth(oauth_id: int, provider: int, status_code: int) -> void {
+    if oauth_id <= 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_oauth] expected=oauth_id>0 got=" + to_string(oauth_id))
+    }
+    if provider < 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_oauth] expected=provider>=0 got=" + to_string(provider))
+    }
+    if provider > 1 {
+        panic("pe_r5_launcher_skeleton FAIL [record_oauth] expected=provider<=1 got=" + to_string(provider))
+    }
+    if status_code < 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_oauth] expected=status_code>=0 got=" + to_string(status_code))
+    }
+    let row = to_string(oauth_id) + "\t" + to_string(provider)
+        + "\t" + to_string(status_code) + "\n"
+    pr5l_append_row(pr5l_oauth_path(), row)
+}
+
+// ─── record_game_launch: launcher 가 launch 한 game 1 건 기록 ───
+fn record_game_launch(game_id: int, game_name: str, exe_path: str, launch_status: int) -> void {
+    if game_id <= 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_game_launch] expected=game_id>0 got=" + to_string(game_id))
+    }
+    if game_name == "" {
+        panic("pe_r5_launcher_skeleton FAIL [record_game_launch] expected=game_name!=empty got=empty")
+    }
+    if exe_path == "" {
+        panic("pe_r5_launcher_skeleton FAIL [record_game_launch] expected=exe_path!=empty got=empty")
+    }
+    if launch_status < 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_game_launch] expected=launch_status>=0 got=" + to_string(launch_status))
+    }
+    if launch_status > 2 {
+        panic("pe_r5_launcher_skeleton FAIL [record_game_launch] expected=launch_status<=2 got=" + to_string(launch_status))
+    }
+    let row = to_string(game_id) + "\t" + game_name + "\t" + exe_path
+        + "\t" + to_string(launch_status) + "\n"
+    pr5l_append_row(pr5l_game_path(), row)
+}
+
+// ─── record_d3d11_init: D3D11 device + swapchain init 기록 ───
+fn record_d3d11_init(d3d_id: int, hwnd_hex: str, swapchain_format: int) -> void {
+    if d3d_id <= 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_d3d11_init] expected=d3d_id>0 got=" + to_string(d3d_id))
+    }
+    if hwnd_hex == "" {
+        panic("pe_r5_launcher_skeleton FAIL [record_d3d11_init] expected=hwnd_hex!=empty got=empty")
+    }
+    if swapchain_format < 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_d3d11_init] expected=swapchain_format>=0 got=" + to_string(swapchain_format))
+    }
+    let row = to_string(d3d_id) + "\t" + hwnd_hex
+        + "\t" + to_string(swapchain_format) + "\n"
+    pr5l_append_row(pr5l_d3d_path(), row)
+}
+
+// ─── record_metal_translation: D3D11 → Metal pixel format translation 기록 ───
+fn record_metal_translation(translate_id: int, d3d_id: int, target_pixel_format: str) -> void {
+    if translate_id <= 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_metal_translation] expected=translate_id>0 got=" + to_string(translate_id))
+    }
+    if d3d_id <= 0 {
+        panic("pe_r5_launcher_skeleton FAIL [record_metal_translation] expected=d3d_id>0 got=" + to_string(d3d_id))
+    }
+    if target_pixel_format == "" {
+        panic("pe_r5_launcher_skeleton FAIL [record_metal_translation] expected=target_pixel_format!=empty got=empty")
+    }
+    let row = to_string(translate_id) + "\t" + to_string(d3d_id)
+        + "\t" + target_pixel_format + "\n"
+    pr5l_append_row(pr5l_metal_path(), row)
+}
+
+// ─── statistics ───
+fn launcher_event_count() -> int {
+    return pr5l_count_rows(pr5l_launcher_path(), 3)
+}
+
+fn oauth_count() -> int {
+    return pr5l_count_rows(pr5l_oauth_path(), 3)
+}
+
+fn game_launch_count() -> int {
+    return pr5l_count_rows(pr5l_game_path(), 4)
+}
+
+fn d3d11_init_count() -> int {
+    return pr5l_count_rows(pr5l_d3d_path(), 3)
+}
+
+fn metal_translation_count() -> int {
+    return pr5l_count_rows(pr5l_metal_path(), 3)
+}
+
+fn pr5l_stats() -> array {
+    let mut out = []
+    out.push(launcher_event_count())
+    out.push(oauth_count())
+    out.push(game_launch_count())
+    out.push(d3d11_init_count())
+    out.push(metal_translation_count())
+    return out
+}
+
+// ─── self_test (≥ 12 record: 10 launcher + 1 oauth + 4 game + 4 d3d11 + 4 metal = 23) ───
+fn self_test() -> void {
+    let sid = "pr5l-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pr5l()
+
+    // ─── 2. 10 launcher_event — 전 단계 (kind 0..9) ───
+    record_launcher_event(1, 0, 1000)        // launcher_start
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":1,\"event_kind\":0,\"event\":\"launcher_start\",\"ts_ns\":1000")
+
+    record_launcher_event(2, 1, 2000)        // splash
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":2,\"event_kind\":1,\"event\":\"splash\",\"ts_ns\":2000")
+
+    record_launcher_event(3, 2, 3000)        // login_screen
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":3,\"event_kind\":2,\"event\":\"login_screen\",\"ts_ns\":3000")
+
+    record_launcher_event(4, 3, 4000)        // oauth_redirect → login.battle.net/oauth/authorize
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":4,\"event_kind\":3,\"event\":\"oauth_redirect\",\"ts_ns\":4000")
+
+    record_launcher_event(5, 4, 5000)        // token_received → /oauth/token (access_token)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":5,\"event_kind\":4,\"event\":\"token_received\",\"ts_ns\":5000")
+
+    record_launcher_event(6, 5, 6000)        // main_screen
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":6,\"event_kind\":5,\"event\":\"main_screen\",\"ts_ns\":6000")
+
+    record_launcher_event(7, 6, 7000)        // game_select (D2R tile clicked)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":7,\"event_kind\":6,\"event\":\"game_select\",\"ts_ns\":7000")
+
+    record_launcher_event(8, 7, 8000)        // game_launch_request (Play button)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":8,\"event_kind\":7,\"event\":\"game_launch_request\",\"ts_ns\":8000")
+
+    record_launcher_event(9, 8, 9000)        // game_running (process spawned)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":9,\"event_kind\":8,\"event\":\"game_running\",\"ts_ns\":9000")
+
+    record_launcher_event(10, 9, 10000)      // launcher_exit
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"launcher_event\",\"event_id\":10,\"event_kind\":9,\"event\":\"launcher_exit\",\"ts_ns\":10000")
+
+    // ─── 3. 1 oauth — blizzard provider, status 200 (token_received) ───
+    record_oauth(1, 0, 200)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"oauth\",\"oauth_id\":1,\"provider\":0,\"provider_name\":\"blizzard\",\"status_code\":200")
+
+    // ─── 4. 4 game_launch — D2R / D4 / WoW / Overwatch2 ───
+    record_game_launch(1, "D2R", "C:\\Program Files (x86)\\Diablo II Resurrected\\D2R.exe", 1)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"game_launch\",\"game_id\":1,\"game_name\":\"D2R\",\"launch_status\":1")
+
+    record_game_launch(2, "D4", "C:\\Program Files (x86)\\Diablo IV\\Diablo IV.exe", 1)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"game_launch\",\"game_id\":2,\"game_name\":\"D4\",\"launch_status\":1")
+
+    record_game_launch(3, "WoW", "C:\\Program Files (x86)\\World of Warcraft\\_retail_\\Wow.exe", 1)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"game_launch\",\"game_id\":3,\"game_name\":\"WoW\",\"launch_status\":1")
+
+    record_game_launch(4, "Overwatch2", "C:\\Program Files (x86)\\Overwatch\\_retail_\\Overwatch.exe", 1)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"game_launch\",\"game_id\":4,\"game_name\":\"Overwatch2\",\"launch_status\":1")
+
+    // ─── 5. 4 d3d11_init — 각 게임 별 swapchain_format=87 (DXGI_FORMAT_B8G8R8A8_UNORM) ───
+    record_d3d11_init(1, "0xD2010001", 87)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"d3d11_init\",\"d3d_id\":1,\"hwnd\":\"0xD2010001\",\"swapchain_format\":87,\"format\":\"BGRA8_UNORM\",\"game\":\"D2R\"")
+
+    record_d3d11_init(2, "0xD4010001", 87)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"d3d11_init\",\"d3d_id\":2,\"hwnd\":\"0xD4010001\",\"swapchain_format\":87,\"format\":\"BGRA8_UNORM\",\"game\":\"D4\"")
+
+    record_d3d11_init(3, "0xW0010001", 87)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"d3d11_init\",\"d3d_id\":3,\"hwnd\":\"0xW0010001\",\"swapchain_format\":87,\"format\":\"BGRA8_UNORM\",\"game\":\"WoW\"")
+
+    record_d3d11_init(4, "0x0W210001", 87)
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"d3d11_init\",\"d3d_id\":4,\"hwnd\":\"0x0W210001\",\"swapchain_format\":87,\"format\":\"BGRA8_UNORM\",\"game\":\"Overwatch2\"")
+
+    // ─── 6. 4 metal_translation — DXGI BGRA8 → Metal BGRA8Unorm ───
+    record_metal_translation(1, 1, "BGRA8Unorm")
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"metal_translation\",\"translate_id\":1,\"d3d_id\":1,\"target_pixel_format\":\"BGRA8Unorm\",\"game\":\"D2R\"")
+
+    record_metal_translation(2, 2, "BGRA8Unorm")
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"metal_translation\",\"translate_id\":2,\"d3d_id\":2,\"target_pixel_format\":\"BGRA8Unorm\",\"game\":\"D4\"")
+
+    record_metal_translation(3, 3, "BGRA8Unorm")
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"metal_translation\",\"translate_id\":3,\"d3d_id\":3,\"target_pixel_format\":\"BGRA8Unorm\",\"game\":\"WoW\"")
+
+    record_metal_translation(4, 4, "BGRA8Unorm")
+    r0_emit("pe_r5_launcher_skeleton_record",
+        "\"kind\":\"metal_translation\",\"translate_id\":4,\"d3d_id\":4,\"target_pixel_format\":\"BGRA8Unorm\",\"game\":\"Overwatch2\"")
+
+    // ─── 7. assertions: launcher==10 / oauth==1 / game==4 / d3d11==4 / metal==4 ───
+    let lec = launcher_event_count()
+    if lec != 10 {
+        panic("pe_r5_launcher_skeleton FAIL [launcher_event_count] expected=10 got=" + to_string(lec))
+    }
+    let oc = oauth_count()
+    if oc != 1 {
+        panic("pe_r5_launcher_skeleton FAIL [oauth_count] expected=1 got=" + to_string(oc))
+    }
+    let gc = game_launch_count()
+    if gc != 4 {
+        panic("pe_r5_launcher_skeleton FAIL [game_launch_count] expected=4 got=" + to_string(gc))
+    }
+    let dc = d3d11_init_count()
+    if dc != 4 {
+        panic("pe_r5_launcher_skeleton FAIL [d3d11_init_count] expected=4 got=" + to_string(dc))
+    }
+    let mc = metal_translation_count()
+    if mc != 4 {
+        panic("pe_r5_launcher_skeleton FAIL [metal_translation_count] expected=4 got=" + to_string(mc))
+    }
+
+    // ─── 8. name lookup assertions ───
+    if event_kind_name(0) != "launcher_start" {
+        panic("pe_r5_launcher_skeleton FAIL [event_kind_name(0)] expected=launcher_start got=" + event_kind_name(0))
+    }
+    if event_kind_name(3) != "oauth_redirect" {
+        panic("pe_r5_launcher_skeleton FAIL [event_kind_name(3)] expected=oauth_redirect got=" + event_kind_name(3))
+    }
+    if event_kind_name(8) != "game_running" {
+        panic("pe_r5_launcher_skeleton FAIL [event_kind_name(8)] expected=game_running got=" + event_kind_name(8))
+    }
+    if event_kind_name(9) != "launcher_exit" {
+        panic("pe_r5_launcher_skeleton FAIL [event_kind_name(9)] expected=launcher_exit got=" + event_kind_name(9))
+    }
+    if provider_name(0) != "blizzard" {
+        panic("pe_r5_launcher_skeleton FAIL [provider_name(0)] expected=blizzard got=" + provider_name(0))
+    }
+    if provider_name(1) != "microsoft" {
+        panic("pe_r5_launcher_skeleton FAIL [provider_name(1)] expected=microsoft got=" + provider_name(1))
+    }
+
+    // ─── 9. stats sanity ───
+    let s = pr5l_stats()
+    if len(s) != 5 {
+        panic("pe_r5_launcher_skeleton FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 10 {
+        panic("pe_r5_launcher_skeleton FAIL [stats launcher] expected=10 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_r5_launcher_skeleton FAIL [stats oauth] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_r5_launcher_skeleton FAIL [stats game_launch] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_r5_launcher_skeleton FAIL [stats d3d11_init] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 4 {
+        panic("pe_r5_launcher_skeleton FAIL [stats metal_translation] expected=4 got=" + to_string(s[4]))
+    }
+
+    // ─── 10. emit stats (23 record + 1 stats = 24 ≥ 14) ───
+    r0_emit("pe_r5_launcher_skeleton_stats",
+        "\"launcher_event_count\":" + to_string(s[0])
+        + ",\"oauth_count\":" + to_string(s[1])
+        + ",\"game_launch_count\":" + to_string(s[2])
+        + ",\"d3d11_init_count\":" + to_string(s[3])
+        + ",\"metal_translation_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_r5_launcher_skeleton FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── 11. cleanup → 모든 stats 0 ───
+    cleanup_pr5l()
+    let s2 = pr5l_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_r5_launcher_skeleton FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_r5_launcher_skeleton self_test PASS (launcher=" + to_string(s[0])
+        + ", oauth=" + to_string(s[1]) + ", game=" + to_string(s[2])
+        + ", d3d11=" + to_string(s[3]) + ", metal=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pr5l_stats()
+            println("launcher_event_count\t" + to_string(s[0]))
+            println("oauth_count\t" + to_string(s[1]))
+            println("game_launch_count\t" + to_string(s[2]))
+            println("d3d11_init_count\t" + to_string(s[3]))
+            println("metal_translation_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "event-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println("event_kind_name\t" + event_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_r5_launcher_skeleton.hexa event-name <event_kind>")
+            return
+        }
+        if sub == "provider-name" {
+            if len(a) >= 4 {
+                let p = to_int(a[3])
+                println("provider_name\t" + provider_name(p))
+                return
+            }
+            println("usage: hexa run pe_r5_launcher_skeleton.hexa provider-name <provider>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pr5l()
+            println("cleaned: " + pr5l_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pr5l_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_r5_launcher_skeleton.hexa { self-test | stats | event-name <k> | provider-name <p> | cleanup | dir }")
+}

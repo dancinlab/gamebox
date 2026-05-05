@@ -1,0 +1,217 @@
+// lib/loader/pe_ipc_request_response.hexa — stage5 sync RPC pattern skeleton
+//
+// 동기 RPC: send request → block on response → return result. timeout 처리,
+// retry 로직 추적.
+//
+// own 1 enforcement: Wine / CrossOver / ReactOS sync RPC bridge 0 줄.
+//   참조 only — Microsoft 공식 IPC / synchronous API spec:
+//     - CreateFile:        https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+//     - ReadFile:          https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
+//     - DeviceIoControl:   https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-deviceiocontrol
+//     - TransactNamedPipe: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-transactnamedpipe
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5 (record × 4 + summary)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_ipc_request_response FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — Win32 sync RPC instrumentation):
+//   stage5 = sync RPC pattern skeleton (rpc record + count + bytes/elapsed).
+//   stage6 = 실 blocking I/O — CreateFile/ReadFile/DeviceIoControl 동기 wait.
+//
+// schema (rpc_calls.tsv): rpc_id<int> | request_size<int> | response_size<int> | elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist 디렉토리 ───
+fn pirr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_ipc_request_response"
+}
+
+fn rpc_calls_path() -> str {
+    return pirr_dir() + "/rpc_calls.tsv"
+}
+
+fn ensure_pirr_dir() -> void {
+    let _ = exec("mkdir -p '" + pirr_dir() + "'")
+}
+
+fn cleanup_pirr() -> void {
+    let _ = exec("rm -rf '" + pirr_dir() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_pirr_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_pirr_row(path: str, row: str) -> void {
+    ensure_pirr_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_rpc ───
+fn record_rpc(rpc_id: int, request_size: int, response_size: int, elapsed_us: int) -> void {
+    let row = to_string(rpc_id) + "\t" + to_string(request_size)
+        + "\t" + to_string(response_size) + "\t" + to_string(elapsed_us) + "\n"
+    append_pirr_row(rpc_calls_path(), row)
+    r0_emit("pirr_record", "\"rpc_id\":" + to_string(rpc_id)
+        + ",\"req\":" + to_string(request_size)
+        + ",\"resp\":" + to_string(response_size)
+        + ",\"elapsed_us\":" + to_string(elapsed_us))
+}
+
+// ─── rpc_count: 전체 row 수 ───
+fn rpc_count() -> int {
+    let t = read_pirr_table(rpc_calls_path())
+    if t == "" {
+        return 0
+    }
+    let r = exec("wc -l < '" + rpc_calls_path() + "' | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_request_bytes: request_size 합계 ───
+fn total_request_bytes() -> int {
+    let t = read_pirr_table(rpc_calls_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + rpc_calls_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_response_bytes: response_size 합계 ───
+fn total_response_bytes() -> int {
+    let t = read_pirr_table(rpc_calls_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + rpc_calls_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── total_elapsed_us: elapsed_us 합계 ───
+fn total_elapsed_us() -> int {
+    let t = read_pirr_table(rpc_calls_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + rpc_calls_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── avg_elapsed_us: 0-guard ───
+fn avg_elapsed_us() -> int {
+    let n = rpc_count()
+    if n == 0 { return 0 }
+    let sum = total_elapsed_us()
+    return sum / n
+}
+
+// ─── rpc_round_trip_us: rpc_id 의 elapsed_us lookup ───
+fn rpc_round_trip_us(rpc_id: int) -> int {
+    let t = read_pirr_table(rpc_calls_path())
+    if t == "" { return 0 }
+    let r = exec("awk -F'\\t' -v i=" + to_string(rpc_id) + " '$1==i {print $4; exit}' '" + rpc_calls_path() + "' 2>/dev/null").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── pirr_stats: [rpc_count, total_request_bytes, total_response_bytes, avg_elapsed_us] ───
+fn pirr_stats() -> array {
+    return [rpc_count(), total_request_bytes(), total_response_bytes(), avg_elapsed_us()]
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pirr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pirr()
+
+    // 합성 4 rpcs — Win32 sync RPC flow
+    record_rpc(113001, 64, 128, 240)     // small RPC
+    record_rpc(113002, 256, 512, 480)    // medium
+    record_rpc(113003, 128, 64, 180)     // reverse (large req, small resp)
+    record_rpc(113004, 1024, 4096, 1200) // bulk transfer
+
+    // rpc_count
+    let rc = rpc_count()
+    if rc != 4 { panic("pe_ipc_request_response FAIL [rpc_count] expected=4 got=" + to_string(rc)) }
+
+    // total_request_bytes
+    let trq = total_request_bytes()
+    if trq != 1472 { panic("pe_ipc_request_response FAIL [total_request_bytes] expected=1472 got=" + to_string(trq)) }
+
+    // total_response_bytes
+    let trp = total_response_bytes()
+    if trp != 4800 { panic("pe_ipc_request_response FAIL [total_response_bytes] expected=4800 got=" + to_string(trp)) }
+
+    // total_elapsed_us
+    let te = total_elapsed_us()
+    if te != 2100 { panic("pe_ipc_request_response FAIL [total_elapsed_us] expected=2100 got=" + to_string(te)) }
+
+    // avg_elapsed_us
+    let avg = avg_elapsed_us()
+    if avg != 525 { panic("pe_ipc_request_response FAIL [avg_elapsed_us] expected=525 got=" + to_string(avg)) }
+
+    // rpc_round_trip_us lookup
+    let rt1 = rpc_round_trip_us(113001)
+    if rt1 != 240 { panic("pe_ipc_request_response FAIL [rtt 113001] expected=240 got=" + to_string(rt1)) }
+    let rt4 = rpc_round_trip_us(113004)
+    if rt4 != 1200 { panic("pe_ipc_request_response FAIL [rtt 113004] expected=1200 got=" + to_string(rt4)) }
+    let rt_missing = rpc_round_trip_us(9999)
+    if rt_missing != 0 { panic("pe_ipc_request_response FAIL [rtt 9999] expected=0 got=" + to_string(rt_missing)) }
+
+    // pirr_stats
+    let s = pirr_stats()
+    if len(s) != 4 { panic("pe_ipc_request_response FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 4 { panic("pe_ipc_request_response FAIL [stats rpc_count] expected=4 got=" + to_string(s[0])) }
+    if s[1] != 1472 { panic("pe_ipc_request_response FAIL [stats total_req] expected=1472 got=" + to_string(s[1])) }
+    if s[2] != 4800 { panic("pe_ipc_request_response FAIL [stats total_resp] expected=4800 got=" + to_string(s[2])) }
+    if s[3] != 525 { panic("pe_ipc_request_response FAIL [stats avg_elapsed] expected=525 got=" + to_string(s[3])) }
+
+    // summary emit
+    r0_emit("pirr_summary", "\"rpcs\":" + to_string(s[0])
+        + ",\"req_bytes\":" + to_string(s[1])
+        + ",\"resp_bytes\":" + to_string(s[2])
+        + ",\"avg_us\":" + to_string(s[3]))
+
+    // emit count >= 5 (4 record + 1 summary)
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("pe_ipc_request_response FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    cleanup_pirr()
+
+    println("  ✅ pe_ipc_request_response self_test PASS (4 rpcs, req=1472 resp=4800 elapsed=2100us avg=525us, rtt[113001]=240 rtt[113004]=1200, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pirr_stats()
+            println("rpc_count=" + to_string(s[0]) + " total_request_bytes=" + to_string(s[1]) + " total_response_bytes=" + to_string(s[2]) + " avg_elapsed_us=" + to_string(s[3]))
+            return
+        }
+        if sub == "rtt" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println(to_string(rpc_round_trip_us(rid)))
+                return
+            }
+            println("usage: hexa run pe_ipc_request_response.hexa rtt <rpc_id>")
+            return
+        }
+        if sub == "cleanup" { cleanup_pirr(); println("cleaned"); return }
+    }
+    println("usage: hexa run pe_ipc_request_response.hexa { self-test | stats | rtt <rpc_id> | cleanup }")
+}

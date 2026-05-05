@@ -1,0 +1,369 @@
+// lib/loader/pe_resource_section.hexa — stage3 PE .rsrc section parser skeleton
+//
+// PE Resource Directory: hierarchical (Type → Name/ID → Lang → Data). RT_ICON,
+// RT_STRING, RT_VERSION, RT_MANIFEST, RT_BITMAP 등. resource ID 별 size 추적.
+//
+// own 1: only `use "../perf/r0_common"` (POSIX equivalent — Wine 0 줄).
+//   참조 only — Microsoft PE/COFF spec (Resource Directory, DataDir[2]).
+// own 2 mandate:
+//   - r0_emit ≥ 5
+//     (실제: prss_record × 4 + prss_stats = 5)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("pe_resource_section FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase — PE .rsrc section instrumentation):
+//   stage1 = pe_parser.hexa 가 PE header parser.
+//   stage2 = pe_loader_stage2.hexa 가 section mapping.
+//   stage3 = .rsrc section ledger (record_resource / stats / per-pe size).
+//   stage4 = 실 resource extraction (icon/bitmap/version write-out, 별도 file).
+//
+// res_kind 코드:
+//   1 = RT_ICON      (icon 그룹/리소스)
+//   2 = RT_STRING    (문자열 테이블)
+//   3 = RT_VERSION   (VS_VERSION_INFO)
+//   4 = RT_MANIFEST  (assembly manifest XML)
+//   5 = RT_BITMAP    (BMP)
+//   6 = RT_DIALOG    (dialog template)
+//   7 = other        (RT_ACCELERATOR/RT_MENU/etc.)
+//
+// Persist layout (TSV, single file):
+//   $GAMEBOX_HOME/persist/pe_resource_section/rsrc_log.tsv
+//     pe_id<int> \t res_kind<int> \t count<int> \t total_bytes<int>
+//
+// 예약어 회피: type/mod/resume/handle 미사용. res_kind 식별자 OK.
+// 함수명 prss_stats 채택 (cycle60 prs_stats / cycle61 pers_stats 와 충돌 회피).
+
+use "../perf/r0_common"
+
+// ─── persist dir / file path ───
+fn prss_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_resource_section"
+}
+
+fn prss_log_path() -> str {
+    return prss_dir() + "/rsrc_log.tsv"
+}
+
+fn ensure_prss_dir() -> void {
+    let _ = exec("mkdir -p '" + prss_dir() + "'")
+}
+
+// ─── cleanup: log file 제거 (avoid `prs` collision → cleanup_prs2) ───
+fn cleanup_prs2() -> void {
+    ensure_prss_dir()
+    let _ = exec("rm -f '" + prss_log_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn prss_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn prss_append_row(path: str, row: str) -> void {
+    ensure_prss_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_resource: 한 PE 의 한 res_kind 1 row 추가 ───
+//   pe_id        — synthetic PE 식별자 (90xxx).
+//   res_kind     — 1=RT_ICON, 2=RT_STRING, 3=RT_VERSION, 4=RT_MANIFEST,
+//                  5=RT_BITMAP, 6=RT_DIALOG, 7=other.
+//   count        — 그 kind 의 resource entry 수.
+//   total_bytes  — 그 kind data 의 누적 byte 수.
+fn record_resource(pe_id: int, res_kind: int, count: int, total_bytes: int) -> void {
+    let row = to_string(pe_id) + "\t" + to_string(res_kind)
+        + "\t" + to_string(count) + "\t" + to_string(total_bytes) + "\n"
+    prss_append_row(prss_log_path(), row)
+}
+
+// ─── resource_count: rsrc_log.tsv 의 row 수 (= record_resource 호출 수) ───
+fn resource_count() -> int {
+    let t = prss_read_table(prss_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── total_count: 모든 row 의 count 합 ───
+fn total_count() -> int {
+    let t = prss_read_table(prss_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_bytes: 모든 row 의 total_bytes 합 ───
+fn total_bytes() -> int {
+    let t = prss_read_table(prss_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_kind: 특정 res_kind 가 등장한 row 수 ───
+fn count_by_kind(kind: int) -> int {
+    let t = prss_read_table(prss_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── pe_resource_bytes: 특정 pe_id 의 모든 res_kind total_bytes 합 ───
+fn pe_resource_bytes(pe_id: int) -> int {
+    let t = prss_read_table(prss_log_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut sum = 0
+    let key = to_string(pe_id)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if parts[0] == key {
+                    sum = sum + to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── prss_stats: [resource_count, total_count, total_bytes, count_by_kind(1)] ───
+fn prss_stats() -> array {
+    let mut out = []
+    let recs = resource_count()
+    let tot_c = total_count()
+    let tot_b = total_bytes()
+    let icons = count_by_kind(1)
+    out.push(recs)
+    out.push(tot_c)
+    out.push(tot_b)
+    out.push(icons)
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "prss-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_prs2()
+    if resource_count() != 0 {
+        panic("pe_resource_section FAIL [cleanup] expected=0 got=" + to_string(resource_count()))
+    }
+
+    // 2. 합성 4 resource kinds — Battle.net Setup .rsrc 가정
+    record_resource(90001, 1, 12, 480000)
+    r0_emit("prss_record",
+        "\"pe_id\":90001,\"res_kind\":1,\"count\":12,\"total_bytes\":480000")
+
+    record_resource(90001, 2, 240, 32000)
+    r0_emit("prss_record",
+        "\"pe_id\":90001,\"res_kind\":2,\"count\":240,\"total_bytes\":32000")
+
+    record_resource(90001, 3, 1, 2400)
+    r0_emit("prss_record",
+        "\"pe_id\":90001,\"res_kind\":3,\"count\":1,\"total_bytes\":2400")
+
+    record_resource(90001, 4, 1, 1024)
+    r0_emit("prss_record",
+        "\"pe_id\":90001,\"res_kind\":4,\"count\":1,\"total_bytes\":1024")
+
+    // 3. resource_count = 4
+    let rc = resource_count()
+    if rc != 4 {
+        panic("pe_resource_section FAIL [resource_count] expected=4 got=" + to_string(rc))
+    }
+
+    // 4. total_count = 12 + 240 + 1 + 1 = 254
+    let tc = total_count()
+    if tc != 254 {
+        panic("pe_resource_section FAIL [total_count] expected=254 got=" + to_string(tc))
+    }
+
+    // 5. total_bytes = 480000 + 32000 + 2400 + 1024 = 515424
+    let tb = total_bytes()
+    if tb != 515424 {
+        panic("pe_resource_section FAIL [total_bytes] expected=515424 got=" + to_string(tb))
+    }
+
+    // 6. count_by_kind 검증 (각 kind 1건씩, 99 = 0)
+    let k1 = count_by_kind(1)
+    if k1 != 1 {
+        panic("pe_resource_section FAIL [count_by_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_kind(2)
+    if k2 != 1 {
+        panic("pe_resource_section FAIL [count_by_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_kind(3)
+    if k3 != 1 {
+        panic("pe_resource_section FAIL [count_by_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_kind(4)
+    if k4 != 1 {
+        panic("pe_resource_section FAIL [count_by_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_kind(99)
+    if k99 != 0 {
+        panic("pe_resource_section FAIL [count_by_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. pe_resource_bytes
+    let pb = pe_resource_bytes(90001)
+    if pb != 515424 {
+        panic("pe_resource_section FAIL [pe_resource_bytes 90001] expected=515424 got="
+            + to_string(pb))
+    }
+    let pb0 = pe_resource_bytes(9999)
+    if pb0 != 0 {
+        panic("pe_resource_section FAIL [pe_resource_bytes 9999] expected=0 got="
+            + to_string(pb0))
+    }
+
+    // 8. prss_stats = [4, 254, 515424, 1]
+    let s = prss_stats()
+    if len(s) != 4 {
+        panic("pe_resource_section FAIL [prss_stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_resource_section FAIL [prss_stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 254 {
+        panic("pe_resource_section FAIL [prss_stats[1]] expected=254 got=" + to_string(s[1]))
+    }
+    if s[2] != 515424 {
+        panic("pe_resource_section FAIL [prss_stats[2]] expected=515424 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_resource_section FAIL [prss_stats[3]] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit prss_stats
+    r0_emit("prss_stats",
+        "\"recs\":" + to_string(s[0])
+        + ",\"total_count\":" + to_string(s[1])
+        + ",\"total_bytes\":" + to_string(s[2])
+        + ",\"icons\":" + to_string(s[3]))
+
+    // 10. r0 emit count >= 5
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_resource_section FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    println("  ✅ pe_resource_section self_test PASS (" + to_string(s[0])
+        + " kinds, " + to_string(s[1]) + " entries, "
+        + to_string(s[2]) + " bytes, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = prss_stats()
+            println("recs\t" + to_string(s[0]))
+            println("total_count\t" + to_string(s[1]))
+            println("total_bytes\t" + to_string(s[2]))
+            println("icons\t" + to_string(s[3]))
+            return
+        }
+        if sub == "bytes" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println(to_string(pe_resource_bytes(pid)))
+                return
+            }
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(to_string(count_by_kind(k)))
+                return
+            }
+        }
+        if sub == "cleanup" {
+            cleanup_prs2()
+            println("cleaned: " + prss_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_resource_section.hexa { self-test | stats | bytes <pe_id> | count <res_kind> | cleanup }")
+}

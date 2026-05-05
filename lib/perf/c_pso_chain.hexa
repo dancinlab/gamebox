@@ -1,0 +1,695 @@
+// lib/perf/c_pso_chain.hexa — CN-7 C-PSO-CHAIN (15/15)
+//
+// 무엇:
+//   PSO 도미노 예측 — boss_fight_start / zone_entry / character_class_load
+//   같은 *trigger event* 발생 시 컴파일되는 PSO 의 *순서 패턴* 학습 →
+//   셰이더A 컴파일 시작하는 순간 다음 셰이더B/C 도 background pre-compile.
+//   첫 launch = 학습 (record_chain 으로 jsonl 누적). 이후 = predict_next_pso
+//   (현재까지 컴파일된 prefix → 빈도 max next).
+//
+// 무기:
+//   - AC trie pattern (PSO compile sequence): c_shader_seq.hexa /
+//     c_dll_load_predict.hexa 의 trie/forecast 동일 패턴 — 평행 array
+//     (prefix→next, count) + group-by-string-key.
+//   - Holt forecast: game/trigger 별 chain 빈도 누적 → 가중 max.
+//
+// 효과:
+//   PSO compile 의 *연쇄 패턴* 학습 → 셰이더A 컴파일 시작하는 순간 다음
+//   셰이더B/C 도 background pre-compile. boss room 진입 직전 hot PSO set
+//   사전 compile → boss-fight 진입 시 hitch 제거.
+//
+// schema (JSONL row):
+//   {"game":"<name>","trigger":"<event>","chain":"H1,H2,H3","count":N,"ts":<unix>}
+//
+// hexa-lang stage1 제약: try/catch X, float X, bit ops X, dict literal X,
+// args() = [hexa, file, ...userargs] → a[2] = first user arg.
+//
+// own 1 mandate: Wine / CrossOver / community 코드 0 줄. 본 모듈은 prediction
+// cache 만 — synthetic chain (text-only PSO hash list) round-trip 검증.
+//
+// own 2 mandate: r0_emit ≥ 5 (record × 5 + predict × 3), fn self_test() +
+// main() dispatch, headless, panic 형식
+// "c_pso_chain FAIL [<sub>] expected=X got=Y".
+
+use "./r0_common"
+
+// ─── cache layout ───
+//   ~/.airgenome/gamebox/persist/pso_chain/sequences.jsonl
+fn chain_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pso_chain"
+}
+
+fn sequences_path() -> str {
+    return chain_dir() + "/sequences.jsonl"
+}
+
+fn chain_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + chain_dir() + "'")
+}
+
+// ─── join hash list → "11111,22222,33333" ───
+fn join_hashes(hashes: array) -> str {
+    let s = ""
+    let i = 0
+    while i < len(hashes) {
+        if i > 0 { s = s + "," }
+        s = s + to_string(hashes[i])
+        i = i + 1
+    }
+    return s
+}
+
+// ─── record_chain ───
+//   한 trigger event 에서 컴파일된 PSO hash 순서 기록 → sequences.jsonl
+//   append + emit "pso_chain_recorded".
+fn record_chain(game: str, trigger: str, pso_hashes: array) -> void {
+    chain_ensure_dir()
+    let chain_str = join_hashes(pso_hashes)
+    let ts = exec("date +%s").trim()
+    let line = "{\"game\":\"" + game + "\""
+        + ",\"trigger\":\"" + trigger + "\""
+        + ",\"chain\":\"" + chain_str + "\""
+        + ",\"count\":" + to_string(len(pso_hashes))
+        + ",\"ts\":" + ts
+        + "}"
+    r0_append_line(sequences_path(), line)
+    r0_emit("pso_chain_recorded",
+        "\"game\":\"" + game + "\",\"trigger\":\"" + trigger
+        + "\",\"count\":" + to_string(len(pso_hashes)))
+}
+
+// ─── load chains for game + trigger ───
+//   각 row → array of int hash. 결과는 array of array.
+//   stage1 dict X → 평행 line scan + sed 추출.
+fn load_chains(game: str, trigger: str) -> array {
+    chain_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let needle_g = "\"game\":\"" + game + "\""
+    let needle_t = "\"trigger\":\"" + trigger + "\""
+    let cmd = "grep -F '" + needle_g + "' '" + path
+        + "' 2>/dev/null | grep -F '" + needle_t
+        + "' 2>/dev/null | sed -E 's/.*\"chain\":\"([^\"]*)\".*/\\1/'"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            let parts = ln.split(",")
+            // string → int conversion
+            let ints = []
+            let j = 0
+            while j < len(parts) {
+                ints = ints + [to_int(parts[j])]
+                j = j + 1
+            }
+            out = out + [ints]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── load chains for game (모든 trigger) ───
+fn load_chains_by_game(game: str) -> array {
+    chain_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let needle_g = "\"game\":\"" + game + "\""
+    // [trigger, chain_str] 튜플 추출 — sed 로 두 필드 같이 추출 후 \t 구분.
+    let cmd = "grep -F '" + needle_g + "' '" + path
+        + "' 2>/dev/null | sed -E 's/.*\"trigger\":\"([^\"]*)\".*\"chain\":\"([^\"]*)\".*/\\1\t\\2/'"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            let cols = ln.split("\t")
+            if len(cols) >= 2 {
+                let trig = cols[0]
+                let chain_str = cols[1]
+                let parts = chain_str.split(",")
+                let ints = []
+                let j = 0
+                while j < len(parts) {
+                    ints = ints + [to_int(parts[j])]
+                    j = j + 1
+                }
+                out = out + [[trig, ints]]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── predict_next_pso ───
+//   game/trigger 의 모든 chain 을 load → current_chain prefix 직후 등장한
+//   PSO hash 빈도 최대값 반환. prefix 가 빈 array 면 0번째 hash 후보.
+//   매칭 없거나 unknown trigger 면 0 emit (unknown marker).
+fn predict_next_pso(game: str, trigger: str, current_chain: array) -> int {
+    let chains = load_chains(game, trigger)
+    if len(chains) == 0 {
+        r0_emit("pso_chain_predict",
+            "\"game\":\"" + game + "\",\"trigger\":\"" + trigger
+            + "\",\"prediction\":0,\"reason\":\"no_data\"")
+        return 0
+    }
+    let cur_len = len(current_chain)
+
+    let candidates = []
+    let counts = []
+
+    let i = 0
+    while i < len(chains) {
+        let seq = chains[i]
+        // prefix match: seq[0..cur_len-1] == current_chain
+        if len(seq) > cur_len {
+            let is_match = true
+            let j = 0
+            while j < cur_len {
+                if seq[j] != current_chain[j] {
+                    is_match = false
+                }
+                j = j + 1
+            }
+            if is_match {
+                let next_h = seq[cur_len]
+                // candidate dedup
+                let found = -1
+                let k = 0
+                while k < len(candidates) {
+                    if candidates[k] == next_h {
+                        found = k
+                    }
+                    k = k + 1
+                }
+                if found < 0 {
+                    candidates = candidates + [next_h]
+                    counts = counts + [1]
+                } else {
+                    counts[found] = counts[found] + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    if len(candidates) == 0 {
+        r0_emit("pso_chain_predict",
+            "\"game\":\"" + game + "\",\"trigger\":\"" + trigger
+            + "\",\"prediction\":0,\"reason\":\"no_match\"")
+        return 0
+    }
+
+    // max count
+    let max_idx = 0
+    let m = 1
+    while m < len(counts) {
+        if counts[m] > counts[max_idx] {
+            max_idx = m
+        }
+        m = m + 1
+    }
+    let pred = candidates[max_idx]
+    r0_emit("pso_chain_predict",
+        "\"game\":\"" + game + "\",\"trigger\":\"" + trigger
+        + "\",\"prediction\":" + to_string(pred)
+        + ",\"count\":" + to_string(counts[max_idx]))
+    return pred
+}
+
+// ─── chain_lengths ───
+//   game 의 trigger 별 chain length 통계 → [[trigger, avg_length, max_length, count], ...]
+//   avg_length 는 int truncation (stage1 float X).
+fn chain_lengths(game: str) -> array {
+    let by = load_chains_by_game(game)
+
+    let triggers = []
+    let sums = []
+    let maxes = []
+    let counts = []
+
+    let i = 0
+    while i < len(by) {
+        let row = by[i]
+        let trig = row[0]
+        let seq = row[1]
+        let l = len(seq)
+        let found = -1
+        let k = 0
+        while k < len(triggers) {
+            if triggers[k] == trig {
+                found = k
+            }
+            k = k + 1
+        }
+        if found < 0 {
+            triggers = triggers + [trig]
+            sums = sums + [l]
+            maxes = maxes + [l]
+            counts = counts + [1]
+        } else {
+            sums[found] = sums[found] + l
+            if l > maxes[found] {
+                maxes[found] = l
+            }
+            counts[found] = counts[found] + 1
+        }
+        i = i + 1
+    }
+
+    let out = []
+    let i2 = 0
+    while i2 < len(triggers) {
+        let avg = sums[i2] / counts[i2]
+        out = out + [[triggers[i2], avg, maxes[i2], counts[i2]]]
+        i2 = i2 + 1
+    }
+    return out
+}
+
+// ─── load all chains (모든 game / trigger) ───
+fn load_all_chains() -> array {
+    chain_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" { return [] }
+
+    let cmd = "sed -E 's/.*\"chain\":\"([^\"]*)\".*/\\1/' '" + path + "' 2>/dev/null"
+    let raw = exec(cmd)
+    if raw == "" { return [] }
+
+    let lines = raw.split("\n")
+    let out = []
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            out = out + [ln]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── top_chains ───
+//   가장 자주 나타나는 PSO chain pattern → [[chain_str, freq], ...]
+//   상위 n 개 (count 내림차순 정렬). chain_str 은 "H1,H2,H3" raw 형식.
+fn top_chains(n: int) -> array {
+    let all = load_all_chains()
+    let chains = []
+    let counts = []
+    let i = 0
+    while i < len(all) {
+        let c = all[i]
+        let found = -1
+        let k = 0
+        while k < len(chains) {
+            if chains[k] == c {
+                found = k
+            }
+            k = k + 1
+        }
+        if found < 0 {
+            chains = chains + [c]
+            counts = counts + [1]
+        } else {
+            counts[found] = counts[found] + 1
+        }
+        i = i + 1
+    }
+
+    // 정렬 (단순 selection sort, count 내림차순)
+    let idxs = []
+    let i2 = 0
+    while i2 < len(chains) {
+        idxs = idxs + [i2]
+        i2 = i2 + 1
+    }
+    let a = 0
+    while a < len(idxs) {
+        let max_pos = a
+        let b = a + 1
+        while b < len(idxs) {
+            if counts[idxs[b]] > counts[idxs[max_pos]] {
+                max_pos = b
+            }
+            b = b + 1
+        }
+        if max_pos != a {
+            let tmp = idxs[a]
+            idxs[a] = idxs[max_pos]
+            idxs[max_pos] = tmp
+        }
+        a = a + 1
+    }
+
+    let out = []
+    let take = n
+    if take > len(idxs) { take = len(idxs) }
+    let p = 0
+    while p < take {
+        let id = idxs[p]
+        out = out + [[chains[id], counts[id]]]
+        p = p + 1
+    }
+    return out
+}
+
+// ─── precompile_candidates ───
+//   현재 chain 시작 hash 가 주어졌을 때 다음에 올 hash array.
+//   game/trigger 의 모든 chain 중 chain[0] == first_hash 인 row → chain[1] 후보.
+//   dedup, 빈도 내림차순 정렬.
+fn precompile_candidates(game: str, trigger: str, first_hash: int) -> array {
+    let chains = load_chains(game, trigger)
+    let cands = []
+    let counts = []
+    let i = 0
+    while i < len(chains) {
+        let seq = chains[i]
+        if len(seq) >= 2 {
+            if seq[0] == first_hash {
+                let nh = seq[1]
+                let found = -1
+                let k = 0
+                while k < len(cands) {
+                    if cands[k] == nh {
+                        found = k
+                    }
+                    k = k + 1
+                }
+                if found < 0 {
+                    cands = cands + [nh]
+                    counts = counts + [1]
+                } else {
+                    counts[found] = counts[found] + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // sort by count desc
+    let a = 0
+    while a < len(cands) {
+        let max_pos = a
+        let b = a + 1
+        while b < len(cands) {
+            if counts[b] > counts[max_pos] {
+                max_pos = b
+            }
+            b = b + 1
+        }
+        if max_pos != a {
+            let tc = cands[a]
+            cands[a] = cands[max_pos]
+            cands[max_pos] = tc
+            let tn = counts[a]
+            counts[a] = counts[max_pos]
+            counts[max_pos] = tn
+        }
+        a = a + 1
+    }
+    return cands
+}
+
+// ─── cache_stats ───
+//   [num_sequences, unique_games, unique_triggers, total_psos]
+fn cache_stats() -> array {
+    chain_ensure_dir()
+    let path = sequences_path()
+    let exists = exec("test -f '" + path + "' && echo ok").trim()
+    if exists != "ok" {
+        return [0, 0, 0, 0]
+    }
+
+    let n_seq = 0
+    let c = exec("wc -l < '" + path + "' 2>/dev/null | tr -d ' '").trim()
+    if c != "" { n_seq = to_int(c) }
+
+    let games_cmd = "sed -E 's/.*\"game\":\"([^\"]*)\".*/\\1/' '" + path
+        + "' 2>/dev/null | sort -u | wc -l | tr -d ' '"
+    let g = exec(games_cmd).trim()
+    let n_games = 0
+    if g != "" { n_games = to_int(g) }
+
+    let trig_cmd = "sed -E 's/.*\"trigger\":\"([^\"]*)\".*/\\1/' '" + path
+        + "' 2>/dev/null | sort -u | wc -l | tr -d ' '"
+    let t = exec(trig_cmd).trim()
+    let n_trigs = 0
+    if t != "" { n_trigs = to_int(t) }
+
+    // total psos = sum of count fields
+    let total_cmd = "sed -E 's/.*\"count\":([0-9]+).*/\\1/' '" + path
+        + "' 2>/dev/null | awk '{s+=$1} END{print s+0}'"
+    let tt = exec(total_cmd).trim()
+    let total = 0
+    if tt != "" { total = to_int(tt) }
+
+    return [n_seq, n_games, n_trigs, total]
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "psochain-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cache reset
+    let path = sequences_path()
+    let _rm = exec("rm -f '" + path + "'")
+
+    // 2-6. record 5 chains
+    record_chain("d4", "boss_fight_start", [11111, 22222, 33333])
+    record_chain("d4", "boss_fight_start", [11111, 22222, 33333])
+    record_chain("d4", "boss_fight_start", [11111, 22222, 44444])
+    record_chain("d4", "zone_entry", [55555, 66666])
+    record_chain("d2r", "character_class_load", [77777, 88888, 99999])
+
+    // 7. predict_next_pso("d4", "boss_fight_start", [11111]) → 22222 (3/3)
+    let p1 = predict_next_pso("d4", "boss_fight_start", [11111])
+    if p1 != 22222 {
+        panic("c_pso_chain FAIL [predict prefix=11111] expected=22222 got=" + to_string(p1))
+    }
+
+    // 8. predict_next_pso("d4", "boss_fight_start", [11111, 22222]) → 33333 (most freq, 2/3)
+    let p2 = predict_next_pso("d4", "boss_fight_start", [11111, 22222])
+    if p2 != 33333 {
+        panic("c_pso_chain FAIL [predict prefix=11111,22222] expected=33333 got=" + to_string(p2))
+    }
+
+    // 9. predict_next_pso("d4", "unknown", []) → 0 (unknown trigger marker)
+    let p3 = predict_next_pso("d4", "unknown", [])
+    if p3 != 0 {
+        panic("c_pso_chain FAIL [predict unknown trigger] expected=0 got=" + to_string(p3))
+    }
+
+    // 10. chain_lengths("d4") → boss_fight_start avg=3, zone_entry avg=2
+    let cl = chain_lengths("d4")
+    let boss_avg = -1
+    let boss_max = -1
+    let boss_cnt = -1
+    let zone_avg = -1
+    let zone_max = -1
+    let zone_cnt = -1
+    let i = 0
+    while i < len(cl) {
+        let row = cl[i]
+        if row[0] == "boss_fight_start" {
+            boss_avg = row[1]
+            boss_max = row[2]
+            boss_cnt = row[3]
+        }
+        if row[0] == "zone_entry" {
+            zone_avg = row[1]
+            zone_max = row[2]
+            zone_cnt = row[3]
+        }
+        i = i + 1
+    }
+    if boss_avg != 3 {
+        panic("c_pso_chain FAIL [chain_lengths boss avg] expected=3 got=" + to_string(boss_avg))
+    }
+    if boss_max != 3 {
+        panic("c_pso_chain FAIL [chain_lengths boss max] expected=3 got=" + to_string(boss_max))
+    }
+    if boss_cnt != 3 {
+        panic("c_pso_chain FAIL [chain_lengths boss count] expected=3 got=" + to_string(boss_cnt))
+    }
+    if zone_avg != 2 {
+        panic("c_pso_chain FAIL [chain_lengths zone avg] expected=2 got=" + to_string(zone_avg))
+    }
+    if zone_max != 2 {
+        panic("c_pso_chain FAIL [chain_lengths zone max] expected=2 got=" + to_string(zone_max))
+    }
+    if zone_cnt != 1 {
+        panic("c_pso_chain FAIL [chain_lengths zone count] expected=1 got=" + to_string(zone_cnt))
+    }
+
+    // 11. precompile_candidates("d4", "boss_fight_start", 11111) → [22222]
+    //     모든 boss chain 이 11111 → 22222 → ... 시작 → 22222 단일 후보 (count=3)
+    let pc = precompile_candidates("d4", "boss_fight_start", 11111)
+    if len(pc) != 1 {
+        panic("c_pso_chain FAIL [precompile len] expected=1 got=" + to_string(len(pc)))
+    }
+    if pc[0] != 22222 {
+        panic("c_pso_chain FAIL [precompile[0]] expected=22222 got=" + to_string(pc[0]))
+    }
+
+    // 11b. top_chains(2) — 가장 자주 등장한 chain pattern.
+    //      "11111,22222,33333" = 2회, 다른 chain 들 = 1회 각.
+    let tc = top_chains(2)
+    if len(tc) < 1 {
+        panic("c_pso_chain FAIL [top_chains len] expected>=1 got=" + to_string(len(tc)))
+    }
+    if tc[0][0] != "11111,22222,33333" {
+        panic("c_pso_chain FAIL [top_chains top] expected=11111,22222,33333 got=" + to_string(tc[0][0]))
+    }
+    if tc[0][1] != 2 {
+        panic("c_pso_chain FAIL [top_chains top freq] expected=2 got=" + to_string(tc[0][1]))
+    }
+
+    // 13. cache_stats → [5, 2, 3, 14]
+    //     14 = 3+3+3+2+3 (총 14 PSO compile event). 본 모듈은 spec text "[5,2,3,13]"
+    //     의 sum 산수 오기 보정 — 실제 합은 14 (3*3 + 2 + 3 = 14).
+    let stats = cache_stats()
+    if stats[0] != 5 {
+        panic("c_pso_chain FAIL [stats num_sequences] expected=5 got=" + to_string(stats[0]))
+    }
+    if stats[1] != 2 {
+        panic("c_pso_chain FAIL [stats unique_games] expected=2 got=" + to_string(stats[1]))
+    }
+    if stats[2] != 3 {
+        panic("c_pso_chain FAIL [stats unique_triggers] expected=3 got=" + to_string(stats[2]))
+    }
+    if stats[3] != 14 {
+        panic("c_pso_chain FAIL [stats total_psos] expected=14 got=" + to_string(stats[3]))
+    }
+
+    // 12. emit count: 5 record + 3 predict ≥ 5
+    let evt_cnt = r0_session_count(sid)
+    if evt_cnt < 5 {
+        panic("c_pso_chain FAIL [emit count] expected>=5 got=" + to_string(evt_cnt))
+    }
+    // record × 5 + predict × 3 = 8 expected.
+    if evt_cnt != 8 {
+        panic("c_pso_chain FAIL [emit count exact] expected=8 got=" + to_string(evt_cnt))
+    }
+
+    // 14. cleanup
+    let _idx_rm = exec("rm -f '" + path + "'")
+
+    println("  ✅ c_pso_chain self_test PASS (5 chains, 2 games, 3 triggers, predict 3/3, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "record" {
+            // record <game> <trigger> <h1,h2,...>
+            if len(a) >= 6 {
+                let parts = a[5].split(",")
+                let hashes = []
+                let i = 0
+                while i < len(parts) {
+                    hashes = hashes + [to_int(parts[i])]
+                    i = i + 1
+                }
+                record_chain(a[3], a[4], hashes)
+                println("recorded: " + a[3] + "/" + a[4] + " (" + to_string(len(hashes)) + " psos)")
+                return
+            }
+        }
+        if sub == "predict" {
+            // predict <game> <trigger> <h1,h2,...>
+            if len(a) >= 6 {
+                let parts = a[5].split(",")
+                let cur = []
+                let i = 0
+                while i < len(parts) {
+                    if parts[i] != "" {
+                        cur = cur + [to_int(parts[i])]
+                    }
+                    i = i + 1
+                }
+                let p = predict_next_pso(a[3], a[4], cur)
+                println(to_string(p))
+                return
+            }
+        }
+        if sub == "chain-lengths" {
+            if len(a) >= 4 {
+                let cl = chain_lengths(a[3])
+                let i = 0
+                while i < len(cl) {
+                    let row = cl[i]
+                    println(to_string(row[0]) + " avg=" + to_string(row[1])
+                        + " max=" + to_string(row[2])
+                        + " count=" + to_string(row[3]))
+                    i = i + 1
+                }
+                return
+            }
+        }
+        if sub == "top-chains" {
+            if len(a) >= 4 {
+                let nn = to_int(a[3])
+                let tc = top_chains(nn)
+                let i = 0
+                while i < len(tc) {
+                    let row = tc[i]
+                    println(to_string(row[0]) + " freq=" + to_string(row[1]))
+                    i = i + 1
+                }
+                return
+            }
+        }
+        if sub == "precompile" {
+            // precompile <game> <trigger> <first_hash>
+            if len(a) >= 6 {
+                let fh = to_int(a[5])
+                let cand = precompile_candidates(a[3], a[4], fh)
+                let i = 0
+                while i < len(cand) {
+                    println(to_string(cand[i]))
+                    i = i + 1
+                }
+                return
+            }
+        }
+        if sub == "stats" {
+            let s = cache_stats()
+            println("num_sequences=" + to_string(s[0])
+                + " unique_games=" + to_string(s[1])
+                + " unique_triggers=" + to_string(s[2])
+                + " total_psos=" + to_string(s[3]))
+            return
+        }
+        if sub == "chain-dir" {
+            println(chain_dir())
+            return
+        }
+        if sub == "sequences-path" {
+            println(sequences_path())
+            return
+        }
+    }
+    println("usage: hexa run c_pso_chain.hexa { self-test | record <game> <trigger> <h1,h2,...> | predict <game> <trigger> <h1,h2,...> | chain-lengths <game> | top-chains <n> | precompile <game> <trigger> <first_hash> | stats | chain-dir | sequences-path }")
+}

@@ -1,0 +1,507 @@
+// lib/loader/pe_user32_core.hexa — USER32.dll core syscall surface tracker (skeleton-tier)
+//
+// own1: Hexa pure. Wine/CrossOver/Whisky/GPTK 의존 0. ReactOS/Wine user32 source 인용 0.
+//       AppKit/Cocoa NSWindow/NSEvent 직접 binding 0. windows.h/winuser.h reference shape 만
+//       (HWND/MSG/WNDCLASSEXW/POINT/RECT). 실 CreateWindowExW / 실 GetMessageW / 실 MessageBoxW
+//       = 미수행.
+// own2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + panic 형식. PARTIAL emit
+//       명시 — full coverage 측 multi-cycle long-horizon, production smoke pending.
+// online_expansion_lockin: L1 + L2 + L3 + L4 + L5 ALL OK (사용자 lock-in 2026-05-03).
+//
+// Track Q1 — USER32 (user32.dll) core UI/window/input surface coverage 20 fn skeleton row.
+// Track O predecessor (KERNEL32 18 fn) 후 본 Track Q1 는 USER32 5 group baseline land. cycle
+// 28 측 26/435 (~5.98%) → cycle 29 측 46/435 (~10.57%) coverage progression (+20 fn 신규).
+//
+// 대상 fn (20 fn — 5 group, fn_kind 0..19):
+//   Window (5):    CreateWindowExW/DestroyWindow/ShowWindow/UpdateWindow/GetWindowRect
+//   Message (5):   GetMessageW/TranslateMessage/DispatchMessageW/PeekMessageW/PostMessageW
+//   Input (5):     GetKeyState/GetAsyncKeyState/GetCursorPos/SetCursorPos/GetForegroundWindow
+//   Dialog (3):    MessageBoxW/MessageBoxA/DialogBoxParamW
+//   Misc (2):      RegisterClassExW/DefWindowProcW
+//
+// synthetic HWND: hwnd_hex "0x00010404", parent "0x00010400" (D2R top-level window).
+// synthetic MSG (28 byte = HWND + UINT + WPARAM + LPARAM + DWORD + POINT 16-byte LE).
+// synthetic WNDCLASSEXW (80 byte, cbSize 0x50 LE), POINT (8 byte): x=640 y=400.
+// synthetic RECT (16 byte = 4×LONG): {0,0,1280,720}.
+// persist schema (TSV 4 table): syscall_invoke / window_lifecycle / message_pump / input_event.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn puser_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_user32_core"
+}
+
+fn puser_syscall_invoke_path() -> str {
+    return puser_dir() + "/syscall_invoke.tsv"
+}
+
+fn puser_window_lifecycle_path() -> str {
+    return puser_dir() + "/window_lifecycle.tsv"
+}
+
+fn puser_message_pump_path() -> str {
+    return puser_dir() + "/message_pump.tsv"
+}
+
+fn puser_input_event_path() -> str {
+    return puser_dir() + "/input_event.tsv"
+}
+
+fn puser_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + puser_dir() + "'")
+}
+
+fn cleanup_puser() -> void {
+    puser_ensure_dir()
+    let _ = exec("rm -f '" + puser_syscall_invoke_path() + "' '" + puser_window_lifecycle_path()
+        + "' '" + puser_message_pump_path() + "' '" + puser_input_event_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn puser_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn puser_append_row(path: str, row: str) -> void {
+    puser_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn puser_count_rows(path: str, min_cols: int) -> int {
+    let t = puser_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: fn_kind_name (20 fn coverage, fn_kind 0..19) ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "CreateWindowExW" }
+    if k == 1 { return "DestroyWindow" }
+    if k == 2 { return "ShowWindow" }
+    if k == 3 { return "UpdateWindow" }
+    if k == 4 { return "GetWindowRect" }
+    if k == 5 { return "GetMessageW" }
+    if k == 6 { return "TranslateMessage" }
+    if k == 7 { return "DispatchMessageW" }
+    if k == 8 { return "PeekMessageW" }
+    if k == 9 { return "PostMessageW" }
+    if k == 10 { return "GetKeyState" }
+    if k == 11 { return "GetAsyncKeyState" }
+    if k == 12 { return "GetCursorPos" }
+    if k == 13 { return "SetCursorPos" }
+    if k == 14 { return "GetForegroundWindow" }
+    if k == 15 { return "MessageBoxW" }
+    if k == 16 { return "MessageBoxA" }
+    if k == 17 { return "DialogBoxParamW" }
+    if k == 18 { return "RegisterClassExW" }
+    if k == 19 { return "DefWindowProcW" }
+    return "unknown"
+}
+
+// ─── helper: fn_group_name (5 group classification) ───
+fn fn_group_name(k: int) -> str {
+    if k >= 0 {
+        if k <= 4 {
+            return "window"
+        }
+    }
+    if k >= 5 {
+        if k <= 9 {
+            return "message"
+        }
+    }
+    if k >= 10 {
+        if k <= 14 {
+            return "input"
+        }
+    }
+    if k >= 15 {
+        if k <= 17 {
+            return "dialog"
+        }
+    }
+    if k >= 18 {
+        if k <= 19 {
+            return "misc"
+        }
+    }
+    return "unknown"
+}
+
+// ─── persist row helpers ───
+
+// ─── record_syscall_invoke: USER32 fn invoke milestone (skeleton row) ───
+fn record_syscall_invoke(invoke_id: int, fn_kind: int, fn_name: str, status: str) -> void {
+    if invoke_id <= 0 {
+        panic("pe_user32_core FAIL [record_syscall_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_user32_core FAIL [record_syscall_invoke] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 19 {
+        panic("pe_user32_core FAIL [record_syscall_invoke] expected=fn_kind<=19 got=" + to_string(fn_kind))
+    }
+    if fn_name == "" {
+        panic("pe_user32_core FAIL [record_syscall_invoke] expected=fn_name!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_user32_core FAIL [record_syscall_invoke] expected=status!=empty got=empty")
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(fn_kind) + "\t"
+        + fn_name + "\t" + status + "\n"
+    puser_append_row(puser_syscall_invoke_path(), row)
+}
+
+// ─── record_window_lifecycle: CreateWindowExW / DestroyWindow / ShowWindow / GetWindowRect synthetic byte counter ───
+fn record_window_lifecycle(life_id: int, op_id: str, hwnd_hex: str, payload_hex: str, status: str) -> void {
+    if life_id <= 0 {
+        panic("pe_user32_core FAIL [record_window_lifecycle] expected=life_id>0 got=" + to_string(life_id))
+    }
+    if op_id == "" {
+        panic("pe_user32_core FAIL [record_window_lifecycle] expected=op_id!=empty got=empty")
+    }
+    if hwnd_hex == "" {
+        panic("pe_user32_core FAIL [record_window_lifecycle] expected=hwnd_hex!=empty got=empty")
+    }
+    if payload_hex == "" {
+        panic("pe_user32_core FAIL [record_window_lifecycle] expected=payload_hex!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_user32_core FAIL [record_window_lifecycle] expected=status!=empty got=empty")
+    }
+    let row = to_string(life_id) + "\t" + op_id + "\t" + hwnd_hex + "\t"
+        + payload_hex + "\t" + status + "\n"
+    puser_append_row(puser_window_lifecycle_path(), row)
+}
+
+// ─── record_message_pump: GetMessageW / TranslateMessage / DispatchMessageW / PostMessageW row ───
+fn record_message_pump(pump_id: int, msg_kind: str, hwnd_hex: str, msg_synth_hex: str, status: str) -> void {
+    if pump_id <= 0 {
+        panic("pe_user32_core FAIL [record_message_pump] expected=pump_id>0 got=" + to_string(pump_id))
+    }
+    if msg_kind == "" {
+        panic("pe_user32_core FAIL [record_message_pump] expected=msg_kind!=empty got=empty")
+    }
+    if hwnd_hex == "" {
+        panic("pe_user32_core FAIL [record_message_pump] expected=hwnd_hex!=empty got=empty")
+    }
+    if msg_synth_hex == "" {
+        panic("pe_user32_core FAIL [record_message_pump] expected=msg_synth_hex!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_user32_core FAIL [record_message_pump] expected=status!=empty got=empty")
+    }
+    let row = to_string(pump_id) + "\t" + msg_kind + "\t" + hwnd_hex + "\t"
+        + msg_synth_hex + "\t" + status + "\n"
+    puser_append_row(puser_message_pump_path(), row)
+}
+
+// ─── record_input_event: input fn event row (POINT + virtual-key code synth) ───
+fn record_input_event(evt_id: int, input_kind: str, fn_name: str, payload_hex: str, status: str) -> void {
+    if evt_id <= 0 {
+        panic("pe_user32_core FAIL [record_input_event] expected=evt_id>0 got=" + to_string(evt_id))
+    }
+    if input_kind == "" {
+        panic("pe_user32_core FAIL [record_input_event] expected=input_kind!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_user32_core FAIL [record_input_event] expected=fn_name!=empty got=empty")
+    }
+    if payload_hex == "" {
+        panic("pe_user32_core FAIL [record_input_event] expected=payload_hex!=empty got=empty")
+    }
+    if status == "" {
+        panic("pe_user32_core FAIL [record_input_event] expected=status!=empty got=empty")
+    }
+    let row = to_string(evt_id) + "\t" + input_kind + "\t" + fn_name + "\t"
+        + payload_hex + "\t" + status + "\n"
+    puser_append_row(puser_input_event_path(), row)
+}
+
+// ─── statistics ───
+fn syscall_invoke_count() -> int {
+    return puser_count_rows(puser_syscall_invoke_path(), 4)
+}
+
+fn window_lifecycle_count() -> int {
+    return puser_count_rows(puser_window_lifecycle_path(), 5)
+}
+
+fn message_pump_count() -> int {
+    return puser_count_rows(puser_message_pump_path(), 5)
+}
+
+fn input_event_count() -> int {
+    return puser_count_rows(puser_input_event_path(), 5)
+}
+
+fn puser_stats() -> array {
+    let mut out = []
+    out.push(syscall_invoke_count())
+    out.push(window_lifecycle_count())
+    out.push(message_pump_count())
+    out.push(input_event_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "puser-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_puser()
+
+    // ─── 1. syscall_invoke × 20 (one per fn, 5 group coverage) ───
+    //   Window group (5)
+    record_syscall_invoke(1, 0, "CreateWindowExW", "PARTIAL")
+    println("__USER32__ PARTIAL CreateWindowExW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":1,\"fn_kind\":0,\"fn_name\":\"CreateWindowExW\",\"fn_group\":\"window\",\"status\":\"PARTIAL\",\"class_name_w_synth\":\"D2RClient\",\"hwnd_hex\":\"0x00010404\",\"ex_style\":\"0x00000000\",\"style\":\"0x10CF0000\"")
+    record_syscall_invoke(2, 1, "DestroyWindow", "PARTIAL")
+    println("__USER32__ PARTIAL DestroyWindow")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":2,\"fn_kind\":1,\"fn_name\":\"DestroyWindow\",\"fn_group\":\"window\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\"")
+    record_syscall_invoke(3, 2, "ShowWindow", "PARTIAL")
+    println("__USER32__ PARTIAL ShowWindow")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":3,\"fn_kind\":2,\"fn_name\":\"ShowWindow\",\"fn_group\":\"window\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\",\"cmd_show\":5")
+    record_syscall_invoke(4, 3, "UpdateWindow", "PARTIAL")
+    println("__USER32__ PARTIAL UpdateWindow")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":4,\"fn_kind\":3,\"fn_name\":\"UpdateWindow\",\"fn_group\":\"window\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\"")
+    record_syscall_invoke(5, 4, "GetWindowRect", "PARTIAL")
+    println("__USER32__ PARTIAL GetWindowRect")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":5,\"fn_kind\":4,\"fn_name\":\"GetWindowRect\",\"fn_group\":\"window\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\",\"rect_synth_hex\":\"00000000000000000005000000D00200\"")
+
+    //   Message group (5)
+    record_syscall_invoke(6, 5, "GetMessageW", "PARTIAL")
+    println("__USER32__ PARTIAL GetMessageW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":6,\"fn_kind\":5,\"fn_name\":\"GetMessageW\",\"fn_group\":\"message\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\",\"msg_synth_hex\":\"04040100000000000F0100000000000000000000000000000000000000000000\"")
+    record_syscall_invoke(7, 6, "TranslateMessage", "PARTIAL")
+    println("__USER32__ PARTIAL TranslateMessage")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":7,\"fn_kind\":6,\"fn_name\":\"TranslateMessage\",\"fn_group\":\"message\",\"status\":\"PARTIAL\",\"msg_kind\":\"WM_KEYDOWN\",\"vk\":\"0x41\"")
+    record_syscall_invoke(8, 7, "DispatchMessageW", "PARTIAL")
+    println("__USER32__ PARTIAL DispatchMessageW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":8,\"fn_kind\":7,\"fn_name\":\"DispatchMessageW\",\"fn_group\":\"message\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\"")
+    record_syscall_invoke(9, 8, "PeekMessageW", "PARTIAL")
+    println("__USER32__ PARTIAL PeekMessageW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":9,\"fn_kind\":8,\"fn_name\":\"PeekMessageW\",\"fn_group\":\"message\",\"status\":\"PARTIAL\",\"remove_msg\":\"PM_NOREMOVE\",\"hwnd_hex\":\"0x00010404\"")
+    record_syscall_invoke(10, 9, "PostMessageW", "PARTIAL")
+    println("__USER32__ PARTIAL PostMessageW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":10,\"fn_kind\":9,\"fn_name\":\"PostMessageW\",\"fn_group\":\"message\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\",\"msg\":\"WM_CLOSE\",\"wparam\":\"0x00000000\",\"lparam\":\"0x00000000\"")
+
+    //   Input group (5: GetKeyState + GetAsyncKeyState + GetCursorPos + SetCursorPos + GetForegroundWindow)
+    record_syscall_invoke(11, 10, "GetKeyState", "PARTIAL")
+    println("__USER32__ PARTIAL GetKeyState")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":11,\"fn_kind\":10,\"fn_name\":\"GetKeyState\",\"fn_group\":\"input\",\"status\":\"PARTIAL\",\"vk\":\"0x10\",\"state_synth\":\"0x0080\"")
+    record_syscall_invoke(12, 11, "GetAsyncKeyState", "PARTIAL")
+    println("__USER32__ PARTIAL GetAsyncKeyState")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":12,\"fn_kind\":11,\"fn_name\":\"GetAsyncKeyState\",\"fn_group\":\"input\",\"status\":\"PARTIAL\",\"vk\":\"0x41\",\"state_synth\":\"0x8000\"")
+    record_syscall_invoke(13, 12, "GetCursorPos", "PARTIAL")
+    println("__USER32__ PARTIAL GetCursorPos")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":13,\"fn_kind\":12,\"fn_name\":\"GetCursorPos\",\"fn_group\":\"input\",\"status\":\"PARTIAL\",\"point_synth_hex\":\"8002000090010000\",\"x\":640,\"y\":400")
+    record_syscall_invoke(14, 13, "SetCursorPos", "PARTIAL")
+    println("__USER32__ PARTIAL SetCursorPos")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":14,\"fn_kind\":13,\"fn_name\":\"SetCursorPos\",\"fn_group\":\"input\",\"status\":\"PARTIAL\",\"x\":640,\"y\":400")
+    record_syscall_invoke(15, 14, "GetForegroundWindow", "PARTIAL")
+    println("__USER32__ PARTIAL GetForegroundWindow")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":15,\"fn_kind\":14,\"fn_name\":\"GetForegroundWindow\",\"fn_group\":\"input\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\"")
+
+    //   Dialog group (3: MessageBoxW + MessageBoxA + DialogBoxParamW)
+    record_syscall_invoke(16, 15, "MessageBoxW", "PARTIAL")
+    println("__USER32__ PARTIAL MessageBoxW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":16,\"fn_kind\":15,\"fn_name\":\"MessageBoxW\",\"fn_group\":\"dialog\",\"status\":\"PARTIAL\",\"text_w_synth\":\"D2R: connection lost\",\"caption_w_synth\":\"Diablo II: Resurrected\",\"flags\":\"0x00000010\"")
+    record_syscall_invoke(17, 16, "MessageBoxA", "PARTIAL")
+    println("__USER32__ PARTIAL MessageBoxA")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":17,\"fn_kind\":16,\"fn_name\":\"MessageBoxA\",\"fn_group\":\"dialog\",\"status\":\"PARTIAL\",\"text_a_synth\":\"info\",\"flags\":\"0x00000040\"")
+    record_syscall_invoke(18, 17, "DialogBoxParamW", "PARTIAL")
+    println("__USER32__ PARTIAL DialogBoxParamW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":18,\"fn_kind\":17,\"fn_name\":\"DialogBoxParamW\",\"fn_group\":\"dialog\",\"status\":\"PARTIAL\",\"resource_id\":\"0x00000064\",\"hwnd_parent\":\"0x00010400\"")
+
+    //   Misc group (2: RegisterClassExW + DefWindowProcW)
+    record_syscall_invoke(19, 18, "RegisterClassExW", "PARTIAL")
+    println("__USER32__ PARTIAL RegisterClassExW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":19,\"fn_kind\":18,\"fn_name\":\"RegisterClassExW\",\"fn_group\":\"misc\",\"status\":\"PARTIAL\",\"class_name_w_synth\":\"D2RClient\",\"wndclassex_synth_bytes\":80,\"cbSize\":\"0x00000050\"")
+    record_syscall_invoke(20, 19, "DefWindowProcW", "PARTIAL")
+    println("__USER32__ PARTIAL DefWindowProcW")
+    r0_emit("pe_user32_core_record", "\"kind\":\"syscall_invoke\",\"invoke_id\":20,\"fn_kind\":19,\"fn_name\":\"DefWindowProcW\",\"fn_group\":\"misc\",\"status\":\"PARTIAL\",\"hwnd_hex\":\"0x00010404\",\"msg\":\"WM_PAINT\"")
+
+    // ─── 2. window_lifecycle × 4 (create / show / update / destroy) ───
+    record_window_lifecycle(1, "create", "0x00010404", "00000000000000000005000000D00200", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"window_lifecycle\",\"life_id\":1,\"op_id\":\"create\",\"hwnd_hex\":\"0x00010404\",\"rect_synth_hex\":\"00000000000000000005000000D00200\",\"class_name_w_synth\":\"D2RClient\",\"status\":\"PARTIAL\"")
+    record_window_lifecycle(2, "show", "0x00010404", "05000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"window_lifecycle\",\"life_id\":2,\"op_id\":\"show\",\"hwnd_hex\":\"0x00010404\",\"cmd_show_hex\":\"05000000\",\"cmd_show\":5,\"status\":\"PARTIAL\"")
+    record_window_lifecycle(3, "update", "0x00010404", "00000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"window_lifecycle\",\"life_id\":3,\"op_id\":\"update\",\"hwnd_hex\":\"0x00010404\",\"return_synth\":\"0x00000000\",\"status\":\"PARTIAL\"")
+    record_window_lifecycle(4, "destroy", "0x00010404", "00000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"window_lifecycle\",\"life_id\":4,\"op_id\":\"destroy\",\"hwnd_hex\":\"0x00010404\",\"return_synth\":\"0x00000000\",\"status\":\"PARTIAL\"")
+
+    // ─── 3. message_pump × 4 (peek / get / translate / dispatch) ───
+    record_message_pump(1, "peek", "0x00010404", "04040100000000000F0100000000000000000000000000000000000000000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"message_pump\",\"pump_id\":1,\"msg_kind\":\"peek\",\"hwnd_hex\":\"0x00010404\",\"msg_synth_hex\":\"04040100000000000F0100000000000000000000000000000000000000000000\",\"msg_id\":\"WM_PAINT\",\"status\":\"PARTIAL\"")
+    record_message_pump(2, "get", "0x00010404", "0404010000000000000100000000000041000000000000000000000000000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"message_pump\",\"pump_id\":2,\"msg_kind\":\"get\",\"hwnd_hex\":\"0x00010404\",\"msg_synth_hex\":\"0404010000000000000100000000000041000000000000000000000000000000\",\"msg_id\":\"WM_KEYDOWN\",\"vk\":\"0x41\",\"status\":\"PARTIAL\"")
+    record_message_pump(3, "translate", "0x00010404", "0404010000000000020100000000000041000000000000000000000000000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"message_pump\",\"pump_id\":3,\"msg_kind\":\"translate\",\"hwnd_hex\":\"0x00010404\",\"out_msg_id\":\"WM_CHAR\",\"char\":\"0x41\",\"status\":\"PARTIAL\"")
+    record_message_pump(4, "dispatch", "0x00010404", "0404010000000000020100000000000041000000000000000000000000000000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"message_pump\",\"pump_id\":4,\"msg_kind\":\"dispatch\",\"hwnd_hex\":\"0x00010404\",\"return_synth\":\"0x00000000\",\"status\":\"PARTIAL\"")
+
+    // ─── 4. input_event × 4 (key / async / cursor get / cursor set) ───
+    record_input_event(1, "key", "GetKeyState", "10008000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"input_event\",\"evt_id\":1,\"input_kind\":\"key\",\"fn_name\":\"GetKeyState\",\"vk\":\"0x10\",\"state_synth\":\"0x0080\",\"shift_held\":true,\"status\":\"PARTIAL\"")
+    record_input_event(2, "async_key", "GetAsyncKeyState", "41000080", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"input_event\",\"evt_id\":2,\"input_kind\":\"async_key\",\"fn_name\":\"GetAsyncKeyState\",\"vk\":\"0x41\",\"state_synth\":\"0x8000\",\"key_pressed\":true,\"status\":\"PARTIAL\"")
+    record_input_event(3, "cursor_get", "GetCursorPos", "8002000090010000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"input_event\",\"evt_id\":3,\"input_kind\":\"cursor_get\",\"fn_name\":\"GetCursorPos\",\"point_synth_hex\":\"8002000090010000\",\"x\":640,\"y\":400,\"status\":\"PARTIAL\"")
+    record_input_event(4, "cursor_set", "SetCursorPos", "8002000090010000", "PARTIAL")
+    r0_emit("pe_user32_core_record", "\"kind\":\"input_event\",\"evt_id\":4,\"input_kind\":\"cursor_set\",\"fn_name\":\"SetCursorPos\",\"x\":640,\"y\":400,\"return_synth\":\"0x00000001\",\"status\":\"PARTIAL\"")
+
+    // ─── assertions: count ───
+    let si = syscall_invoke_count()
+    if si != 20 {
+        panic("pe_user32_core FAIL [syscall_invoke_count] expected=20 got=" + to_string(si))
+    }
+    let wl = window_lifecycle_count()
+    if wl != 4 {
+        panic("pe_user32_core FAIL [window_lifecycle_count] expected=4 got=" + to_string(wl))
+    }
+    let mp = message_pump_count()
+    if mp != 4 {
+        panic("pe_user32_core FAIL [message_pump_count] expected=4 got=" + to_string(mp))
+    }
+    let ie = input_event_count()
+    if ie != 4 {
+        panic("pe_user32_core FAIL [input_event_count] expected=4 got=" + to_string(ie))
+    }
+
+    // ─── helper name + group classification sanity ───
+    if fn_kind_name(0) != "CreateWindowExW" { panic("pe_user32_core FAIL [fn_kind_name(0)]") }
+    if fn_kind_name(5) != "GetMessageW" { panic("pe_user32_core FAIL [fn_kind_name(5)]") }
+    if fn_kind_name(10) != "GetKeyState" { panic("pe_user32_core FAIL [fn_kind_name(10)]") }
+    if fn_kind_name(15) != "MessageBoxW" { panic("pe_user32_core FAIL [fn_kind_name(15)]") }
+    if fn_kind_name(19) != "DefWindowProcW" { panic("pe_user32_core FAIL [fn_kind_name(19)]") }
+    if fn_kind_name(99) != "unknown" { panic("pe_user32_core FAIL [fn_kind_name(99)]") }
+    if fn_group_name(0) != "window" { panic("pe_user32_core FAIL [fn_group_name(0)]") }
+    if fn_group_name(5) != "message" { panic("pe_user32_core FAIL [fn_group_name(5)]") }
+    if fn_group_name(10) != "input" { panic("pe_user32_core FAIL [fn_group_name(10)]") }
+    if fn_group_name(15) != "dialog" { panic("pe_user32_core FAIL [fn_group_name(15)]") }
+    if fn_group_name(18) != "misc" { panic("pe_user32_core FAIL [fn_group_name(18)]") }
+    if fn_group_name(99) != "unknown" { panic("pe_user32_core FAIL [fn_group_name(99)]") }
+
+    // ─── stats sanity ───
+    let s = puser_stats()
+    if len(s) != 4 { panic("pe_user32_core FAIL [stats len] expected=4 got=" + to_string(len(s))) }
+    if s[0] != 20 { panic("pe_user32_core FAIL [stats syscall_invoke_count] expected=20 got=" + to_string(s[0])) }
+    if s[1] != 4 { panic("pe_user32_core FAIL [stats window_lifecycle_count] expected=4 got=" + to_string(s[1])) }
+    if s[2] != 4 { panic("pe_user32_core FAIL [stats message_pump_count] expected=4 got=" + to_string(s[2])) }
+    if s[3] != 4 { panic("pe_user32_core FAIL [stats input_event_count] expected=4 got=" + to_string(s[3])) }
+
+    // ─── stats / summary / KPI emit ───
+    r0_emit("pe_user32_core_stats",
+        "\"syscall_invoke_count\":" + to_string(s[0])
+        + ",\"window_lifecycle_count\":" + to_string(s[1])
+        + ",\"message_pump_count\":" + to_string(s[2])
+        + ",\"input_event_count\":" + to_string(s[3]))
+
+    r0_emit("pe_user32_core_summary",
+        "\"target\":\"USER32.dll\",\"fn_total\":20,\"fn_emit_partial\":20,\"groups\":[\"window\",\"message\",\"input\",\"dialog\",\"misc\"],\"hwnd_synth\":\"0x00010404\",\"msg_synth_bytes\":28,\"wndclassex_synth_bytes\":80,\"point_synth_bytes\":8,\"rect_synth_bytes\":16,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"posture\":\"PARTIAL\"")
+
+    r0_emit("pe_user32_core_kpi",
+        "\"window_emits\":5,\"message_emits\":5,\"input_emits\":5,\"dialog_emits\":3,\"misc_emits\":2,\"real_syscall\":false,\"warden_compat_long_horizon\":true,\"warden_natural_env_alignment_indirect\":true")
+
+    // ─── cycle 28 → 29 USER32 coverage progression evidence emit ───
+    r0_emit("pe_user32_core_coverage_progression",
+        "\"surface\":\"USER32_full_~30_fn_estimated\",\"cycle_28_count\":26,\"cycle_29_count\":46,\"delta\":20,\"cycle_28_percent\":5.98,\"cycle_29_percent\":10.57,\"cycle_29_module\":\"pe_user32_core.hexa\",\"long_horizon_cycles_remaining\":\"many (full ~435 fn = multi-cycle)\"")
+
+    // ─── PARTIAL round-trip matrix emit (cond evidence augment, NOT met promotion) ───
+    r0_emit("pe_user32_core_round_trip_matrix",
+        "\"surface\":\"USER32_core_20_fn\",\"fn_partial\":20,\"fn_groups\":5,\"shim_kind\":\"skeleton\",\"real_syscall\":false,\"cond\":\"loader_win32.cond.2\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"production_smoke_gap\":\"real CreateWindowExW + GetMessageW + GetCursorPos + MessageBoxW pending separate cycle\",\"warden_compat_horizon\":\"long_horizon_L2\",\"online_expansion_lockin\":\"L1+L2+L3+L4+L5_OK\",\"track_q_cross_link_to_track_o\":\"USER32_baseline + KERNEL32_18_fn = cumulative skeleton-tier surface coverage toward Warden natural-environment alignment\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_user32_core FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_puser()
+    let s2 = puser_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_user32_core FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_user32_core self_test PASS (syscall_invoke="
+        + to_string(s[0]) + ", window_lifecycle=" + to_string(s[1])
+        + ", message_pump=" + to_string(s[2]) + ", input_event=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = puser_stats()
+            println("syscall_invoke_count\t" + to_string(s[0]))
+            println("window_lifecycle_count\t" + to_string(s[1]))
+            println("message_pump_count\t" + to_string(s[2]))
+            println("input_event_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_user32_core.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "fn-group-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_group_name(k))
+                return
+            }
+            println("usage: hexa run pe_user32_core.hexa fn-group-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_puser()
+            println("cleaned: " + puser_dir())
+            return
+        }
+        if sub == "dir" {
+            println(puser_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_user32_core.hexa { self-test | stats | fn-kind-name <int> | fn-group-name <int> | cleanup | dir }")
+}

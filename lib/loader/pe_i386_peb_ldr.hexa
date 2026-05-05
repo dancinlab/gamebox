@@ -1,0 +1,479 @@
+// lib/loader/pe_i386_peb_ldr.hexa — i386 PEB / PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY tracker
+//
+// 후속 interpreter 가 KERNEL32.GetModuleHandleA / GetProcAddress 등을 PE 표준
+// 방식 (PEB.Ldr.InLoadOrderModuleList walk) 으로 해석할 때 필요한 PEB / Loader
+// data structure 의 hexa 측 record skeleton.
+//
+// 본 module 은 Wine / Box86 / QEMU / CrossOver / community 코드 를 단 한 줄도
+// 포함하지 않는 pure tracker. Microsoft NTDDK winternl.h spec 만 참조한다.
+// Apple SDK 호출 X — Hexa pure module.
+//
+// Win32 i386 PEB layout:
+//   TEB.ProcessEnvironmentBlock = TEB+0x30 (i386) → PEB*
+//   PEB.Ldr                     = PEB+0x0C → PEB_LDR_DATA*
+//   PEB_LDR_DATA.InLoadOrderModuleList         = +0x0C  LIST_ENTRY (Flink/Blink)
+//   PEB_LDR_DATA.InMemoryOrderModuleList       = +0x14  LIST_ENTRY
+//   PEB_LDR_DATA.InInitializationOrderModuleList = +0x1C LIST_ENTRY
+//
+// LDR_DATA_TABLE_ENTRY (i386):
+//   InLoadOrderLinks           LIST_ENTRY
+//   InMemoryOrderLinks         LIST_ENTRY
+//   InInitializationOrderLinks LIST_ENTRY
+//   DllBase           PVOID
+//   EntryPoint        PVOID
+//   SizeOfImage       ULONG
+//   FullDllName       UNICODE_STRING
+//   BaseDllName       UNICODE_STRING
+//
+// list_kind code:
+//   0 = InLoadOrderModuleList
+//   1 = InMemoryOrderModuleList
+//   2 = InInitializationOrderModuleList
+//
+// own 1: Wine / CrossOver / community 0 줄. NTDDK winternl.h spec 자체 구현.
+// own 2: r0_emit ≥ 12 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — 5 separate tables):
+//   peb_field.tsv   : field_id<int> \t field_name<str> \t offset_hex<str> \t value_hex<str>
+//   ldr_module.tsv  : module_id<int> \t base_va_hex<str> \t entry_point_hex<str>
+//                     \t size_of_image<int> \t base_dll_name<str>
+//   module_walk.tsv : walk_id<int> \t list_kind<int> \t walked_count<int>
+//   lookup.tsv      : lookup_id<int> \t search_name<str> \t found_module_id<int>
+//   string_field.tsv: string_id<int> \t length<int> \t max_length<int>
+//                     \t buffer_va_hex<str> \t decoded_text<str>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pipl_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_peb_ldr"
+}
+
+fn pipl_peb_field_path() -> str {
+    return pipl_dir() + "/peb_field.tsv"
+}
+
+fn pipl_modules_path() -> str {
+    return pipl_dir() + "/ldr_module.tsv"
+}
+
+fn pipl_walk_path() -> str {
+    return pipl_dir() + "/module_walk.tsv"
+}
+
+fn pipl_lookup_path() -> str {
+    return pipl_dir() + "/lookup.tsv"
+}
+
+fn pipl_string_path() -> str {
+    return pipl_dir() + "/string_field.tsv"
+}
+
+fn pipl_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pipl_dir() + "'")
+}
+
+fn cleanup_pipl() -> void {
+    pipl_ensure_dir()
+    let _ = exec("rm -f '" + pipl_peb_field_path() + "' '" + pipl_modules_path()
+        + "' '" + pipl_walk_path() + "' '" + pipl_lookup_path()
+        + "' '" + pipl_string_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pipl_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pipl_append_row(path: str, row: str) -> void {
+    pipl_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pipl_count_rows(path: str, min_cols: int) -> int {
+    let t = pipl_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── name lookup: list_kind → list 이름 ───
+fn list_name(k: int) -> str {
+    if k == 0 { return "InLoad" }
+    if k == 1 { return "InMemory" }
+    if k == 2 { return "InInit" }
+    return "?"
+}
+
+// ─── record_peb_field: PEB 의 주요 field 1 건 ───
+fn record_peb_field(field_id: int, field_name: str, offset_hex: str, value_hex: str) -> void {
+    if field_id <= 0 {
+        panic("pe_i386_peb_ldr FAIL [record_peb_field] expected=field_id>0 got=" + to_string(field_id))
+    }
+    if field_name == "" {
+        panic("pe_i386_peb_ldr FAIL [record_peb_field] expected=field_name!=empty got=empty")
+    }
+    if offset_hex == "" {
+        panic("pe_i386_peb_ldr FAIL [record_peb_field] expected=offset_hex!=empty got=empty")
+    }
+    if value_hex == "" {
+        panic("pe_i386_peb_ldr FAIL [record_peb_field] expected=value_hex!=empty got=empty")
+    }
+    let row = to_string(field_id) + "\t" + field_name
+        + "\t" + offset_hex + "\t" + value_hex + "\n"
+    pipl_append_row(pipl_peb_field_path(), row)
+}
+
+// ─── record_ldr_module: LDR_DATA_TABLE_ENTRY 1 건 ───
+fn record_ldr_module(module_id: int, base_va_hex: str, entry_point_hex: str,
+                     size_of_image: int, base_dll_name: str) -> void {
+    if module_id <= 0 {
+        panic("pe_i386_peb_ldr FAIL [record_ldr_module] expected=module_id>0 got=" + to_string(module_id))
+    }
+    if base_va_hex == "" {
+        panic("pe_i386_peb_ldr FAIL [record_ldr_module] expected=base_va_hex!=empty got=empty")
+    }
+    if entry_point_hex == "" {
+        panic("pe_i386_peb_ldr FAIL [record_ldr_module] expected=entry_point_hex!=empty got=empty")
+    }
+    if size_of_image <= 0 {
+        panic("pe_i386_peb_ldr FAIL [record_ldr_module] expected=size_of_image>0 got=" + to_string(size_of_image))
+    }
+    if base_dll_name == "" {
+        panic("pe_i386_peb_ldr FAIL [record_ldr_module] expected=base_dll_name!=empty got=empty")
+    }
+    let row = to_string(module_id) + "\t" + base_va_hex
+        + "\t" + entry_point_hex + "\t" + to_string(size_of_image)
+        + "\t" + base_dll_name + "\n"
+    pipl_append_row(pipl_modules_path(), row)
+}
+
+// ─── record_module_walk: list walk 결과 1 건 ───
+fn record_module_walk(walk_id: int, list_kind: int, walked_count: int) -> void {
+    if walk_id <= 0 {
+        panic("pe_i386_peb_ldr FAIL [record_module_walk] expected=walk_id>0 got=" + to_string(walk_id))
+    }
+    if list_kind < 0 {
+        panic("pe_i386_peb_ldr FAIL [record_module_walk] expected=list_kind>=0 got=" + to_string(list_kind))
+    }
+    if list_kind > 2 {
+        panic("pe_i386_peb_ldr FAIL [record_module_walk] expected=list_kind<=2 got=" + to_string(list_kind))
+    }
+    if walked_count < 0 {
+        panic("pe_i386_peb_ldr FAIL [record_module_walk] expected=walked_count>=0 got=" + to_string(walked_count))
+    }
+    let row = to_string(walk_id) + "\t" + to_string(list_kind)
+        + "\t" + to_string(walked_count) + "\n"
+    pipl_append_row(pipl_walk_path(), row)
+}
+
+// ─── record_module_lookup: GetModuleHandleA 등 lookup 결과 1 건 ───
+//   found_module_id == 0 → not found
+fn record_module_lookup(lookup_id: int, search_name: str, found_module_id: int) -> void {
+    if lookup_id <= 0 {
+        panic("pe_i386_peb_ldr FAIL [record_module_lookup] expected=lookup_id>0 got=" + to_string(lookup_id))
+    }
+    if search_name == "" {
+        panic("pe_i386_peb_ldr FAIL [record_module_lookup] expected=search_name!=empty got=empty")
+    }
+    if found_module_id < 0 {
+        panic("pe_i386_peb_ldr FAIL [record_module_lookup] expected=found_module_id>=0 got=" + to_string(found_module_id))
+    }
+    let row = to_string(lookup_id) + "\t" + search_name
+        + "\t" + to_string(found_module_id) + "\n"
+    pipl_append_row(pipl_lookup_path(), row)
+}
+
+// ─── record_string_field: UNICODE_STRING 1 건 ───
+fn record_string_field(string_id: int, length: int, max_length: int,
+                       buffer_va_hex: str, decoded_text: str) -> void {
+    if string_id <= 0 {
+        panic("pe_i386_peb_ldr FAIL [record_string_field] expected=string_id>0 got=" + to_string(string_id))
+    }
+    if length < 0 {
+        panic("pe_i386_peb_ldr FAIL [record_string_field] expected=length>=0 got=" + to_string(length))
+    }
+    if max_length < length {
+        panic("pe_i386_peb_ldr FAIL [record_string_field] expected=max_length>=length got=" + to_string(max_length))
+    }
+    if buffer_va_hex == "" {
+        panic("pe_i386_peb_ldr FAIL [record_string_field] expected=buffer_va_hex!=empty got=empty")
+    }
+    if decoded_text == "" {
+        panic("pe_i386_peb_ldr FAIL [record_string_field] expected=decoded_text!=empty got=empty")
+    }
+    let row = to_string(string_id) + "\t" + to_string(length)
+        + "\t" + to_string(max_length) + "\t" + buffer_va_hex
+        + "\t" + decoded_text + "\n"
+    pipl_append_row(pipl_string_path(), row)
+}
+
+// ─── statistics ───
+fn peb_field_count() -> int {
+    return pipl_count_rows(pipl_peb_field_path(), 4)
+}
+
+fn ldr_module_count() -> int {
+    return pipl_count_rows(pipl_modules_path(), 5)
+}
+
+fn module_walk_count() -> int {
+    return pipl_count_rows(pipl_walk_path(), 3)
+}
+
+fn lookup_count() -> int {
+    return pipl_count_rows(pipl_lookup_path(), 3)
+}
+
+fn string_field_count() -> int {
+    return pipl_count_rows(pipl_string_path(), 5)
+}
+
+fn pipl_stats() -> array {
+    let mut out = []
+    out.push(peb_field_count())
+    out.push(ldr_module_count())
+    out.push(module_walk_count())
+    out.push(lookup_count())
+    out.push(string_field_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + assertions ───
+fn self_test() -> void {
+    let sid = "pipl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pipl()
+
+    // 1. PEB field × 5 — BeingDebugged / Ldr / ProcessParameters / ProcessHeap / NumberOfProcessors
+    record_peb_field(1, "BeingDebugged", "0x002", "0x00")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"peb_field\",\"field_id\":1,\"field_name\":\"BeingDebugged\","
+        + "\"offset_hex\":\"0x002\",\"value_hex\":\"0x00\"")
+
+    record_peb_field(2, "Ldr", "0x00C", "0x77F60000")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"peb_field\",\"field_id\":2,\"field_name\":\"Ldr\","
+        + "\"offset_hex\":\"0x00C\",\"value_hex\":\"0x77F60000\"")
+
+    record_peb_field(3, "ProcessParameters", "0x010", "0x00251000")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"peb_field\",\"field_id\":3,\"field_name\":\"ProcessParameters\","
+        + "\"offset_hex\":\"0x010\",\"value_hex\":\"0x00251000\"")
+
+    record_peb_field(4, "ProcessHeap", "0x018", "0x00140000")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"peb_field\",\"field_id\":4,\"field_name\":\"ProcessHeap\","
+        + "\"offset_hex\":\"0x018\",\"value_hex\":\"0x00140000\"")
+
+    record_peb_field(5, "NumberOfProcessors", "0x064", "0x00000008")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"peb_field\",\"field_id\":5,\"field_name\":\"NumberOfProcessors\","
+        + "\"offset_hex\":\"0x064\",\"value_hex\":\"0x00000008\"")
+
+    // 2. LDR module × 4 — kernel32 / ntdll / Battle.net-Setup.exe / msvcrt
+    record_ldr_module(1, "0x77E40000", "0x77E5A000", 1130496, "kernel32.dll")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"ldr_module\",\"module_id\":1,\"base_va_hex\":\"0x77E40000\","
+        + "\"entry_point_hex\":\"0x77E5A000\",\"size_of_image\":1130496,"
+        + "\"base_dll_name\":\"kernel32.dll\"")
+
+    record_ldr_module(2, "0x77F60000", "0x77F70000", 909312, "ntdll.dll")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"ldr_module\",\"module_id\":2,\"base_va_hex\":\"0x77F60000\","
+        + "\"entry_point_hex\":\"0x77F70000\",\"size_of_image\":909312,"
+        + "\"base_dll_name\":\"ntdll.dll\"")
+
+    record_ldr_module(3, "0x00400000", "0x00401000", 4194304, "Battle.net-Setup.exe")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"ldr_module\",\"module_id\":3,\"base_va_hex\":\"0x00400000\","
+        + "\"entry_point_hex\":\"0x00401000\",\"size_of_image\":4194304,"
+        + "\"base_dll_name\":\"Battle.net-Setup.exe\"")
+
+    record_ldr_module(4, "0x77BE0000", "0x77BE2000", 348160, "msvcrt.dll")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"ldr_module\",\"module_id\":4,\"base_va_hex\":\"0x77BE0000\","
+        + "\"entry_point_hex\":\"0x77BE2000\",\"size_of_image\":348160,"
+        + "\"base_dll_name\":\"msvcrt.dll\"")
+
+    // 3. module_walk × 3 — InLoad / InMemory / InInit
+    record_module_walk(1, 0, 4)
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"module_walk\",\"walk_id\":1,\"list_kind\":0,\"list\":\"InLoad\","
+        + "\"walked_count\":4")
+
+    record_module_walk(2, 1, 4)
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"module_walk\",\"walk_id\":2,\"list_kind\":1,\"list\":\"InMemory\","
+        + "\"walked_count\":4")
+
+    record_module_walk(3, 2, 3)
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"module_walk\",\"walk_id\":3,\"list_kind\":2,\"list\":\"InInit\","
+        + "\"walked_count\":3")
+
+    // 4. module_lookup × 2 — kernel32 hit / user32 miss
+    record_module_lookup(1, "kernel32.dll", 1)
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"module_lookup\",\"lookup_id\":1,\"search_name\":\"kernel32.dll\","
+        + "\"found_module_id\":1")
+
+    record_module_lookup(2, "user32.dll", 0)
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"module_lookup\",\"lookup_id\":2,\"search_name\":\"user32.dll\","
+        + "\"found_module_id\":0")
+
+    // 5. string_field × 2 — BaseDllName UNICODE_STRING
+    record_string_field(1, 24, 26, "0x77E40100", "kernel32.dll")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"string_field\",\"string_id\":1,\"length\":24,\"max_length\":26,"
+        + "\"buffer_va_hex\":\"0x77E40100\",\"decoded_text\":\"kernel32.dll\"")
+
+    record_string_field(2, 18, 20, "0x77F60080", "ntdll.dll")
+    r0_emit("pe_i386_peb_ldr_record",
+        "\"kind\":\"string_field\",\"string_id\":2,\"length\":18,\"max_length\":20,"
+        + "\"buffer_va_hex\":\"0x77F60080\",\"decoded_text\":\"ntdll.dll\"")
+
+    // ─── assertions ───
+    let pf = peb_field_count()
+    if pf != 5 {
+        panic("pe_i386_peb_ldr FAIL [peb_field_count] expected=5 got=" + to_string(pf))
+    }
+    let lm = ldr_module_count()
+    if lm != 4 {
+        panic("pe_i386_peb_ldr FAIL [ldr_module_count] expected=4 got=" + to_string(lm))
+    }
+    let mw = module_walk_count()
+    if mw != 3 {
+        panic("pe_i386_peb_ldr FAIL [module_walk_count] expected=3 got=" + to_string(mw))
+    }
+    let lc = lookup_count()
+    if lc != 2 {
+        panic("pe_i386_peb_ldr FAIL [lookup_count] expected=2 got=" + to_string(lc))
+    }
+    let sf = string_field_count()
+    if sf != 2 {
+        panic("pe_i386_peb_ldr FAIL [string_field_count] expected=2 got=" + to_string(sf))
+    }
+
+    // ─── list_name lookup assertions ───
+    let n_load = list_name(0)
+    if n_load != "InLoad" {
+        panic("pe_i386_peb_ldr FAIL [list_name(0)] expected=InLoad got=" + n_load)
+    }
+    let n_mem = list_name(1)
+    if n_mem != "InMemory" {
+        panic("pe_i386_peb_ldr FAIL [list_name(1)] expected=InMemory got=" + n_mem)
+    }
+    let n_init = list_name(2)
+    if n_init != "InInit" {
+        panic("pe_i386_peb_ldr FAIL [list_name(2)] expected=InInit got=" + n_init)
+    }
+    let n_unk = list_name(99)
+    if n_unk != "?" {
+        panic("pe_i386_peb_ldr FAIL [list_name(99)] expected=? got=" + n_unk)
+    }
+
+    // ─── stats sanity ───
+    let s = pipl_stats()
+    if len(s) != 5 {
+        panic("pe_i386_peb_ldr FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_i386_peb_ldr FAIL [stats peb_field] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_peb_ldr FAIL [stats ldr_module] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_i386_peb_ldr FAIL [stats module_walk] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_i386_peb_ldr FAIL [stats lookup] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_peb_ldr FAIL [stats string_field] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit (전체 emit ≥ 12 보장: 위 record 16 + 이 1 = 17) ───
+    r0_emit("pe_i386_peb_ldr_stats",
+        "\"peb_field_count\":" + to_string(s[0])
+        + ",\"ldr_module_count\":" + to_string(s[1])
+        + ",\"module_walk_count\":" + to_string(s[2])
+        + ",\"lookup_count\":" + to_string(s[3])
+        + ",\"string_field_count\":" + to_string(s[4]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 12 {
+        panic("pe_i386_peb_ldr FAIL [r0 emit count] expected=>=12 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pipl()
+    let s2 = pipl_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_peb_ldr FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_peb_ldr self_test PASS (peb_field=" + to_string(s[0])
+        + ", ldr_module=" + to_string(s[1]) + ", module_walk=" + to_string(s[2])
+        + ", lookup=" + to_string(s[3]) + ", string_field=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pipl_stats()
+            println("peb_field_count\t" + to_string(s[0]))
+            println("ldr_module_count\t" + to_string(s[1]))
+            println("module_walk_count\t" + to_string(s[2]))
+            println("lookup_count\t" + to_string(s[3]))
+            println("string_field_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pipl()
+            println("cleaned: " + pipl_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pipl_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_peb_ldr.hexa { self-test | stats | cleanup | dir }")
+}

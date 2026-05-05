@@ -1,0 +1,194 @@
+// lib/perf/c_abi_calling_convention_track.hexa — CN-69 skeleton manjeom 15/15
+//
+// x86_64 vs i386 calling convention 호출 빈도 + 변환 cost 추적.
+// PE 의 모든 imports 를 convention 별로 분류 → ARM64 변환 cost 추정.
+//
+// 무기: convention histogram + columnar (cost per call type).
+// 효과: i386 ABI 강화 우선순위 결정 (가장 자주 쓰이는 convention 부터).
+
+use "./r0_common"
+
+let CCT_DIR = GAMEBOX_HOME + "/persist/abi_calling_convention"
+let CALL_LOG = CCT_DIR + "/calls.tsv"
+let CONV_HISTORY = CCT_DIR + "/conventions.jsonl"
+
+fn cct_dir() -> str { return CCT_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CCT_DIR + "'")
+}
+
+// ─── call 등록 ───
+//   convention (cdecl/stdcall/fastcall/thiscall), name, args_bytes
+fn record_call(convention: str, name: str, args_bytes: int) -> void {
+    ensure_dir()
+    let line = convention + "\t" + name + "\t" + to_string(args_bytes)
+    let tmp = CALL_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + CALL_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── convention 별 카운트 ───
+fn count_by_convention(conv: str) -> int {
+    let exists = exec("test -f '" + CALL_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v c='" + conv + "' '$1==c' '" + CALL_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// ─── convention 분포 ───
+//   array of [conv, count, total_args_bytes]
+fn convention_distribution() -> array {
+    let convs = ["cdecl", "stdcall", "fastcall", "thiscall"]
+    let result = []
+    let i = 0
+    while i < len(convs) {
+        let cnt = count_by_convention(convs[i])
+        let bytes_str = exec("awk -F'\\t' -v c='" + convs[i] + "' '$1==c {s+=$3} END{print s+0}' '" + CALL_LOG + "' 2>/dev/null").trim()
+        let bytes = 0
+        if bytes_str != "" { bytes = to_int(bytes_str) }
+        result = result + [[convs[i], cnt, bytes]]
+        i = i + 1
+    }
+    return result
+}
+
+// ─── x86 → ARM64 변환 cost 추정 ───
+//   cdecl:    args 만 ARM64 reg 옮김 — moderate
+//   stdcall:  args + callee cleanup — moderate
+//   fastcall: ecx/edx → x0/x1 — easy (이미 register 안 있음)
+//   thiscall: this → x0 + args — moderate
+fn convert_cost_estimate(conv: str, args_bytes: int) -> int {
+    let base = 0
+    if conv == "cdecl" { base = 30 }
+    if conv == "stdcall" { base = 35 }  // +callee cleanup
+    if conv == "fastcall" { base = 20 }
+    if conv == "thiscall" { base = 28 }
+    if base == 0 { return 0 }
+    // args_bytes 마다 +1 cost (4-byte 마다 stack→reg 한 번)
+    let arg_count = args_bytes / 4
+    return base + arg_count * 5
+}
+
+// ─── distribution snapshot ───
+fn record_snapshot() -> array {
+    let dist = convention_distribution()
+    ensure_dir()
+    let total = 0
+    let i = 0
+    while i < len(dist) {
+        total = total + dist[i][1]
+        i = i + 1
+    }
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"total\":" + to_string(total) + ",\"cdecl\":" + to_string(dist[0][1]) + ",\"stdcall\":" + to_string(dist[1][1]) + ",\"fastcall\":" + to_string(dist[2][1]) + ",\"thiscall\":" + to_string(dist[3][1]) + "}"
+    let tmp = CONV_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + CONV_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("convention_dist", "\"total\":" + to_string(total) + ",\"stdcall\":" + to_string(dist[1][1]) + ",\"cdecl\":" + to_string(dist[0][1]))
+    return dist
+}
+
+fn cct_stats() -> array {
+    let exists_c = exec("test -f '" + CALL_LOG + "' && echo ok").trim()
+    let calls = 0
+    if exists_c == "ok" {
+        calls = to_int(exec("wc -l < '" + CALL_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_h = exec("test -f '" + CONV_HISTORY + "' && echo ok").trim()
+    let snaps = 0
+    if exists_h == "ok" {
+        snaps = to_int(exec("wc -l < '" + CONV_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [calls, snaps]
+}
+
+fn cleanup_cct() -> void {
+    let _ = exec("rm -rf '" + CCT_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cct-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cct()
+
+    // 합성 calls — Battle.net-Setup 풍 분포 (stdcall dominant)
+    let i = 0
+    while i < 50 {
+        record_call("stdcall", "WinFunc" + to_string(i), 8 + (i % 4) * 4)
+        i = i + 1
+    }
+    let j = 0
+    while j < 30 {
+        record_call("cdecl", "_libfunc" + to_string(j), 4)
+        j = j + 1
+    }
+    record_call("fastcall", "@math1@8", 8)
+    record_call("fastcall", "@math2@4", 4)
+    record_call("thiscall", "obj_method", 16)
+
+    // count
+    let std_cnt = count_by_convention("stdcall")
+    if std_cnt != 50 { panic("c_abi_calling_convention_track FAIL [stdcall count] expected=50 got=" + to_string(std_cnt)) }
+
+    let cdecl_cnt = count_by_convention("cdecl")
+    if cdecl_cnt != 30 { panic("c_abi_calling_convention_track FAIL [cdecl count]") }
+
+    // distribution
+    let dist = convention_distribution()
+    if len(dist) != 4 { panic("c_abi_calling_convention_track FAIL [dist count]") }
+
+    // cost
+    let cost_std = convert_cost_estimate("stdcall", 28)
+    if cost_std < 35 { panic("c_abi_calling_convention_track FAIL [cost stdcall]") }
+
+    let cost_fast = convert_cost_estimate("fastcall", 8)
+    if cost_fast < 20 { panic("c_abi_calling_convention_track FAIL [cost fastcall]") }
+
+    let cost_unk = convert_cost_estimate("unknown_conv", 0)
+    if cost_unk != 0 { panic("c_abi_calling_convention_track FAIL [cost unknown]") }
+
+    // snapshot
+    let snap = record_snapshot()
+    if snap[1][1] != 50 { panic("c_abi_calling_convention_track FAIL [snapshot stdcall]") }
+
+    // stats
+    let stats = cct_stats()
+    if stats[0] != 83 { panic("c_abi_calling_convention_track FAIL [stats calls] expected=83 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_abi_calling_convention_track FAIL [stats snaps]") }
+
+    r0_emit("convention_summary", "\"calls\":" + to_string(stats[0]) + ",\"stdcall\":" + to_string(std_cnt) + ",\"cdecl\":" + to_string(cdecl_cnt))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_abi_calling_convention_track FAIL [emit count]") }
+
+    cleanup_cct()
+
+    println("  ✅ c_abi_calling_convention_track self_test PASS (83 calls, stdcall=50 cdecl=30 fast=2 this=1, costs OK, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "snapshot" {
+            let d = record_snapshot()
+            let i = 0
+            while i < len(d) {
+                println(d[i][0] + "\t" + to_string(d[i][1]) + "\t" + to_string(d[i][2]))
+                i = i + 1
+            }
+            return
+        }
+        if sub == "stats" {
+            let s = cct_stats()
+            println("calls=" + to_string(s[0]) + " snaps=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_cct(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_abi_calling_convention_track.hexa { self-test | snapshot | stats | cleanup }")
+}

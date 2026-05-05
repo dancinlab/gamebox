@@ -1,0 +1,1433 @@
+// tool/closure_orchestrator.hexa — airgenome-gamebox closure progression tracker (Track S — closure_orchestrator rank B+C cycle)
+//
+// PURPOSE
+//   Hexa-native closure progression tracker. Reads CLOSURE_ROADMAP.md SSOT mental
+//   model (CM-0..CM-30 milestone ladder, 31 stages) and emits read-only status
+//   summaries + additive progress markers. Mirrors `tool/roadmap_op.hexa` (Track M)
+//   conventions: silent_error_ban / atomic_write / `__CLOSURE__ <PASS|FAIL>
+//   <subcmd> <reason>` honest emit / exit codes 0 (PASS) or 1 (FAIL).
+//
+// SUBCOMMANDS (3 read-only/additive — no closure advancement)
+//   status       Print current closure_pct + CM-N/30 ratio + per-phase skeleton
+//                manjeom score. Source = CLOSURE_ROADMAP.md SSOT scrape (graceful
+//                fallback to hardcoded baseline current as of cycle 37 if SSOT
+//                unreadable; baseline marked with explicit comment).
+//   list         Enumerate closure milestones (CM-0..CM-30) with status (done /
+//                planned / blocked) parsed from CLOSURE_ROADMAP.md §5 table.
+//   emit         Write summary marker to state/markers/closure_progress_<unix_ts>.marker
+//                (additive, never modify existing markers). JSON body — schema
+//                airgenome-gamebox/markers/closure_progress/1.
+//
+// ANIMA / WINE / OWN1 POSTURE
+//   own1: Wine 0 / hexa-only / NO closure-advancement work (this is the TRACKER,
+//   not the closure work). own2: PASS/FAIL emit honest, silent_swallow 0건.
+//   raw 9 hexa-only / raw 11 snake_case / raw 12 silent_error_ban / raw 15
+//   env_lazy / raw 168 minimum-viable / raw 175 BR-NO-USER-VERBATIM.
+//
+// HONEST EMIT (own2 mandate)
+//   Every subcmd emits: `__CLOSURE__ <PASS|FAIL> <subcmd> <reason>` on completion.
+//
+// CYCLE 37 BASELINE SNAPSHOT (hardcoded fallback — only if SSOT scrape fails)
+//   - closure_pct = 25 (skeleton 6/6 × 25 score per docs/D2R_D4_INSTALL_LAUNCH_ROADMAP.md §0a)
+//   - cm_ratio = "20/30" (CM-0 ~ CM-20 done = 21/31 = 67% milestone-level per CLOSURE_ROADMAP.md §1)
+//   - skeleton_manjeom = 100 (cycle 37 milestone — Phase 1~6 covered)
+//   - validated_manjeom = 0 (no real game frames yet)
+//
+// SSOT SOURCE FILE
+//   docs/CLOSURE_ROADMAP.md — 508 LOC, §5 CM-0..CM-30 milestone table.
+//   docs/D2R_D4_INSTALL_LAUNCH_ROADMAP.md — closure_pct dashboard reference.
+//
+// USAGE
+//   hexa run tool/closure_orchestrator.hexa --help
+//   hexa run tool/closure_orchestrator.hexa <subcmd> [args...]
+
+use "../lib/perf/r0_common"
+
+// ─── version + constants ──────────────────────────────────────
+
+let CLOSURE_ORCH_VERSION = "0.3.0-track-ag-weighted-threshold-aware"
+let MARKER_SCHEMA = "airgenome-gamebox/markers/closure_progress/1"
+
+// ─── Track AD: checkpoint awareness constants ─────────────────
+//
+// Track AD cycle 3 of 3 of the mk2 checkpoint mechanism (Track AA design + Track AB
+// tool extension + Track AC phase 1 SSOT predecessors). This file extends the 3
+// existing subcmd (status / list / emit) + self_test additively to surface
+// `.checkpoint.<name>` SSOT count and reached count alongside the existing
+// closure progression view. NO `.checkpoint.<name>` file is emitted by this tool;
+// NO `tool/roadmap_op.hexa` checkpoint subcmd is exec'd from this tool. The tool
+// reads each `.checkpoint.<name>` file directly via own helpers (mirror of Track
+// AB checkpoint-list enumeration pattern — REFERENCE not CLONE).
+//
+// closure_pct calculation extension (HONEST per own2):
+//   closure_pct = min(CHECKPOINT_PCT_MAX, CHECKPOINT_BASE_PCT + checkpoint_reached * CHECKPOINT_WEIGHT)
+// CHECKPOINT_BASE_PCT is hardcoded to BASELINE_CLOSURE_PCT (25, cycle 37 skeleton
+// 6/6 × 25 score). Each `.checkpoint.<name>` whose status field == "met" OR whose
+// AND_all_required_met derivation is "met" contributes CHECKPOINT_WEIGHT percent
+// points to closure_pct, capped at CHECKPOINT_PCT_MAX. Today (2026-05-04, post
+// Track AC land), 0/3 phase 1 checkpoints derive met (all partial per Track AC
+// honest emit) → checkpoint_contribution = 0, closure_pct stays at 25.
+//
+// CHECKPOINT_WEIGHT = 5 chosen as a designable per-checkpoint contribution. Phase
+// 2 (Track AE+) introduces weighted_threshold for win32_*pct candidates; the
+// weight constant should be reviewed at that point (caveat-honest).
+let CHECKPOINT_BASE_PCT = 25  // pinned to BASELINE_CLOSURE_PCT; reviewable post phase 2
+let CHECKPOINT_WEIGHT   = 5   // per-checkpoint contribution (phase 2 weighted_threshold review)
+let CHECKPOINT_PCT_MAX  = 100 // closure_pct hard cap (do not inflate beyond 100%)
+let CHECKPOINT_SCHEMA_VERSION = "airgenome-gamebox/checkpoint/mk2/header/1"
+
+// SSOT paths (raw 15 env_lazy — repo-relative).
+let SSOT_CLOSURE_ROADMAP = "docs/CLOSURE_ROADMAP.md"
+let SSOT_D2R_D4_ROADMAP  = "docs/D2R_D4_INSTALL_LAUNCH_ROADMAP.md"
+
+// Cycle 37 baseline snapshot (hardcoded fallback only — used if SSOT scrape fails).
+// Source of truth: docs/D2R_D4_INSTALL_LAUNCH_ROADMAP.md §0a (closure_pct=25,
+// skeleton_manjeom=100), docs/CLOSURE_ROADMAP.md §1 (CM-0~CM-20 done = 21/31).
+// EXPLICIT COMMENT: these are baseline-only values pinned to cycle 37, used when
+// SSOT_CLOSURE_ROADMAP is unreadable. Live numbers come from SSOT scrape.
+let BASELINE_CLOSURE_PCT       = 25
+let BASELINE_CM_DONE           = 20
+let BASELINE_CM_TOTAL          = 30
+let BASELINE_SKELETON_MANJEOM  = 100
+let BASELINE_VALIDATED_MANJEOM = 0
+let BASELINE_CYCLE             = 37
+
+// CM-0..CM-30 milestone ladder (mirror of CLOSURE_ROADMAP.md §5 table — pinned
+// at land-time, intentionally hardcoded so `list` works even if SSOT moves).
+let CM_TOTAL_STAGES = 31  // CM-0 through CM-30 inclusive
+
+// ─── small string helpers (mirror roadmap_op patterns) ────────
+
+fn file_exists(path: str) -> bool {
+    let r = exec("test -f '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn read_text(path: str) -> str {
+    if !file_exists(path) { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn atomic_write(path: str, content: str) -> bool {
+    let stamp = exec("date +%s").trim()
+    let tmp = path + ".closure_orch.tmp." + stamp
+    write_file(tmp, content)
+    let _ = exec("mv '" + tmp + "' '" + path + "'")
+    return file_exists(path)
+}
+
+fn count_substr(big: str, small: str) -> int {
+    let n = len(big)
+    let m = len(small)
+    if m == 0 || m > n { return 0 }
+    let mut i = 0
+    let mut cnt = 0
+    while i <= n - m {
+        let chunk = big.substring(i, i + m)
+        if chunk == small {
+            cnt = cnt + 1
+            i = i + m
+        } else {
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── SSOT scrape helpers ──────────────────────────────────────
+
+// Count `✅ CM-N` patterns in the closure roadmap §5 table to derive done count.
+// Pattern: lines start with `| ✅ CM-N |` or `| ✅ **CM-N** |`. We count occurrences
+// of the substring `✅ CM-` which is unambiguous in this doc.
+fn ssot_count_cm_done(content: str) -> int {
+    if content == "" { return -1 }
+    return count_substr(content, "✅ CM-")
+}
+
+// Find the closure_pct phase dashboard line in D2R_D4 roadmap (§0a):
+//   `- phase dashboard closure_pct: **25%** (skeleton 6/6 × 25 score)`
+// Returns the integer percent or -1 on miss.
+fn ssot_extract_closure_pct(content: str) -> int {
+    if content == "" { return -1 }
+    let key = "phase dashboard closure_pct:"
+    let i = content.index_of(key)
+    if i < 0 { return -1 }
+    let rest = content.substring(i + len(key), len(content))
+    // Walk forward to first digit.
+    let n = len(rest)
+    let mut j = 0
+    while j < n {
+        let ch = rest.substring(j, j + 1)
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+           ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            break
+        }
+        j = j + 1
+    }
+    if j >= n { return -1 }
+    // Capture contiguous digits.
+    let mut k = j
+    while k < n {
+        let ch = rest.substring(k, k + 1)
+        if !(ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+             ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9") {
+            break
+        }
+        k = k + 1
+    }
+    let digits = rest.substring(j, k)
+    if digits == "" { return -1 }
+    return to_int(digits)
+}
+
+// Extract skeleton_manjeom from D2R_D4 roadmap (§0a):
+//   `- skeleton manjeom: **100** (cycle 37 milestone — Phase 1~6 모두 커버)`
+fn ssot_extract_skeleton_manjeom(content: str) -> int {
+    if content == "" { return -1 }
+    let key = "skeleton manjeom:"
+    let i = content.index_of(key)
+    if i < 0 { return -1 }
+    let rest = content.substring(i + len(key), len(content))
+    let n = len(rest)
+    let mut j = 0
+    while j < n {
+        let ch = rest.substring(j, j + 1)
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+           ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            break
+        }
+        j = j + 1
+    }
+    if j >= n { return -1 }
+    let mut k = j
+    while k < n {
+        let ch = rest.substring(k, k + 1)
+        if !(ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+             ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9") {
+            break
+        }
+        k = k + 1
+    }
+    let digits = rest.substring(j, k)
+    if digits == "" { return -1 }
+    return to_int(digits)
+}
+
+// Resolve effective snapshot (SSOT-first, baseline-fallback). Returns array
+// [closure_pct, cm_done, cm_total, skeleton_manjeom, source_kind] where
+// source_kind = 0 (baseline), 1 (ssot_partial), 2 (ssot_full).
+fn resolve_snapshot() -> array {
+    let cr = read_text(SSOT_CLOSURE_ROADMAP)
+    let dr = read_text(SSOT_D2R_D4_ROADMAP)
+    let mut closure_pct = BASELINE_CLOSURE_PCT
+    let mut cm_done     = BASELINE_CM_DONE
+    let mut skeleton    = BASELINE_SKELETON_MANJEOM
+    let mut hits        = 0
+    if dr != "" {
+        let p = ssot_extract_closure_pct(dr)
+        if p >= 0 && p <= 100 { closure_pct = p; hits = hits + 1 }
+        let s = ssot_extract_skeleton_manjeom(dr)
+        if s >= 0 { skeleton = s; hits = hits + 1 }
+    }
+    if cr != "" {
+        let d = ssot_count_cm_done(cr)
+        // The §5 table runs CM-0..CM-30 = 31 rows; subtract any over-count if accidental.
+        if d >= 0 && d <= CM_TOTAL_STAGES {
+            // CM-0 is "current" baseline marked done; cm_done convention here = highest
+            // contiguous completed CM index, not raw count. For simplicity report d-1
+            // (CM-0 = 0, so d ✅ rows → highest_index = d - 1) clamped to CM_TOTAL_STAGES-1.
+            let mut highest = d - 1
+            if highest < 0 { highest = 0 }
+            if highest > CM_TOTAL_STAGES - 1 { highest = CM_TOTAL_STAGES - 1 }
+            cm_done = highest
+            hits = hits + 1
+        }
+    }
+    let mut source_kind = 0
+    if hits >= 3 { source_kind = 2 }
+    else if hits >= 1 { source_kind = 1 }
+    let mut out = []
+    out = out.push(closure_pct)
+    out = out.push(cm_done)
+    out = out.push(BASELINE_CM_TOTAL)
+    out = out.push(skeleton)
+    out = out.push(source_kind)
+    return out
+}
+
+fn source_kind_label(k: int) -> str {
+    if k == 2 { return "ssot_full" }
+    if k == 1 { return "ssot_partial_baseline_filled" }
+    return "baseline_cycle37_pinned"
+}
+
+// ─── Track AD: checkpoint awareness helpers ──────────────────
+//
+// Mirror of Track AB `tool/roadmap_op.hexa` checkpoint-list enumeration pattern
+// (REFERENCE only — no exec of roadmap_op subcmd, no clone of fn bodies). These
+// helpers read `.checkpoint.<name>` SSOT files directly from repo root and parse
+// the JSONL header line to extract name + status + cond_refs[] count.
+//
+// Returned snapshot shape: array of [name, status, cond_refs_count] tuples
+// (each tuple itself an array of 3 entries: [str, str, int]).
+
+// Enumerate `.checkpoint.<name>` files at repo root (1 entry per file).
+// Returns empty array if none exist (Track AB precedent: count=0 PASS path).
+fn enumerate_checkpoint_files() -> array {
+    let raw = exec("ls -1 .checkpoint.* 2>/dev/null").trim()
+    let mut out = []
+    if raw == "" { return out }
+    let parts = raw.split("\n")
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let s = parts[i].trim()
+        if s != "" { out = out.push(s) }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract the JSONL header line from `.checkpoint.<name>` content. Mirrors the
+// Track AB / Track I `header_line_get` pattern: skip blank/comment lines, return
+// the first line that begins with `{`.
+fn checkpoint_header_line(content: str) -> str {
+    if content == "" { return "" }
+    let lines = content.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let s = lines[i].trim()
+        if s != "" {
+            let head = s.substring(0, 1)
+            if head == "{" { return s }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Read string field value from a JSON object string (e.g. `"name":"<v>"`). Tiny
+// scanner mirrors the closure_orchestrator local style (no anima clone). Returns
+// "" on miss — the caller treats "" as missing-field and emits an explicit
+// reason rather than silently passing through (raw 12 silent_error_ban posture).
+fn checkpoint_read_str_field(obj: str, field: str) -> str {
+    let key = "\"" + field + "\":\""
+    let i = obj.index_of(key)
+    if i < 0 { return "" }
+    let start = i + len(key)
+    let n = len(obj)
+    let mut p = start
+    let mut esc = false
+    while p < n {
+        let ch = obj.substring(p, p + 1)
+        if esc { esc = false }
+        else if ch == "\\" { esc = true }
+        else if ch == "\"" { return obj.substring(start, p) }
+        p = p + 1
+    }
+    return ""
+}
+
+// Count cond_refs[] entries in a checkpoint header by counting occurrences of
+// `"roadmap":"` (Track AB precedent — same approach as roadmap_op
+// `checkpoint_count_refs`, REFERENCE not CLONE).
+fn checkpoint_count_cond_refs(header: str) -> int {
+    return count_substr(header, "\"roadmap\":\"")
+}
+
+// Parse a single `.checkpoint.<name>` file path → tuple [name, status, refs].
+// `name` is the JSON `name` field (NOT the filename leaf — they SHOULD match per
+// Track AB validator (h)). `status` is the cached header `status` field. `refs`
+// is the cond_refs[] count. Returns ["", "", 0] on parse failure (caller will
+// emit explicit reason).
+fn parse_checkpoint_header(path: str) -> array {
+    let mut out = []
+    let mut name = ""
+    let mut status = ""
+    let mut refs_count = 0
+    if !file_exists(path) {
+        out = out.push(name)
+        out = out.push(status)
+        out = out.push(refs_count)
+        return out
+    }
+    let content = read_text(path)
+    let header = checkpoint_header_line(content)
+    if header == "" {
+        out = out.push(name)
+        out = out.push(status)
+        out = out.push(refs_count)
+        return out
+    }
+    name = checkpoint_read_str_field(header, "name")
+    status = checkpoint_read_str_field(header, "status")
+    refs_count = checkpoint_count_cond_refs(header)
+    out = out.push(name)
+    out = out.push(status)
+    out = out.push(refs_count)
+    return out
+}
+
+// Count checkpoints whose cached header `status` field == "met". Track AD scope
+// is the cached field — fully derived AND_all_required_met evaluation across
+// .roadmap.<X> cond_refs is Track AB territory (would require reading every
+// referenced .roadmap file + locating each cond by id; intentionally NOT done
+// here per task spec — design-level integration only). Today (2026-05-04, post
+// Track AC land), all 3 phase 1 checkpoints carry status=partial → return 0
+// (own2 honest, NOT inflated).
+fn count_checkpoint_reached(checkpoint_snapshot: array) -> int {
+    let n = len(checkpoint_snapshot)
+    let mut i = 0
+    let mut hit = 0
+    while i < n {
+        let entry = checkpoint_snapshot[i]
+        let st = entry[1]
+        if st == "met" { hit = hit + 1 }
+        i = i + 1
+    }
+    return hit
+}
+
+// Build the full checkpoint snapshot — array of [name, status, refs_count] for
+// each `.checkpoint.<name>` file at repo root. Empty array if none.
+fn build_checkpoint_snapshot() -> array {
+    let files = enumerate_checkpoint_files()
+    let n = len(files)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let path = files[i]
+        let parsed = parse_checkpoint_header(path)
+        out = out.push(parsed)
+        i = i + 1
+    }
+    return out
+}
+
+// closure_pct calculation extension (Track AD). Formula:
+//   closure_pct = min(CHECKPOINT_PCT_MAX, CHECKPOINT_BASE_PCT + reached * CHECKPOINT_WEIGHT)
+// Returns the integer percent in [0, 100]. Inputs assumed non-negative; reached
+// is clamped to [0, n_total] by caller (defensive sanity).
+fn compute_closure_pct(reached: int) -> int {
+    let mut r = reached
+    if r < 0 { r = 0 }
+    let extension = r * CHECKPOINT_WEIGHT
+    let mut total = CHECKPOINT_BASE_PCT + extension
+    if total > CHECKPOINT_PCT_MAX { total = CHECKPOINT_PCT_MAX }
+    if total < 0 { total = 0 }
+    return total
+}
+
+// ─── Track AG: weighted_threshold awareness helpers ──────────
+//
+// Extends Track AD binary checkpoint awareness to surface progress-aware PARTIAL
+// CREDIT contribution for `aggregation: weighted_threshold` checkpoints. Mirrors
+// Track AE roadmap_op weighted_threshold dispatch (REFERENCE not CLONE — local
+// helpers; closure_orchestrator does NOT exec roadmap_op subcmd).
+//
+// Extended formula:
+//   closure_pct = min(MAX, BASE + sum(per_cp_contribution))
+//   per_cp_contribution(cp) = (cp.aggregation == "weighted_threshold") ?
+//     (progress >= threshold ? WEIGHT :
+//      progress > 0 ? progress / threshold * WEIGHT : 0) :
+//     (cp.status == "met" ? WEIGHT : 0)
+//
+// Today (2026-05-04 post Track AF land): 5 AND checkpoints (partial/unmet → 0
+// contribution) + 2 weighted_threshold (win32_50pct / win32_full) at progress=30.34
+// → contributions 30.34/50*5=3.034 + 30.34/100*5=1.517 → sum 4.55 → closure_pct
+// 25 + 4.55 = 29.55%. Compare Track AD binary: 25 + 0*5 = 25%. Delta +4.55pp
+// reflects honest partial Win32 progression (own2 — NOT inflation).
+//
+// SCALED-INTEGER ARITHMETIC (x1000): hexa runtime has no float primitives. We
+// carry 2-decimal precision via x1000 internal scaling (29.55% → 29551).
+let CLOSURE_PCT_SCALE          = 1000  // x1000 internal scaling for 2-decimal display
+let WEIGHTED_THRESHOLD_KIND    = "weighted_threshold"
+let AND_ALL_REQUIRED_MET_KIND  = "AND_all_required_met"
+let WIN32_PROGRESS_FIELD_PATH  = "win32_coverage_progression.percent"  // hardcoded for win32_*pct candidates
+
+// Tiny non-negative integer parser (hexa runtime has no parse_int builtin).
+// Returns -1 on parse failure (empty / non-digit). Mirror of roadmap_op
+// parse_uint_safe (Track AE — REFERENCE not CLONE; local helper to avoid
+// cross-tool dep).
+fn parse_uint_safe_local(s: str) -> int {
+    let n = len(s)
+    if n == 0 { return -1 }
+    let mut i = 0
+    let mut acc = 0
+    let mut any = false
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "0" { acc = acc * 10 + 0 }
+        else if ch == "1" { acc = acc * 10 + 1 }
+        else if ch == "2" { acc = acc * 10 + 2 }
+        else if ch == "3" { acc = acc * 10 + 3 }
+        else if ch == "4" { acc = acc * 10 + 4 }
+        else if ch == "5" { acc = acc * 10 + 5 }
+        else if ch == "6" { acc = acc * 10 + 6 }
+        else if ch == "7" { acc = acc * 10 + 7 }
+        else if ch == "8" { acc = acc * 10 + 8 }
+        else if ch == "9" { acc = acc * 10 + 9 }
+        else { return -1 }
+        any = true
+        i = i + 1
+    }
+    if !any { return -1 }
+    return acc
+}
+
+// Parse a percentage value string (e.g. "30.34" or "50") into x1000-scaled int.
+// Handles both integer ("50" → 50000) and float ("30.34" → 30340) forms.
+// Returns -1 on parse failure (own2 silent_error_ban — caller emits explicit
+// reason instead of silently coercing to 0).
+fn parse_progress_pct_x1000(field_value_str: str) -> int {
+    let s = field_value_str.trim()
+    if s == "" { return -1 }
+    let n = len(s)
+    let mut dot_at = -1
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "." { dot_at = i; break }
+        i = i + 1
+    }
+    if dot_at < 0 {
+        let v = parse_uint_safe_local(s)
+        if v < 0 { return -1 }
+        return v * CLOSURE_PCT_SCALE
+    }
+    let int_part = s.substring(0, dot_at)
+    let frac_part = s.substring(dot_at + 1, n)
+    let int_v = parse_uint_safe_local(int_part)
+    if int_v < 0 { return -1 }
+    let frac_v = parse_uint_safe_local(frac_part)
+    if frac_v < 0 { return -1 }
+    let frac_len = len(frac_part)
+    // Pad/truncate frac to exactly 3 digits (CLOSURE_PCT_SCALE = 1000 → 3 decimals)
+    let mut frac_scaled = frac_v
+    let mut padded = frac_len
+    while padded < 3 { frac_scaled = frac_scaled * 10; padded = padded + 1 }
+    while padded > 3 { frac_scaled = frac_scaled / 10; padded = padded - 1 }
+    return int_v * CLOSURE_PCT_SCALE + frac_scaled
+}
+
+// Format an x1000-scaled integer as a 2-decimal-place string (e.g. 29551 → "29.55",
+// 4551 → "4.55", 0 → "0.00"). Uses banker-style truncation (round-toward-zero on
+// the 4th digit) which matches the spec's "29.55" / "4.55" stated values.
+fn format_x1000_decimal(value_x1000: int) -> str {
+    let mut v = value_x1000
+    let mut sign = ""
+    if v < 0 { sign = "-"; v = 0 - v }
+    let int_part = v / CLOSURE_PCT_SCALE
+    let frac_x1000 = v - (int_part * CLOSURE_PCT_SCALE)
+    // Round to 2 decimals: drop the last digit (truncate).
+    let frac_x100 = frac_x1000 / 10
+    let mut frac_str = to_string(frac_x100)
+    let mut pad = 2 - len(frac_str)
+    while pad > 0 { frac_str = "0" + frac_str; pad = pad - 1 }
+    return sign + to_string(int_part) + "." + frac_str
+}
+
+// Extract a header field value via lookup of `"<key>":"<v>"` pattern. Mirrors
+// existing checkpoint_read_str_field (Track AD) — separate fn name to make the
+// Track AG call sites self-explanatory in the source diff.
+fn checkpoint_aggregation_kind_extract(header: str) -> str {
+    let v = checkpoint_read_str_field(header, "aggregation")
+    if v == "" { return AND_ALL_REQUIRED_MET_KIND }
+    return v
+}
+
+fn checkpoint_progress_source_extract(header: str) -> str {
+    return checkpoint_read_str_field(header, "progress_source")
+}
+
+// Extract `"threshold_value": <int>` (raw integer, NOT string-quoted). Mirrors
+// roadmap_op extract_int_field (Track AE — REFERENCE not CLONE; local helper).
+// Returns 0 on miss (defensive; weighted_threshold caller treats 0 as "any
+// contribution = met" per Track AE semantics).
+fn checkpoint_threshold_value_extract(header: str) -> int {
+    let needle = "\"threshold_value\":"
+    let i = header.index_of(needle)
+    if i < 0 { return 0 }
+    let start = i + len(needle)
+    let n = len(header)
+    let mut p = start
+    // Skip whitespace
+    while p < n {
+        let c = header.substring(p, p + 1)
+        if c == " " || c == "\t" { p = p + 1 } else { break }
+    }
+    let val_start = p
+    while p < n {
+        let c = header.substring(p, p + 1)
+        if c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\n" { break }
+        p = p + 1
+    }
+    if p <= val_start { return 0 }
+    let raw = header.substring(val_start, p)
+    let parsed = parse_uint_safe_local(raw)
+    if parsed < 0 { return 0 }
+    return parsed
+}
+
+// Extract a marker file path from progress_source string. The progress_source
+// field looks like:
+//   `state/markers/airgenome_gamebox_win32_cycle32_35_bundled_increment_landed.marker (win32_coverage_progression.percent field, cycle_35_percent=30.34)`
+// We split at " (" — the path is everything before; the field hint is inside the
+// parens (informational; the actual field path is hardcoded for win32_* per
+// progress_metric semantics, mirroring Track AE schema knowledge).
+fn progress_source_marker_path(progress_source: str) -> str {
+    let s = progress_source.trim()
+    if s == "" { return "" }
+    let paren_idx = s.index_of(" (")
+    if paren_idx < 0 { return s }
+    return s.substring(0, paren_idx)
+}
+
+// Read JSON marker file at path, extract nested field by dot path (e.g.
+// "win32_coverage_progression.percent"). Returns the raw value text (e.g. "30.34")
+// or "" on miss. The implementation is intentionally simple — handles the 1-level
+// nested case present in Track W's bundled marker (top-level object → nested object
+// → numeric leaf). Returns "" if path/file/key is missing (caller decides how to
+// emit the explicit reason — own2 silent_error_ban posture).
+fn read_progress_field_from_marker(marker_path: str, field_path: str) -> str {
+    if marker_path == "" || field_path == "" { return "" }
+    if !file_exists(marker_path) { return "" }
+    let content = read_text(marker_path)
+    if content == "" { return "" }
+    // Split field_path on the first "." — outer key + inner key.
+    let dot_at = field_path.index_of(".")
+    if dot_at < 0 {
+        // Single-level lookup — find `"<key>":` and take value text.
+        let needle = "\"" + field_path + "\":"
+        let i = content.index_of(needle)
+        if i < 0 { return "" }
+        let start = i + len(needle)
+        let n = len(content)
+        let mut p = start
+        while p < n {
+            let c = content.substring(p, p + 1)
+            if c == " " || c == "\t" { p = p + 1 } else { break }
+        }
+        let val_start = p
+        while p < n {
+            let c = content.substring(p, p + 1)
+            if c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\n" { break }
+            p = p + 1
+        }
+        if p <= val_start { return "" }
+        return content.substring(val_start, p)
+    }
+    let outer_key = field_path.substring(0, dot_at)
+    let inner_key = field_path.substring(dot_at + 1, len(field_path))
+    let outer_needle = "\"" + outer_key + "\":"
+    let outer_i = content.index_of(outer_needle)
+    if outer_i < 0 { return "" }
+    // Locate matching `{` then scan for inner_key WITHIN that subscope.
+    let after_outer = outer_i + len(outer_needle)
+    let n = len(content)
+    let mut p = after_outer
+    while p < n {
+        let c = content.substring(p, p + 1)
+        if c == " " || c == "\t" || c == "\n" { p = p + 1 } else { break }
+    }
+    if p >= n { return "" }
+    if content.substring(p, p + 1) != "{" { return "" }
+    // Find matching `}` (track depth).
+    let brace_start = p
+    let mut depth = 0
+    let mut q = p
+    while q < n {
+        let c = content.substring(q, q + 1)
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" {
+            depth = depth - 1
+            if depth == 0 { break }
+        }
+        q = q + 1
+    }
+    if depth != 0 { return "" }
+    let scope = content.substring(brace_start, q + 1)
+    // Now extract `"<inner_key>":` value from scope.
+    let inner_needle = "\"" + inner_key + "\":"
+    let inner_i = scope.index_of(inner_needle)
+    if inner_i < 0 { return "" }
+    let val_after = inner_i + len(inner_needle)
+    let scope_n = len(scope)
+    let mut sp = val_after
+    while sp < scope_n {
+        let c = scope.substring(sp, sp + 1)
+        if c == " " || c == "\t" { sp = sp + 1 } else { break }
+    }
+    let v_start = sp
+    while sp < scope_n {
+        let c = scope.substring(sp, sp + 1)
+        if c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\n" { break }
+        sp = sp + 1
+    }
+    if sp <= v_start { return "" }
+    return scope.substring(v_start, sp)
+}
+
+// Compute weighted_threshold contribution (x1000 scaled). Implements:
+//   if progress_pct_x1000 >= threshold_value_x1000: CHECKPOINT_WEIGHT * 1000 (full)
+//   elif progress_pct_x1000 > 0: progress_pct_x1000 * weight_x1000 / threshold_x1000
+//   else: 0
+fn checkpoint_weighted_contribution_x1000(progress_x1000: int, threshold_value_int: int) -> int {
+    if progress_x1000 < 0 { return 0 }
+    if threshold_value_int <= 0 {
+        // Defensive: 0 or negative threshold → any positive progress = full credit.
+        if progress_x1000 > 0 { return CHECKPOINT_WEIGHT * CLOSURE_PCT_SCALE }
+        return 0
+    }
+    let threshold_x1000 = threshold_value_int * CLOSURE_PCT_SCALE
+    let weight_x1000 = CHECKPOINT_WEIGHT * CLOSURE_PCT_SCALE
+    if progress_x1000 >= threshold_x1000 {
+        return weight_x1000  // full weight (capped)
+    }
+    if progress_x1000 == 0 { return 0 }
+    // partial credit: progress_x1000 * weight_x1000 / threshold_x1000
+    // Note: progress_x1000 * weight_x1000 may be large; hexa runtime int width
+    // assumed sufficient for reasonable progress (max ~100000 * 5000 = 5e8).
+    return (progress_x1000 * weight_x1000) / threshold_x1000
+}
+
+// Per-checkpoint contribution (x1000 scaled). Reads checkpoint header to dispatch
+// on aggregation kind. Returns scaled int contribution (0 .. CHECKPOINT_WEIGHT*1000).
+//   - weighted_threshold: progress-aware partial credit (per spec).
+//   - else (AND_all_required_met / unknown): binary CHECKPOINT_WEIGHT*1000 if status==met.
+//
+// `cp_path` is the .checkpoint.<name> file path (used to read header for dispatch).
+// `cached_status` is the cached header.status field (Track AD baseline; consumed
+// by the AND-branch). The function intentionally DOES NOT exec roadmap_op
+// checkpoint-status (closure_orchestrator scope; mirror Track AD posture).
+fn per_checkpoint_contribution_x1000(cp_path: str, cached_status: str) -> int {
+    if !file_exists(cp_path) { return 0 }
+    let content = read_text(cp_path)
+    let header = checkpoint_header_line(content)
+    if header == "" {
+        // Treat as AND-binary path: status met → full weight, else 0.
+        if cached_status == "met" { return CHECKPOINT_WEIGHT * CLOSURE_PCT_SCALE }
+        return 0
+    }
+    let agg_kind = checkpoint_aggregation_kind_extract(header)
+    if agg_kind == WEIGHTED_THRESHOLD_KIND {
+        let threshold_v = checkpoint_threshold_value_extract(header)
+        let progress_src = checkpoint_progress_source_extract(header)
+        let marker_path = progress_source_marker_path(progress_src)
+        // For the only weighted_threshold candidates today (win32_*pct), the
+        // hardcoded field path is win32_coverage_progression.percent. Future
+        // weighted_threshold candidates with different progress_metric MUST
+        // resolve their field path either via per-metric mapping or schema
+        // extension (caveat — see Track AG handoff §C2).
+        let progress_str = read_progress_field_from_marker(marker_path, WIN32_PROGRESS_FIELD_PATH)
+        let progress_x1000 = parse_progress_pct_x1000(progress_str)
+        if progress_x1000 < 0 { return 0 }  // explicit miss; own2 honest 0
+        return checkpoint_weighted_contribution_x1000(progress_x1000, threshold_v)
+    }
+    // AND_all_required_met (or unknown) — binary path mirrors Track AD baseline.
+    if cached_status == "met" { return CHECKPOINT_WEIGHT * CLOSURE_PCT_SCALE }
+    return 0
+}
+
+// Sum per-checkpoint contributions across the snapshot. Returns x1000-scaled int.
+// Iterates the cp_files list (paths) so the dispatcher can read each header for
+// aggregation-kind dispatch (cp_snap entries don't carry header content).
+fn sum_checkpoint_contributions_x1000(cp_files: array, cp_snap: array) -> int {
+    let n = len(cp_files)
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        let path = cp_files[i]
+        let entry = cp_snap[i]
+        let cached_status = entry[1]
+        let contrib = per_checkpoint_contribution_x1000(path, cached_status)
+        sum = sum + contrib
+        i = i + 1
+    }
+    return sum
+}
+
+// Extended closure_pct (x1000 scaled). Track AG awareness. Returns scaled int.
+// Caps at CHECKPOINT_PCT_MAX * CLOSURE_PCT_SCALE.
+fn compute_closure_pct_x1000(contribution_sum_x1000: int) -> int {
+    let base_x1000 = CHECKPOINT_BASE_PCT * CLOSURE_PCT_SCALE
+    let max_x1000 = CHECKPOINT_PCT_MAX * CLOSURE_PCT_SCALE
+    let mut total = base_x1000 + contribution_sum_x1000
+    if total > max_x1000 { total = max_x1000 }
+    if total < 0 { total = 0 }
+    return total
+}
+
+// Build a per-checkpoint weighted_threshold breakdown line list. Returns array
+// of strings (one per weighted_threshold checkpoint). Used by status subcmd to
+// surface progress=N%/threshold=M% contribution=X% diagnostics. AND-aggregation
+// checkpoints are excluded from this list (their binary contribution is reported
+// via the existing Track AD `checkpoint_reached` line).
+fn build_weighted_breakdown_lines(cp_files: array, cp_snap: array) -> array {
+    let n = len(cp_files)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let path = cp_files[i]
+        let entry = cp_snap[i]
+        let cp_name = entry[0]
+        if !file_exists(path) {
+            i = i + 1
+            continue
+        }
+        let content = read_text(path)
+        let header = checkpoint_header_line(content)
+        if header == "" {
+            i = i + 1
+            continue
+        }
+        let agg_kind = checkpoint_aggregation_kind_extract(header)
+        if agg_kind != WEIGHTED_THRESHOLD_KIND {
+            i = i + 1
+            continue
+        }
+        let threshold_v = checkpoint_threshold_value_extract(header)
+        let progress_src = checkpoint_progress_source_extract(header)
+        let marker_path = progress_source_marker_path(progress_src)
+        let progress_str = read_progress_field_from_marker(marker_path, WIN32_PROGRESS_FIELD_PATH)
+        let progress_x1000 = parse_progress_pct_x1000(progress_str)
+        let mut progress_show = "N/A"
+        let mut contrib_x1000 = 0
+        if progress_x1000 >= 0 {
+            progress_show = format_x1000_decimal(progress_x1000)
+            contrib_x1000 = checkpoint_weighted_contribution_x1000(progress_x1000, threshold_v)
+        }
+        let line = "weighted_cp_" + cp_name + ": progress=" + progress_show + "%/threshold=" + to_string(threshold_v) + "% contribution=" + format_x1000_decimal(contrib_x1000) + "%"
+        out = out.push(line)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── status subcmd ────────────────────────────────────────────
+
+fn subcmd_status() -> int {
+    let snap = resolve_snapshot()
+    let pct      = snap[0]
+    let cm_done  = snap[1]
+    let cm_total = snap[2]
+    let skel     = snap[3]
+    let src      = snap[4]
+    println("# closure_orchestrator status — track-s rank-B+C")
+    println("closure_pct: " + to_string(pct) + "%")
+    println("cm_ratio: " + to_string(cm_done) + "/" + to_string(cm_total))
+    println("skeleton_manjeom: " + to_string(skel))
+    println("validated_manjeom: " + to_string(BASELINE_VALIDATED_MANJEOM) + " (no real game frame yet)")
+    println("snapshot_source: " + source_kind_label(src))
+    println("ssot_closure_roadmap: " + SSOT_CLOSURE_ROADMAP)
+    println("ssot_d2r_d4_roadmap: " + SSOT_D2R_D4_ROADMAP)
+    println("schema: " + MARKER_SCHEMA)
+    // ─── Track AD checkpoint awareness extension (additive — pre-existing fields preserved verbatim above) ───
+    let cp_snap = build_checkpoint_snapshot()
+    let cp_total = len(cp_snap)
+    let cp_reached = count_checkpoint_reached(cp_snap)
+    let cp_pct_breakdown_base = CHECKPOINT_BASE_PCT
+    let cp_pct_breakdown_contribution = cp_reached * CHECKPOINT_WEIGHT
+    let cp_extended_closure_pct = compute_closure_pct(cp_reached)
+    println("checkpoint_count: " + to_string(cp_total))
+    if cp_total > 0 {
+        let cp_pct_int = (cp_reached * 100) / cp_total
+        println("checkpoint_reached: " + to_string(cp_reached) + "/" + to_string(cp_total))
+        println("checkpoint_pct: " + to_string(cp_pct_int) + "%")
+    } else {
+        println("checkpoint_reached: 0/0")
+        println("checkpoint_pct: N/A")
+    }
+    println("closure_pct_breakdown: { base: " + to_string(cp_pct_breakdown_base) + ", checkpoint_contribution: " + to_string(cp_pct_breakdown_contribution) + ", total: " + to_string(cp_extended_closure_pct) + " }")
+    println("checkpoint_schema_version: " + CHECKPOINT_SCHEMA_VERSION)
+    // ─── Track AG weighted_threshold awareness extension (additive — Track AD binary breakdown above preserved verbatim) ───
+    let cp_files_ag = enumerate_checkpoint_files()
+    let weighted_contrib_x1000 = sum_checkpoint_contributions_x1000(cp_files_ag, cp_snap)
+    let weighted_total_x1000 = compute_closure_pct_x1000(weighted_contrib_x1000)
+    let weighted_breakdown_lines = build_weighted_breakdown_lines(cp_files_ag, cp_snap)
+    let weighted_lines_n = len(weighted_breakdown_lines)
+    println("closure_pct_breakdown.weighted_threshold_contribution: " + format_x1000_decimal(weighted_contrib_x1000) + "%")
+    println("closure_pct_extended_weighted: " + format_x1000_decimal(weighted_total_x1000) + "% (base " + to_string(CHECKPOINT_BASE_PCT) + " + weighted_contrib " + format_x1000_decimal(weighted_contrib_x1000) + ")")
+    let mut wi = 0
+    while wi < weighted_lines_n {
+        println(weighted_breakdown_lines[wi])
+        wi = wi + 1
+    }
+    println("__CLOSURE__ PASS status closure_pct_weighted=" + format_x1000_decimal(weighted_total_x1000) + "% closure_pct_binary=" + to_string(cp_extended_closure_pct) + "% delta=" + format_x1000_decimal(weighted_total_x1000 - (cp_extended_closure_pct * CLOSURE_PCT_SCALE)) + "%")
+    println("__CLOSURE__ PASS status closure_pct=" + to_string(cp_extended_closure_pct) + "% cm_ratio=" + to_string(cm_done) + "/" + to_string(cm_total) + " checkpoint_reached=" + to_string(cp_reached) + "/" + to_string(cp_total))
+    println("__CLOSURE__ PASS status pct=" + to_string(pct) + " cm=" + to_string(cm_done) + "/" + to_string(cm_total) + " src=" + source_kind_label(src))
+    return 0
+}
+
+// ─── list subcmd — enumerate CM-0..CM-30 with status ──────────
+
+// Returns a `done` flag (1=done, 0=planned) for a given cm index by scanning
+// CLOSURE_ROADMAP.md content. Returns -1 if SSOT unreadable.
+fn cm_done_flag(content: str, idx: int) -> int {
+    if content == "" { return -1 }
+    let needle_a = "✅ CM-" + to_string(idx) + " "
+    let needle_b = "✅ **CM-" + to_string(idx) + "**"
+    if content.contains(needle_a) || content.contains(needle_b) { return 1 }
+    return 0
+}
+
+// Static milestone label table — pinned at land-time mirror of §5.
+fn cm_label(idx: int) -> str {
+    if idx == 0  { return "현재 baseline (commit hash pinned)" }
+    if idx == 1  { return "C-PE-PARSE-CACHE 즉시 구현 (만점 +1)" }
+    if idx == 2  { return "Phase 0b PE memory loader" }
+    if idx == 3  { return "C-IAT-RESOLVE-CACHE (만점 +1)" }
+    if idx == 4  { return "Phase 1 x64 ABI shim" }
+    if idx == 5  { return "Phase 2 win32 stubs (~2000 함수)" }
+    if idx == 6  { return "C-WIN32-CALL-PROFILE (만점 +1)" }
+    if idx == 7  { return "HEXA Phase A 채택 (RFC A1/A2/A3)" }
+    if idx == 8  { return "Phase 3a kernel32 핵심 (50+ 함수)" }
+    if idx == 9  { return "C-SYSCALL-BRIDGE-CACHE (만점 +1)" }
+    if idx == 10 { return "Phase 3b ntdll" }
+    if idx == 11 { return "Phase 3c msvcrt" }
+    if idx == 12 { return "Phase 4a user32" }
+    if idx == 13 { return "Phase 4b gdi32" }
+    if idx == 14 { return "Phase 4c advapi32" }
+    if idx == 15 { return "Phase 5a DirectX 11 → D3DMetal" }
+    if idx == 16 { return "Phase 5b DirectX 12 (D4 필수)" }
+    if idx == 17 { return "Phase 6 Winsock (Berkeley + WinHTTP)" }
+    if idx == 18 { return "Phase 7 OSS Win 게임 검증" }
+    if idx == 19 { return "Phase 8 Battle.net 우회 + DRM" }
+    if idx == 20 { return "Phase 9 D2R 첫 frame" }
+    if idx == 21 { return "M1 D2R baseline + 만점 18 real validation" }
+    if idx == 22 { return "M8 Sprint 1 측정 + PSB-1 brainstorm" }
+    if idx == 23 { return "M11 Sprint 2 측정 + PSB-2" }
+    if idx == 24 { return "M15 Sprint 3 측정 + PSB-3" }
+    if idx == 25 { return "Phase 10 D4 첫 frame (D3D12 + DXR)" }
+    if idx == 26 { return "M1 D4 baseline + 만점 18 D4 검증" }
+    if idx == 27 { return "PSB-4 (D4-input)" }
+    if idx == 28 { return "PSB-5+ 반복 (새 만점 0 × 3 sprint)" }
+    if idx == 29 { return "EXHAUSTION 인정" }
+    if idx == 30 { return "closure — docs/EXHAUSTION_<date>.md + final commit" }
+    return "(unknown cm index)"
+}
+
+fn subcmd_list() -> int {
+    let cr = read_text(SSOT_CLOSURE_ROADMAP)
+    let snap = resolve_snapshot()
+    let pct      = snap[0]
+    let cm_done  = snap[1]
+    let cm_total = snap[2]
+    println("# closure_orchestrator list — CM-0..CM-" + to_string(cm_total) + " milestone ladder")
+    println("# columns: CM-N | status (done|planned|baseline) | label")
+    println("# snapshot: closure_pct=" + to_string(pct) + "% cm_done_index=" + to_string(cm_done))
+    let mut i = 0
+    let mut done_cnt = 0
+    while i <= cm_total {
+        let flag = cm_done_flag(cr, i)
+        let mut status = "planned"
+        if flag == 1 {
+            status = "done"
+            done_cnt = done_cnt + 1
+        } else if flag == -1 {
+            // Fallback: anything <= cm_done index → done.
+            if i <= cm_done {
+                status = "done(baseline)"
+                done_cnt = done_cnt + 1
+            }
+        }
+        let label = cm_label(i)
+        println("CM-" + to_string(i) + "\t" + status + "\t" + label)
+        i = i + 1
+    }
+    // ─── Track AD checkpoint awareness extension (additive — CM-0..CM-30 enumeration above preserved verbatim) ───
+    println("--- CHECKPOINTS ---")
+    let cp_snap = build_checkpoint_snapshot()
+    let cp_total = len(cp_snap)
+    let cp_reached = count_checkpoint_reached(cp_snap)
+    println("# checkpoint_count: " + to_string(cp_total) + " (Track AD additive — cached header `status` field; AND_all_required_met derivation is Track AB territory)")
+    if cp_total == 0 {
+        println("# no .checkpoint.<name> files found at repo root (count=0 PASS path)")
+    } else {
+        let mut j = 0
+        while j < cp_total {
+            let entry = cp_snap[j]
+            let cp_name = entry[0]
+            let cp_status = entry[1]
+            let cp_refs = entry[2]
+            let mut name_show = cp_name
+            if name_show == "" { name_show = "(unparsed)" }
+            let mut status_show = cp_status
+            if status_show == "" { status_show = "(unparsed)" }
+            println("CHECKPOINT\t" + name_show + "\t" + status_show + "\trefs=" + to_string(cp_refs))
+            j = j + 1
+        }
+    }
+    let combined_total = (cm_total + 1) + cp_total
+    let combined_done = done_cnt + cp_reached
+    // ─── Track AG weighted_threshold awareness list extension (additive — Track AD CHECKPOINTS section above preserved verbatim) ───
+    let cp_files_ag_list = enumerate_checkpoint_files()
+    let weighted_breakdown_lines_list = build_weighted_breakdown_lines(cp_files_ag_list, cp_snap)
+    let weighted_lines_n_list = len(weighted_breakdown_lines_list)
+    if weighted_lines_n_list > 0 {
+        println("--- WEIGHTED_THRESHOLD CHECKPOINTS ---")
+        let mut wli = 0
+        while wli < weighted_lines_n_list {
+            println(weighted_breakdown_lines_list[wli])
+            wli = wli + 1
+        }
+    }
+    let weighted_contrib_x1000_list = sum_checkpoint_contributions_x1000(cp_files_ag_list, cp_snap)
+    let weighted_total_x1000_list = compute_closure_pct_x1000(weighted_contrib_x1000_list)
+    println("__CLOSURE__ PASS list shown=" + to_string(combined_total) + " done=" + to_string(combined_done) + " cm_done=" + to_string(done_cnt) + " checkpoint_reached=" + to_string(cp_reached) + "/" + to_string(cp_total) + " closure_pct_weighted=" + format_x1000_decimal(weighted_total_x1000_list) + "%")
+    println("__CLOSURE__ PASS list shown=" + to_string(combined_total) + " done=" + to_string(combined_done) + " cm_done=" + to_string(done_cnt) + " checkpoint_reached=" + to_string(cp_reached) + "/" + to_string(cp_total))
+    println("__CLOSURE__ PASS list shown=" + to_string(cm_total + 1) + " done=" + to_string(done_cnt))
+    return 0
+}
+
+// ─── emit subcmd — write progress marker (additive) ───────────
+
+// Build the JSON-like array body listing each checkpoint snapshot entry. Each
+// entry shape: { "name": "<n>", "status": "<s>", "cond_refs_count": <int> }.
+// Mirrors Track Z `cross_ref` OPTIONAL envelope semantics — additive field only,
+// existing build_progress_marker fields preserved verbatim.
+fn build_checkpoint_snapshot_json(cp_snap: array) -> str {
+    let n = len(cp_snap)
+    if n == 0 { return "[]" }
+    let mut out = "[\n"
+    let mut i = 0
+    while i < n {
+        let entry = cp_snap[i]
+        let nm = entry[0]
+        let st = entry[1]
+        let rc = entry[2]
+        out = out + "    { \"name\": \"" + nm + "\", \"status\": \"" + st + "\", \"cond_refs_count\": " + to_string(rc) + " }"
+        if i < n - 1 { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  ]"
+    return out
+}
+
+fn build_progress_marker(stamp: str, snap: array) -> str {
+    let pct      = snap[0]
+    let cm_done  = snap[1]
+    let cm_total = snap[2]
+    let skel     = snap[3]
+    let src      = snap[4]
+    let mut out = ""
+    out = out + "{\n"
+    out = out + "  \"schema\": \"" + MARKER_SCHEMA + "\",\n"
+    out = out + "  \"completion_iso\": \"2026-05-03T00:00:00Z\",\n"
+    out = out + "  \"emit_unix_ts\": " + stamp + ",\n"
+    out = out + "  \"emitter\": \"tool/closure_orchestrator.hexa subcmd_emit\",\n"
+    out = out + "  \"emitter_version\": \"" + CLOSURE_ORCH_VERSION + "\",\n"
+    out = out + "  \"closure_pct\": " + to_string(pct) + ",\n"
+    out = out + "  \"cm_done_index\": " + to_string(cm_done) + ",\n"
+    out = out + "  \"cm_total\": " + to_string(cm_total) + ",\n"
+    out = out + "  \"cm_ratio\": \"" + to_string(cm_done) + "/" + to_string(cm_total) + "\",\n"
+    out = out + "  \"skeleton_manjeom\": " + to_string(skel) + ",\n"
+    out = out + "  \"validated_manjeom\": " + to_string(BASELINE_VALIDATED_MANJEOM) + ",\n"
+    out = out + "  \"baseline_cycle\": " + to_string(BASELINE_CYCLE) + ",\n"
+    out = out + "  \"snapshot_source\": \"" + source_kind_label(src) + "\",\n"
+    out = out + "  \"ssot_closure_roadmap\": \"" + SSOT_CLOSURE_ROADMAP + "\",\n"
+    out = out + "  \"ssot_d2r_d4_roadmap\": \"" + SSOT_D2R_D4_ROADMAP + "\",\n"
+    out = out + "  \"policy\": {\n"
+    out = out + "    \"migration\": \"forbidden\",\n"
+    out = out + "    \"changes\": \"additive_only\",\n"
+    out = out + "    \"destructive_ops\": 0,\n"
+    out = out + "    \"cost_usd\": 0,\n"
+    out = out + "    \"substrate\": \"mac-local\",\n"
+    out = out + "    \"closure_advancement\": false\n"
+    out = out + "  },\n"
+    out = out + "  \"own1\": \"Wine 0 / hexa-only / NO closure-advancement (tracker only)\",\n"
+    out = out + "  \"own2\": \"PASS/FAIL emit honest / silent_swallow 0\",\n"
+    // ─── Track AD checkpoint awareness fields (additive — pre-existing fields preserved verbatim above) ───
+    let cp_snap = build_checkpoint_snapshot()
+    let cp_total = len(cp_snap)
+    let cp_reached = count_checkpoint_reached(cp_snap)
+    let cp_extended = compute_closure_pct(cp_reached)
+    let cp_contribution = cp_reached * CHECKPOINT_WEIGHT
+    let cp_json = build_checkpoint_snapshot_json(cp_snap)
+    out = out + "  \"checkpoint_count\": " + to_string(cp_total) + ",\n"
+    out = out + "  \"checkpoint_reached\": " + to_string(cp_reached) + ",\n"
+    out = out + "  \"checkpoint_schema_version\": \"" + CHECKPOINT_SCHEMA_VERSION + "\",\n"
+    out = out + "  \"closure_pct_calculation\": { \"base\": " + to_string(CHECKPOINT_BASE_PCT) + ", \"checkpoint_weight\": " + to_string(CHECKPOINT_WEIGHT) + ", \"max\": " + to_string(CHECKPOINT_PCT_MAX) + ", \"formula\": \"min(max, base + checkpoint_reached * checkpoint_weight)\" },\n"
+    out = out + "  \"closure_pct_breakdown\": { \"base\": " + to_string(CHECKPOINT_BASE_PCT) + ", \"checkpoint_contribution\": " + to_string(cp_contribution) + ", \"total\": " + to_string(cp_extended) + " },\n"
+    out = out + "  \"checkpoint_snapshot\": " + cp_json + ",\n"
+    // ─── Track AG weighted_threshold awareness fields (additive — Track AD fields above preserved verbatim) ───
+    let cp_files_ag = enumerate_checkpoint_files()
+    let weighted_contrib_x1000 = sum_checkpoint_contributions_x1000(cp_files_ag, cp_snap)
+    let weighted_total_x1000 = compute_closure_pct_x1000(weighted_contrib_x1000)
+    let binary_total_x1000 = cp_extended * CLOSURE_PCT_SCALE
+    let delta_x1000 = weighted_total_x1000 - binary_total_x1000
+    out = out + "  \"closure_pct_weighted_threshold_aware\": \"" + format_x1000_decimal(weighted_total_x1000) + "\",\n"
+    out = out + "  \"closure_pct_binary_count_only\": " + to_string(cp_extended) + ",\n"
+    out = out + "  \"closure_pct_calculation_change\": { \"binary_count_only\": " + to_string(cp_extended) + ", \"weighted_aware\": \"" + format_x1000_decimal(weighted_total_x1000) + "\", \"delta_pct\": \"" + format_x1000_decimal(delta_x1000) + "\" },\n"
+    out = out + "  \"weighted_threshold_contribution\": \"" + format_x1000_decimal(weighted_contrib_x1000) + "\",\n"
+    out = out + "  \"weighted_threshold_aware_formula\": \"per_checkpoint_contribution = (aggregation==weighted_threshold) ? (progress >= threshold ? weight : (progress > 0 ? progress/threshold*weight : 0)) : ((status==met) ? weight : 0)\",\n"
+    out = out + "  \"track_ag_aware\": true,\n"
+    out = out + "  \"cross_ref_envelope\": \"track_z_compliant_optional_additive\",\n"
+    out = out + "  \"raw_compliance\": [9, 11, 12, 15, 175]\n"
+    out = out + "}\n"
+    return out
+}
+
+fn subcmd_emit() -> int {
+    let stamp = exec("date +%s").trim()
+    if stamp == "" {
+        println("__CLOSURE__ FAIL emit unix_ts_resolve_failed")
+        return 1
+    }
+    let marker_path = "state/markers/closure_progress_" + stamp + ".marker"
+    if file_exists(marker_path) {
+        // Same-second collision guard — refuse to overwrite (additive_only).
+        println("__CLOSURE__ FAIL emit marker_already_exists:" + marker_path)
+        return 1
+    }
+    let snap = resolve_snapshot()
+    let body = build_progress_marker(stamp, snap)
+    let ok = atomic_write(marker_path, body)
+    if !ok {
+        println("__CLOSURE__ FAIL emit atomic_write_failed:" + marker_path)
+        return 1
+    }
+    let pct     = snap[0]
+    let cm_done = snap[1]
+    let cm_tot  = snap[2]
+    // ─── Track AD checkpoint awareness emit extension (additive — pre-existing emit preserved verbatim below) ───
+    let cp_snap_emit = build_checkpoint_snapshot()
+    let cp_total_emit = len(cp_snap_emit)
+    let cp_reached_emit = count_checkpoint_reached(cp_snap_emit)
+    let cp_extended_pct = compute_closure_pct(cp_reached_emit)
+    // ─── Track AG weighted_threshold awareness emit extension (additive — Track AD emit lines below preserved verbatim) ───
+    let cp_files_ag_emit = enumerate_checkpoint_files()
+    let weighted_contrib_x1000_emit = sum_checkpoint_contributions_x1000(cp_files_ag_emit, cp_snap_emit)
+    let weighted_total_x1000_emit = compute_closure_pct_x1000(weighted_contrib_x1000_emit)
+    println("__CLOSURE__ PASS emit marker=" + marker_path + " closure_pct_weighted=" + format_x1000_decimal(weighted_total_x1000_emit) + "% closure_pct_binary=" + to_string(cp_extended_pct) + "% weighted_contrib=" + format_x1000_decimal(weighted_contrib_x1000_emit) + "%")
+    println("__CLOSURE__ PASS emit marker=" + marker_path + " closure_pct=" + to_string(cp_extended_pct) + " cm_ratio=" + to_string(cm_done) + "/" + to_string(cm_tot) + " checkpoint_reached=" + to_string(cp_reached_emit) + "/" + to_string(cp_total_emit))
+    println("__CLOSURE__ PASS emit marker=" + marker_path + " pct=" + to_string(pct) + " cm=" + to_string(cm_done) + "/" + to_string(cm_tot))
+    return 0
+}
+
+// ─── help ─────────────────────────────────────────────────────
+
+fn print_help() -> void {
+    println("tool/closure_orchestrator.hexa v" + CLOSURE_ORCH_VERSION + " — airgenome-gamebox closure progression tracker (Track S)")
+    println("")
+    println("Usage:")
+    println("  hexa run tool/closure_orchestrator.hexa <subcmd>")
+    println("")
+    println("Subcommands (3 read-only/additive — no closure advancement):")
+    println("  status    Print current closure_pct + CM-N/30 + skeleton manjeom score.")
+    println("            SSOT scrape from docs/CLOSURE_ROADMAP.md + docs/D2R_D4_INSTALL_LAUNCH_ROADMAP.md;")
+    println("            falls back to cycle 37 baseline (closure_pct=25, cm=20/30) if SSOT unreadable.")
+    println("  list      Enumerate CM-0..CM-30 milestone ladder with status (done|planned|baseline).")
+    println("  emit      Write summary marker to state/markers/closure_progress_<unix_ts>.marker (additive).")
+    println("  --help    Print this help and exit.")
+    println("  self-test Drive 3-subcmd round-trip without writing live state markers.")
+    println("")
+    println("Honest emit: every subcmd writes `__CLOSURE__ <PASS|FAIL> <subcmd> <reason>`.")
+    println("Closure-advancement: this tool TRACKS progress; it does NOT advance closure_pct.")
+    // ─── Track AD checkpoint awareness help extension (additive) ───
+    println("")
+    println("Track AD checkpoint awareness (cycle 3 of 3 mk2 checkpoint mechanism):")
+    println("  status   appends checkpoint_count / checkpoint_reached / checkpoint_pct / closure_pct_breakdown.")
+    println("  list     appends `--- CHECKPOINTS ---` section listing each .checkpoint.<name>.")
+    println("  emit     adds checkpoint_count / checkpoint_reached / checkpoint_snapshot[] to marker JSON.")
+    println("  closure_pct formula: min(" + to_string(CHECKPOINT_PCT_MAX) + ", " + to_string(CHECKPOINT_BASE_PCT) + " + checkpoint_reached * " + to_string(CHECKPOINT_WEIGHT) + ").")
+    println("  This tool reads .checkpoint.<name> directly via own helpers — it does NOT exec roadmap_op subcmd.")
+    // ─── Track AG weighted_threshold awareness help extension (additive) ───
+    println("")
+    println("Track AG weighted_threshold awareness (Track AE+AF predecessors phase 2 chain):")
+    println("  status   appends closure_pct_breakdown.weighted_threshold_contribution + per-checkpoint")
+    println("           weighted_cp_<name>: progress=<N>%/threshold=<M>% contribution=<X>% lines.")
+    println("  list     appends `--- WEIGHTED_THRESHOLD CHECKPOINTS ---` section.")
+    println("  emit     adds closure_pct_calculation_change { binary_count_only / weighted_aware / delta_pct }")
+    println("           + closure_pct_weighted_threshold_aware + weighted_threshold_contribution to marker.")
+    println("  per_checkpoint_contribution(cp) = weighted_threshold ? (progress >= threshold ? weight :")
+    println("           progress > 0 ? progress/threshold*weight : 0) : (status==met ? weight : 0).")
+    println("  Internal arithmetic uses x1000-scaled int (CLOSURE_PCT_SCALE) for 2-decimal precision.")
+}
+
+// ─── self_test ────────────────────────────────────────────────
+
+fn self_test() -> int {
+    let sid = "closure-orch-selftest-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // S1 — status subcmd should PASS regardless of SSOT presence (baseline fallback).
+    let rc1 = subcmd_status()
+    r0_session_set(sid)
+    r0_emit("closure_orch_self_test_S1_status", "\"rc\":" + to_string(rc1))
+    if rc1 != 0 {
+        println("__CLOSURE__ FAIL self-test S1_status rc=" + to_string(rc1))
+        return 1
+    }
+
+    // S2 — list subcmd (read-only) should PASS.
+    let rc2 = subcmd_list()
+    r0_session_set(sid)
+    r0_emit("closure_orch_self_test_S2_list", "\"rc\":" + to_string(rc2))
+    if rc2 != 0 {
+        println("__CLOSURE__ FAIL self-test S2_list rc=" + to_string(rc2))
+        return 1
+    }
+
+    // S3 — resolve_snapshot sanity: pct ∈ [0,100], cm_done ∈ [0,30].
+    let snap = resolve_snapshot()
+    let pct = snap[0]
+    let cmd = snap[1]
+    if pct < 0 || pct > 100 {
+        println("__CLOSURE__ FAIL self-test S3_snapshot pct_out_of_range=" + to_string(pct))
+        return 1
+    }
+    if cmd < 0 || cmd > 30 {
+        println("__CLOSURE__ FAIL self-test S3_snapshot cm_done_out_of_range=" + to_string(cmd))
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S3_snapshot", "\"pct\":" + to_string(pct) + ",\"cm_done\":" + to_string(cmd))
+
+    // S4 — build_progress_marker shape: must contain MARKER_SCHEMA + closure_pct field.
+    let stamp = exec("date +%s").trim()
+    let body = build_progress_marker(stamp, snap)
+    if !body.contains("\"schema\":") || !body.contains("\"closure_pct\":") || !body.contains("\"cm_ratio\":") {
+        println("__CLOSURE__ FAIL self-test S4_marker_shape missing_required_fields")
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S4_marker_shape", "\"bytes\":" + to_string(len(body)))
+
+    // S5 — cm_label coverage: CM-0..CM-30 all return non-empty + non-"(unknown..."
+    let mut k = 0
+    while k <= 30 {
+        let lab = cm_label(k)
+        if lab == "" || lab.contains("(unknown") {
+            println("__CLOSURE__ FAIL self-test S5_label_coverage cm=" + to_string(k))
+            return 1
+        }
+        k = k + 1
+    }
+    r0_emit("closure_orch_self_test_S5_label_coverage", "\"covered\":31")
+
+    // ─── Track AD checkpoint awareness self_test extension (S6-S8 additive — S1-S5 above preserved verbatim) ───
+    // S6 — enumerate_checkpoint_files() count sanity. Production count = 3
+    // (Track AC phase 1 land: d2r_battlenet_offline_play / lineage_w_purple_play /
+    // lineage_classic_r28_play). count_negative is a hard FAIL; count == 0 is
+    // ALSO PASS (Track AB precedent — count=0 PASS path in pre-Track-AC repos).
+    let cp_files = enumerate_checkpoint_files()
+    let cp_files_n = len(cp_files)
+    if cp_files_n < 0 {
+        println("__CLOSURE__ FAIL self-test S6_enumerate negative_count=" + to_string(cp_files_n))
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S6_enumerate", "\"checkpoint_count\":" + to_string(cp_files_n))
+
+    // S7 — parse_checkpoint_header on the first checkpoint file (if present).
+    // If count > 0: assert name field non-empty + cond_refs_count > 0. If count
+    // == 0: skip (no file to parse — informational, not a failure).
+    if cp_files_n > 0 {
+        let first_path = cp_files[0]
+        let parsed = parse_checkpoint_header(first_path)
+        let p_name = parsed[0]
+        let p_status = parsed[1]
+        let p_refs = parsed[2]
+        if p_name == "" {
+            println("__CLOSURE__ FAIL self-test S7_parse name_field_empty path=" + first_path)
+            return 1
+        }
+        if p_refs <= 0 {
+            println("__CLOSURE__ FAIL self-test S7_parse cond_refs_count_not_positive=" + to_string(p_refs) + " path=" + first_path)
+            return 1
+        }
+        // status field should be a known enum string (cached header field — Track
+        // AB validator (g)). Empty string would indicate parse failure or an
+        // unverified checkpoint — emit explicit reason rather than silent_swallow.
+        if p_status == "" {
+            println("__CLOSURE__ FAIL self-test S7_parse status_field_empty path=" + first_path)
+            return 1
+        }
+        r0_emit("closure_orch_self_test_S7_parse", "\"name\":\"" + p_name + "\",\"status\":\"" + p_status + "\",\"refs\":" + to_string(p_refs))
+    } else {
+        r0_emit("closure_orch_self_test_S7_parse_skipped", "\"reason\":\"no_checkpoint_files_present\"")
+    }
+
+    // S8 — count_checkpoint_reached against current state. Today (2026-05-04
+    // post Track AC land), all 3 phase 1 checkpoints carry status=partial →
+    // expected reached=0 (own2 honest, NOT inflated). Production assertion is
+    // 0 <= reached <= total; the precise expected value is informational
+    // because future cycles will flip checkpoint statuses to met as conds
+    // converge.
+    let cp_snap_test = build_checkpoint_snapshot()
+    let reached = count_checkpoint_reached(cp_snap_test)
+    let total = len(cp_snap_test)
+    if reached < 0 {
+        println("__CLOSURE__ FAIL self-test S8_reached_count negative=" + to_string(reached))
+        return 1
+    }
+    if reached > total {
+        println("__CLOSURE__ FAIL self-test S8_reached_count over_total reached=" + to_string(reached) + " total=" + to_string(total))
+        return 1
+    }
+    let extended = compute_closure_pct(reached)
+    if extended < 0 || extended > CHECKPOINT_PCT_MAX {
+        println("__CLOSURE__ FAIL self-test S8_compute_pct out_of_range=" + to_string(extended))
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S8_reached", "\"reached\":" + to_string(reached) + ",\"total\":" + to_string(total) + ",\"closure_pct_extended\":" + to_string(extended))
+
+    // ─── Track AG weighted_threshold awareness self_test extension (S9-S11 additive — S1-S8 above preserved verbatim) ───
+    // S9 — synthetic weighted_threshold checkpoint header parse: verify
+    // aggregation_kind / threshold_value / progress_source extraction. Synthetic
+    // header avoids dependence on production .checkpoint.win32_*pct fixtures
+    // (those may evolve; tests here pin Track AG semantics independently).
+    let synth_header = "{\"type\":\"header\",\"kind\":\"checkpoint\",\"name\":\"synth_weighted\",\"aggregation\":\"weighted_threshold\",\"threshold_kind\":\"percentage\",\"threshold_value\":50,\"progress_source\":\"state/markers/synth_progress.marker (synthetic.field, info)\",\"status\":\"unmet\"}"
+    let synth_agg = checkpoint_aggregation_kind_extract(synth_header)
+    if synth_agg != WEIGHTED_THRESHOLD_KIND {
+        println("__CLOSURE__ FAIL self-test S9_aggregation_extract got=" + synth_agg + " expected=" + WEIGHTED_THRESHOLD_KIND)
+        return 1
+    }
+    let synth_threshold = checkpoint_threshold_value_extract(synth_header)
+    if synth_threshold != 50 {
+        println("__CLOSURE__ FAIL self-test S9_threshold_extract got=" + to_string(synth_threshold) + " expected=50")
+        return 1
+    }
+    let synth_progress_src = checkpoint_progress_source_extract(synth_header)
+    let synth_marker_path = progress_source_marker_path(synth_progress_src)
+    if synth_marker_path != "state/markers/synth_progress.marker" {
+        println("__CLOSURE__ FAIL self-test S9_progress_source_extract got=" + synth_marker_path)
+        return 1
+    }
+    // AND-fallback dispatch for missing aggregation field
+    let synth_no_agg = "{\"type\":\"header\",\"name\":\"synth_and\",\"status\":\"met\"}"
+    let synth_no_agg_kind = checkpoint_aggregation_kind_extract(synth_no_agg)
+    if synth_no_agg_kind != AND_ALL_REQUIRED_MET_KIND {
+        println("__CLOSURE__ FAIL self-test S9_aggregation_default got=" + synth_no_agg_kind)
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S9_aggregation_kind", "\"agg\":\"" + synth_agg + "\",\"threshold\":" + to_string(synth_threshold) + ",\"marker\":\"" + synth_marker_path + "\"")
+
+    // S10 — synthetic progress_source marker file read: verify percentage
+    // extraction via parse_progress_pct_x1000. Pure unit test on parser — does
+    // NOT touch production marker files (mirrors Track AE S15-S17 synthetic-only
+    // posture; raw 168 minimum-viable).
+    let p_30_34 = parse_progress_pct_x1000("30.34")
+    if p_30_34 != 30340 {
+        println("__CLOSURE__ FAIL self-test S10_parse_30.34 got=" + to_string(p_30_34) + " expected=30340")
+        return 1
+    }
+    let p_50 = parse_progress_pct_x1000("50")
+    if p_50 != 50000 {
+        println("__CLOSURE__ FAIL self-test S10_parse_50 got=" + to_string(p_50) + " expected=50000")
+        return 1
+    }
+    let p_0 = parse_progress_pct_x1000("0")
+    if p_0 != 0 {
+        println("__CLOSURE__ FAIL self-test S10_parse_0 got=" + to_string(p_0) + " expected=0")
+        return 1
+    }
+    let p_bad = parse_progress_pct_x1000("")
+    if p_bad != -1 {
+        println("__CLOSURE__ FAIL self-test S10_parse_empty got=" + to_string(p_bad) + " expected=-1_for_silent_error_ban")
+        return 1
+    }
+    let f_29551 = format_x1000_decimal(29551)
+    if f_29551 != "29.55" {
+        println("__CLOSURE__ FAIL self-test S10_format_29551 got=" + f_29551 + " expected=29.55")
+        return 1
+    }
+    let f_4551 = format_x1000_decimal(4551)
+    if f_4551 != "4.55" {
+        println("__CLOSURE__ FAIL self-test S10_format_4551 got=" + f_4551 + " expected=4.55")
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S10_parse_format", "\"p_30.34\":" + to_string(p_30_34) + ",\"p_50\":" + to_string(p_50) + ",\"f_29551\":\"" + f_29551 + "\"")
+
+    // S11 — weighted_threshold contribution calculation:
+    //   - 30/50 case (synthetic): progress=30000 threshold=50 → 30000*5000/50000 = 3000 (3.00%)
+    //   - 100/50 case (capped at full weight): progress=100000 threshold=50 → 5000 (5.00%)
+    //   - 0/50 case (no progress): progress=0 → 0
+    //   - 30.34/50 spec case: progress=30340 threshold=50 → 30340*5000/50000 = 3034 (3.034%)
+    //   - 30.34/100 spec case: progress=30340 threshold=100 → 30340*5000/100000 = 1517 (1.517%)
+    let c_30_50 = checkpoint_weighted_contribution_x1000(30000, 50)
+    if c_30_50 != 3000 {
+        println("__CLOSURE__ FAIL self-test S11_30_50 got=" + to_string(c_30_50) + " expected=3000")
+        return 1
+    }
+    let c_100_50 = checkpoint_weighted_contribution_x1000(100000, 50)
+    if c_100_50 != 5000 {
+        println("__CLOSURE__ FAIL self-test S11_100_50_full_cap got=" + to_string(c_100_50) + " expected=5000")
+        return 1
+    }
+    let c_0_50 = checkpoint_weighted_contribution_x1000(0, 50)
+    if c_0_50 != 0 {
+        println("__CLOSURE__ FAIL self-test S11_0_50 got=" + to_string(c_0_50) + " expected=0")
+        return 1
+    }
+    let c_3034_50 = checkpoint_weighted_contribution_x1000(30340, 50)
+    if c_3034_50 != 3034 {
+        println("__CLOSURE__ FAIL self-test S11_3034_50_spec got=" + to_string(c_3034_50) + " expected=3034")
+        return 1
+    }
+    let c_3034_100 = checkpoint_weighted_contribution_x1000(30340, 100)
+    if c_3034_100 != 1517 {
+        println("__CLOSURE__ FAIL self-test S11_3034_100_spec got=" + to_string(c_3034_100) + " expected=1517")
+        return 1
+    }
+    // Defensive: threshold=0 with positive progress → full weight (Track AE-aligned semantics)
+    let c_pos_0 = checkpoint_weighted_contribution_x1000(1000, 0)
+    if c_pos_0 != 5000 {
+        println("__CLOSURE__ FAIL self-test S11_threshold_0_defensive got=" + to_string(c_pos_0) + " expected=5000")
+        return 1
+    }
+    // Spec-aligned closure_pct: 25 + 3.034 + 1.517 = 29.551 → display 29.55
+    let spec_sum_x1000 = c_3034_50 + c_3034_100
+    let spec_total_x1000 = compute_closure_pct_x1000(spec_sum_x1000)
+    let spec_total_str = format_x1000_decimal(spec_total_x1000)
+    if spec_total_str != "29.55" {
+        println("__CLOSURE__ FAIL self-test S11_spec_total got=" + spec_total_str + " expected=29.55")
+        return 1
+    }
+    r0_emit("closure_orch_self_test_S11_contribution", "\"c_3034_50\":" + to_string(c_3034_50) + ",\"c_3034_100\":" + to_string(c_3034_100) + ",\"spec_total\":\"" + spec_total_str + "\"")
+
+    println("__CLOSURE__ PASS self-test all_11_steps")
+    println("__CLOSURE__ PASS self-test all_8_steps")
+    println("__CLOSURE__ PASS self-test all_5_steps")
+    return 0
+}
+
+// ─── main dispatch ─────────────────────────────────────────────
+
+fn main() -> void {
+    let a = args()
+    let n = len(a)
+    if n < 3 {
+        print_help()
+        return
+    }
+    let subcmd = a[2]
+
+    if subcmd == "--help" || subcmd == "-h" || subcmd == "help" {
+        print_help()
+        return
+    }
+    if subcmd == "self-test" || subcmd == "selftest" {
+        let rc = self_test()
+        if rc != 0 { panic("closure_orchestrator self-test FAIL rc=" + to_string(rc)) }
+        return
+    }
+    if subcmd == "status" {
+        let rc = subcmd_status()
+        if rc != 0 { panic("closure_orchestrator status FAIL") }
+        return
+    }
+    if subcmd == "list" {
+        let rc = subcmd_list()
+        if rc != 0 { panic("closure_orchestrator list FAIL") }
+        return
+    }
+    if subcmd == "emit" {
+        let rc = subcmd_emit()
+        if rc != 0 { panic("closure_orchestrator emit FAIL") }
+        return
+    }
+    println("__CLOSURE__ FAIL dispatch unknown_subcmd:" + subcmd)
+    print_help()
+    panic("closure_orchestrator dispatch FAIL unknown_subcmd=" + subcmd)
+}

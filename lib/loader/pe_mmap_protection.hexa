@@ -1,0 +1,388 @@
+// lib/loader/pe_mmap_protection.hexa — stage3 mmap page protection skeleton
+//
+// macOS Apple Silicon W^X 정책 — write 와 execute 동시 X. PE .text section 은
+// initial map 후 mprotect (R+X), .data 는 R+W. 본 파일은 protection toggle
+// 추적 — 실 mmap/mprotect 는 stage4.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   Apple mmap(2) / mprotect(2) man page + Apple Silicon W^X policy 만 참조.
+// own 2 mandate: r0_emit ≥ 5 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// prot_kind:
+//   1 = R         (read-only)
+//   2 = R+W       (.data)
+//   3 = R+X       (.text — Apple Silicon JIT 시 toggle 필요)
+//   4 = R+W+X     (forbidden — W^X 위반)
+//
+// persist schema (TSV — pmp_history.tsv):
+//   region_id<int> \t prot_kind<int> \t page_count<int> \t elapsed_us<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pmp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_mmap_protection"
+}
+
+fn pmp_history_path() -> str {
+    return pmp_dir() + "/pmp_history.tsv"
+}
+
+fn pmp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pmp_dir() + "'")
+}
+
+fn cleanup_pmp() -> void {
+    pmp_ensure_dir()
+    let _ = exec("rm -f '" + pmp_history_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pmp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pmp_append_row(path: str, row: str) -> void {
+    pmp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_page_op: page protection toggle 기록 ───
+fn record_page_op(region_id: int, prot_kind: int, page_count: int, elapsed_us: int) -> void {
+    if region_id <= 0 {
+        panic("pe_mmap_protection FAIL [record_page_op] expected=region_id>0 got=" + to_string(region_id))
+    }
+    if prot_kind <= 0 {
+        panic("pe_mmap_protection FAIL [record_page_op] expected=prot_kind>0 got=" + to_string(prot_kind))
+    }
+    if prot_kind > 4 {
+        panic("pe_mmap_protection FAIL [record_page_op] expected=prot_kind<=4 got=" + to_string(prot_kind))
+    }
+    if page_count <= 0 {
+        panic("pe_mmap_protection FAIL [record_page_op] expected=page_count>0 got=" + to_string(page_count))
+    }
+    if elapsed_us < 0 {
+        panic("pe_mmap_protection FAIL [record_page_op] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    let row = to_string(region_id) + "\t" + to_string(prot_kind)
+        + "\t" + to_string(page_count) + "\t" + to_string(elapsed_us) + "\n"
+    pmp_append_row(pmp_history_path(), row)
+}
+
+// ─── op_count: 전체 op row 수 ───
+fn op_count() -> int {
+    let mut cnt = 0
+    let t = pmp_read_table(pmp_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    cnt = cnt + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── total_pages: page_count sum ───
+fn total_pages() -> int {
+    let mut sum = 0
+    let t = pmp_read_table(pmp_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum = sum + to_int(parts[2])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum
+}
+
+// ─── total_elapsed_us: elapsed_us sum ───
+fn total_elapsed_us() -> int {
+    let mut sum = 0
+    let t = pmp_read_table(pmp_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    sum = sum + to_int(parts[3])
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum
+}
+
+// ─── count_by_prot: 특정 prot_kind 의 op row 수 ───
+fn count_by_prot(kind: int) -> int {
+    let mut cnt = 0
+    let t = pmp_read_table(pmp_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[1]) == kind {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return cnt
+}
+
+// ─── forbidden_count: prot_kind == 4 (R+W+X — W^X 위반) row 수 ───
+fn forbidden_count() -> int {
+    return count_by_prot(4)
+}
+
+// ─── region_pages: 특정 region 의 page_count sum ───
+fn region_pages(region_id: int) -> int {
+    let mut sum = 0
+    let t = pmp_read_table(pmp_history_path())
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 4 {
+                    if to_int(parts[0]) == region_id {
+                        sum = sum + to_int(parts[2])
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return sum
+}
+
+// ─── pmp_stats: [op_count, total_pages, count_by_prot(3), forbidden_count] ───
+fn pmp_stats() -> array {
+    let mut out = []
+    out.push(op_count())
+    out.push(total_pages())
+    out.push(count_by_prot(3))
+    out.push(forbidden_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pmp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pmp()
+
+    // 2. record 4 synthetic ops
+    record_page_op(81001, 3, 240, 80)
+    r0_emit("pe_mmap_protection_record",
+        "\"region_id\":81001,\"prot_kind\":3,\"page_count\":240,\"elapsed_us\":80,\"label\":\".text\"")
+
+    record_page_op(81002, 2, 120, 60)
+    r0_emit("pe_mmap_protection_record",
+        "\"region_id\":81002,\"prot_kind\":2,\"page_count\":120,\"elapsed_us\":60,\"label\":\".data\"")
+
+    record_page_op(81003, 1, 60, 40)
+    r0_emit("pe_mmap_protection_record",
+        "\"region_id\":81003,\"prot_kind\":1,\"page_count\":60,\"elapsed_us\":40,\"label\":\".rdata\"")
+
+    record_page_op(81004, 3, 180, 70)
+    r0_emit("pe_mmap_protection_record",
+        "\"region_id\":81004,\"prot_kind\":3,\"page_count\":180,\"elapsed_us\":70,\"label\":\"jit_stub\"")
+
+    // 3. op_count = 4
+    let oc = op_count()
+    if oc != 4 {
+        panic("pe_mmap_protection FAIL [op_count] expected=4 got=" + to_string(oc))
+    }
+
+    // 4. total_pages = 240+120+60+180 = 600
+    let tp = total_pages()
+    if tp != 600 {
+        panic("pe_mmap_protection FAIL [total_pages] expected=600 got=" + to_string(tp))
+    }
+
+    // 5. total_elapsed_us = 80+60+40+70 = 250
+    let te = total_elapsed_us()
+    if te != 250 {
+        panic("pe_mmap_protection FAIL [total_elapsed_us] expected=250 got=" + to_string(te))
+    }
+
+    // 6. count_by_prot
+    let c1 = count_by_prot(1)
+    if c1 != 1 {
+        panic("pe_mmap_protection FAIL [count_by_prot(1)] expected=1 got=" + to_string(c1))
+    }
+    let c2 = count_by_prot(2)
+    if c2 != 1 {
+        panic("pe_mmap_protection FAIL [count_by_prot(2)] expected=1 got=" + to_string(c2))
+    }
+    let c3 = count_by_prot(3)
+    if c3 != 2 {
+        panic("pe_mmap_protection FAIL [count_by_prot(3)] expected=2 got=" + to_string(c3))
+    }
+    let c4 = count_by_prot(4)
+    if c4 != 0 {
+        panic("pe_mmap_protection FAIL [count_by_prot(4)] expected=0 got=" + to_string(c4))
+    }
+    let c99 = count_by_prot(99)
+    if c99 != 0 {
+        panic("pe_mmap_protection FAIL [count_by_prot(99)] expected=0 got=" + to_string(c99))
+    }
+
+    // 7. forbidden_count = 0
+    let fc = forbidden_count()
+    if fc != 0 {
+        panic("pe_mmap_protection FAIL [forbidden_count] expected=0 got=" + to_string(fc))
+    }
+
+    // 8. region_pages
+    let rp1 = region_pages(81001)
+    if rp1 != 240 {
+        panic("pe_mmap_protection FAIL [region_pages(81001)] expected=240 got=" + to_string(rp1))
+    }
+    let rp4 = region_pages(81004)
+    if rp4 != 180 {
+        panic("pe_mmap_protection FAIL [region_pages(81004)] expected=180 got=" + to_string(rp4))
+    }
+    let rpx = region_pages(9999)
+    if rpx != 0 {
+        panic("pe_mmap_protection FAIL [region_pages(9999)] expected=0 got=" + to_string(rpx))
+    }
+
+    // 9. pmp_stats() = [4, 600, 2, 0]
+    let s = pmp_stats()
+    if len(s) != 4 {
+        panic("pe_mmap_protection FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_mmap_protection FAIL [stats[0]] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 600 {
+        panic("pe_mmap_protection FAIL [stats[1]] expected=600 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_mmap_protection FAIL [stats[2]] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 0 {
+        panic("pe_mmap_protection FAIL [stats[3]] expected=0 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_mmap_protection_stats",
+        "\"op_count\":" + to_string(s[0])
+        + ",\"total_pages\":" + to_string(s[1])
+        + ",\"rx_count\":" + to_string(s[2])
+        + ",\"forbidden\":" + to_string(s[3])
+        + ",\"total_elapsed_us\":" + to_string(te))
+
+    // 11. emit count >= 5 (4 records + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("pe_mmap_protection FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pmp()
+    let s2 = pmp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_mmap_protection FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_mmap_protection self_test PASS (ops=" + to_string(s[0])
+        + ", pages=" + to_string(s[1]) + ", rx=" + to_string(s[2])
+        + ", forbidden=" + to_string(s[3]) + ", elapsed_us=" + to_string(te)
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pmp_stats()
+            println("op_count\t" + to_string(s[0]))
+            println("total_pages\t" + to_string(s[1]))
+            println("rx_count\t" + to_string(s[2]))
+            println("forbidden_count\t" + to_string(s[3]))
+            println("total_elapsed_us\t" + to_string(total_elapsed_us()))
+            return
+        }
+        if sub == "pages" {
+            if len(a) >= 4 {
+                let rid = to_int(a[3])
+                println("region_pages\t" + to_string(region_pages(rid)))
+                return
+            }
+            println("usage: hexa run pe_mmap_protection.hexa pages <region_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println("count_by_prot\t" + to_string(count_by_prot(k)))
+                return
+            }
+            println("usage: hexa run pe_mmap_protection.hexa count <prot_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pmp()
+            println("cleaned: " + pmp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pmp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_mmap_protection.hexa { self-test | stats | pages <region_id> | count <prot_kind> | cleanup | dir }")
+}

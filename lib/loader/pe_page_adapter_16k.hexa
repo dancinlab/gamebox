@@ -1,0 +1,379 @@
+// lib/loader/pe_page_adapter_16k.hexa — Phase 1 Apple Silicon 16KB ↔ Win32 4KB page adapter skeleton
+//
+// Apple Silicon 16KB page granularity adapter:
+//   - mmap length must be multiple of getpagesize() = 16384
+//   - Win32 PE section padding = FileAlignment (0x200) → SectionAlignment (0x1000)
+//   - 16KB native page 강제 시 small section 의 fragmentation +20~30%
+//   - cross-section RIP-relative reference 보존 위해 인접 section 합치기 가능
+// own1: Apple mmap(2) + sysctl hw.pagesize only
+//
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV — adapts.tsv):
+//   adapt_id<int> \t native_size_bytes<int> \t padded_size_bytes<int> \t waste_bytes<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ppa16_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_page_adapter_16k"
+}
+
+fn ppa16_adapts_path() -> str {
+    return ppa16_dir() + "/adapts.tsv"
+}
+
+fn ppa16_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ppa16_dir() + "'")
+}
+
+fn cleanup_ppa16() -> void {
+    ppa16_ensure_dir()
+    let _ = exec("rm -f '" + ppa16_adapts_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ppa16_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ppa16_append_row(path: str, row: str) -> void {
+    ppa16_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_adapt: adapt 1 건 기록 ───
+fn record_adapt(adapt_id: int, native_size_bytes: int, padded_size_bytes: int) -> void {
+    if adapt_id <= 0 {
+        panic("pe_page_adapter_16k FAIL [record_adapt] expected=adapt_id>0 got=" + to_string(adapt_id))
+    }
+    if native_size_bytes < 0 {
+        panic("pe_page_adapter_16k FAIL [record_adapt] expected=native_size_bytes>=0 got=" + to_string(native_size_bytes))
+    }
+    if padded_size_bytes < 0 {
+        panic("pe_page_adapter_16k FAIL [record_adapt] expected=padded_size_bytes>=0 got=" + to_string(padded_size_bytes))
+    }
+    if padded_size_bytes < native_size_bytes {
+        panic("pe_page_adapter_16k FAIL [record_adapt] expected=padded>=native got_padded=" + to_string(padded_size_bytes)
+            + " got_native=" + to_string(native_size_bytes))
+    }
+    let waste_bytes = padded_size_bytes - native_size_bytes
+    let row = to_string(adapt_id) + "\t" + to_string(native_size_bytes)
+        + "\t" + to_string(padded_size_bytes) + "\t" + to_string(waste_bytes) + "\n"
+    ppa16_append_row(ppa16_adapts_path(), row)
+}
+
+// ─── adapt_count: total adapt 수 ───
+fn adapt_count() -> int {
+    let t = ppa16_read_table(ppa16_adapts_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_native_bytes: 모든 adapt native_size_bytes 합 ───
+fn total_native_bytes() -> int {
+    let t = ppa16_read_table(ppa16_adapts_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[1])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_padded_bytes: 모든 adapt padded_size_bytes 합 ───
+fn total_padded_bytes() -> int {
+    let t = ppa16_read_table(ppa16_adapts_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── total_waste_bytes: 모든 adapt waste_bytes 합 ───
+fn total_waste_bytes() -> int {
+    let t = ppa16_read_table(ppa16_adapts_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── waste_pct: total_waste_bytes / total_native_bytes * 100 (0-guard) ───
+fn waste_pct() -> int {
+    let nat = total_native_bytes()
+    if nat == 0 {
+        return 0
+    }
+    return (total_waste_bytes() * 100) / nat
+}
+
+// ─── adapt_waste: 특정 adapt_id 의 waste_bytes (없으면 0) ───
+fn adapt_waste(adapt_id: int) -> int {
+    let t = ppa16_read_table(ppa16_adapts_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == adapt_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ppa16_stats: [adapt_count, total_native_bytes, total_padded_bytes, total_waste_bytes, waste_pct] ───
+fn ppa16_stats() -> array {
+    let mut out = []
+    out.push(adapt_count())
+    out.push(total_native_bytes())
+    out.push(total_padded_bytes())
+    out.push(total_waste_bytes())
+    out.push(waste_pct())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ppa16-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ppa16()
+
+    // 2. record 5 adapts — Win32 small section sizes padded to 16KB Apple page
+    //    native sums = 4096 + 8192 + 1024 + 2048 + 16384 = 31744
+    //    padded sums = 16384 + 16384 + 16384 + 16384 + 16384 = 81920
+    //    waste sums  = 12288 + 8192 + 15360 + 14336 + 0     = 50176
+    //    waste_pct   = 50176 * 100 / 31744 = 158
+    record_adapt(210001, 4096, 16384)
+    r0_emit("pe_page_adapter_16k_record",
+        "\"adapt_id\":210001,\"native\":4096,\"padded\":16384,\"waste\":12288,\"section\":\".text-tiny\"")
+
+    record_adapt(210002, 8192, 16384)
+    r0_emit("pe_page_adapter_16k_record",
+        "\"adapt_id\":210002,\"native\":8192,\"padded\":16384,\"waste\":8192,\"section\":\".rdata\"")
+
+    record_adapt(210003, 1024, 16384)
+    r0_emit("pe_page_adapter_16k_record",
+        "\"adapt_id\":210003,\"native\":1024,\"padded\":16384,\"waste\":15360,\"section\":\".tls\"")
+
+    record_adapt(210004, 2048, 16384)
+    r0_emit("pe_page_adapter_16k_record",
+        "\"adapt_id\":210004,\"native\":2048,\"padded\":16384,\"waste\":14336,\"section\":\".pdata\"")
+
+    record_adapt(210005, 16384, 16384)
+    r0_emit("pe_page_adapter_16k_record",
+        "\"adapt_id\":210005,\"native\":16384,\"padded\":16384,\"waste\":0,\"section\":\".rsrc\"")
+
+    // 3. adapt_count = 5
+    let c = adapt_count()
+    if c != 5 {
+        panic("pe_page_adapter_16k FAIL [adapt_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_native_bytes = 31744
+    let tn = total_native_bytes()
+    if tn != 31744 {
+        panic("pe_page_adapter_16k FAIL [total_native_bytes] expected=31744 got=" + to_string(tn))
+    }
+
+    // 5. total_padded_bytes = 81920
+    let tp = total_padded_bytes()
+    if tp != 81920 {
+        panic("pe_page_adapter_16k FAIL [total_padded_bytes] expected=81920 got=" + to_string(tp))
+    }
+
+    // 6. total_waste_bytes = 50176
+    let tw = total_waste_bytes()
+    if tw != 50176 {
+        panic("pe_page_adapter_16k FAIL [total_waste_bytes] expected=50176 got=" + to_string(tw))
+    }
+
+    // 7. waste_pct = 158
+    let wp = waste_pct()
+    if wp != 158 {
+        panic("pe_page_adapter_16k FAIL [waste_pct] expected=158 got=" + to_string(wp))
+    }
+
+    // 8. adapt_waste sanity
+    let w1 = adapt_waste(210001)
+    if w1 != 12288 {
+        panic("pe_page_adapter_16k FAIL [adapt_waste(210001)] expected=12288 got=" + to_string(w1))
+    }
+    let w5 = adapt_waste(210005)
+    if w5 != 0 {
+        panic("pe_page_adapter_16k FAIL [adapt_waste(210005)] expected=0 got=" + to_string(w5))
+    }
+    let w_miss = adapt_waste(9999)
+    if w_miss != 0 {
+        panic("pe_page_adapter_16k FAIL [adapt_waste(9999)] expected=0 got=" + to_string(w_miss))
+    }
+
+    // 9. ppa16_stats() = [5, 31744, 81920, 50176, 158]
+    let s = ppa16_stats()
+    if len(s) != 5 {
+        panic("pe_page_adapter_16k FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_page_adapter_16k FAIL [stats adapt_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 31744 {
+        panic("pe_page_adapter_16k FAIL [stats total_native] expected=31744 got=" + to_string(s[1]))
+    }
+    if s[2] != 81920 {
+        panic("pe_page_adapter_16k FAIL [stats total_padded] expected=81920 got=" + to_string(s[2]))
+    }
+    if s[3] != 50176 {
+        panic("pe_page_adapter_16k FAIL [stats total_waste] expected=50176 got=" + to_string(s[3]))
+    }
+    if s[4] != 158 {
+        panic("pe_page_adapter_16k FAIL [stats waste_pct] expected=158 got=" + to_string(s[4]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_page_adapter_16k_stats",
+        "\"adapt_count\":" + to_string(s[0])
+        + ",\"total_native\":" + to_string(s[1])
+        + ",\"total_padded\":" + to_string(s[2])
+        + ",\"total_waste\":" + to_string(s[3])
+        + ",\"waste_pct\":" + to_string(s[4]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_page_adapter_16k FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_ppa16()
+    let s2 = ppa16_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_page_adapter_16k FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_page_adapter_16k self_test PASS (adapts=" + to_string(s[0])
+        + ", native=" + to_string(s[1]) + ", padded=" + to_string(s[2])
+        + ", waste=" + to_string(s[3]) + ", waste_pct=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ppa16_stats()
+            println("adapt_count\t" + to_string(s[0]))
+            println("total_native_bytes\t" + to_string(s[1]))
+            println("total_padded_bytes\t" + to_string(s[2]))
+            println("total_waste_bytes\t" + to_string(s[3]))
+            println("waste_pct\t" + to_string(s[4]))
+            return
+        }
+        if sub == "waste" {
+            if len(a) >= 4 {
+                let aid = to_int(a[3])
+                println("adapt_waste\t" + to_string(adapt_waste(aid)))
+                return
+            }
+            println("usage: hexa run pe_page_adapter_16k.hexa waste <adapt_id>")
+            return
+        }
+        if sub == "count" {
+            println("adapt_count\t" + to_string(adapt_count()))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ppa16()
+            println("cleaned: " + ppa16_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ppa16_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_page_adapter_16k.hexa { self-test | stats | waste <adapt_id> | count | cleanup | dir }")
+}

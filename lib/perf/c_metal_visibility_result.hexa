@@ -1,0 +1,217 @@
+// lib/perf/c_metal_visibility_result.hexa — CN-147 skeleton manjeom 15/15
+//
+// MTLVisibilityResultMode (Metal occlusion query) 추적 — visibility result buffer
+// 로 hidden mesh 의 draw call 을 predicated culling 하여 회피한다. D4 outdoor /
+// open-world large draw call 시나리오 (vegetation / foliage / distant detail) 에
+//서 occlusion query 결과를 frame 간 재사용해 hidden draw 를 GPU 측에서 skip 시키고,
+// 이로써 CPU draw call 양과 GPU vertex / fragment work 를 동시에 절감한다.
+//
+// 무기: query × pass_count × culled_draws × ms_saved 4-key columnar log + sum/avg.
+// 효과: D4 outdoor scene 의 occlusion-culled draw call 양을 정량화 → frame budget
+// 회복 (culled_draws × per-draw cost ≈ ms_saved).
+
+use "./r0_common"
+
+let MVR_DIR = GAMEBOX_HOME + "/persist/metal_visibility_result"
+let QUERY_LOG = MVR_DIR + "/queries.tsv"
+
+fn mvr_dir() -> str { return MVR_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + MVR_DIR + "'")
+}
+
+// ─── query 등록 ───
+//   query_id (D4 vegetation / distant prop / dungeon LOD 등 occlusion 대상의 hash),
+//   pass_count (이 query 가 적용된 render pass 수),
+//   culled_draws (visibility result 로 skip 된 draw call 누적 수),
+//   ms_saved (절약된 frame budget ms — host 측 측정).
+fn record_query(query_id: int, pass_count: int, culled_draws: int, ms_saved: int) -> void {
+    ensure_dir()
+    let line = to_string(query_id) + "\t" + to_string(pass_count) + "\t" + to_string(culled_draws) + "\t" + to_string(ms_saved)
+    let tmp = QUERY_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + QUERY_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("metal_visibility_record", "\"query\":" + to_string(query_id) + ",\"passes\":" + to_string(pass_count) + ",\"culled\":" + to_string(culled_draws) + ",\"ms_saved\":" + to_string(ms_saved))
+}
+
+// ─── query_count — 등록된 query 행 수 ───
+fn query_count() -> int {
+    let exists = exec("test -f '" + QUERY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + QUERY_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_passes — 모든 query 의 pass_count 합 ───
+fn total_passes() -> int {
+    let exists = exec("test -f '" + QUERY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + QUERY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_culled — 모든 query 의 culled_draws 합 ───
+fn total_culled() -> int {
+    let exists = exec("test -f '" + QUERY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + QUERY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_ms_saved — 모든 query 의 ms_saved 합 ───
+fn total_ms_saved() -> int {
+    let exists = exec("test -f '" + QUERY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + QUERY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── avg_culled_per_pass — total_culled / total_passes (정수 trunc) ───
+//   passes 0 이면 0 반환 (divide-by-zero guard).
+fn avg_culled_per_pass() -> int {
+    let tp = total_passes()
+    if tp == 0 { return 0 }
+    let tc = total_culled()
+    return tc / tp
+}
+
+// ─── query_ms_saved — 특정 query_id 의 ms_saved 합 ───
+//   query_id 미등록이면 0.
+fn query_ms_saved(query_id: int) -> int {
+    let exists = exec("test -f '" + QUERY_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v q=" + to_string(query_id) + " '$1==q {s+=$4} END{print s+0}' '" + QUERY_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── mvr_stats — [query_count, total_passes, total_culled, total_ms_saved] ───
+fn mvr_stats() -> array {
+    return [query_count(), total_passes(), total_culled(), total_ms_saved()]
+}
+
+fn cleanup_mvr() -> void {
+    let _ = exec("rm -rf '" + MVR_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "mvr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_mvr()
+
+    // 합성 query 3 종 (D4 open-world occlusion targets):
+    //   D4 vegetation occlusion   (id=4001) — 8 passes / 240 culled / 3 ms saved
+    //   D4 distant prop occlusion (id=4002) — 12 passes / 360 culled / 5 ms saved
+    //   D4 dungeon LOD occlusion  (id=4003) — 4 passes / 80 culled  / 2 ms saved
+    record_query(4001, 8, 240, 3)
+    record_query(4002, 12, 360, 5)
+    record_query(4003, 4, 80, 2)
+
+    // query_count = 3
+    let qc = query_count()
+    if qc != 3 { panic("c_metal_visibility_result FAIL [query_count] expected=3 got=" + to_string(qc)) }
+
+    // total_passes = 8+12+4 = 24
+    let tp = total_passes()
+    if tp != 24 { panic("c_metal_visibility_result FAIL [total_passes] expected=24 got=" + to_string(tp)) }
+
+    // total_culled = 240+360+80 = 680
+    let tc = total_culled()
+    if tc != 680 { panic("c_metal_visibility_result FAIL [total_culled] expected=680 got=" + to_string(tc)) }
+
+    // total_ms_saved = 3+5+2 = 10
+    let tms = total_ms_saved()
+    if tms != 10 { panic("c_metal_visibility_result FAIL [total_ms_saved] expected=10 got=" + to_string(tms)) }
+
+    // avg_culled_per_pass = 680 / 24 = 28 (int trunc)
+    let avg = avg_culled_per_pass()
+    if avg != 28 { panic("c_metal_visibility_result FAIL [avg_culled_per_pass] expected=28 got=" + to_string(avg)) }
+
+    // query_ms_saved per id
+    let s1 = query_ms_saved(4001)
+    if s1 != 3 { panic("c_metal_visibility_result FAIL [ms_saved 4001] expected=3 got=" + to_string(s1)) }
+    let s2 = query_ms_saved(4002)
+    if s2 != 5 { panic("c_metal_visibility_result FAIL [ms_saved 4002] expected=5 got=" + to_string(s2)) }
+    let s3 = query_ms_saved(4003)
+    if s3 != 2 { panic("c_metal_visibility_result FAIL [ms_saved 4003] expected=2 got=" + to_string(s3)) }
+    // 미등록 query_id 는 0
+    let s4 = query_ms_saved(9999)
+    if s4 != 0 { panic("c_metal_visibility_result FAIL [ms_saved unknown] expected=0 got=" + to_string(s4)) }
+
+    let stats = mvr_stats()
+    if stats[0] != 3 { panic("c_metal_visibility_result FAIL [stats queries] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 24 { panic("c_metal_visibility_result FAIL [stats passes] expected=24 got=" + to_string(stats[1])) }
+    if stats[2] != 680 { panic("c_metal_visibility_result FAIL [stats culled] expected=680 got=" + to_string(stats[2])) }
+    if stats[3] != 10 { panic("c_metal_visibility_result FAIL [stats ms_saved] expected=10 got=" + to_string(stats[3])) }
+
+    r0_emit("metal_visibility_summary", "\"queries\":" + to_string(stats[0]) + ",\"passes\":" + to_string(stats[1]) + ",\"culled\":" + to_string(stats[2]) + ",\"ms_saved\":" + to_string(stats[3]) + ",\"avg_culled_per_pass\":" + to_string(avg))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_metal_visibility_result FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic MTLVisibilityResultBuffer state machine round-trip (cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track AP mission: D2R/D4 cond.3 (Apple Metal layer) 측 evidence augment.
+    // cond.3 측 status `partial` 영구 유지 — D3DMetal binary licence transitive
+    // (loader_dx blk.1) 측 영구 외부 의존, met 승격 X. Apple-native scaffold.
+    //
+    // (a) synthetic MTLVisibilityResultBuffer 4-phase occlusion query cycle —
+    //     bind → setMode → render → readback state machine:
+    //     phase_count               4                   (bind/setMode/render/readback)
+    //     vis_buf_obj_off           0x18001A000         (synthetic VisibilityResultBuffer RVA)
+    //     query_kind                "synthetic_inline"  (실 setVisibilityResultMode X)
+    //
+    // (b) synthetic query × pass 12-slot occlusion matrix —
+    //     3 query (D2R/D4/shared) × 4 pass_kind = 12 slot walk:
+    //     slot_total                12                  (3 query × 4 pass_kind)
+    //     culled_slot_count         8                   (24 passes / 3 query 측 8 slot per query avg)
+    //     matrix_kind               "synthetic_inline"  (실 query result readback X)
+    //
+    // round-trip = synthesize_visibility_phase(scaffold) → walk_query_pass_matrix(scaffold).
+    //              hexa-native loop only — 실 setVisibilityResultMode() 0,
+    //              real GPU occlusion query 0.
+    //
+    // synthetic visibility phase emit
+    r0_emit("c_metal_visibility_result_synthetic_phase",
+        "\"stage\":\"visibility_phase\",\"phase_count\":4,\"vis_buf_obj_off\":\"0x18001A000\",\"query_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"d3dmetal_gap\":\"permanent — D3DMetal binary licence transitive (loader_dx blk.1)\"")
+    println("__METAL_VISIBILITY__ PARTIAL visibility_phase")
+
+    // synthetic query × pass occlusion matrix emit
+    r0_emit("c_metal_visibility_result_synthetic_matrix",
+        "\"stage\":\"query_pass_matrix\",\"slot_total\":12,\"culled_slot_count\":8,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"d3dmetal_gap\":\"permanent — D3DMetal binary licence transitive (loader_dx blk.1)\"")
+    println("__METAL_VISIBILITY__ PARTIAL query_pass_matrix")
+
+    cleanup_mvr()
+
+    println("  ✅ c_metal_visibility_result self_test PASS (3 queries, 24 passes, 680 culled, 10 ms saved, avg=28/pass, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = mvr_stats()
+            println("queries=" + to_string(s[0]) + " passes=" + to_string(s[1]) + " culled=" + to_string(s[2]) + " ms_saved=" + to_string(s[3]))
+            return
+        }
+        if sub == "saved" {
+            if len(a) >= 4 {
+                let qid = to_int(a[3])
+                let ms = query_ms_saved(qid)
+                println(to_string(ms))
+                return
+            }
+        }
+        if sub == "cleanup" { cleanup_mvr(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_metal_visibility_result.hexa { self-test | stats | saved <query_id> | cleanup }")
+}

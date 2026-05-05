@@ -1,0 +1,413 @@
+// lib/loader/pe_vm_pressure_handler.hexa — Mach vm_pressure event handler skeleton
+//
+// macOS Mach kernel vm_pressure notification → gamebox loader 의 cache /
+// texture / helper 정리 dispatcher. host XPC 또는 dispatch_source_t
+// (DISPATCH_SOURCE_TYPE_MEMORYPRESSURE) 가 emit 한 event 를 record + aggregate.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 vm_pressure event tracker — 실 dispatch_source / mach port
+//   호출 X (stage6 native bridge).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// pressure_level code:
+//   1 = normal
+//   2 = warn
+//   3 = urgent
+//   4 = critical
+//
+// action_kind code:
+//   1 = noop
+//   2 = purge_caches
+//   3 = evict_textures
+//   4 = kill_helper
+//
+// persist schema (TSV — events.tsv):
+//   event_id<int> \t pressure_level<int> \t freed_kb<int> \t action_kind<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pvph_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_vm_pressure_handler"
+}
+
+fn pvph_events_path() -> str {
+    return pvph_dir() + "/events.tsv"
+}
+
+fn pvph_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pvph_dir() + "'")
+}
+
+fn cleanup_pvph() -> void {
+    pvph_ensure_dir()
+    let _ = exec("rm -f '" + pvph_events_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pvph_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pvph_append_row(path: str, row: str) -> void {
+    pvph_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_event: vm_pressure event 1 건 기록 ───
+fn record_event(event_id: int, pressure_level: int, freed_kb: int, action_kind: int) -> void {
+    if event_id <= 0 {
+        panic("pe_vm_pressure_handler FAIL [record_event] expected=event_id>0 got=" + to_string(event_id))
+    }
+    if pressure_level < 1 {
+        panic("pe_vm_pressure_handler FAIL [record_event] expected=pressure_level>=1 got=" + to_string(pressure_level))
+    }
+    if pressure_level > 4 {
+        panic("pe_vm_pressure_handler FAIL [record_event] expected=pressure_level<=4 got=" + to_string(pressure_level))
+    }
+    if freed_kb < 0 {
+        panic("pe_vm_pressure_handler FAIL [record_event] expected=freed_kb>=0 got=" + to_string(freed_kb))
+    }
+    if action_kind < 1 {
+        panic("pe_vm_pressure_handler FAIL [record_event] expected=action_kind>=1 got=" + to_string(action_kind))
+    }
+    if action_kind > 4 {
+        panic("pe_vm_pressure_handler FAIL [record_event] expected=action_kind<=4 got=" + to_string(action_kind))
+    }
+    let row = to_string(event_id) + "\t" + to_string(pressure_level)
+        + "\t" + to_string(freed_kb) + "\t" + to_string(action_kind) + "\n"
+    pvph_append_row(pvph_events_path(), row)
+}
+
+// ─── event_count: total event 수 ───
+fn event_count() -> int {
+    let t = pvph_read_table(pvph_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_freed_kb: 모든 event freed_kb 합 ───
+fn total_freed_kb() -> int {
+    let t = pvph_read_table(pvph_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_level: 특정 pressure_level 의 event 수 ───
+fn count_by_level(pressure_level: int) -> int {
+    let t = pvph_read_table(pvph_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == pressure_level {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_action: 특정 action_kind 의 event 수 ───
+fn count_by_action(action_kind: int) -> int {
+    let t = pvph_read_table(pvph_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == action_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── event_freed_kb: 특정 event_id 의 freed_kb (없으면 0) ───
+fn event_freed_kb(event_id: int) -> int {
+    let t = pvph_read_table(pvph_events_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == event_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pvph_stats: [event_count, total_freed_kb, count_by_level(3), count_by_action(2)] ───
+fn pvph_stats() -> array {
+    let mut out = []
+    out.push(event_count())
+    out.push(total_freed_kb())
+    out.push(count_by_level(3))
+    out.push(count_by_action(2))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pvph-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pvph()
+
+    // 2. record 5 events covering pressure_levels {1,2,3,4} & actions {1,2,3,4}
+    record_event(120001, 1, 0, 1)
+    r0_emit("pe_vm_pressure_handler_record",
+        "\"event_id\":120001,\"pressure_level\":1,\"freed_kb\":0,\"action_kind\":1,\"target\":\"normal_noop\"")
+
+    record_event(120002, 2, 512, 2)
+    r0_emit("pe_vm_pressure_handler_record",
+        "\"event_id\":120002,\"pressure_level\":2,\"freed_kb\":512,\"action_kind\":2,\"target\":\"warn_purge_caches\"")
+
+    record_event(120003, 3, 2048, 3)
+    r0_emit("pe_vm_pressure_handler_record",
+        "\"event_id\":120003,\"pressure_level\":3,\"freed_kb\":2048,\"action_kind\":3,\"target\":\"urgent_evict_textures\"")
+
+    record_event(120004, 3, 1024, 2)
+    r0_emit("pe_vm_pressure_handler_record",
+        "\"event_id\":120004,\"pressure_level\":3,\"freed_kb\":1024,\"action_kind\":2,\"target\":\"urgent_purge_caches\"")
+
+    record_event(120005, 4, 8192, 4)
+    r0_emit("pe_vm_pressure_handler_record",
+        "\"event_id\":120005,\"pressure_level\":4,\"freed_kb\":8192,\"action_kind\":4,\"target\":\"critical_kill_helper\"")
+
+    // 3. event_count = 5
+    let c = event_count()
+    if c != 5 {
+        panic("pe_vm_pressure_handler FAIL [event_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_freed_kb = 11776
+    let tf = total_freed_kb()
+    if tf != 11776 {
+        panic("pe_vm_pressure_handler FAIL [total_freed_kb] expected=11776 got=" + to_string(tf))
+    }
+
+    // 5. count_by_level sanity (covers ≥3 levels: 1,2,3,4)
+    let l1 = count_by_level(1)
+    if l1 != 1 {
+        panic("pe_vm_pressure_handler FAIL [count_by_level(1)] expected=1 got=" + to_string(l1))
+    }
+    let l2 = count_by_level(2)
+    if l2 != 1 {
+        panic("pe_vm_pressure_handler FAIL [count_by_level(2)] expected=1 got=" + to_string(l2))
+    }
+    let l3 = count_by_level(3)
+    if l3 != 2 {
+        panic("pe_vm_pressure_handler FAIL [count_by_level(3)] expected=2 got=" + to_string(l3))
+    }
+    let l4 = count_by_level(4)
+    if l4 != 1 {
+        panic("pe_vm_pressure_handler FAIL [count_by_level(4)] expected=1 got=" + to_string(l4))
+    }
+    let l99 = count_by_level(99)
+    if l99 != 0 {
+        panic("pe_vm_pressure_handler FAIL [count_by_level(99)] expected=0 got=" + to_string(l99))
+    }
+
+    // 6. count_by_action sanity (covers ≥3 actions: 1,2,3,4)
+    let a1 = count_by_action(1)
+    if a1 != 1 {
+        panic("pe_vm_pressure_handler FAIL [count_by_action(1)] expected=1 got=" + to_string(a1))
+    }
+    let a2 = count_by_action(2)
+    if a2 != 2 {
+        panic("pe_vm_pressure_handler FAIL [count_by_action(2)] expected=2 got=" + to_string(a2))
+    }
+    let a3 = count_by_action(3)
+    if a3 != 1 {
+        panic("pe_vm_pressure_handler FAIL [count_by_action(3)] expected=1 got=" + to_string(a3))
+    }
+    let a4 = count_by_action(4)
+    if a4 != 1 {
+        panic("pe_vm_pressure_handler FAIL [count_by_action(4)] expected=1 got=" + to_string(a4))
+    }
+
+    // 7. event_freed_kb sanity
+    let f3 = event_freed_kb(120003)
+    if f3 != 2048 {
+        panic("pe_vm_pressure_handler FAIL [event_freed_kb(120003)] expected=2048 got=" + to_string(f3))
+    }
+    let f5 = event_freed_kb(120005)
+    if f5 != 8192 {
+        panic("pe_vm_pressure_handler FAIL [event_freed_kb(120005)] expected=8192 got=" + to_string(f5))
+    }
+    let f_miss = event_freed_kb(9999)
+    if f_miss != 0 {
+        panic("pe_vm_pressure_handler FAIL [event_freed_kb(9999)] expected=0 got=" + to_string(f_miss))
+    }
+
+    // 8. pvph_stats() = [5, 11776, 2, 2]
+    let s = pvph_stats()
+    if len(s) != 4 {
+        panic("pe_vm_pressure_handler FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_vm_pressure_handler FAIL [stats event_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 11776 {
+        panic("pe_vm_pressure_handler FAIL [stats total_freed_kb] expected=11776 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_vm_pressure_handler FAIL [stats count_level(3)] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_vm_pressure_handler FAIL [stats count_action(2)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_vm_pressure_handler_stats",
+        "\"event_count\":" + to_string(s[0])
+        + ",\"total_freed_kb\":" + to_string(s[1])
+        + ",\"level_urgent\":" + to_string(s[2])
+        + ",\"action_purge_caches\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_vm_pressure_handler FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pvph()
+    let s2 = pvph_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_vm_pressure_handler FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_vm_pressure_handler self_test PASS (events=" + to_string(s[0])
+        + ", freed_kb=" + to_string(s[1]) + ", urgent=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pvph_stats()
+            println("event_count\t" + to_string(s[0]))
+            println("total_freed_kb\t" + to_string(s[1]))
+            println("count_level_urgent\t" + to_string(s[2]))
+            println("count_action_purge_caches\t" + to_string(s[3]))
+            return
+        }
+        if sub == "freed" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println("event_freed_kb\t" + to_string(event_freed_kb(eid)))
+                return
+            }
+            println("usage: hexa run pe_vm_pressure_handler.hexa freed <event_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 5 {
+                let target = a[3]
+                let val = to_int(a[4])
+                if target == "level" {
+                    println("count_by_level\t" + to_string(count_by_level(val)))
+                    return
+                }
+                if target == "action" {
+                    println("count_by_action\t" + to_string(count_by_action(val)))
+                    return
+                }
+            }
+            println("usage: hexa run pe_vm_pressure_handler.hexa count level <n>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pvph()
+            println("cleaned: " + pvph_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pvph_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_vm_pressure_handler.hexa { self-test | stats | freed <event_id> | count level <n> | cleanup | dir }")
+}

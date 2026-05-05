@@ -1,0 +1,565 @@
+// lib/loader/dx_d3d11_stage1.hexa — Phase 5a — DirectX 11 stage1 (D3DMetal call simulation)
+//
+// own 1 enforcement: Wine / DXVK / VKD3D / community 코드 0 줄.
+//   참조 only — Microsoft 공식 Direct3D 11 spec:
+//     - https://learn.microsoft.com/en-us/windows/win32/api/d3d11/
+//   참조 only — Apple D3DMetal redist:
+//     - DMG/redist/lib/external/D3DMetal.framework
+//   Wine / DXVK / VKD3D source 단 1 줄도 import / copy / port 금지.
+//
+// own 2 mandate:
+//   - r0_emit ≥ 5 (실제: d3d11_create_device + d3d11_resource_create × N + d3d11_draw + d3d11_present)
+//   - fn self_test() + main() dispatch
+//   - headless (stdin/stdout/file 만)
+//   - panic("dx_d3d11_stage1 FAIL [<sub>] expected=X got=Y")
+//
+// 범위 (Phase 5a stage1 — handle simulation):
+//   skeleton mapping (dx_d3d11.hexa) 와 달리 *실제 D3DMetal.framework 호출* 은 후속 Phase.
+//   여기서는 *synthetic handle table* 으로 D3D11 동작만 검증.
+//   D2R 게임이 D3D11 호출 → 우리 simulator → reasonable handle 반환.
+//
+// handle table 구조:
+//   device_table.tsv   — "device_id\ttype\tversion"
+//   buffer_table.tsv   — "buffer_id\tsize_bytes\tusage"
+//   texture_table.tsv  — "texture_id\twidth\theight\tformat"
+//   shader_table.tsv   — "shader_id\tstage\tbytecode_hash"   (stage = "vs"/"ps")
+//   pipeline_table.tsv — "pipeline_id\tvs_hash\tps_hash\tblend\traster"
+//   파일 위치: ~/.airgenome/gamebox/persist/d3d11_handles/
+//
+// handle id 범위:
+//   device   = 1xxx
+//   buffer   = 2xxx
+//   texture  = 3xxx
+//   vs       = 4xxx
+//   ps       = 5xxx
+//   pipeline = 6xxx
+//   handle 0 / -1 은 invalid.
+
+use "../perf/r0_common"
+
+// ─── handle table 디렉토리 ───
+fn handle_dir() -> str {
+    return GAMEBOX_HOME + "/persist/d3d11_handles"
+}
+
+fn device_table_path() -> str {
+    return handle_dir() + "/device_table.tsv"
+}
+
+fn buffer_table_path() -> str {
+    return handle_dir() + "/buffer_table.tsv"
+}
+
+fn texture_table_path() -> str {
+    return handle_dir() + "/texture_table.tsv"
+}
+
+fn shader_table_path() -> str {
+    return handle_dir() + "/shader_table.tsv"
+}
+
+fn pipeline_table_path() -> str {
+    return handle_dir() + "/pipeline_table.tsv"
+}
+
+fn ensure_handle_dir() -> void {
+    let _ = exec("mkdir -p '" + handle_dir() + "'")
+}
+
+fn cleanup() -> void {
+    ensure_handle_dir()
+    let _ = exec("rm -f '" + device_table_path() + "' '" + buffer_table_path()
+        + "' '" + texture_table_path() + "' '" + shader_table_path()
+        + "' '" + pipeline_table_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn append_row(path: str, row: str) -> void {
+    ensure_handle_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── 다음 handle id (table 의 max + 1; empty → base) ───
+fn next_id_for(path: str, base: int) -> int {
+    let t = read_table(path)
+    if t == "" {
+        return base
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut max_h = base - 1
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                let h = to_int(parts[0])
+                if h > max_h {
+                    max_h = h
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_h + 1
+}
+
+fn count_rows(path: str) -> int {
+    let t = read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        if lines[i] != "" {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── lookup: row id 가 table 에 존재하는지 ───
+fn id_exists(path: str, hnd: int) -> bool {
+    let t = read_table(path)
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 1 {
+                if parts[0] == key {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── D3D11CreateDevice ───
+//   type     = 1 (HARDWARE), 2 (REFERENCE), 3 (WARP)
+//   version  = D3D feature level (예: 0xb000 == 11_0)
+//   handle   = 1xxx (1000 부터)
+fn d3d11_create_device() -> int {
+    let h = next_id_for(device_table_path(), 1000)
+    let row = to_string(h) + "\t1\t" + to_string(0xb000) + "\n"
+    append_row(device_table_path(), row)
+    return h
+}
+
+// ─── ID3D11Device::CreateBuffer ───
+//   usage 값 (D3D11_USAGE):
+//     0 DEFAULT, 1 IMMUTABLE, 2 DYNAMIC, 3 STAGING
+//   handle = 2xxx
+fn create_buffer(size_bytes: int, usage: int) -> int {
+    if size_bytes <= 0 {
+        return -1
+    }
+    let h = next_id_for(buffer_table_path(), 2000)
+    let row = to_string(h) + "\t" + to_string(size_bytes) + "\t" + to_string(usage) + "\n"
+    append_row(buffer_table_path(), row)
+    return h
+}
+
+// ─── ID3D11Device::CreateTexture2D ───
+//   format = DXGI_FORMAT (예: 28 == DXGI_FORMAT_R8G8B8A8_UNORM)
+//   handle = 3xxx
+fn create_texture_2d(width: int, height: int, format: int) -> int {
+    if width <= 0 {
+        return -1
+    }
+    if height <= 0 {
+        return -1
+    }
+    let h = next_id_for(texture_table_path(), 3000)
+    let row = to_string(h) + "\t" + to_string(width) + "\t" + to_string(height)
+        + "\t" + to_string(format) + "\n"
+    append_row(texture_table_path(), row)
+    return h
+}
+
+// ─── ID3D11Device::CreateVertexShader ───
+//   handle = 4xxx
+fn create_vertex_shader(bytecode_hash: int) -> int {
+    let h = next_id_for(shader_table_path(), 4000)
+    let row = to_string(h) + "\tvs\t" + to_string(bytecode_hash) + "\n"
+    append_row(shader_table_path(), row)
+    return h
+}
+
+// ─── ID3D11Device::CreatePixelShader ───
+//   handle = 5xxx
+//   shader_table 공유 — vs/ps stage column 으로 구분.
+fn create_pixel_shader(bytecode_hash: int) -> int {
+    // ps 만의 분리된 id 공간 (5xxx) 보장 — vs 와 max() 충돌 방지 위해
+    // shader_table 안에서 5000+ 로 강제.
+    let t = read_table(shader_table_path())
+    let mut max_ps = 4999
+    if t != "" {
+        let lines = t.split("\n")
+        let n = len(lines)
+        let i = 0
+        while i < n {
+            let line = lines[i]
+            if line != "" {
+                let parts = line.split("\t")
+                if len(parts) >= 2 {
+                    if parts[1] == "ps" {
+                        let v = to_int(parts[0])
+                        if v > max_ps {
+                            max_ps = v
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    let h = max_ps + 1
+    let row = to_string(h) + "\tps\t" + to_string(bytecode_hash) + "\n"
+    append_row(shader_table_path(), row)
+    return h
+}
+
+// ─── shader_table 에서 stage 별 count ───
+fn count_shaders_by_stage(stage: str) -> int {
+    let t = read_table(shader_table_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut c = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 2 {
+                if parts[1] == stage {
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── shader_table 에서 stage 매칭하는 id 가 존재하는지 ───
+fn shader_exists(hnd: int, stage: str) -> bool {
+    let t = read_table(shader_table_path())
+    if t == "" {
+        return false
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let key = to_string(hnd)
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 2 {
+                if parts[0] == key {
+                    if parts[1] == stage {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── ID3D11Device::Create*PipelineState ───
+//   blend  = 0 OFF, 1 ALPHA, 2 ADD
+//   raster = 0 SOLID, 1 WIREFRAME
+//   handle = 6xxx
+fn create_pipeline_state(vs: int, ps: int, blend: int, raster: int) -> int {
+    if !shader_exists(vs, "vs") {
+        return -1
+    }
+    if !shader_exists(ps, "ps") {
+        return -1
+    }
+    let h = next_id_for(pipeline_table_path(), 6000)
+    let row = to_string(h) + "\t" + to_string(vs) + "\t" + to_string(ps)
+        + "\t" + to_string(blend) + "\t" + to_string(raster) + "\n"
+    append_row(pipeline_table_path(), row)
+    return h
+}
+
+// ─── ID3D11DeviceContext::Draw ───
+//   pipeline 이 존재하고 vertex_count > 0 → simulator 가 success 반환.
+fn draw(pipeline: int, vertex_count: int) -> bool {
+    if vertex_count <= 0 {
+        return false
+    }
+    if !id_exists(pipeline_table_path(), pipeline) {
+        return false
+    }
+    return true
+}
+
+// ─── IDXGISwapChain::Present ───
+//   device 가 존재 → success.
+fn present(device: int) -> bool {
+    if !id_exists(device_table_path(), device) {
+        return false
+    }
+    return true
+}
+
+// ─── handle_counts: [devices, buffers, textures, vs, ps, pipelines] ───
+fn handle_counts() -> array {
+    let mut out = []
+    out.push(count_rows(device_table_path()))
+    out.push(count_rows(buffer_table_path()))
+    out.push(count_rows(texture_table_path()))
+    out.push(count_shaders_by_stage("vs"))
+    out.push(count_shaders_by_stage("ps"))
+    out.push(count_rows(pipeline_table_path()))
+    return out
+}
+
+// ─── self-test ───
+fn self_test() -> void {
+    let sid = "d3d11s1-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup()
+
+    // 2. d3d11_create_device > 0
+    let dev = d3d11_create_device()
+    if dev <= 0 {
+        panic("dx_d3d11_stage1 FAIL [d3d11_create_device] expected=>0 got=" + to_string(dev))
+    }
+    if dev < 1000 {
+        panic("dx_d3d11_stage1 FAIL [device id range] expected=>=1000 got=" + to_string(dev))
+    }
+
+    // emit 1: d3d11_create_device
+    r0_emit("d3d11_create_device",
+        "\"device\":" + to_string(dev) + ",\"type\":1,\"version\":\"11_0\"")
+
+    // 3. create_buffer (4096, 1)
+    let buf1 = create_buffer(4096, 1)
+    if buf1 <= 0 {
+        panic("dx_d3d11_stage1 FAIL [create_buffer] expected=>0 got=" + to_string(buf1))
+    }
+    if buf1 < 2000 {
+        panic("dx_d3d11_stage1 FAIL [buffer id range] expected=>=2000 got=" + to_string(buf1))
+    }
+
+    // emit 2: d3d11_resource_create (buffer)
+    r0_emit("d3d11_resource_create",
+        "\"kind\":\"buffer\",\"handle\":" + to_string(buf1)
+        + ",\"size_bytes\":4096,\"usage\":1")
+
+    // 4. create_texture_2d (1920, 1080, 28)
+    let tex1 = create_texture_2d(1920, 1080, 28)
+    if tex1 <= 0 {
+        panic("dx_d3d11_stage1 FAIL [create_texture_2d] expected=>0 got=" + to_string(tex1))
+    }
+    if tex1 < 3000 {
+        panic("dx_d3d11_stage1 FAIL [texture id range] expected=>=3000 got=" + to_string(tex1))
+    }
+
+    // emit 3: d3d11_resource_create (texture)
+    r0_emit("d3d11_resource_create",
+        "\"kind\":\"texture2d\",\"handle\":" + to_string(tex1)
+        + ",\"width\":1920,\"height\":1080,\"format\":28")
+
+    // 5. create_vertex_shader (0xABCD)
+    let vs = create_vertex_shader(0xABCD)
+    if vs <= 0 {
+        panic("dx_d3d11_stage1 FAIL [create_vertex_shader] expected=>0 got=" + to_string(vs))
+    }
+    if vs < 4000 {
+        panic("dx_d3d11_stage1 FAIL [vs id range] expected=>=4000 got=" + to_string(vs))
+    }
+    if vs >= 5000 {
+        panic("dx_d3d11_stage1 FAIL [vs id range upper] expected=<5000 got=" + to_string(vs))
+    }
+
+    // emit 4: d3d11_resource_create (vs)
+    r0_emit("d3d11_resource_create",
+        "\"kind\":\"vertex_shader\",\"handle\":" + to_string(vs)
+        + ",\"bytecode_hash\":\"0xABCD\"")
+
+    // 6. create_pixel_shader (0x1234)
+    let ps = create_pixel_shader(0x1234)
+    if ps <= 0 {
+        panic("dx_d3d11_stage1 FAIL [create_pixel_shader] expected=>0 got=" + to_string(ps))
+    }
+    if ps < 5000 {
+        panic("dx_d3d11_stage1 FAIL [ps id range] expected=>=5000 got=" + to_string(ps))
+    }
+
+    // emit 5: d3d11_resource_create (ps)
+    r0_emit("d3d11_resource_create",
+        "\"kind\":\"pixel_shader\",\"handle\":" + to_string(ps)
+        + ",\"bytecode_hash\":\"0x1234\"")
+
+    // 7. create_pipeline_state (vs, ps, 0, 0)
+    let pipeline = create_pipeline_state(vs, ps, 0, 0)
+    if pipeline <= 0 {
+        panic("dx_d3d11_stage1 FAIL [create_pipeline_state] expected=>0 got=" + to_string(pipeline))
+    }
+    if pipeline < 6000 {
+        panic("dx_d3d11_stage1 FAIL [pipeline id range] expected=>=6000 got=" + to_string(pipeline))
+    }
+
+    // emit 6: d3d11_resource_create (pipeline)
+    r0_emit("d3d11_resource_create",
+        "\"kind\":\"pipeline\",\"handle\":" + to_string(pipeline)
+        + ",\"vs\":" + to_string(vs) + ",\"ps\":" + to_string(ps)
+        + ",\"blend\":0,\"raster\":0")
+
+    // 7b. create_pipeline_state with bad shader → -1
+    let bad_pipeline = create_pipeline_state(99999, ps, 0, 0)
+    if bad_pipeline != -1 {
+        panic("dx_d3d11_stage1 FAIL [pipeline bad vs] expected=-1 got=" + to_string(bad_pipeline))
+    }
+
+    // 8. draw(pipeline, 3) → true
+    let dr = draw(pipeline, 3)
+    if !dr {
+        panic("dx_d3d11_stage1 FAIL [draw] expected=true got=false")
+    }
+
+    // 8b. draw with bad pipeline → false
+    let dr_bad = draw(99999, 3)
+    if dr_bad {
+        panic("dx_d3d11_stage1 FAIL [draw bad pipeline] expected=false got=true")
+    }
+
+    // 8c. draw with vertex_count=0 → false
+    let dr_zero = draw(pipeline, 0)
+    if dr_zero {
+        panic("dx_d3d11_stage1 FAIL [draw zero verts] expected=false got=true")
+    }
+
+    // emit 7: d3d11_draw
+    r0_emit("d3d11_draw",
+        "\"pipeline\":" + to_string(pipeline)
+        + ",\"vertex_count\":3,\"result\":\"S_OK\"")
+
+    // 9. present(dev) → true
+    let pr = present(dev)
+    if !pr {
+        panic("dx_d3d11_stage1 FAIL [present] expected=true got=false")
+    }
+
+    // 9b. present with bad device → false
+    let pr_bad = present(99999)
+    if pr_bad {
+        panic("dx_d3d11_stage1 FAIL [present bad device] expected=false got=true")
+    }
+
+    // emit 8: d3d11_present
+    r0_emit("d3d11_present",
+        "\"device\":" + to_string(dev) + ",\"result\":\"S_OK\"")
+
+    // 10. handle_counts → [1, 1, 1, 1, 1, 1]
+    let counts = handle_counts()
+    if len(counts) != 6 {
+        panic("dx_d3d11_stage1 FAIL [counts len] expected=6 got=" + to_string(len(counts)))
+    }
+    if counts[0] != 1 {
+        panic("dx_d3d11_stage1 FAIL [counts devices] expected=1 got=" + to_string(counts[0]))
+    }
+    if counts[1] != 1 {
+        panic("dx_d3d11_stage1 FAIL [counts buffers] expected=1 got=" + to_string(counts[1]))
+    }
+    if counts[2] != 1 {
+        panic("dx_d3d11_stage1 FAIL [counts textures] expected=1 got=" + to_string(counts[2]))
+    }
+    if counts[3] != 1 {
+        panic("dx_d3d11_stage1 FAIL [counts vs] expected=1 got=" + to_string(counts[3]))
+    }
+    if counts[4] != 1 {
+        panic("dx_d3d11_stage1 FAIL [counts ps] expected=1 got=" + to_string(counts[4]))
+    }
+    if counts[5] != 1 {
+        panic("dx_d3d11_stage1 FAIL [counts pipelines] expected=1 got=" + to_string(counts[5]))
+    }
+
+    // 11. emit count >= 5 검증 (실제 8)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 5 {
+        panic("dx_d3d11_stage1 FAIL [r0 emit count] expected=>=5 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup
+    cleanup()
+
+    // 12b. cleanup 후 counts 모두 0
+    let counts_after = handle_counts()
+    let i = 0
+    while i < len(counts_after) {
+        if counts_after[i] != 0 {
+            panic("dx_d3d11_stage1 FAIL [cleanup counts[" + to_string(i)
+                + "]] expected=0 got=" + to_string(counts_after[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ dx_d3d11_stage1 self_test PASS (device + buffer + texture + VS/PS + pipeline + draw + present, sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "counts" {
+            let c = handle_counts()
+            println("devices\t" + to_string(c[0]))
+            println("buffers\t" + to_string(c[1]))
+            println("textures\t" + to_string(c[2]))
+            println("vs\t" + to_string(c[3]))
+            println("ps\t" + to_string(c[4]))
+            println("pipelines\t" + to_string(c[5]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup()
+            println("cleaned: " + handle_dir())
+            return
+        }
+        if sub == "dir" {
+            println(handle_dir())
+            return
+        }
+    }
+    println("usage: hexa run dx_d3d11_stage1.hexa { self-test | counts | cleanup | dir }")
+}

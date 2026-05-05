@@ -1,0 +1,154 @@
+// lib/perf/c_raw_paradigm_extract.hexa — CN-26 PSB-4 만점 15/15
+//
+// gamebox 측정 → airgenome `raw` 새 paradigm rule 자동 추출.
+// 1000 시간 게임 측정 → "frametime stutter > 30ms 와 PSO compile cluster
+// 동시 발생률 95%" 같은 rule → airgenome `raw` 추가.
+//
+// 무기: pattern miner + statistical significance + raw rule generator.
+// 효과: gamebox 가 closure 후에도 *airgenome MAIN AGI 학습 substrate* 에 새 raw 공급.
+
+use "./r0_common"
+
+let RAW_DIR = GAMEBOX_HOME + "/persist/raw_paradigm"
+let RAW_RULES_PATH = RAW_DIR + "/extracted_rules.jsonl"
+let OBSERVATION_PATH = RAW_DIR + "/observations.jsonl"
+
+fn raw_dir() -> str { return RAW_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + RAW_DIR + "'")
+}
+
+// ─── observation 등록 (시간순 multi-event) ───
+fn record_observation(ts_us: int, event_type: str, label: str, value: int) -> void {
+    ensure_dir()
+    let line = "{\"ts\":" + to_string(ts_us) + ",\"type\":\"" + event_type + "\",\"label\":\"" + label + "\",\"value\":" + to_string(value) + "}"
+    let tmp = OBSERVATION_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + OBSERVATION_PATH + "' && rm -f '" + tmp + "'")
+}
+
+// ─── pattern 빈도 카운트 ───
+//   특정 두 이벤트 (A → B, ts_window us 안) 동시 발생 횟수
+fn cooccurrence_count(label_a: str, label_b: str, window_us: int) -> int {
+    let exists = exec("test -f '" + OBSERVATION_PATH + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    // 합성 — A 발생 시 window 안에 B 도 있으면 카운트
+    let cmd = "awk -F',' -v la='" + label_a + "' -v lb='" + label_b + "' -v w=" + to_string(window_us) + " '{ts=int(substr($1, index($1, \":\")+1)); l=substr($3, index($3, \":\")+2); gsub(/\"/, \"\", l); if (l==la) { a_ts=ts } else if (l==lb && a_ts>0 && (ts-a_ts) <= w && (ts-a_ts) >= 0) { c++; a_ts=0 } } END {print c+0}' '" + OBSERVATION_PATH + "' 2>/dev/null"
+    let result = exec(cmd).trim()
+    if result == "" { return 0 }
+    return to_int(result)
+}
+
+// ─── statistical significance — A 단독 vs A+B 동시 ───
+//   significance = (cooccur_count / a_count) * 100  (= conditional probability %)
+fn significance(label_a: str, label_b: str, window_us: int) -> int {
+    let a_count_str = exec("grep -c '\"label\":\"" + label_a + "\"' '" + OBSERVATION_PATH + "' 2>/dev/null").trim()
+    if a_count_str == "" { return 0 }
+    let a_count = to_int(a_count_str)
+    if a_count == 0 { return 0 }
+    let cooccur = cooccurrence_count(label_a, label_b, window_us)
+    return cooccur * 1000 / a_count  // deci-percent
+}
+
+// ─── raw rule 생성 ───
+//   significance 가 80%+ 면 raw rule 로 채택
+//   format: airgenome `.raw` 형식 — "raw NN: <label_a> implies <label_b> within <window>us (conf <%>)"
+fn extract_raw_rule(label_a: str, label_b: str, window_us: int, rule_id: int) -> str {
+    let conf = significance(label_a, label_b, window_us)
+    if conf < 800 { return "" }  // 80% 미만은 채택 X
+    let rule = "raw " + to_string(rule_id) + ": " + label_a + " implies " + label_b + " within " + to_string(window_us) + "us (conf " + to_string(conf) + "/1000)"
+    let line = "{\"rule_id\":" + to_string(rule_id) + ",\"a\":\"" + label_a + "\",\"b\":\"" + label_b + "\",\"window_us\":" + to_string(window_us) + ",\"conf\":" + to_string(conf) + ",\"text\":\"" + rule + "\"}"
+    ensure_dir()
+    let tmp = RAW_RULES_PATH + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + RAW_RULES_PATH + "' && rm -f '" + tmp + "'")
+    r0_emit("raw_rule_extracted", "\"rule_id\":" + to_string(rule_id) + ",\"conf\":" + to_string(conf) + ",\"text\":\"" + rule + "\"")
+    return rule
+}
+
+fn raw_stats() -> array {
+    let exists_o = exec("test -f '" + OBSERVATION_PATH + "' && echo ok").trim()
+    let observations = 0
+    if exists_o == "ok" {
+        observations = to_int(exec("wc -l < '" + OBSERVATION_PATH + "' | tr -d ' '").trim())
+    }
+    let exists_r = exec("test -f '" + RAW_RULES_PATH + "' && echo ok").trim()
+    let rules = 0
+    if exists_r == "ok" {
+        rules = to_int(exec("wc -l < '" + RAW_RULES_PATH + "' | tr -d ' '").trim())
+    }
+    return [observations, rules]
+}
+
+fn cleanup_raw() -> void {
+    let _ = exec("rm -rf '" + RAW_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "rawext-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_raw()
+
+    // 합성 observation — A 후 100ms 안에 B 가 항상 발생 패턴 (5번)
+    let i = 0
+    while i < 5 {
+        let base = 1000000 + i * 1000000
+        record_observation(base, "event", "pso_compile", 50)
+        record_observation(base + 50000, "event", "stutter_spike", 30)
+        i = i + 1
+    }
+    // A 단독 (B 없는 경우 — 노이즈 1번)
+    record_observation(8000000, "event", "pso_compile", 40)
+
+    // pattern: pso_compile → stutter_spike (5/6 = 83.3%)
+    let conf = significance("pso_compile", "stutter_spike", 100000)
+    if conf < 800 {
+        panic("c_raw_paradigm_extract FAIL [conf] expected>=800 got=" + to_string(conf))
+    }
+
+    // raw rule extract
+    let rule1 = extract_raw_rule("pso_compile", "stutter_spike", 100000, 1)
+    if rule1 == "" {
+        panic("c_raw_paradigm_extract FAIL [rule1] expected non-empty")
+    }
+    if !rule1.contains("implies") {
+        panic("c_raw_paradigm_extract FAIL [rule format] expected contains implies, got=" + rule1)
+    }
+
+    // 채택 안 되는 케이스 (낮은 conf)
+    let rule_low = extract_raw_rule("pso_compile", "unknown_label", 100000, 2)
+    if rule_low != "" {
+        panic("c_raw_paradigm_extract FAIL [rule_low] expected empty (low conf)")
+    }
+
+    // stats
+    let stats = raw_stats()
+    if stats[0] != 11 { panic("c_raw_paradigm_extract FAIL [stats obs] expected=11 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_raw_paradigm_extract FAIL [stats rules] expected=1 got=" + to_string(stats[1])) }
+
+    r0_emit("raw_extract_summary", "\"observations\":" + to_string(stats[0]) + ",\"rules\":" + to_string(stats[1]) + ",\"conf\":" + to_string(conf))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_raw_paradigm_extract FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_raw()
+
+    println("  ✅ c_raw_paradigm_extract self_test PASS (11 obs, 1 raw rule extracted (conf " + to_string(conf) + "‰), emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = raw_stats()
+            println("observations=" + to_string(s[0]) + " rules=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_raw(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_raw_paradigm_extract.hexa { self-test | stats | cleanup }")
+}

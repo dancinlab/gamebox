@@ -1,0 +1,391 @@
+// lib/loader/pe_cold_launch_phase.hexa — cycle 67 cold-launch phase markers
+//
+// PE cold-launch lifecycle 의 5 phase 를 timeline 으로 기록한다.
+// pe_parse → iat_resolve → tls_init → entry_call → first_frame.
+// 각 phase 는 elapsed microseconds + sequence 로 측정되어 cold-launch
+// 전체 latency budget breakdown 에 사용된다.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 phase marker recorder — 실 PE loader / IAT resolver 호출 X.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = pe_parse
+//   2 = iat_resolve
+//   3 = tls_init
+//   4 = entry_call
+//   5 = first_frame
+//
+// persist schema (TSV — phases.tsv):
+//   phase_id<int> \t phase_kind<int> \t elapsed_us<int> \t sequence<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pclp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_cold_launch_phase"
+}
+
+fn pclp_phases_path() -> str {
+    return pclp_dir() + "/phases.tsv"
+}
+
+fn pclp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pclp_dir() + "'")
+}
+
+fn cleanup_pclp() -> void {
+    pclp_ensure_dir()
+    let _ = exec("rm -f '" + pclp_phases_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pclp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pclp_append_row(path: str, row: str) -> void {
+    pclp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_phase: phase marker 1 건 기록 ───
+fn record_phase(phase_id: int, phase_kind: int, elapsed_us: int, sequence: int) -> void {
+    if phase_id <= 0 {
+        panic("pe_cold_launch_phase FAIL [record_phase] expected=phase_id>0 got=" + to_string(phase_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_cold_launch_phase FAIL [record_phase] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 5 {
+        panic("pe_cold_launch_phase FAIL [record_phase] expected=phase_kind<=5 got=" + to_string(phase_kind))
+    }
+    if elapsed_us < 0 {
+        panic("pe_cold_launch_phase FAIL [record_phase] expected=elapsed_us>=0 got=" + to_string(elapsed_us))
+    }
+    if sequence <= 0 {
+        panic("pe_cold_launch_phase FAIL [record_phase] expected=sequence>0 got=" + to_string(sequence))
+    }
+    let row = to_string(phase_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(elapsed_us) + "\t" + to_string(sequence) + "\n"
+    pclp_append_row(pclp_phases_path(), row)
+}
+
+// ─── phase_count: total phase 수 ───
+fn phase_count() -> int {
+    let t = pclp_read_table(pclp_phases_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_elapsed_us: 모든 phase elapsed_us 합 ───
+fn total_elapsed_us() -> int {
+    let t = pclp_read_table(pclp_phases_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_kind: 특정 phase_kind 의 phase 수 ───
+fn count_by_kind(kind: int) -> int {
+    let t = pclp_read_table(pclp_phases_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── max_sequence: 가장 큰 sequence 값 (없으면 0) ───
+fn max_sequence() -> int {
+    let t = pclp_read_table(pclp_phases_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut max_v = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let s = to_int(parts[3])
+                if s > max_v {
+                    max_v = s
+                }
+            }
+        }
+        i = i + 1
+    }
+    return max_v
+}
+
+// ─── phase_elapsed_us: 특정 phase_id 의 elapsed_us (없으면 0) ───
+fn phase_elapsed_us(phase_id: int) -> int {
+    let t = pclp_read_table(pclp_phases_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == phase_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pclp_stats: [phase_count, total_elapsed_us, max_sequence, count_by_kind(5)] ───
+fn pclp_stats() -> array {
+    let mut out = []
+    out.push(phase_count())
+    out.push(total_elapsed_us())
+    out.push(max_sequence())
+    out.push(count_by_kind(5))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pclp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pclp()
+
+    // 2. record 5 phases (deterministic synthetic — all 5 kinds in sequence 1..5)
+    record_phase(670001, 1, 1200, 1)
+    r0_emit("pe_cold_launch_phase_record",
+        "\"phase_id\":670001,\"phase_kind\":1,\"elapsed_us\":1200,\"sequence\":1,\"target\":\"pe_parse\"")
+
+    record_phase(670002, 2, 3400, 2)
+    r0_emit("pe_cold_launch_phase_record",
+        "\"phase_id\":670002,\"phase_kind\":2,\"elapsed_us\":3400,\"sequence\":2,\"target\":\"iat_resolve\"")
+
+    record_phase(670003, 3, 800, 3)
+    r0_emit("pe_cold_launch_phase_record",
+        "\"phase_id\":670003,\"phase_kind\":3,\"elapsed_us\":800,\"sequence\":3,\"target\":\"tls_init\"")
+
+    record_phase(670004, 4, 600, 4)
+    r0_emit("pe_cold_launch_phase_record",
+        "\"phase_id\":670004,\"phase_kind\":4,\"elapsed_us\":600,\"sequence\":4,\"target\":\"entry_call\"")
+
+    record_phase(670005, 5, 16000, 5)
+    r0_emit("pe_cold_launch_phase_record",
+        "\"phase_id\":670005,\"phase_kind\":5,\"elapsed_us\":16000,\"sequence\":5,\"target\":\"first_frame\"")
+
+    // 3. phase_count = 5
+    let c = phase_count()
+    if c != 5 {
+        panic("pe_cold_launch_phase FAIL [phase_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_elapsed_us = 22000
+    let te = total_elapsed_us()
+    if te != 22000 {
+        panic("pe_cold_launch_phase FAIL [total_elapsed_us] expected=22000 got=" + to_string(te))
+    }
+
+    // 5. count_by_kind sanity (one each)
+    let k1 = count_by_kind(1)
+    if k1 != 1 {
+        panic("pe_cold_launch_phase FAIL [count_by_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_kind(2)
+    if k2 != 1 {
+        panic("pe_cold_launch_phase FAIL [count_by_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_kind(3)
+    if k3 != 1 {
+        panic("pe_cold_launch_phase FAIL [count_by_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_kind(4)
+    if k4 != 1 {
+        panic("pe_cold_launch_phase FAIL [count_by_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_kind(5)
+    if k5 != 1 {
+        panic("pe_cold_launch_phase FAIL [count_by_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k99 = count_by_kind(99)
+    if k99 != 0 {
+        panic("pe_cold_launch_phase FAIL [count_by_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. max_sequence = 5
+    let ms = max_sequence()
+    if ms != 5 {
+        panic("pe_cold_launch_phase FAIL [max_sequence] expected=5 got=" + to_string(ms))
+    }
+
+    // 7. phase_elapsed_us sanity
+    let e2 = phase_elapsed_us(670002)
+    if e2 != 3400 {
+        panic("pe_cold_launch_phase FAIL [phase_elapsed_us(670002)] expected=3400 got=" + to_string(e2))
+    }
+    let e5 = phase_elapsed_us(670005)
+    if e5 != 16000 {
+        panic("pe_cold_launch_phase FAIL [phase_elapsed_us(670005)] expected=16000 got=" + to_string(e5))
+    }
+    let e_miss = phase_elapsed_us(9999)
+    if e_miss != 0 {
+        panic("pe_cold_launch_phase FAIL [phase_elapsed_us(9999)] expected=0 got=" + to_string(e_miss))
+    }
+
+    // 8. pclp_stats() = [5, 22000, 5, 1]
+    let s = pclp_stats()
+    if len(s) != 4 {
+        panic("pe_cold_launch_phase FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_cold_launch_phase FAIL [stats phase_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 22000 {
+        panic("pe_cold_launch_phase FAIL [stats total_elapsed_us] expected=22000 got=" + to_string(s[1]))
+    }
+    if s[2] != 5 {
+        panic("pe_cold_launch_phase FAIL [stats max_sequence] expected=5 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_cold_launch_phase FAIL [stats count_kind(5)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_cold_launch_phase_stats",
+        "\"phase_count\":" + to_string(s[0])
+        + ",\"total_elapsed_us\":" + to_string(s[1])
+        + ",\"max_sequence\":" + to_string(s[2])
+        + ",\"kind_first_frame\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_cold_launch_phase FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_pclp()
+    let s2 = pclp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_cold_launch_phase FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_cold_launch_phase self_test PASS (phases=" + to_string(s[0])
+        + ", elapsed_us=" + to_string(s[1]) + ", max_seq=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pclp_stats()
+            println("phase_count\t" + to_string(s[0]))
+            println("total_elapsed_us\t" + to_string(s[1]))
+            println("max_sequence\t" + to_string(s[2]))
+            println("count_kind_first_frame\t" + to_string(s[3]))
+            return
+        }
+        if sub == "elapsed" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("phase_elapsed_us\t" + to_string(phase_elapsed_us(pid)))
+                return
+            }
+            println("usage: hexa run pe_cold_launch_phase.hexa elapsed <phase_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_kind\t" + to_string(count_by_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_cold_launch_phase.hexa count <kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pclp()
+            println("cleaned: " + pclp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pclp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_cold_launch_phase.hexa { self-test | stats | elapsed <phase_id> | count <kind> | cleanup | dir }")
+}

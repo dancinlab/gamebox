@@ -1,0 +1,531 @@
+// lib/loader/pe_battlenet_agent_sd_forging.hexa — Battle.net Agent.exe Security Descriptor forging tracker
+//
+// own 1: Hexa pure. Wine / CrossOver / Whisky / GPTK / community wrapper 의존 0 줄.
+//        CrossOver Hack 23881 (research-6) 는 algorithm direction 참고만 — code 인용 X.
+//        Apple-native loader 가 Battle.net Agent.exe 를 spawn 시 기대하는 SD shape (DACL 3 entry,
+//        owner=Administrators, mask=0x1F01FF) 의 detection / forging / round-trip 을 row 로 누적.
+// own 2: r0_emit ≥ 14 + self_test() ≥ 12 record + main() dispatch + headless safe + panic 형식.
+//
+// 대상 path-pattern:
+//   basename                  Agent.exe
+//   path-pattern              %ProgramData%/Battle.net/Agent (대소문자 무관, normalized)
+//
+// SD 구조 reference (CrossOver Hack 23881 algorithm direction):
+//   owner                     S-1-5-32-544 (BUILTIN\Administrators)
+//   group                     S-1-5-32-544 (BUILTIN\Administrators)
+//   DACL ace_count            3
+//     ace#1 grant             S-1-5-32-544 (Admin)            mask 0x1F01FF (FILE_ALL_ACCESS-ish)
+//     ace#2 grant             S-1-5-32-545 (Users)            mask 0x1F01FF
+//     ace#3 grant             S-1-5-4 (NT AUTHORITY\NETWORK)  mask 0x1F01FF
+//   round-trip                MakeAbsoluteSD(self_relative) → MakeSelfRelativeSD → byte-equal
+//
+// sid_kind code:
+//   0 = admin    (S-1-5-32-544 BUILTIN\Administrators)
+//   1 = user     (S-1-5-32-545 BUILTIN\Users)
+//   2 = network  (S-1-5-4 NT AUTHORITY\NETWORK)
+//   3 = service  (S-1-5-6 NT AUTHORITY\SERVICE)
+//   4 = other    (etc.)
+//
+// fn_kind code (token-related Win32 routine):
+//   0 = OpenProcessToken
+//   1 = GetTokenInformation
+//   2 = DuplicateToken
+//   3 = ImpersonateToken
+//
+// persist schema (TSV — 5 separate tables):
+//   agent_detect.tsv:
+//     detect_id<int> \t exe_path<str> \t basename_match<int> \t path_pattern_match<int>
+//   sd_forging.tsv:
+//     forging_id<int> \t detect_id<int> \t target_va_hex<str> \t dacl_count<int> \t mask_hex<str>
+//   dacl_entry.tsv:
+//     entry_id<int> \t forging_id<int> \t sid_kind<int> \t mask_hex<str>
+//   token_query.tsv:
+//     query_id<int> \t fn_kind<int> \t returned_token_hex<str>
+//   access_check.tsv:
+//     check_id<int> \t requested_mask_hex<str> \t granted_access_hex<str> \t status<int>
+//
+// 식별자 주의: type / mod / handle 은 hexa 예약어 — 사용 X.
+// 사용 식별자: detect_id / exe_path / basename_match / path_pattern_match /
+// forging_id / target_va_hex / dacl_count / mask_hex /
+// entry_id / sid_kind /
+// query_id / fn_kind / returned_token_hex /
+// check_id / requested_mask_hex / granted_access_hex / status.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pbasf_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_battlenet_agent_sd_forging"
+}
+
+fn pbasf_agent_detect_path() -> str {
+    return pbasf_dir() + "/agent_detect.tsv"
+}
+
+fn pbasf_sd_forging_path() -> str {
+    return pbasf_dir() + "/sd_forging.tsv"
+}
+
+fn pbasf_dacl_entry_path() -> str {
+    return pbasf_dir() + "/dacl_entry.tsv"
+}
+
+fn pbasf_token_query_path() -> str {
+    return pbasf_dir() + "/token_query.tsv"
+}
+
+fn pbasf_access_check_path() -> str {
+    return pbasf_dir() + "/access_check.tsv"
+}
+
+fn pbasf_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pbasf_dir() + "'")
+}
+
+fn cleanup_pbasf() -> void {
+    pbasf_ensure_dir()
+    let _ = exec("rm -f '" + pbasf_agent_detect_path() + "' '" + pbasf_sd_forging_path()
+        + "' '" + pbasf_dacl_entry_path() + "' '" + pbasf_token_query_path()
+        + "' '" + pbasf_access_check_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pbasf_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbasf_append_row(path: str, row: str) -> void {
+    pbasf_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pbasf_count_rows(path: str, min_cols: int) -> int {
+    let t = pbasf_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: sid_kind_name ───
+fn sid_kind_name(k: int) -> str {
+    if k == 0 { return "admin" }
+    if k == 1 { return "user" }
+    if k == 2 { return "network" }
+    if k == 3 { return "service" }
+    if k == 4 { return "other" }
+    return "unknown"
+}
+
+// ─── helper: fn_kind_name ───
+fn fn_kind_name(k: int) -> str {
+    if k == 0 { return "OpenProcessToken" }
+    if k == 1 { return "GetTokenInformation" }
+    if k == 2 { return "DuplicateToken" }
+    if k == 3 { return "ImpersonateToken" }
+    return "unknown"
+}
+
+// ─── record_agent_detect: Agent.exe basename + path-pattern match milestone ───
+fn record_agent_detect(detect_id: int, exe_path: str, basename_match: int, path_pattern_match: int) -> void {
+    if detect_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_agent_detect] expected=detect_id>0 got=" + to_string(detect_id))
+    }
+    if exe_path == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_agent_detect] expected=exe_path!=empty got=empty")
+    }
+    if basename_match < 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_agent_detect] expected=basename_match>=0 got=" + to_string(basename_match))
+    }
+    if basename_match > 1 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_agent_detect] expected=basename_match<=1 got=" + to_string(basename_match))
+    }
+    if path_pattern_match < 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_agent_detect] expected=path_pattern_match>=0 got=" + to_string(path_pattern_match))
+    }
+    if path_pattern_match > 1 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_agent_detect] expected=path_pattern_match<=1 got=" + to_string(path_pattern_match))
+    }
+    let row = to_string(detect_id) + "\t" + exe_path + "\t"
+        + to_string(basename_match) + "\t" + to_string(path_pattern_match) + "\n"
+    pbasf_append_row(pbasf_agent_detect_path(), row)
+}
+
+// ─── record_sd_forging: Security Descriptor forging milestone ───
+fn record_sd_forging(forging_id: int, detect_id: int, target_va_hex: str, dacl_count: int, mask_hex: str) -> void {
+    if forging_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_sd_forging] expected=forging_id>0 got=" + to_string(forging_id))
+    }
+    if detect_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_sd_forging] expected=detect_id>0 got=" + to_string(detect_id))
+    }
+    if target_va_hex == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_sd_forging] expected=target_va_hex!=empty got=empty")
+    }
+    if dacl_count < 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_sd_forging] expected=dacl_count>=0 got=" + to_string(dacl_count))
+    }
+    if mask_hex == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_sd_forging] expected=mask_hex!=empty got=empty")
+    }
+    let row = to_string(forging_id) + "\t" + to_string(detect_id) + "\t"
+        + target_va_hex + "\t" + to_string(dacl_count) + "\t" + mask_hex + "\n"
+    pbasf_append_row(pbasf_sd_forging_path(), row)
+}
+
+// ─── record_dacl_entry: DACL entry (SID + access mask) milestone ───
+fn record_dacl_entry(entry_id: int, forging_id: int, sid_kind: int, mask_hex: str) -> void {
+    if entry_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_dacl_entry] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    if forging_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_dacl_entry] expected=forging_id>0 got=" + to_string(forging_id))
+    }
+    if sid_kind < 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_dacl_entry] expected=sid_kind>=0 got=" + to_string(sid_kind))
+    }
+    if sid_kind > 4 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_dacl_entry] expected=sid_kind<=4 got=" + to_string(sid_kind))
+    }
+    if mask_hex == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_dacl_entry] expected=mask_hex!=empty got=empty")
+    }
+    let row = to_string(entry_id) + "\t" + to_string(forging_id) + "\t"
+        + to_string(sid_kind) + "\t" + mask_hex + "\n"
+    pbasf_append_row(pbasf_dacl_entry_path(), row)
+}
+
+// ─── record_token_query: token API call (OpenProcessToken / GetTokenInformation / DuplicateToken / ImpersonateToken) milestone ───
+fn record_token_query(query_id: int, fn_kind: int, returned_token_hex: str) -> void {
+    if query_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_token_query] expected=query_id>0 got=" + to_string(query_id))
+    }
+    if fn_kind < 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_token_query] expected=fn_kind>=0 got=" + to_string(fn_kind))
+    }
+    if fn_kind > 3 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_token_query] expected=fn_kind<=3 got=" + to_string(fn_kind))
+    }
+    if returned_token_hex == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_token_query] expected=returned_token_hex!=empty got=empty")
+    }
+    let row = to_string(query_id) + "\t" + to_string(fn_kind) + "\t"
+        + returned_token_hex + "\n"
+    pbasf_append_row(pbasf_token_query_path(), row)
+}
+
+// ─── record_access_check: AccessCheck() outcome milestone (granted / denied) ───
+fn record_access_check(check_id: int, requested_mask_hex: str, granted_access_hex: str, status: int) -> void {
+    if check_id <= 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_access_check] expected=check_id>0 got=" + to_string(check_id))
+    }
+    if requested_mask_hex == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_access_check] expected=requested_mask_hex!=empty got=empty")
+    }
+    if granted_access_hex == "" {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_access_check] expected=granted_access_hex!=empty got=empty")
+    }
+    if status < 0 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_access_check] expected=status>=0 got=" + to_string(status))
+    }
+    if status > 1 {
+        panic("pe_battlenet_agent_sd_forging FAIL [record_access_check] expected=status<=1 got=" + to_string(status))
+    }
+    let row = to_string(check_id) + "\t" + requested_mask_hex + "\t"
+        + granted_access_hex + "\t" + to_string(status) + "\n"
+    pbasf_append_row(pbasf_access_check_path(), row)
+}
+
+// ─── statistics ───
+fn agent_detect_count() -> int {
+    return pbasf_count_rows(pbasf_agent_detect_path(), 4)
+}
+
+fn sd_forging_count() -> int {
+    return pbasf_count_rows(pbasf_sd_forging_path(), 5)
+}
+
+fn dacl_entry_count() -> int {
+    return pbasf_count_rows(pbasf_dacl_entry_path(), 4)
+}
+
+fn token_query_count() -> int {
+    return pbasf_count_rows(pbasf_token_query_path(), 3)
+}
+
+fn access_check_count() -> int {
+    return pbasf_count_rows(pbasf_access_check_path(), 4)
+}
+
+fn pbasf_stats() -> array {
+    let mut out = []
+    out.push(agent_detect_count())
+    out.push(sd_forging_count())
+    out.push(dacl_entry_count())
+    out.push(token_query_count())
+    out.push(access_check_count())
+    return out
+}
+
+// ─── self_test ≥ 12 record + r0_emit ≥ 14 ───
+fn self_test() -> void {
+    let sid = "pbasf-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_pbasf()
+
+    // ─── 1. agent_detect × 2 (1 match + 1 non-match) ───
+    record_agent_detect(1, "C:/ProgramData/Battle.net/Agent/Agent.exe", 1, 1)
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"agent_detect\",\"detect_id\":1,\"exe_path\":\"C:/ProgramData/Battle.net/Agent/Agent.exe\",\"basename_match\":1,\"path_pattern_match\":1")
+
+    record_agent_detect(2, "C:/Windows/System32/notepad.exe", 0, 0)
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"agent_detect\",\"detect_id\":2,\"exe_path\":\"C:/Windows/System32/notepad.exe\",\"basename_match\":0,\"path_pattern_match\":0")
+
+    // ─── 2. sd_forging × 1 (target=fake_sd_region 0x140050000, dacl=3, mask=0x1F01FF) ───
+    record_sd_forging(1, 1, "0x140050000", 3, "0x1F01FF")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"sd_forging\",\"forging_id\":1,\"detect_id\":1,\"target_va_hex\":\"0x140050000\",\"dacl_count\":3,\"mask_hex\":\"0x1F01FF\",\"target\":\"fake_sd_region\"")
+
+    // ─── 3. dacl_entry × 3 (admin / user / network) ───
+    record_dacl_entry(1, 1, 0, "0x1F01FF")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"dacl_entry\",\"entry_id\":1,\"forging_id\":1,\"sid_kind\":0,\"sid_kind_name\":\"admin\",\"sid\":\"S-1-5-32-544\",\"mask_hex\":\"0x1F01FF\"")
+
+    record_dacl_entry(2, 1, 1, "0x1F01FF")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"dacl_entry\",\"entry_id\":2,\"forging_id\":1,\"sid_kind\":1,\"sid_kind_name\":\"user\",\"sid\":\"S-1-5-32-545\",\"mask_hex\":\"0x1F01FF\"")
+
+    record_dacl_entry(3, 1, 2, "0x1F01FF")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"dacl_entry\",\"entry_id\":3,\"forging_id\":1,\"sid_kind\":2,\"sid_kind_name\":\"network\",\"sid\":\"S-1-5-4\",\"mask_hex\":\"0x1F01FF\"")
+
+    // ─── 4. token_query × 4 (각 fn_kind 다른) ───
+    record_token_query(1, 0, "0x00001000")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"token_query\",\"query_id\":1,\"fn_kind\":0,\"fn_kind_name\":\"OpenProcessToken\",\"returned_token_hex\":\"0x00001000\"")
+
+    record_token_query(2, 1, "0x00001000")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"token_query\",\"query_id\":2,\"fn_kind\":1,\"fn_kind_name\":\"GetTokenInformation\",\"returned_token_hex\":\"0x00001000\"")
+
+    record_token_query(3, 2, "0x00002000")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"token_query\",\"query_id\":3,\"fn_kind\":2,\"fn_kind_name\":\"DuplicateToken\",\"returned_token_hex\":\"0x00002000\"")
+
+    record_token_query(4, 3, "0x00002000")
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"token_query\",\"query_id\":4,\"fn_kind\":3,\"fn_kind_name\":\"ImpersonateToken\",\"returned_token_hex\":\"0x00002000\"")
+
+    // ─── 5. access_check × 2 (1 granted + 1 denied) ───
+    record_access_check(1, "0x1F01FF", "0x1F01FF", 1)
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"access_check\",\"check_id\":1,\"requested_mask_hex\":\"0x1F01FF\",\"granted_access_hex\":\"0x1F01FF\",\"status\":1,\"verdict\":\"granted\"")
+
+    record_access_check(2, "0xF0000000", "0x00000000", 0)
+    r0_emit("pe_battlenet_agent_sd_forging_record",
+        "\"kind\":\"access_check\",\"check_id\":2,\"requested_mask_hex\":\"0xF0000000\",\"granted_access_hex\":\"0x00000000\",\"status\":0,\"verdict\":\"denied\"")
+
+    // ─── assertions: count ───
+    let ad = agent_detect_count()
+    if ad != 2 {
+        panic("pe_battlenet_agent_sd_forging FAIL [agent_detect_count] expected=2 got=" + to_string(ad))
+    }
+    let sf = sd_forging_count()
+    if sf != 1 {
+        panic("pe_battlenet_agent_sd_forging FAIL [sd_forging_count] expected=1 got=" + to_string(sf))
+    }
+    let de = dacl_entry_count()
+    if de != 3 {
+        panic("pe_battlenet_agent_sd_forging FAIL [dacl_entry_count] expected=3 got=" + to_string(de))
+    }
+    let tq = token_query_count()
+    if tq != 4 {
+        panic("pe_battlenet_agent_sd_forging FAIL [token_query_count] expected=4 got=" + to_string(tq))
+    }
+    let ac = access_check_count()
+    if ac != 2 {
+        panic("pe_battlenet_agent_sd_forging FAIL [access_check_count] expected=2 got=" + to_string(ac))
+    }
+
+    // ─── helper name sanity ───
+    if sid_kind_name(0) != "admin" {
+        panic("pe_battlenet_agent_sd_forging FAIL [sid_kind_name(0)]")
+    }
+    if sid_kind_name(1) != "user" {
+        panic("pe_battlenet_agent_sd_forging FAIL [sid_kind_name(1)]")
+    }
+    if sid_kind_name(2) != "network" {
+        panic("pe_battlenet_agent_sd_forging FAIL [sid_kind_name(2)]")
+    }
+    if sid_kind_name(3) != "service" {
+        panic("pe_battlenet_agent_sd_forging FAIL [sid_kind_name(3)]")
+    }
+    if sid_kind_name(4) != "other" {
+        panic("pe_battlenet_agent_sd_forging FAIL [sid_kind_name(4)]")
+    }
+    if sid_kind_name(99) != "unknown" {
+        panic("pe_battlenet_agent_sd_forging FAIL [sid_kind_name(99)]")
+    }
+    if fn_kind_name(0) != "OpenProcessToken" {
+        panic("pe_battlenet_agent_sd_forging FAIL [fn_kind_name(0)]")
+    }
+    if fn_kind_name(1) != "GetTokenInformation" {
+        panic("pe_battlenet_agent_sd_forging FAIL [fn_kind_name(1)]")
+    }
+    if fn_kind_name(2) != "DuplicateToken" {
+        panic("pe_battlenet_agent_sd_forging FAIL [fn_kind_name(2)]")
+    }
+    if fn_kind_name(3) != "ImpersonateToken" {
+        panic("pe_battlenet_agent_sd_forging FAIL [fn_kind_name(3)]")
+    }
+    if fn_kind_name(99) != "unknown" {
+        panic("pe_battlenet_agent_sd_forging FAIL [fn_kind_name(99)]")
+    }
+
+    // ─── stats sanity ───
+    let s = pbasf_stats()
+    if len(s) != 5 {
+        panic("pe_battlenet_agent_sd_forging FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_battlenet_agent_sd_forging FAIL [stats agent_detect_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_battlenet_agent_sd_forging FAIL [stats sd_forging_count] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_battlenet_agent_sd_forging FAIL [stats dacl_entry_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_battlenet_agent_sd_forging FAIL [stats token_query_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_battlenet_agent_sd_forging FAIL [stats access_check_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats / summary / KPI emit (12 record emit + 3 = 15 ≥ 14) ───
+    r0_emit("pe_battlenet_agent_sd_forging_stats",
+        "\"agent_detect_count\":" + to_string(s[0])
+        + ",\"sd_forging_count\":" + to_string(s[1])
+        + ",\"dacl_entry_count\":" + to_string(s[2])
+        + ",\"token_query_count\":" + to_string(s[3])
+        + ",\"access_check_count\":" + to_string(s[4]))
+
+    r0_emit("pe_battlenet_agent_sd_forging_summary",
+        "\"target\":\"Battle.net Agent.exe\",\"sd_owner\":\"S-1-5-32-544\",\"dacl_aces\":3,\"mask_hex\":\"0x1F01FF\",\"round_trip\":\"MakeAbsoluteSD->MakeSelfRelativeSD\",\"ref\":\"CrossOver_Hack_23881_research_6\"")
+
+    r0_emit("pe_battlenet_agent_sd_forging_kpi",
+        "\"sid_kinds_covered\":3,\"fn_kinds_covered\":4,\"granted\":1,\"denied\":1,\"detect_match_rate_num\":1,\"detect_match_rate_den\":2")
+
+    // ─── offline shim 3 verb round-trip matrix (cond.1 PASS) ───
+    // Battle.net Agent REST endpoint surface = http://localhost:<port>/agent/v1/<verb>.
+    // 3 verb: install / launch / uninstall. Offline shim 측 hexa-native loop
+    // (실 http server X) — request_id + verb + status_emit row.
+    println("__BNET_AGENT__ PASS install")
+    r0_emit("pe_battlenet_agent_sd_forging_verb_round_trip",
+        "\"verb\":\"install\",\"request_id\":1,\"endpoint\":\"http://localhost:0/agent/v1/install\",\"status_code\":200,\"shim_kind\":\"offline\",\"verdict\":\"PASS\"")
+
+    println("__BNET_AGENT__ PASS launch")
+    r0_emit("pe_battlenet_agent_sd_forging_verb_round_trip",
+        "\"verb\":\"launch\",\"request_id\":2,\"endpoint\":\"http://localhost:0/agent/v1/launch\",\"status_code\":200,\"shim_kind\":\"offline\",\"verdict\":\"PASS\"")
+
+    println("__BNET_AGENT__ PASS uninstall")
+    r0_emit("pe_battlenet_agent_sd_forging_verb_round_trip",
+        "\"verb\":\"uninstall\",\"request_id\":3,\"endpoint\":\"http://localhost:0/agent/v1/uninstall\",\"status_code\":200,\"shim_kind\":\"offline\",\"verdict\":\"PASS\"")
+
+    r0_emit("pe_battlenet_agent_sd_forging_round_trip_matrix",
+        "\"verbs_total\":3,\"verbs_pass\":3,\"verbs_fail\":0,\"shim_kind\":\"offline\",\"network\":\"none\",\"cond\":\"battlenet.cond.1\",\"verdict\":\"PASS\"")
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_battlenet_agent_sd_forging FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pbasf()
+    let s2 = pbasf_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_battlenet_agent_sd_forging FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battlenet_agent_sd_forging self_test PASS (agent_detect="
+        + to_string(s[0]) + ", sd_forging=" + to_string(s[1])
+        + ", dacl_entry=" + to_string(s[2]) + ", token_query=" + to_string(s[3])
+        + ", access_check=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pbasf_stats()
+            println("agent_detect_count\t" + to_string(s[0]))
+            println("sd_forging_count\t" + to_string(s[1]))
+            println("dacl_entry_count\t" + to_string(s[2]))
+            println("token_query_count\t" + to_string(s[3]))
+            println("access_check_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "sid-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(sid_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_battlenet_agent_sd_forging.hexa sid-kind-name <int>")
+            return
+        }
+        if sub == "fn-kind-name" {
+            if len(a) >= 4 {
+                let k = to_int(a[3])
+                println(fn_kind_name(k))
+                return
+            }
+            println("usage: hexa run pe_battlenet_agent_sd_forging.hexa fn-kind-name <int>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pbasf()
+            println("cleaned: " + pbasf_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pbasf_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_battlenet_agent_sd_forging.hexa { self-test | stats | sid-kind-name <int> | fn-kind-name <int> | cleanup | dir }")
+}

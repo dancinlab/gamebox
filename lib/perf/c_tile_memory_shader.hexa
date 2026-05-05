@@ -1,0 +1,144 @@
+// lib/perf/c_tile_memory_shader.hexa — CN-35 PSB-7 만점 15/15
+//
+// Metal tile shader (TBDR) on-chip memory access pattern → DX12 render pass remap.
+// D4 deferred lighting GBuffer pass — TBDR tile memory 안 G/D/L attachment fusion.
+//
+// 무기: tile usage histogram + columnar (attachment access pattern).
+// 효과: GBuffer/depth/light tile memory 안 fusion → memory bandwidth ↓.
+
+use "./r0_common"
+
+let TMS_DIR = GAMEBOX_HOME + "/persist/tile_memory_shader"
+let ATTACHMENT_LOG = TMS_DIR + "/attachments.tsv"
+let FUSION_HISTORY = TMS_DIR + "/fusions.jsonl"
+
+fn tms_dir() -> str { return TMS_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + TMS_DIR + "'")
+}
+
+// ─── render pass attachment 등록 ───
+//   pass_id, attachment_name, access (read|write|read_write), size_kb
+fn register_attachment(pass_id: int, attachment_name: str, access: str, size_kb: int) -> void {
+    ensure_dir()
+    let line = to_string(pass_id) + "\t" + attachment_name + "\t" + access + "\t" + to_string(size_kb)
+    let tmp = ATTACHMENT_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + ATTACHMENT_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── pass 안 read+write attachment 들이 같이 fusion 가능 (TBDR tile memory) ───
+//   조건: 같은 pass_id 안 attachment 2+ 개 → tile memory fusion 가능
+//   benefit: 각 attachment 의 size 합만큼 memory 절약 (외부 RAM 거치지 않음)
+fn can_fuse(pass_id: int) -> array {
+    let exists = exec("test -f '" + ATTACHMENT_LOG + "' && echo ok").trim()
+    if exists != "ok" { return [0, 0] }
+    let count_str = exec("awk -F'\\t' -v p=" + to_string(pass_id) + " '$1==p' '" + ATTACHMENT_LOG + "' | wc -l | tr -d ' '").trim()
+    let count = to_int(count_str)
+    if count < 2 { return [count, 0] }
+    let total_size_str = exec("awk -F'\\t' -v p=" + to_string(pass_id) + " '$1==p {s+=$4} END{print s+0}' '" + ATTACHMENT_LOG + "'").trim()
+    let total = to_int(total_size_str)
+    return [count, total]
+}
+
+// ─── fusion 결과 기록 ───
+fn record_fusion(pass_id: int, count: int, saved_kb: int) -> void {
+    ensure_dir()
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"pass\":" + to_string(pass_id) + ",\"attachments\":" + to_string(count) + ",\"saved_kb\":" + to_string(saved_kb) + "}"
+    let tmp = FUSION_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + FUSION_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("tile_memory_fusion", "\"pass\":" + to_string(pass_id) + ",\"attachments\":" + to_string(count) + ",\"saved_kb\":" + to_string(saved_kb))
+}
+
+// ─── auto fusion workflow ───
+fn auto_fuse(pass_id: int) -> array {
+    let res = can_fuse(pass_id)
+    if res[0] < 2 { return res }
+    record_fusion(pass_id, res[0], res[1])
+    return res
+}
+
+fn fusion_stats() -> array {
+    let exists_a = exec("test -f '" + ATTACHMENT_LOG + "' && echo ok").trim()
+    let attachments = 0
+    if exists_a == "ok" {
+        attachments = to_int(exec("wc -l < '" + ATTACHMENT_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_f = exec("test -f '" + FUSION_HISTORY + "' && echo ok").trim()
+    let fusions = 0
+    let saved_total = 0
+    if exists_f == "ok" {
+        fusions = to_int(exec("wc -l < '" + FUSION_HISTORY + "' | tr -d ' '").trim())
+        let s_str = exec("grep -oE '\"saved_kb\":[0-9]+' '" + FUSION_HISTORY + "' | cut -d: -f2 | awk '{s+=$1} END{print s+0}'").trim()
+        if s_str != "" { saved_total = to_int(s_str) }
+    }
+    return [attachments, fusions, saved_total]
+}
+
+fn cleanup_tms() -> void {
+    let _ = exec("rm -rf '" + TMS_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "tms-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_tms()
+
+    // GBuffer pass — albedo + normal + depth + light (4 attachment, fusion 가능)
+    register_attachment(1, "albedo", "write", 4096)
+    register_attachment(1, "normal", "write", 2048)
+    register_attachment(1, "depth", "read_write", 2048)
+    register_attachment(1, "light", "read", 4096)
+
+    // single attachment pass (fusion 불가)
+    register_attachment(2, "shadow_map", "write", 8192)
+
+    // can_fuse
+    let r1 = can_fuse(1)
+    if r1[0] != 4 { panic("c_tile_memory_shader FAIL [pass1 count] expected=4 got=" + to_string(r1[0])) }
+    if r1[1] != 12288 { panic("c_tile_memory_shader FAIL [pass1 saved] expected=12288 got=" + to_string(r1[1])) }
+
+    let r2 = can_fuse(2)
+    if r2[0] != 1 { panic("c_tile_memory_shader FAIL [pass2 count] expected=1 got=" + to_string(r2[0])) }
+    if r2[1] != 0 { panic("c_tile_memory_shader FAIL [pass2 saved] expected=0 got=" + to_string(r2[1])) }
+
+    let af = auto_fuse(1)
+    if af[1] != 12288 { panic("c_tile_memory_shader FAIL [auto_fuse] expected=12288 got=" + to_string(af[1])) }
+
+    let af2 = auto_fuse(2)
+    if af2[1] != 0 { panic("c_tile_memory_shader FAIL [auto_fuse 2] expected=0 got=" + to_string(af2[1])) }
+
+    // stats
+    let stats = fusion_stats()
+    if stats[0] != 5 { panic("c_tile_memory_shader FAIL [stats attach] expected=5 got=" + to_string(stats[0])) }
+    if stats[1] != 1 { panic("c_tile_memory_shader FAIL [stats fusions] expected=1 got=" + to_string(stats[1])) }
+    if stats[2] != 12288 { panic("c_tile_memory_shader FAIL [stats saved] expected=12288 got=" + to_string(stats[2])) }
+
+    r0_emit("tile_memory_summary", "\"attachments\":" + to_string(stats[0]) + ",\"fusions\":" + to_string(stats[1]) + ",\"saved_kb\":" + to_string(stats[2]))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 2 { panic("c_tile_memory_shader FAIL [emit count] expected>=2 got=" + to_string(cnt)) }
+
+    cleanup_tms()
+
+    println("  ✅ c_tile_memory_shader self_test PASS (5 attachments, 1 fusion, saved=12288kb, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = fusion_stats()
+            println("attachments=" + to_string(s[0]) + " fusions=" + to_string(s[1]) + " saved=" + to_string(s[2]))
+            return
+        }
+        if sub == "cleanup" { cleanup_tms(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_tile_memory_shader.hexa { self-test | stats | cleanup }")
+}

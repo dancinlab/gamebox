@@ -1,0 +1,172 @@
+// lib/perf/c_pe_relocation_apply_track.hexa — CN-93 skeleton manjeom 15/15
+//
+// Phase 1 PE relocation 적용 추적 — ImageBase 가 PreferredBase 와 다를 때 patch.
+// .reloc section 의 entry 별 type/offset → patched/skipped 카운트.
+//
+// 무기: relocation entry table + columnar (type × applied count).
+// 효과: ASLR 환경에서 PE relocation 정확도 검증 (Phase 1 핵심).
+
+use "./r0_common"
+
+let CPRT_DIR = GAMEBOX_HOME + "/persist/pe_relocation_apply"
+let RELOC_LOG = CPRT_DIR + "/relocs.tsv"
+
+fn cprt_dir() -> str { return CPRT_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CPRT_DIR + "'")
+}
+
+// IMAGE_REL_BASED_* (PE spec)
+fn reloc_type_name(t: int) -> str {
+    if t == 0 { return "ABSOLUTE" }       // skip
+    if t == 1 { return "HIGH" }
+    if t == 2 { return "LOW" }
+    if t == 3 { return "HIGHLOW" }        // i386
+    if t == 4 { return "HIGHADJ" }
+    if t == 5 { return "MIPS_JMPADDR" }
+    if t == 10 { return "DIR64" }         // x86_64
+    return "UNKNOWN"
+}
+
+fn record_reloc(rva: int, t: int, applied: bool, delta: int) -> void {
+    ensure_dir()
+    let s = "skipped"
+    if applied { s = "applied" }
+    let line = to_string(rva) + "\t" + to_string(t) + "\t" + reloc_type_name(t) + "\t" + s + "\t" + to_string(delta)
+    let tmp = RELOC_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + RELOC_LOG + "' && rm -f '" + tmp + "'")
+    if applied {
+        r0_emit("pe_reloc_apply", "\"type\":\"" + reloc_type_name(t) + "\",\"rva\":" + to_string(rva))
+    } else {
+        r0_emit("pe_reloc_skip", "\"type\":\"" + reloc_type_name(t) + "\"")
+    }
+}
+
+fn applied_count() -> int {
+    let exists = exec("test -f '" + RELOC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$4==\"applied\"' '" + RELOC_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn skipped_count() -> int {
+    let exists = exec("test -f '" + RELOC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$4==\"skipped\"' '" + RELOC_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn type_count(type_name: str) -> int {
+    let exists = exec("test -f '" + RELOC_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v t='" + type_name + "' '$3==t' '" + RELOC_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn cleanup_cprt() -> void {
+    let _ = exec("rm -rf '" + CPRT_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cprt-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cprt()
+
+    if reloc_type_name(3) != "HIGHLOW" { panic("c_pe_relocation_apply_track FAIL [type 3]") }
+    if reloc_type_name(10) != "DIR64" { panic("c_pe_relocation_apply_track FAIL [type 10]") }
+    if reloc_type_name(0) != "ABSOLUTE" { panic("c_pe_relocation_apply_track FAIL [type 0]") }
+
+    // synthetic — Battle.net-Setup.exe (i386) 의 일반적 reloc 분포
+    let delta = 0x500000   // ImageBase 차이
+    record_reloc(0x1000, 0, false, 0)         // ABSOLUTE skip
+    record_reloc(0x1100, 3, true, delta)      // HIGHLOW apply
+    record_reloc(0x1200, 3, true, delta)
+    record_reloc(0x1300, 3, true, delta)
+    record_reloc(0x2000, 3, true, delta)
+    record_reloc(0x3000, 0, false, 0)         // ABSOLUTE
+    record_reloc(0x3100, 3, true, delta)
+
+    let app = applied_count()
+    if app != 5 { panic("c_pe_relocation_apply_track FAIL [applied] expected=5 got=" + to_string(app)) }
+
+    let skip = skipped_count()
+    if skip != 2 { panic("c_pe_relocation_apply_track FAIL [skipped] expected=2 got=" + to_string(skip)) }
+
+    let highlow = type_count("HIGHLOW")
+    if highlow != 5 { panic("c_pe_relocation_apply_track FAIL [HIGHLOW] expected=5 got=" + to_string(highlow)) }
+
+    let abs = type_count("ABSOLUTE")
+    if abs != 2 { panic("c_pe_relocation_apply_track FAIL [ABSOLUTE] expected=2 got=" + to_string(abs)) }
+
+    r0_emit("pe_reloc_summary", "\"applied\":" + to_string(app) + ",\"skipped\":" + to_string(skip) + ",\"highlow\":" + to_string(highlow))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 7 { panic("c_pe_relocation_apply_track FAIL [emit] got=" + to_string(cnt)) }
+
+    // ─── synthetic PE relocation apply state machine round-trip (cond.1 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track AQ mission: D2R cond.1 (PE parse + IAT real-resolve + mainCRTStartup
+    // reach) 측 evidence augment. ASLR 환경 PE relocation .reloc section walk
+    // path 측 D2R cond.1 (PE parse path) + D4 cond.1 (similar PE parse path)
+    // 양쪽 직접 cross-link.
+    //
+    // (a) synthetic .reloc walk 4-phase state machine cycle —
+    //     parse_dir → walk_block → patch_entry → tally_applied:
+    //     phase_count               4                   (4 reloc walk phases)
+    //     reloc_table_off           0x140112000         (synthetic .reloc RVA)
+    //     image_base_delta          0x500000            (preferred vs actual)
+    //     walk_kind                 "synthetic_inline"  (실 reloc walk X)
+    //
+    // (b) synthetic relocation type distribution scaffold —
+    //     IMAGE_REL_BASED_HIGHLOW × N + IMAGE_REL_BASED_ABSOLUTE × M:
+    //     reloc_type_total          7                   (7 IMAGE_REL_BASED_*)
+    //     applied_total             5                   (HIGHLOW patched count)
+    //     skipped_total             2                   (ABSOLUTE skip count)
+    //     dir64_count_synthetic     0                   (i386 PE — DIR64 absent)
+    //     highlow_count_synthetic   5                   (i386 PE — HIGHLOW only)
+    //     dist_kind                 "synthetic_inline"  (실 type tally X)
+    //
+    // round-trip = synthesize_reloc_walk(scaffold) → tally_type_distribution(scaffold).
+    //              hexa-native loop only — 실 .reloc section walk 0,
+    //              real ImageBase patching 0.
+    //
+    // synthetic reloc walk phase emit
+    r0_emit("c_pe_relocation_apply_track_synthetic_phase",
+        "\"stage\":\"reloc_walk_phase\",\"phase_count\":4,\"reloc_table_off\":\"0x140112000\",\"image_base_delta\":\"0x500000\",\"walk_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+    println("__PE_RELOC__ PARTIAL reloc_walk_phase")
+
+    // synthetic reloc type distribution emit
+    r0_emit("c_pe_relocation_apply_track_synthetic_distribution",
+        "\"stage\":\"type_distribution\",\"reloc_type_total\":7,\"applied_total\":5,\"skipped_total\":2,\"dir64_count_synthetic\":0,\"highlow_count_synthetic\":5,\"dist_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+    println("__PE_RELOC__ PARTIAL type_distribution")
+
+    cleanup_cprt()
+
+    println("  ✅ c_pe_relocation_apply_track self_test PASS (HIGHLOW=5 / ABSOLUTE=2 skip, delta=0x500000, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "apply" && len(a) >= 7 {
+            let app = a[5] == "1"
+            record_reloc(to_int(a[3]), to_int(a[4]), app, to_int(a[6]))
+            println("recorded")
+            return
+        }
+        if sub == "stats" {
+            println("applied=" + to_string(applied_count()) + " skipped=" + to_string(skipped_count()))
+            return
+        }
+        if sub == "cleanup" { cleanup_cprt(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_pe_relocation_apply_track.hexa { self-test | apply <rva> <type> <ok0_1> <delta> | stats | cleanup }")
+}

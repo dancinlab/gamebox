@@ -1,0 +1,416 @@
+// lib/loader/pe_seh_unwinder_real.hexa — R6 Tier 5 SEH unwinder 실 구현 추적
+//
+// SEH unwinder 실 구현 (R6 Tier 5, 만점 검토 13/25 — 큰 작업):
+//   x64 PE: .pdata directory → RUNTIME_FUNCTION { BeginAddress, EndAddress, UnwindData }
+//   UnwindData → UNWIND_INFO { Version, Flags, SizeOfProlog, CountOfCodes, FrameRegister, ... }
+//   UNWIND_OP_CODES (PUSH_NONVOL, ALLOC_LARGE/SMALL, SAVE_NONVOL_FAR, SAVE_XMM128, etc.)
+//     → arm64 frame chain (X29 frame pointer + LR + saved regs on stack)
+//   __C_specific_handler / __GSHandlerCheck_SEH (LANGUAGE_HANDLERS):
+//     scope table walking + ExceptionFilter invocation + EXCEPTION_DISPOSITION
+//   own2 자체 구현 (Apple Silicon 의 setjmp/longjmp 활용)
+//   Rosetta 2 (R4 시나리오 B) 사용 시 .pdata → DWARF .eh_frame 변환 후 위임 가능
+// own1: PE/COFF + MSDN __try/__except spec only. Wine ntdll/exception.c 인용 X
+//
+// phase_kind code:
+//   1 = raise_exception
+//   2 = walk_pdata
+//   3 = invoke_filter
+//   4 = invoke_handler
+//   5 = continue_unwind
+//   6 = resume
+//
+// persist schema (TSV — unwinds.tsv):
+//   unwind_id<int> \t phase_kind<int> \t frame_count<int> \t handler_invoked<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn psur_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_seh_unwinder_real"
+}
+
+fn psur_unwinds_path() -> str {
+    return psur_dir() + "/unwinds.tsv"
+}
+
+fn psur_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + psur_dir() + "'")
+}
+
+fn cleanup_psur() -> void {
+    psur_ensure_dir()
+    let _ = exec("rm -f '" + psur_unwinds_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn psur_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn psur_append_row(path: str, row: str) -> void {
+    psur_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_unwind: unwind 1 건 기록 ───
+fn record_unwind(unwind_id: int, phase_kind: int, frame_count: int, handler_invoked: int) -> void {
+    if unwind_id <= 0 {
+        panic("pe_seh_unwinder_real FAIL [record_unwind] expected=unwind_id>0 got=" + to_string(unwind_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_seh_unwinder_real FAIL [record_unwind] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 6 {
+        panic("pe_seh_unwinder_real FAIL [record_unwind] expected=phase_kind<=6 got=" + to_string(phase_kind))
+    }
+    if frame_count < 0 {
+        panic("pe_seh_unwinder_real FAIL [record_unwind] expected=frame_count>=0 got=" + to_string(frame_count))
+    }
+    if handler_invoked < 0 {
+        panic("pe_seh_unwinder_real FAIL [record_unwind] expected=handler_invoked>=0 got=" + to_string(handler_invoked))
+    }
+    if handler_invoked > 1 {
+        panic("pe_seh_unwinder_real FAIL [record_unwind] expected=handler_invoked<=1 got=" + to_string(handler_invoked))
+    }
+    let row = to_string(unwind_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(frame_count) + "\t" + to_string(handler_invoked) + "\n"
+    psur_append_row(psur_unwinds_path(), row)
+}
+
+// ─── unwind_count: total unwind row 수 ───
+fn unwind_count() -> int {
+    let t = psur_read_table(psur_unwinds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_frame_count: 모든 unwind frame_count 합 ───
+fn total_frame_count() -> int {
+    let t = psur_read_table(psur_unwinds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 unwind 수 ───
+fn count_by_phase_kind(kind: int) -> int {
+    let t = psur_read_table(psur_unwinds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── handler_invoked_count: handler_invoked=1 인 unwind 수 ───
+fn handler_invoked_count() -> int {
+    let t = psur_read_table(psur_unwinds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── complete_count: phase_kind == 6 (resume) row 수 ───
+fn complete_count() -> int {
+    return count_by_phase_kind(6)
+}
+
+// ─── unwind_frame_count: 특정 unwind_id 의 frame_count (없으면 0) ───
+fn unwind_frame_count(unwind_id: int) -> int {
+    let t = psur_read_table(psur_unwinds_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == unwind_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── psur_stats: [unwind_count, total_frame_count, handler_invoked_count, complete_count] ───
+fn psur_stats() -> array {
+    let mut out = []
+    out.push(unwind_count())
+    out.push(total_frame_count())
+    out.push(handler_invoked_count())
+    out.push(complete_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "psur-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_psur()
+
+    // 2. record 6 unwinds covering all 6 phase_kinds (≥3 handler_invoked)
+    record_unwind(180001, 1, 0, 0)
+    r0_emit("pe_seh_unwinder_real_record",
+        "\"unwind_id\":180001,\"phase_kind\":1,\"frame_count\":0,\"handler_invoked\":0,\"target\":\"raise_exception\"")
+
+    record_unwind(180002, 2, 4, 0)
+    r0_emit("pe_seh_unwinder_real_record",
+        "\"unwind_id\":180002,\"phase_kind\":2,\"frame_count\":4,\"handler_invoked\":0,\"target\":\"walk_pdata\"")
+
+    record_unwind(180003, 3, 4, 1)
+    r0_emit("pe_seh_unwinder_real_record",
+        "\"unwind_id\":180003,\"phase_kind\":3,\"frame_count\":4,\"handler_invoked\":1,\"target\":\"invoke_filter\"")
+
+    record_unwind(180004, 4, 4, 1)
+    r0_emit("pe_seh_unwinder_real_record",
+        "\"unwind_id\":180004,\"phase_kind\":4,\"frame_count\":4,\"handler_invoked\":1,\"target\":\"invoke_handler\"")
+
+    record_unwind(180005, 5, 5, 0)
+    r0_emit("pe_seh_unwinder_real_record",
+        "\"unwind_id\":180005,\"phase_kind\":5,\"frame_count\":5,\"handler_invoked\":0,\"target\":\"continue_unwind\"")
+
+    record_unwind(180006, 6, 6, 1)
+    r0_emit("pe_seh_unwinder_real_record",
+        "\"unwind_id\":180006,\"phase_kind\":6,\"frame_count\":6,\"handler_invoked\":1,\"target\":\"resume\"")
+
+    // 3. unwind_count = 6
+    let c = unwind_count()
+    if c != 6 {
+        panic("pe_seh_unwinder_real FAIL [unwind_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. total_frame_count = 0+4+4+4+5+6 = 23
+    let tf = total_frame_count()
+    if tf != 23 {
+        panic("pe_seh_unwinder_real FAIL [total_frame_count] expected=23 got=" + to_string(tf))
+    }
+
+    // 5. count_by_phase_kind sanity (1,2,3,4,5,6 each = 1; 99 = 0)
+    let k1 = count_by_phase_kind(1)
+    if k1 != 1 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_phase_kind(2)
+    if k2 != 1 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_phase_kind(3)
+    if k3 != 1 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_phase_kind(4)
+    if k4 != 1 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_phase_kind(5)
+    if k5 != 1 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_phase_kind(6)
+    if k6 != 1 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k99 = count_by_phase_kind(99)
+    if k99 != 0 {
+        panic("pe_seh_unwinder_real FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 6. handler_invoked_count = 3 (180003, 180004, 180006)
+    let hi = handler_invoked_count()
+    if hi != 3 {
+        panic("pe_seh_unwinder_real FAIL [handler_invoked_count] expected=3 got=" + to_string(hi))
+    }
+
+    // 7. complete_count = 1 (only 180006 phase_kind==6)
+    let cc = complete_count()
+    if cc != 1 {
+        panic("pe_seh_unwinder_real FAIL [complete_count] expected=1 got=" + to_string(cc))
+    }
+
+    // 8. unwind_frame_count sanity
+    let f3 = unwind_frame_count(180003)
+    if f3 != 4 {
+        panic("pe_seh_unwinder_real FAIL [unwind_frame_count(180003)] expected=4 got=" + to_string(f3))
+    }
+    let f6 = unwind_frame_count(180006)
+    if f6 != 6 {
+        panic("pe_seh_unwinder_real FAIL [unwind_frame_count(180006)] expected=6 got=" + to_string(f6))
+    }
+    let f_miss = unwind_frame_count(9999)
+    if f_miss != 0 {
+        panic("pe_seh_unwinder_real FAIL [unwind_frame_count(9999)] expected=0 got=" + to_string(f_miss))
+    }
+
+    // 9. psur_stats() = [6, 23, 3, 1]
+    let s = psur_stats()
+    if len(s) != 4 {
+        panic("pe_seh_unwinder_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_seh_unwinder_real FAIL [stats unwind_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 23 {
+        panic("pe_seh_unwinder_real FAIL [stats total_frame_count] expected=23 got=" + to_string(s[1]))
+    }
+    if s[2] != 3 {
+        panic("pe_seh_unwinder_real FAIL [stats handler_invoked_count] expected=3 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_seh_unwinder_real FAIL [stats complete_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_seh_unwinder_real_stats",
+        "\"unwind_count\":" + to_string(s[0])
+        + ",\"total_frame_count\":" + to_string(s[1])
+        + ",\"handler_invoked_count\":" + to_string(s[2])
+        + ",\"complete_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 7 (6 records + 1 stats = 7)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_seh_unwinder_real FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_psur()
+    let s2 = psur_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_seh_unwinder_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_seh_unwinder_real self_test PASS (unwinds=" + to_string(s[0])
+        + ", frames=" + to_string(s[1]) + ", handlers=" + to_string(s[2])
+        + ", complete=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = psur_stats()
+            println("unwind_count\t" + to_string(s[0]))
+            println("total_frame_count\t" + to_string(s[1]))
+            println("handler_invoked_count\t" + to_string(s[2]))
+            println("complete_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "frames" {
+            if len(a) >= 4 {
+                let uid = to_int(a[3])
+                println("unwind_frame_count\t" + to_string(unwind_frame_count(uid)))
+                return
+            }
+            println("usage: hexa run pe_seh_unwinder_real.hexa frames <unwind_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_seh_unwinder_real.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_psur()
+            println("cleaned: " + psur_dir())
+            return
+        }
+        if sub == "dir" {
+            println(psur_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_seh_unwinder_real.hexa { self-test | stats | frames <unwind_id> | count <phase_kind> | cleanup | dir }")
+}

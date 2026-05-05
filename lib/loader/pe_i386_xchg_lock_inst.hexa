@@ -1,0 +1,519 @@
+// lib/loader/pe_i386_xchg_lock_inst.hexa — i386 atomic XCHG / LOCK / CMPXCHG / XADD instruction tracker
+//
+// Phase 후속 interpreter 가 i386 32-bit PE 의 atomic instruction 집합을
+// 디코드한 결과를 hexa side 가 받아 multi-processor atomic semantics
+// (XCHG implicit-lock / LOCK prefix valid target / CMPXCHG / XADD / atomic violation)
+// 를 추적한다.
+//
+// 추적 대상 (Intel SDM Vol 2 + Vol 3 §8 Multi-Processor):
+//   - 0x86 / 0x87 XCHG r/m, r — 항상 atomic (LOCK 묵시적, Intel SDM Vol 3 §8.1.2.1)
+//   - 0x91-0x97 XCHG EAX, r32 — short-form, atomic 동일
+//   - 0xF0 LOCK prefix — 다음 RMW instruction 을 atomic 화
+//     (valid: ADD/OR/ADC/SBB/AND/SUB/XOR/INC/DEC/NOT/NEG/BTC/BTR/BTS/XADD/XCHG/CMPXCHG/CMPXCHG8B)
+//   - 0x0F B0/B1 CMPXCHG r/m, r — compare-and-exchange (LOCK 가능)
+//   - 0x0F C0/C1 XADD r/m, r — exchange-and-add (LOCK 가능)
+//   - LOCK prefix invalid target (MOV/NOP 등) — atomic violation 추적
+//
+// LOCK prefix valid target group (Intel SDM Vol 2A §3.1.1.5 — LOCK prefix):
+//   group 1 : ADD/OR/ADC/SBB/AND/SUB/XOR
+//   group 2 : INC/DEC
+//   group 3 : NOT/NEG
+//   bit-test: BTC/BTR/BTS
+//   atomic  : XADD/XCHG/CMPXCHG/CMPXCHG8B
+//
+// own 1 enforcement: Wine / Box86 / CrossOver / Whisky / community 0 줄.
+//   - Wine wine/dlls/ntdll/x86_64/* 인용 X
+//   - Box86 dynarec_arm64 atomic helper 인용 X
+//   - QEMU target/i386/cpu_helper atomic 인용 X
+//   - Intel SDM Vol 2 + Vol 3 §8 multi-processor 자체 구현만 OK
+// own 2 mandate: r0_emit ≥ 14 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// persist schema (TSV 5 종 — xchg.tsv + lock.tsv + cmpxchg.tsv + xadd.tsv + violation.tsv):
+//   xchg.tsv      : xchg_id<int>      \t opcode_byte<str> \t lhs_reg_idx<int> \t rhs_reg_idx_or_mem<int> \t atomic_kind<int>
+//   lock.tsv      : lock_id<int>      \t target_opcode<str> \t valid_target<int>
+//   cmpxchg.tsv   : cx_id<int>        \t opcode_byte<str> \t lhs_reg_idx<int> \t src_reg_idx<int> \t eax_compare_pass<int>
+//   xadd.tsv      : xa_id<int>        \t opcode_byte<str> \t lhs_reg_idx<int> \t src_reg_idx<int>
+//   violation.tsv : viol_id<int>      \t prefix_byte<str> \t opcode_byte<str> \t reason<str>
+//
+// Hexa 예약어 회피: type/mod/resume/handle 단독 identifier 금지.
+//   식별자: opcode_byte / lhs_reg_idx / rhs_reg_idx_or_mem / atomic_kind
+//           target_opcode / valid_target / cx_id / xa_id
+//           src_reg_idx / eax_compare_pass / viol_id / prefix_byte / reason
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pixl_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_xchg_lock_inst"
+}
+
+fn pixl_xchg_path() -> str {
+    return pixl_dir() + "/xchg.tsv"
+}
+
+fn pixl_lock_path() -> str {
+    return pixl_dir() + "/lock.tsv"
+}
+
+fn pixl_cmpxchg_path() -> str {
+    return pixl_dir() + "/cmpxchg.tsv"
+}
+
+fn pixl_xadd_path() -> str {
+    return pixl_dir() + "/xadd.tsv"
+}
+
+fn pixl_violation_path() -> str {
+    return pixl_dir() + "/violation.tsv"
+}
+
+fn pixl_inst_path() -> str {
+    return pixl_dir()
+}
+
+fn pixl_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pixl_dir() + "'")
+}
+
+fn cleanup_pixl() -> void {
+    pixl_ensure_dir()
+    let _ = exec("rm -f '" + pixl_xchg_path()
+        + "' '" + pixl_lock_path()
+        + "' '" + pixl_cmpxchg_path()
+        + "' '" + pixl_xadd_path()
+        + "' '" + pixl_violation_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pixl_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pixl_append_row(path: str, row: str) -> void {
+    pixl_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── reg32_name: register index 0..7 → eax/ecx/edx/ebx/esp/ebp/esi/edi ───
+fn reg32_name(idx: int) -> str {
+    if idx == 0 { return "eax" }
+    if idx == 1 { return "ecx" }
+    if idx == 2 { return "edx" }
+    if idx == 3 { return "ebx" }
+    if idx == 4 { return "esp" }
+    if idx == 5 { return "ebp" }
+    if idx == 6 { return "esi" }
+    if idx == 7 { return "edi" }
+    return ""
+}
+
+// ─── atomic_kind_name: 0/1/2 → label ───
+fn atomic_kind_name(k: int) -> str {
+    if k == 0 { return "implicit_xchg" }
+    if k == 1 { return "xchg_eax" }
+    if k == 2 { return "user_lock" }
+    return ""
+}
+
+// ─── record_xchg: XCHG instruction 1 건 ───
+//   atomic_kind 0 = XCHG_implicit_lock (0x86/0x87 reg-reg or reg-mem)
+//   atomic_kind 1 = XCHG_eax_reg (0x91-0x97 short-form)
+//   atomic_kind 2 = user_lock (LOCK + XCHG)
+fn record_xchg(xchg_id: int, opcode_byte: str, lhs_reg_idx: int, rhs_reg_idx_or_mem: int, atomic_kind: int) -> void {
+    if xchg_id < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=xchg_id>=0 got=" + to_string(xchg_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=opcode_byte!=empty got=empty")
+    }
+    if lhs_reg_idx < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=lhs_reg_idx>=0 got=" + to_string(lhs_reg_idx))
+    }
+    if lhs_reg_idx > 7 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=lhs_reg_idx<=7 got=" + to_string(lhs_reg_idx))
+    }
+    if rhs_reg_idx_or_mem < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=rhs_reg_idx_or_mem>=0 got=" + to_string(rhs_reg_idx_or_mem))
+    }
+    if atomic_kind < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=atomic_kind>=0 got=" + to_string(atomic_kind))
+    }
+    if atomic_kind > 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xchg] expected=atomic_kind<=2 got=" + to_string(atomic_kind))
+    }
+    let row = to_string(xchg_id) + "\t" + opcode_byte + "\t"
+        + to_string(lhs_reg_idx) + "\t" + to_string(rhs_reg_idx_or_mem) + "\t"
+        + to_string(atomic_kind) + "\n"
+    pixl_append_row(pixl_xchg_path(), row)
+}
+
+// ─── record_lock_prefix: 0xF0 LOCK prefix instance 1 건 ───
+//   valid_target 1 = valid (RMW group 1/2/3, bit-test, atomic)
+//   valid_target 0 = invalid (MOV/NOP 등 — #UD on real CPU)
+fn record_lock_prefix(lock_id: int, target_opcode: str, valid_target: int) -> void {
+    if lock_id < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_lock_prefix] expected=lock_id>=0 got=" + to_string(lock_id))
+    }
+    if target_opcode == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_lock_prefix] expected=target_opcode!=empty got=empty")
+    }
+    if valid_target < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_lock_prefix] expected=valid_target>=0 got=" + to_string(valid_target))
+    }
+    if valid_target > 1 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_lock_prefix] expected=valid_target<=1 got=" + to_string(valid_target))
+    }
+    let row = to_string(lock_id) + "\t" + target_opcode + "\t" + to_string(valid_target) + "\n"
+    pixl_append_row(pixl_lock_path(), row)
+}
+
+// ─── record_cmpxchg: 0x0F B0/B1 CMPXCHG 1 건 ───
+//   eax_compare_pass 1 = ZF=1 (EAX==dest, write src), 0 = ZF=0 (load dest into EAX)
+fn record_cmpxchg(cx_id: int, opcode_byte: str, lhs_reg_idx: int, src_reg_idx: int, eax_compare_pass: int) -> void {
+    if cx_id < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=cx_id>=0 got=" + to_string(cx_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=opcode_byte!=empty got=empty")
+    }
+    if lhs_reg_idx < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=lhs_reg_idx>=0 got=" + to_string(lhs_reg_idx))
+    }
+    if lhs_reg_idx > 7 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=lhs_reg_idx<=7 got=" + to_string(lhs_reg_idx))
+    }
+    if src_reg_idx < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=src_reg_idx>=0 got=" + to_string(src_reg_idx))
+    }
+    if src_reg_idx > 7 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=src_reg_idx<=7 got=" + to_string(src_reg_idx))
+    }
+    if eax_compare_pass < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=eax_compare_pass>=0 got=" + to_string(eax_compare_pass))
+    }
+    if eax_compare_pass > 1 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_cmpxchg] expected=eax_compare_pass<=1 got=" + to_string(eax_compare_pass))
+    }
+    let row = to_string(cx_id) + "\t" + opcode_byte + "\t"
+        + to_string(lhs_reg_idx) + "\t" + to_string(src_reg_idx) + "\t"
+        + to_string(eax_compare_pass) + "\n"
+    pixl_append_row(pixl_cmpxchg_path(), row)
+}
+
+// ─── record_xadd: 0x0F C0/C1 XADD 1 건 ───
+fn record_xadd(xa_id: int, opcode_byte: str, lhs_reg_idx: int, src_reg_idx: int) -> void {
+    if xa_id < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xadd] expected=xa_id>=0 got=" + to_string(xa_id))
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xadd] expected=opcode_byte!=empty got=empty")
+    }
+    if lhs_reg_idx < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xadd] expected=lhs_reg_idx>=0 got=" + to_string(lhs_reg_idx))
+    }
+    if lhs_reg_idx > 7 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xadd] expected=lhs_reg_idx<=7 got=" + to_string(lhs_reg_idx))
+    }
+    if src_reg_idx < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xadd] expected=src_reg_idx>=0 got=" + to_string(src_reg_idx))
+    }
+    if src_reg_idx > 7 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_xadd] expected=src_reg_idx<=7 got=" + to_string(src_reg_idx))
+    }
+    let row = to_string(xa_id) + "\t" + opcode_byte + "\t"
+        + to_string(lhs_reg_idx) + "\t" + to_string(src_reg_idx) + "\n"
+    pixl_append_row(pixl_xadd_path(), row)
+}
+
+// ─── record_atomic_violation: invalid LOCK target 추적 ───
+fn record_atomic_violation(viol_id: int, prefix_byte: str, opcode_byte: str, reason: str) -> void {
+    if viol_id < 0 {
+        panic("pe_i386_xchg_lock_inst FAIL [record_atomic_violation] expected=viol_id>=0 got=" + to_string(viol_id))
+    }
+    if prefix_byte == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_atomic_violation] expected=prefix_byte!=empty got=empty")
+    }
+    if opcode_byte == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_atomic_violation] expected=opcode_byte!=empty got=empty")
+    }
+    if reason == "" {
+        panic("pe_i386_xchg_lock_inst FAIL [record_atomic_violation] expected=reason!=empty got=empty")
+    }
+    let row = to_string(viol_id) + "\t" + prefix_byte + "\t" + opcode_byte + "\t" + reason + "\n"
+    pixl_append_row(pixl_violation_path(), row)
+}
+
+// ─── 통계 헬퍼 ───
+fn pixl_count_rows(path: str, min_cols: int) -> int {
+    let t = pixl_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn xchg_count() -> int {
+    return pixl_count_rows(pixl_xchg_path(), 5)
+}
+
+fn lock_prefix_count() -> int {
+    return pixl_count_rows(pixl_lock_path(), 3)
+}
+
+fn cmpxchg_count() -> int {
+    return pixl_count_rows(pixl_cmpxchg_path(), 5)
+}
+
+fn xadd_count() -> int {
+    return pixl_count_rows(pixl_xadd_path(), 4)
+}
+
+fn violation_count() -> int {
+    return pixl_count_rows(pixl_violation_path(), 4)
+}
+
+// ─── pixl_stats: [xchg, lock_prefix, cmpxchg, xadd, violation] ───
+fn pixl_stats() -> array {
+    let mut out = []
+    out.push(xchg_count())
+    out.push(lock_prefix_count())
+    out.push(cmpxchg_count())
+    out.push(xadd_count())
+    out.push(violation_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pixl-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pixl()
+
+    // 2. record_xchg 4종 — 0x87 reg-reg / 0x86 reg-mem / 0x91 EAX-ECX / 0x97 EAX-EDI
+    //    Intel SDM Vol 2A XCHG: 0x86/0x87 → ModR/M form (atomic implicit), 0x90+r → short-form (EAX,r32)
+    record_xchg(0, "87", 0, 1, 0)  // XCHG eax, ecx (reg-reg, ModR/M form, implicit lock)
+    r0_emit("pe_i386_xchg_lock_inst_record_xchg",
+        "\"xchg_id\":0,\"opcode_byte\":\"87\",\"lhs_reg_idx\":0,\"rhs_reg_idx_or_mem\":1,\"atomic_kind\":0,\"target\":\"XCHG.eax.ecx.implicit_lock\"")
+
+    record_xchg(1, "86", 3, 0, 0)  // XCHG bl, [eax] (reg-mem 8-bit, implicit lock)
+    r0_emit("pe_i386_xchg_lock_inst_record_xchg",
+        "\"xchg_id\":1,\"opcode_byte\":\"86\",\"lhs_reg_idx\":3,\"rhs_reg_idx_or_mem\":0,\"atomic_kind\":0,\"target\":\"XCHG.bl.mem.implicit_lock\"")
+
+    record_xchg(2, "91", 0, 1, 1)  // XCHG EAX, ECX (short-form 0x91 = 0x90+1)
+    r0_emit("pe_i386_xchg_lock_inst_record_xchg",
+        "\"xchg_id\":2,\"opcode_byte\":\"91\",\"lhs_reg_idx\":0,\"rhs_reg_idx_or_mem\":1,\"atomic_kind\":1,\"target\":\"XCHG.eax.ecx.short_form\"")
+
+    record_xchg(3, "97", 0, 7, 1)  // XCHG EAX, EDI (short-form 0x97 = 0x90+7)
+    r0_emit("pe_i386_xchg_lock_inst_record_xchg",
+        "\"xchg_id\":3,\"opcode_byte\":\"97\",\"lhs_reg_idx\":0,\"rhs_reg_idx_or_mem\":7,\"atomic_kind\":1,\"target\":\"XCHG.eax.edi.short_form\"")
+
+    // 3. record_lock_prefix 4종 — 0xF0 + 0x01 ADD valid / 0xF0 + 0x29 SUB valid / 0xF0 + 0x89 MOV invalid / 0xF0 + 0x90 NOP invalid
+    record_lock_prefix(0, "01", 1)  // LOCK ADD r/m32, r32 — valid (group 1)
+    r0_emit("pe_i386_xchg_lock_inst_record_lock_prefix",
+        "\"lock_id\":0,\"target_opcode\":\"01\",\"valid_target\":1,\"target\":\"LOCK.ADD.group1.valid\"")
+
+    record_lock_prefix(1, "29", 1)  // LOCK SUB r/m32, r32 — valid (group 1)
+    r0_emit("pe_i386_xchg_lock_inst_record_lock_prefix",
+        "\"lock_id\":1,\"target_opcode\":\"29\",\"valid_target\":1,\"target\":\"LOCK.SUB.group1.valid\"")
+
+    record_lock_prefix(2, "89", 0)  // LOCK MOV — invalid (#UD)
+    r0_emit("pe_i386_xchg_lock_inst_record_lock_prefix",
+        "\"lock_id\":2,\"target_opcode\":\"89\",\"valid_target\":0,\"target\":\"LOCK.MOV.invalid\"")
+
+    record_lock_prefix(3, "90", 0)  // LOCK NOP — invalid (#UD)
+    r0_emit("pe_i386_xchg_lock_inst_record_lock_prefix",
+        "\"lock_id\":3,\"target_opcode\":\"90\",\"valid_target\":0,\"target\":\"LOCK.NOP.invalid\"")
+
+    // 4. record_cmpxchg 2종 — 0x0F B0 r/m8, r8 pass=1 / 0x0F B1 r/m32, r32 pass=0
+    record_cmpxchg(0, "B0", 3, 1, 1)  // CMPXCHG r/m8, r8 — AL==dest 일치 → ZF=1, dest := r8
+    r0_emit("pe_i386_xchg_lock_inst_record_cmpxchg",
+        "\"cx_id\":0,\"opcode_byte\":\"B0\",\"lhs_reg_idx\":3,\"src_reg_idx\":1,\"eax_compare_pass\":1,\"target\":\"CMPXCHG.r8.pass\"")
+
+    record_cmpxchg(1, "B1", 6, 2, 0)  // CMPXCHG r/m32, r32 — EAX!=dest → ZF=0, EAX := dest
+    r0_emit("pe_i386_xchg_lock_inst_record_cmpxchg",
+        "\"cx_id\":1,\"opcode_byte\":\"B1\",\"lhs_reg_idx\":6,\"src_reg_idx\":2,\"eax_compare_pass\":0,\"target\":\"CMPXCHG.r32.fail\"")
+
+    // 5. record_xadd 2종 — 0x0F C0 r/m8, r8 / 0x0F C1 r/m32, r32
+    record_xadd(0, "C0", 3, 1)  // XADD r/m8, r8 (bl ↔ cl)
+    r0_emit("pe_i386_xchg_lock_inst_record_xadd",
+        "\"xa_id\":0,\"opcode_byte\":\"C0\",\"lhs_reg_idx\":3,\"src_reg_idx\":1,\"target\":\"XADD.r8\"")
+
+    record_xadd(1, "C1", 6, 2)  // XADD r/m32, r32 (esi ↔ edx)
+    r0_emit("pe_i386_xchg_lock_inst_record_xadd",
+        "\"xa_id\":1,\"opcode_byte\":\"C1\",\"lhs_reg_idx\":6,\"src_reg_idx\":2,\"target\":\"XADD.r32\"")
+
+    // 6. record_atomic_violation 2종 — 0x89 MOV with LOCK / 0x90 NOP with LOCK
+    record_atomic_violation(0, "F0", "89", "LOCK_MOV_undefined_opcode")
+    r0_emit("pe_i386_xchg_lock_inst_record_atomic_violation",
+        "\"viol_id\":0,\"prefix_byte\":\"F0\",\"opcode_byte\":\"89\",\"reason\":\"LOCK_MOV_undefined_opcode\",\"target\":\"#UD.MOV\"")
+
+    record_atomic_violation(1, "F0", "90", "LOCK_NOP_undefined_opcode")
+    r0_emit("pe_i386_xchg_lock_inst_record_atomic_violation",
+        "\"viol_id\":1,\"prefix_byte\":\"F0\",\"opcode_byte\":\"90\",\"reason\":\"LOCK_NOP_undefined_opcode\",\"target\":\"#UD.NOP\"")
+
+    // 7. assertion: xchg == 4
+    let xc = xchg_count()
+    if xc != 4 {
+        panic("pe_i386_xchg_lock_inst FAIL [xchg_count] expected=4 got=" + to_string(xc))
+    }
+
+    // 8. assertion: lock_prefix == 4
+    let lc = lock_prefix_count()
+    if lc != 4 {
+        panic("pe_i386_xchg_lock_inst FAIL [lock_prefix_count] expected=4 got=" + to_string(lc))
+    }
+
+    // 9. assertion: cmpxchg == 2
+    let cc = cmpxchg_count()
+    if cc != 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [cmpxchg_count] expected=2 got=" + to_string(cc))
+    }
+
+    // 10. assertion: xadd == 2
+    let ac = xadd_count()
+    if ac != 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [xadd_count] expected=2 got=" + to_string(ac))
+    }
+
+    // 11. assertion: violation == 2
+    let vc = violation_count()
+    if vc != 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [violation_count] expected=2 got=" + to_string(vc))
+    }
+
+    // 12. atomic_kind_name sanity (0..2 + invalid)
+    if atomic_kind_name(0) != "implicit_xchg" {
+        panic("pe_i386_xchg_lock_inst FAIL [atomic_kind_name(0)] expected=implicit_xchg got=" + atomic_kind_name(0))
+    }
+    if atomic_kind_name(1) != "xchg_eax" {
+        panic("pe_i386_xchg_lock_inst FAIL [atomic_kind_name(1)] expected=xchg_eax got=" + atomic_kind_name(1))
+    }
+    if atomic_kind_name(2) != "user_lock" {
+        panic("pe_i386_xchg_lock_inst FAIL [atomic_kind_name(2)] expected=user_lock got=" + atomic_kind_name(2))
+    }
+    if atomic_kind_name(99) != "" {
+        panic("pe_i386_xchg_lock_inst FAIL [atomic_kind_name(99)] expected=empty got=" + atomic_kind_name(99))
+    }
+
+    // 13. reg32_name sanity (0..7 + invalid)
+    if reg32_name(0) != "eax" {
+        panic("pe_i386_xchg_lock_inst FAIL [reg32_name(0)] expected=eax got=" + reg32_name(0))
+    }
+    if reg32_name(3) != "ebx" {
+        panic("pe_i386_xchg_lock_inst FAIL [reg32_name(3)] expected=ebx got=" + reg32_name(3))
+    }
+    if reg32_name(4) != "esp" {
+        panic("pe_i386_xchg_lock_inst FAIL [reg32_name(4)] expected=esp got=" + reg32_name(4))
+    }
+    if reg32_name(7) != "edi" {
+        panic("pe_i386_xchg_lock_inst FAIL [reg32_name(7)] expected=edi got=" + reg32_name(7))
+    }
+    if reg32_name(8) != "" {
+        panic("pe_i386_xchg_lock_inst FAIL [reg32_name(8)] expected=empty got=" + reg32_name(8))
+    }
+
+    // 14. pixl_stats() = [4, 4, 2, 2, 2]
+    let s = pixl_stats()
+    if len(s) != 5 {
+        panic("pe_i386_xchg_lock_inst FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_i386_xchg_lock_inst FAIL [stats xchg_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_i386_xchg_lock_inst FAIL [stats lock_prefix_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [stats cmpxchg_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [stats xadd_count] expected=2 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_i386_xchg_lock_inst FAIL [stats violation_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // 15. emit stats summary
+    r0_emit("pe_i386_xchg_lock_inst_stats",
+        "\"xchg_count\":" + to_string(s[0])
+        + ",\"lock_prefix_count\":" + to_string(s[1])
+        + ",\"cmpxchg_count\":" + to_string(s[2])
+        + ",\"xadd_count\":" + to_string(s[3])
+        + ",\"violation_count\":" + to_string(s[4]))
+
+    // 16. r0 emit count assertion (≥ 14)
+    //     실제 emit: 4 xchg + 4 lock + 2 cmpxchg + 2 xadd + 2 violation + 1 stats = 15
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_i386_xchg_lock_inst FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 17. cleanup → stats 모두 0
+    cleanup_pixl()
+    let s2 = pixl_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_xchg_lock_inst FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_xchg_lock_inst self_test PASS (xchg=" + to_string(s[0])
+        + ", lock=" + to_string(s[1]) + ", cmpxchg=" + to_string(s[2])
+        + ", xadd=" + to_string(s[3]) + ", violation=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pixl_stats()
+            println("xchg_count\t" + to_string(s[0]))
+            println("lock_prefix_count\t" + to_string(s[1]))
+            println("cmpxchg_count\t" + to_string(s[2]))
+            println("xadd_count\t" + to_string(s[3]))
+            println("violation_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pixl()
+            println("cleaned: " + pixl_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pixl_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_xchg_lock_inst.hexa { self-test | stats | cleanup | dir }")
+}

@@ -1,0 +1,510 @@
+// lib/loader/pe_r4_tls_download_skeleton.hexa — R4 cycle TLS/HTTPS download tracker
+//
+// 역할:
+//   Battle.net Setup 의 install 단계 (R4 cycle) 에서 launcher / agent 가
+//   server 로부터 manifest / patch / installer chunk 를 fetch 하기 위해 수행하는
+//   TLS handshake + HTTPS request/response + chunked download path 를 추적한다.
+//
+//   본 module 은 R4 cycle 의 network/file 작업 timeline 만 기록한다 — 실제 fetch
+//   는 OS native HTTPS stack (NSURLSession / WinHTTP) 가 수행. 본 skeleton 은
+//   observation-only event recorder (own 1 — Hexa pure, no Wine/CrossOver/Whisky).
+//
+//   R4 phase coverage:
+//     • TLS 1.2 / 1.3 handshake (cipher suite negotiate)
+//     • HTTPS GET/POST/HEAD with header set (User-Agent, Accept, Range, etc.)
+//     • Chunked response stream (Transfer-Encoding chunked OR Content-Length range)
+//     • download lifecycle state transitions (init → connecting → streaming → complete)
+//
+// own 1: Hexa pure. Apple SDK 호출 없음. Battle.net updater protocol 관찰만.
+//        타사 Wine/CrossOver/GPTK/Whisky 인용 X — RFC8446 / RFC9110 spec only.
+// own 2: r0_emit ≥ 14, panic-on-violation, self-test ≥ 12 record.
+//
+// method code (record_url_fetch):
+//   0 = GET
+//   1 = POST
+//   2 = HEAD
+//
+// version code (record_tls_handshake):
+//   12 = TLS 1.2  (RFC5246)
+//   13 = TLS 1.3  (RFC8446)
+//
+// state_kind code (record_download_state):
+//   0 = init
+//   1 = connecting
+//   2 = streaming
+//   3 = complete
+//   4 = cancelled
+//   5 = error
+//
+// persist schema (5 separate TSVs):
+//   url_fetches.tsv      : fetch_id    \t url_hex_hash    \t method        \t status_code
+//   tls_handshakes.tsv   : tls_id      \t fetch_id        \t version       \t cipher_suite_id
+//   http_headers.tsv     : header_id   \t fetch_id        \t name          \t value_hex_hash
+//   chunks.tsv           : chunk_id    \t fetch_id        \t offset        \t length
+//   download_states.tsv  : state_id    \t fetch_id        \t state_kind    \t bytes_total
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pr4td_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_r4_tls_download_skeleton"
+}
+
+fn pr4td_url_fetches_path() -> str {
+    return pr4td_dir() + "/url_fetches.tsv"
+}
+
+fn pr4td_tls_handshakes_path() -> str {
+    return pr4td_dir() + "/tls_handshakes.tsv"
+}
+
+fn pr4td_http_headers_path() -> str {
+    return pr4td_dir() + "/http_headers.tsv"
+}
+
+fn pr4td_chunks_path() -> str {
+    return pr4td_dir() + "/chunks.tsv"
+}
+
+fn pr4td_download_states_path() -> str {
+    return pr4td_dir() + "/download_states.tsv"
+}
+
+fn pr4td_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pr4td_dir() + "'")
+}
+
+fn cleanup_pr4td() -> void {
+    pr4td_ensure_dir()
+    let _ = exec("rm -f '" + pr4td_url_fetches_path() + "'")
+    let _ = exec("rm -f '" + pr4td_tls_handshakes_path() + "'")
+    let _ = exec("rm -f '" + pr4td_http_headers_path() + "'")
+    let _ = exec("rm -f '" + pr4td_chunks_path() + "'")
+    let _ = exec("rm -f '" + pr4td_download_states_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pr4td_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pr4td_append_row(path: str, row: str) -> void {
+    pr4td_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pr4td_count_rows(path: str, min_cols: int) -> int {
+    let t = pr4td_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── helper: method_name (0=GET / 1=POST / 2=HEAD) ───
+fn method_name(m: int) -> str {
+    if m == 0 { return "GET" }
+    if m == 1 { return "POST" }
+    if m == 2 { return "HEAD" }
+    return "?"
+}
+
+// ─── helper: state_name (0=init / 1=connecting / 2=streaming / 3=complete / 4=cancelled / 5=error) ───
+fn state_name(s: int) -> str {
+    if s == 0 { return "init" }
+    if s == 1 { return "connecting" }
+    if s == 2 { return "streaming" }
+    if s == 3 { return "complete" }
+    if s == 4 { return "cancelled" }
+    if s == 5 { return "error" }
+    return "?"
+}
+
+// ─── record_url_fetch: HTTPS request 1 건 ───
+fn record_url_fetch(fetch_id: int, url_hex_hash: int, method: int, status_code: int) -> void {
+    if fetch_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_url_fetch] expected=fetch_id>0 got=" + to_string(fetch_id))
+    }
+    if url_hex_hash < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_url_fetch] expected=url_hex_hash>=0 got=" + to_string(url_hex_hash))
+    }
+    if method < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_url_fetch] expected=method>=0 got=" + to_string(method))
+    }
+    if method > 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_url_fetch] expected=method<=2 got=" + to_string(method))
+    }
+    if status_code < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_url_fetch] expected=status_code>=0 got=" + to_string(status_code))
+    }
+    if status_code > 599 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_url_fetch] expected=status_code<=599 got=" + to_string(status_code))
+    }
+    let row = to_string(fetch_id) + "\t" + to_string(url_hex_hash)
+        + "\t" + to_string(method) + "\t" + to_string(status_code) + "\n"
+    pr4td_append_row(pr4td_url_fetches_path(), row)
+}
+
+// ─── record_tls_handshake: TLS handshake 1 건 (version 12=TLS1.2 / 13=TLS1.3) ───
+fn record_tls_handshake(tls_id: int, fetch_id: int, version: int, cipher_suite_id: int) -> void {
+    if tls_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_tls_handshake] expected=tls_id>0 got=" + to_string(tls_id))
+    }
+    if fetch_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_tls_handshake] expected=fetch_id>0 got=" + to_string(fetch_id))
+    }
+    if version != 12 {
+        if version != 13 {
+            panic("pe_r4_tls_download_skeleton FAIL [record_tls_handshake] expected=version in {12,13} got=" + to_string(version))
+        }
+    }
+    if cipher_suite_id < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_tls_handshake] expected=cipher_suite_id>=0 got=" + to_string(cipher_suite_id))
+    }
+    let row = to_string(tls_id) + "\t" + to_string(fetch_id)
+        + "\t" + to_string(version) + "\t" + to_string(cipher_suite_id) + "\n"
+    pr4td_append_row(pr4td_tls_handshakes_path(), row)
+}
+
+// ─── record_http_header: HTTP header 1 건 (name=plain str, value=hashed) ───
+fn record_http_header(header_id: int, fetch_id: int, name: str, value_hex_hash: int) -> void {
+    if header_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_http_header] expected=header_id>0 got=" + to_string(header_id))
+    }
+    if fetch_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_http_header] expected=fetch_id>0 got=" + to_string(fetch_id))
+    }
+    if name == "" {
+        panic("pe_r4_tls_download_skeleton FAIL [record_http_header] expected=name!=empty got=empty")
+    }
+    if value_hex_hash < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_http_header] expected=value_hex_hash>=0 got=" + to_string(value_hex_hash))
+    }
+    let row = to_string(header_id) + "\t" + to_string(fetch_id)
+        + "\t" + name + "\t" + to_string(value_hex_hash) + "\n"
+    pr4td_append_row(pr4td_http_headers_path(), row)
+}
+
+// ─── record_chunk_received: response body chunk 1 건 ───
+fn record_chunk_received(chunk_id: int, fetch_id: int, offset: int, length: int) -> void {
+    if chunk_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_chunk_received] expected=chunk_id>0 got=" + to_string(chunk_id))
+    }
+    if fetch_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_chunk_received] expected=fetch_id>0 got=" + to_string(fetch_id))
+    }
+    if offset < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_chunk_received] expected=offset>=0 got=" + to_string(offset))
+    }
+    if length < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_chunk_received] expected=length>=0 got=" + to_string(length))
+    }
+    let row = to_string(chunk_id) + "\t" + to_string(fetch_id)
+        + "\t" + to_string(offset) + "\t" + to_string(length) + "\n"
+    pr4td_append_row(pr4td_chunks_path(), row)
+}
+
+// ─── record_download_state: lifecycle state transition 1 건 ───
+fn record_download_state(state_id: int, fetch_id: int, state_kind: int, bytes_total: int) -> void {
+    if state_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_download_state] expected=state_id>0 got=" + to_string(state_id))
+    }
+    if fetch_id <= 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_download_state] expected=fetch_id>0 got=" + to_string(fetch_id))
+    }
+    if state_kind < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_download_state] expected=state_kind>=0 got=" + to_string(state_kind))
+    }
+    if state_kind > 5 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_download_state] expected=state_kind<=5 got=" + to_string(state_kind))
+    }
+    if bytes_total < 0 {
+        panic("pe_r4_tls_download_skeleton FAIL [record_download_state] expected=bytes_total>=0 got=" + to_string(bytes_total))
+    }
+    let row = to_string(state_id) + "\t" + to_string(fetch_id)
+        + "\t" + to_string(state_kind) + "\t" + to_string(bytes_total) + "\n"
+    pr4td_append_row(pr4td_download_states_path(), row)
+}
+
+// ─── 통계 ───
+fn url_fetch_count() -> int {
+    return pr4td_count_rows(pr4td_url_fetches_path(), 4)
+}
+
+fn tls_handshake_count() -> int {
+    return pr4td_count_rows(pr4td_tls_handshakes_path(), 4)
+}
+
+fn http_header_count() -> int {
+    return pr4td_count_rows(pr4td_http_headers_path(), 4)
+}
+
+fn chunk_count() -> int {
+    return pr4td_count_rows(pr4td_chunks_path(), 4)
+}
+
+fn state_count() -> int {
+    return pr4td_count_rows(pr4td_download_states_path(), 4)
+}
+
+fn pr4td_stats() -> array {
+    let mut out = []
+    out.push(url_fetch_count())
+    out.push(tls_handshake_count())
+    out.push(http_header_count())
+    out.push(chunk_count())
+    out.push(state_count())
+    return out
+}
+
+// ─── self_test (≥ 12 record + ≥ 14 r0_emit + assertions) ───
+fn self_test() -> void {
+    let sid = "pr4td-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pr4td()
+
+    // ─── fetch_id=1 : GET https://us.battle.net/launcher/manifest.json (TLS 1.3, status 200) ───
+    // 2. record_url_fetch #1 — GET, status_code=200
+    record_url_fetch(1, 12345678, 0, 200)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"url_fetch\",\"fetch_id\":1,\"url_hex_hash\":12345678,\"method\":0,\"method_name\":\"GET\",\"status_code\":200,\"target\":\"manifest.json\"")
+
+    // 3. record_tls_handshake #1 — TLS 1.3, AES_256_GCM_SHA384 (cipher_suite_id 0x1302)
+    record_tls_handshake(1, 1, 13, 4866)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"tls_handshake\",\"tls_id\":1,\"fetch_id\":1,\"version\":13,\"name\":\"TLS_1_3\",\"cipher_suite_id\":4866")
+
+    // 4. record_http_header #1 — User-Agent: Battle.net/2.x
+    record_http_header(1, 1, "User-Agent", 100001)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"http_header\",\"header_id\":1,\"fetch_id\":1,\"name\":\"User-Agent\",\"value_hex_hash\":100001")
+
+    // 5. record_http_header #2 — Accept: application/json
+    record_http_header(2, 1, "Accept", 100002)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"http_header\",\"header_id\":2,\"fetch_id\":1,\"name\":\"Accept\",\"value_hex_hash\":100002")
+
+    // 6. record_chunk_received #1 — offset=0, length=4096
+    record_chunk_received(1, 1, 0, 4096)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"chunk_received\",\"chunk_id\":1,\"fetch_id\":1,\"offset\":0,\"length\":4096")
+
+    // 7. record_chunk_received #2 — offset=4096, length=4096
+    record_chunk_received(2, 1, 4096, 4096)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"chunk_received\",\"chunk_id\":2,\"fetch_id\":1,\"offset\":4096,\"length\":4096")
+
+    // 8. record_download_state #1 — state_kind=2 streaming (init→connecting→streaming consolidated)
+    record_download_state(1, 1, 2, 8192)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"download_state\",\"state_id\":1,\"fetch_id\":1,\"state_kind\":2,\"name\":\"streaming\",\"bytes_total\":8192")
+
+    // ─── fetch_id=2 : GET https://us.battle.net/launcher/patch.bin (TLS 1.3, status 304 Not Modified) ───
+    // 9. record_url_fetch #2 — GET, status_code=304 (cached)
+    record_url_fetch(2, 87654321, 0, 304)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"url_fetch\",\"fetch_id\":2,\"url_hex_hash\":87654321,\"method\":0,\"method_name\":\"GET\",\"status_code\":304,\"target\":\"patch.bin\"")
+
+    // 10. record_tls_handshake #2 — TLS 1.3, CHACHA20_POLY1305_SHA256 (cipher_suite_id 0x1303)
+    record_tls_handshake(2, 2, 13, 4867)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"tls_handshake\",\"tls_id\":2,\"fetch_id\":2,\"version\":13,\"name\":\"TLS_1_3\",\"cipher_suite_id\":4867")
+
+    // 11. record_http_header #3 — Content-Type: application/octet-stream
+    record_http_header(3, 2, "Content-Type", 100003)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"http_header\",\"header_id\":3,\"fetch_id\":2,\"name\":\"Content-Type\",\"value_hex_hash\":100003")
+
+    // 12. record_http_header #4 — Content-Length: 8192
+    record_http_header(4, 2, "Content-Length", 100004)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"http_header\",\"header_id\":4,\"fetch_id\":2,\"name\":\"Content-Length\",\"value_hex_hash\":100004")
+
+    // 13. record_chunk_received #3 — offset=8192, length=4096
+    record_chunk_received(3, 2, 8192, 4096)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"chunk_received\",\"chunk_id\":3,\"fetch_id\":2,\"offset\":8192,\"length\":4096")
+
+    // 14. record_chunk_received #4 — offset=12288, length=4096
+    record_chunk_received(4, 2, 12288, 4096)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"chunk_received\",\"chunk_id\":4,\"fetch_id\":2,\"offset\":12288,\"length\":4096")
+
+    // 15. record_download_state #2 — state_kind=3 complete
+    record_download_state(2, 2, 3, 16384)
+    r0_emit("pe_r4_tls_download_skeleton_record",
+        "\"kind\":\"download_state\",\"state_id\":2,\"fetch_id\":2,\"state_kind\":3,\"name\":\"complete\",\"bytes_total\":16384")
+
+    // ─── assertions: url==2, tls==2, header==4, chunk==4, state==2 ───
+    let uc = url_fetch_count()
+    if uc != 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [url_fetch_count] expected=2 got=" + to_string(uc))
+    }
+    let tc = tls_handshake_count()
+    if tc != 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [tls_handshake_count] expected=2 got=" + to_string(tc))
+    }
+    let hc = http_header_count()
+    if hc != 4 {
+        panic("pe_r4_tls_download_skeleton FAIL [http_header_count] expected=4 got=" + to_string(hc))
+    }
+    let cc = chunk_count()
+    if cc != 4 {
+        panic("pe_r4_tls_download_skeleton FAIL [chunk_count] expected=4 got=" + to_string(cc))
+    }
+    let stc = state_count()
+    if stc != 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [state_count] expected=2 got=" + to_string(stc))
+    }
+
+    // ─── method_name lookup sanity ───
+    let mn_get = method_name(0)
+    if mn_get != "GET" {
+        panic("pe_r4_tls_download_skeleton FAIL [method_name(0)] expected=GET got=" + mn_get)
+    }
+    let mn_post = method_name(1)
+    if mn_post != "POST" {
+        panic("pe_r4_tls_download_skeleton FAIL [method_name(1)] expected=POST got=" + mn_post)
+    }
+    let mn_head = method_name(2)
+    if mn_head != "HEAD" {
+        panic("pe_r4_tls_download_skeleton FAIL [method_name(2)] expected=HEAD got=" + mn_head)
+    }
+
+    // ─── state_name lookup sanity ───
+    let sn_init = state_name(0)
+    if sn_init != "init" {
+        panic("pe_r4_tls_download_skeleton FAIL [state_name(0)] expected=init got=" + sn_init)
+    }
+    let sn_conn = state_name(1)
+    if sn_conn != "connecting" {
+        panic("pe_r4_tls_download_skeleton FAIL [state_name(1)] expected=connecting got=" + sn_conn)
+    }
+    let sn_strm = state_name(2)
+    if sn_strm != "streaming" {
+        panic("pe_r4_tls_download_skeleton FAIL [state_name(2)] expected=streaming got=" + sn_strm)
+    }
+    let sn_done = state_name(3)
+    if sn_done != "complete" {
+        panic("pe_r4_tls_download_skeleton FAIL [state_name(3)] expected=complete got=" + sn_done)
+    }
+    let sn_canc = state_name(4)
+    if sn_canc != "cancelled" {
+        panic("pe_r4_tls_download_skeleton FAIL [state_name(4)] expected=cancelled got=" + sn_canc)
+    }
+    let sn_err = state_name(5)
+    if sn_err != "error" {
+        panic("pe_r4_tls_download_skeleton FAIL [state_name(5)] expected=error got=" + sn_err)
+    }
+
+    // ─── stats sanity ───
+    let s = pr4td_stats()
+    if len(s) != 5 {
+        panic("pe_r4_tls_download_skeleton FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [stats url_fetch_count] expected=2 got=" + to_string(s[0]))
+    }
+    if s[1] != 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [stats tls_handshake_count] expected=2 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_r4_tls_download_skeleton FAIL [stats http_header_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_r4_tls_download_skeleton FAIL [stats chunk_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 2 {
+        panic("pe_r4_tls_download_skeleton FAIL [stats state_count] expected=2 got=" + to_string(s[4]))
+    }
+
+    // ─── stats r0_emit ───
+    r0_emit("pe_r4_tls_download_skeleton_stats",
+        "\"url_fetch_count\":" + to_string(s[0])
+        + ",\"tls_handshake_count\":" + to_string(s[1])
+        + ",\"http_header_count\":" + to_string(s[2])
+        + ",\"chunk_count\":" + to_string(s[3])
+        + ",\"state_count\":" + to_string(s[4]))
+
+    r0_emit("pe_r4_tls_download_skeleton_summary",
+        "\"phase\":\"r4_tls_download_complete\""
+        + ",\"fetches\":2"
+        + ",\"fetch1\":\"GET_200_TLS13_streaming\""
+        + ",\"fetch2\":\"GET_304_TLS13_complete\""
+        + ",\"total_chunks\":" + to_string(s[3])
+        + ",\"total_headers\":" + to_string(s[2]))
+
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_r4_tls_download_skeleton FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // ─── cleanup → 모든 stats 0 ───
+    cleanup_pr4td()
+    let s2 = pr4td_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_r4_tls_download_skeleton FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_r4_tls_download_skeleton self_test PASS (url=" + to_string(s[0])
+        + ", tls=" + to_string(s[1]) + ", header=" + to_string(s[2])
+        + ", chunk=" + to_string(s[3]) + ", state=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pr4td_stats()
+            println("url_fetch_count\t" + to_string(s[0]))
+            println("tls_handshake_count\t" + to_string(s[1]))
+            println("http_header_count\t" + to_string(s[2]))
+            println("chunk_count\t" + to_string(s[3]))
+            println("state_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pr4td()
+            println("cleaned: " + pr4td_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pr4td_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_r4_tls_download_skeleton.hexa { self-test | stats | cleanup | dir }")
+}

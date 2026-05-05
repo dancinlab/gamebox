@@ -1,0 +1,415 @@
+// lib/loader/pe_tls_invoke_real.hexa — cycle 82 R2 phase 2 PE TLS callback invoke 추적 skeleton
+//
+// PE TLS callback invoke:
+//   IMAGE_TLS_DIRECTORY.AddressOfCallBacks → null-terminated PIMAGE_TLS_CALLBACK[]
+//   각 callback signature:
+//     VOID NTAPI TlsCallback(PVOID DllHandle, DWORD Reason, PVOID Reserved)
+//   Reason 값 = DLL_*_ATTACH/DETACH (1=process_attach / 2=thread_attach /
+//                                    3=thread_detach / 4=process_detach)
+//   Apple-native 매핑:
+//     pthread_key_create(&key, dtor) — per-thread destructor 로 thread_detach 모방
+//     helper.mm IPC bridge 가 invoke 통보 → docker hexa 측에서 추적
+// own1: PE TLS spec + Apple pthread_key_create only
+//
+// cross-ref:
+//   cycle 80 pe_tls_init_real → init_kind 와 본 모듈의 callback_phase 동일 의미
+//                               (1=process_attach / 2=thread_attach / 3=thread_detach / 4=process_detach)
+//   cycle 72 pe_tls_callback_dispatch → reason_kind 와도 동일
+//   helper.mm pthread_key_create IPC invoke 추적 — Apple-native phase 2
+//
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// callback_phase code:
+//   1 = process_attach   (DLL_PROCESS_ATTACH)
+//   2 = thread_attach    (DLL_THREAD_ATTACH)
+//   3 = thread_detach    (DLL_THREAD_DETACH)
+//   4 = process_detach   (DLL_PROCESS_DETACH)
+//
+// elevated 의미:
+//   0 = 일반 user-mode invoke
+//   1 = elevated/admin context invoke (UAC consent / token elevation 후)
+//
+// persist schema (TSV — invokes.tsv):
+//   invoke_id<int> \t callback_phase<int> \t callback_index<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn ptir2_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_tls_invoke_real"
+}
+
+fn ptir2_invokes_path() -> str {
+    return ptir2_dir() + "/invokes.tsv"
+}
+
+fn ptir2_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + ptir2_dir() + "'")
+}
+
+fn cleanup_ptir2() -> void {
+    ptir2_ensure_dir()
+    let _ = exec("rm -f '" + ptir2_invokes_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn ptir2_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ptir2_append_row(path: str, row: str) -> void {
+    ptir2_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_invoke: TLS callback invoke 1 건 기록 ───
+fn record_invoke(invoke_id: int, callback_phase: int, callback_index: int, elevated: int) -> void {
+    if invoke_id <= 0 {
+        panic("pe_tls_invoke_real FAIL [record_invoke] expected=invoke_id>0 got=" + to_string(invoke_id))
+    }
+    if callback_phase < 1 {
+        panic("pe_tls_invoke_real FAIL [record_invoke] expected=callback_phase>=1 got=" + to_string(callback_phase))
+    }
+    if callback_phase > 4 {
+        panic("pe_tls_invoke_real FAIL [record_invoke] expected=callback_phase<=4 got=" + to_string(callback_phase))
+    }
+    if callback_index < 0 {
+        panic("pe_tls_invoke_real FAIL [record_invoke] expected=callback_index>=0 got=" + to_string(callback_index))
+    }
+    if elevated < 0 {
+        panic("pe_tls_invoke_real FAIL [record_invoke] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_tls_invoke_real FAIL [record_invoke] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(invoke_id) + "\t" + to_string(callback_phase)
+        + "\t" + to_string(callback_index) + "\t" + to_string(elevated) + "\n"
+    ptir2_append_row(ptir2_invokes_path(), row)
+}
+
+// ─── invoke_count: total invoke 수 ───
+fn invoke_count() -> int {
+    let t = ptir2_read_table(ptir2_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_callback_index: 모든 invoke 의 callback_index 합 ───
+fn total_callback_index() -> int {
+    let t = ptir2_read_table(ptir2_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_callback_phase: 특정 callback_phase 의 invoke 수 ───
+fn count_by_callback_phase(callback_phase: int) -> int {
+    let t = ptir2_read_table(ptir2_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == callback_phase {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── elevated_count: elevated=1 인 invoke 수 ───
+fn elevated_count() -> int {
+    let t = ptir2_read_table(ptir2_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── process_attach_count: callback_phase=1 의 invoke 수 (alias) ───
+fn process_attach_count() -> int {
+    return count_by_callback_phase(1)
+}
+
+// ─── invoke_callback_index: 특정 invoke_id 의 callback_index (없으면 0) ───
+fn invoke_callback_index(invoke_id: int) -> int {
+    let t = ptir2_read_table(ptir2_invokes_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == invoke_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── ptir2_stats: [invoke_count, total_callback_index, elevated_count, process_attach_count] ───
+fn ptir2_stats() -> array {
+    let mut out = []
+    out.push(invoke_count())
+    out.push(total_callback_index())
+    out.push(elevated_count())
+    out.push(process_attach_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "ptir2-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_ptir2()
+
+    // 2. record 5 invokes covering all 4 callback_phases
+    //    callback_phase: 1=process_attach / 2=thread_attach / 3=thread_detach / 4=process_detach
+    record_invoke(820001, 1, 0, 1)
+    r0_emit("pe_tls_invoke_real_record",
+        "\"invoke_id\":820001,\"callback_phase\":1,\"callback_index\":0,\"elevated\":1,\"target\":\"process_attach\"")
+
+    record_invoke(820002, 2, 1, 0)
+    r0_emit("pe_tls_invoke_real_record",
+        "\"invoke_id\":820002,\"callback_phase\":2,\"callback_index\":1,\"elevated\":0,\"target\":\"thread_attach\"")
+
+    record_invoke(820003, 2, 2, 0)
+    r0_emit("pe_tls_invoke_real_record",
+        "\"invoke_id\":820003,\"callback_phase\":2,\"callback_index\":2,\"elevated\":0,\"target\":\"thread_attach\"")
+
+    record_invoke(820004, 3, 1, 0)
+    r0_emit("pe_tls_invoke_real_record",
+        "\"invoke_id\":820004,\"callback_phase\":3,\"callback_index\":1,\"elevated\":0,\"target\":\"thread_detach\"")
+
+    record_invoke(820005, 4, 0, 0)
+    r0_emit("pe_tls_invoke_real_record",
+        "\"invoke_id\":820005,\"callback_phase\":4,\"callback_index\":0,\"elevated\":0,\"target\":\"process_detach\"")
+
+    // 3. invoke_count = 5
+    let c = invoke_count()
+    if c != 5 {
+        panic("pe_tls_invoke_real FAIL [invoke_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_callback_index = 0 + 1 + 2 + 1 + 0 = 4
+    let tci = total_callback_index()
+    if tci != 4 {
+        panic("pe_tls_invoke_real FAIL [total_callback_index] expected=4 got=" + to_string(tci))
+    }
+
+    // 5. count_by_callback_phase sanity (all 4 phases covered)
+    let p1 = count_by_callback_phase(1)
+    if p1 != 1 {
+        panic("pe_tls_invoke_real FAIL [count_by_callback_phase(1)] expected=1 got=" + to_string(p1))
+    }
+    let p2 = count_by_callback_phase(2)
+    if p2 != 2 {
+        panic("pe_tls_invoke_real FAIL [count_by_callback_phase(2)] expected=2 got=" + to_string(p2))
+    }
+    let p3 = count_by_callback_phase(3)
+    if p3 != 1 {
+        panic("pe_tls_invoke_real FAIL [count_by_callback_phase(3)] expected=1 got=" + to_string(p3))
+    }
+    let p4 = count_by_callback_phase(4)
+    if p4 != 1 {
+        panic("pe_tls_invoke_real FAIL [count_by_callback_phase(4)] expected=1 got=" + to_string(p4))
+    }
+    let p99 = count_by_callback_phase(99)
+    if p99 != 0 {
+        panic("pe_tls_invoke_real FAIL [count_by_callback_phase(99)] expected=0 got=" + to_string(p99))
+    }
+
+    // 6. elevated_count = 1 (only invoke 820001)
+    let ec = elevated_count()
+    if ec != 1 {
+        panic("pe_tls_invoke_real FAIL [elevated_count] expected=1 got=" + to_string(ec))
+    }
+
+    // 7. process_attach_count = 1 (alias of count_by_callback_phase(1))
+    let pac = process_attach_count()
+    if pac != 1 {
+        panic("pe_tls_invoke_real FAIL [process_attach_count] expected=1 got=" + to_string(pac))
+    }
+
+    // 8. invoke_callback_index sanity
+    let ci2 = invoke_callback_index(820002)
+    if ci2 != 1 {
+        panic("pe_tls_invoke_real FAIL [invoke_callback_index(820002)] expected=1 got=" + to_string(ci2))
+    }
+    let ci3 = invoke_callback_index(820003)
+    if ci3 != 2 {
+        panic("pe_tls_invoke_real FAIL [invoke_callback_index(820003)] expected=2 got=" + to_string(ci3))
+    }
+    let ci_miss = invoke_callback_index(9999)
+    if ci_miss != 0 {
+        panic("pe_tls_invoke_real FAIL [invoke_callback_index(9999)] expected=0 got=" + to_string(ci_miss))
+    }
+
+    // 9. ptir2_stats() = [5, 4, 1, 1]
+    let s = ptir2_stats()
+    if len(s) != 4 {
+        panic("pe_tls_invoke_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_tls_invoke_real FAIL [stats invoke_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_tls_invoke_real FAIL [stats total_callback_index] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_tls_invoke_real FAIL [stats elevated_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_tls_invoke_real FAIL [stats process_attach_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_tls_invoke_real_stats",
+        "\"invoke_count\":" + to_string(s[0])
+        + ",\"total_callback_index\":" + to_string(s[1])
+        + ",\"elevated_count\":" + to_string(s[2])
+        + ",\"process_attach_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_tls_invoke_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_ptir2()
+    let s2 = ptir2_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_tls_invoke_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_tls_invoke_real self_test PASS (invokes=" + to_string(s[0])
+        + ", cb_idx_sum=" + to_string(s[1]) + ", elevated=" + to_string(s[2])
+        + ", proc_attach=" + to_string(s[3])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = ptir2_stats()
+            println("invoke_count\t" + to_string(s[0]))
+            println("total_callback_index\t" + to_string(s[1]))
+            println("elevated_count\t" + to_string(s[2]))
+            println("process_attach_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "index" {
+            if len(a) >= 4 {
+                let iid = to_int(a[3])
+                println("invoke_callback_index\t" + to_string(invoke_callback_index(iid)))
+                return
+            }
+            println("usage: hexa run pe_tls_invoke_real.hexa index <invoke_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let phase = to_int(a[3])
+                println("count_by_callback_phase\t" + to_string(count_by_callback_phase(phase)))
+                return
+            }
+            println("usage: hexa run pe_tls_invoke_real.hexa count <callback_phase>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_ptir2()
+            println("cleaned: " + ptir2_dir())
+            return
+        }
+        if sub == "dir" {
+            println(ptir2_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_tls_invoke_real.hexa { self-test | stats | index <invoke_id> | count <callback_phase> | cleanup | dir }")
+}

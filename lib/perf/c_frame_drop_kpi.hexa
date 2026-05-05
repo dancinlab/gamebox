@@ -1,0 +1,305 @@
+// lib/perf/c_frame_drop_kpi.hexa — CN-107 skeleton manjeom 15/15
+//
+// Phase 6 live tune — frame drop KPI.
+// 16.67ms (60fps) / 8.33ms (120fps) 초과 frame 비율을 측정하고,
+// 1% / 0.1% lows (실 게임 평가 핵심) 을 정확히 산출.
+//
+// 무기: frame time histogram + columnar (frame_id × duration_us).
+// 효과: 1% / 0.1% lows 정확 측정 — 실 게임 평가 핵심.
+//
+// schema: rec_bytes=12 (frame_id u32 + duration_us u64) — stage1 hexa-lang 은
+//   struct-pack 미지원이므로 JSONL 로 기록 + columnar 헤더 1행 prefix.
+
+use "./r0_common"
+
+let FDK_DIR = GAMEBOX_HOME + "/persist/frame_drop_kpi"
+let FDK_RING = FDK_DIR + "/frames.jsonl"
+let FDK_HIST = FDK_DIR + "/histogram.jsonl"
+
+// ─── target frame budget (microseconds) ───
+// 60fps  = 1_000_000 / 60  ≈ 16666.67  → 16670 (round)
+// 120fps = 1_000_000 / 120 ≈ 8333.33   → 8333
+fn target_60fps_us() -> int { return 16670 }
+fn target_120fps_us() -> int { return 8333 }
+
+// ─── ensure_dir ───
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + FDK_DIR + "'")
+    let exists = exec("test -f '" + FDK_RING + "' && echo ok").trim()
+    if exists != "ok" {
+        let header = "{\"_header\":1,\"magic\":\"AGGB\",\"schema_ver\":1,\"axes\":2,\"rec_bytes\":12,\"component\":\"FDKP\",\"cols\":[\"frame_id\",\"duration_us\"]}\n"
+        write_file(FDK_RING, header)
+    }
+}
+
+// ─── cleanup ───
+fn cleanup_fdk() -> void {
+    let _ = exec("rm -rf '" + FDK_DIR + "'")
+}
+
+// ─── record_frame — append one columnar row ───
+fn record_frame(frame_id: int, duration_us: int) -> void {
+    ensure_dir()
+    let line = "{\"frame_id\":" + to_string(frame_id) + ",\"duration_us\":" + to_string(duration_us) + "}"
+    r0_append_line(FDK_RING, line)
+    r0_emit("frame_drop_record", "\"frame_id\":" + to_string(frame_id) + ",\"duration_us\":" + to_string(duration_us))
+}
+
+// ─── histogram bucket — coarse 1ms-resolution buckets up to 100ms ───
+//   bucket index = duration_us / 1000  (clamped 0..100)
+fn record_histogram_bucket(bucket_ms: int, count: int) -> void {
+    ensure_dir()
+    let line = "{\"bucket_ms\":" + to_string(bucket_ms) + ",\"count\":" + to_string(count) + "}"
+    r0_append_line(FDK_HIST, line)
+    r0_emit("frame_drop_hist", "\"bucket_ms\":" + to_string(bucket_ms) + ",\"count\":" + to_string(count))
+}
+
+// ─── int math primitives (integers only — hexa-lang stage1 no float) ───
+fn fdk_sum(xs: array) -> int {
+    let mut s = 0
+    let mut i = 0
+    while i < len(xs) {
+        s = s + xs[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn fdk_avg(xs: array) -> int {
+    if len(xs) == 0 { return 0 }
+    return fdk_sum(xs) / len(xs)
+}
+
+// insertion sort (descending — worst frames first) — copy first
+fn fdk_sort_desc(xs: array) -> array {
+    let n = len(xs)
+    let mut copy = []
+    let mut i = 0
+    while i < n {
+        copy = copy + [xs[i]]
+        i = i + 1
+    }
+    let mut k = 1
+    while k < n {
+        let v = copy[k]
+        let mut j = k - 1
+        let mut done = false
+        while j >= 0 && !done {
+            if copy[j] < v {
+                copy[j + 1] = copy[j]
+                j = j - 1
+            } else {
+                done = true
+            }
+        }
+        copy[j + 1] = v
+        k = k + 1
+    }
+    return copy
+}
+
+// ─── drop counts ───
+fn drop_count_60(durations: array) -> int {
+    let t = target_60fps_us()
+    let mut c = 0
+    let mut i = 0
+    while i < len(durations) {
+        if durations[i] > t { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn drop_count_120(durations: array) -> int {
+    let t = target_120fps_us()
+    let mut c = 0
+    let mut i = 0
+    while i < len(durations) {
+        if durations[i] > t { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// ─── 1% low / 0.1% low ───
+//   sort descending → take top floor(N * pct/1000) worst frames → average their duration_us.
+//   fallback: if window=0 (small N), use 1 frame.
+fn fdk_low_us(durations: array, permille: int) -> int {
+    let n = len(durations)
+    if n == 0 { return 0 }
+    let mut win = (n * permille) / 1000
+    if win < 1 { win = 1 }
+    let sorted = fdk_sort_desc(durations)
+    // sorted[0..win-1] are the worst frames (longest)
+    let mut s = 0
+    let mut i = 0
+    while i < win {
+        s = s + sorted[i]
+        i = i + 1
+    }
+    return s / win
+}
+
+fn pct_1_low_us(durations: array) -> int {
+    return fdk_low_us(durations, 10)  // 1% = 10 permille
+}
+
+fn pct_0_1_low_us(durations: array) -> int {
+    return fdk_low_us(durations, 1)   // 0.1% = 1 permille
+}
+
+// ─── fps_avg = 1_000_000 / avg(duration_us) ───
+fn fps_avg(durations: array) -> int {
+    let avg = fdk_avg(durations)
+    if avg <= 0 { return 0 }
+    return 1000000 / avg
+}
+
+// ─── stats record (summary emit) ───
+fn record_stats_summary(durations: array) -> void {
+    ensure_dir()
+    let n = len(durations)
+    let d60 = drop_count_60(durations)
+    let d120 = drop_count_120(durations)
+    let p1 = pct_1_low_us(durations)
+    let p01 = pct_0_1_low_us(durations)
+    let fps = fps_avg(durations)
+    r0_emit("frame_drop_stats",
+        "\"n\":" + to_string(n)
+        + ",\"drop_60\":" + to_string(d60)
+        + ",\"drop_120\":" + to_string(d120)
+        + ",\"low_1pct_us\":" + to_string(p1)
+        + ",\"low_0_1pct_us\":" + to_string(p01)
+        + ",\"fps_avg\":" + to_string(fps))
+}
+
+// ─── self_test — 100 frames 합성 (95 × 16ms + 5 × 30ms) ───
+fn self_test() -> void {
+    let sid = "fdk-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_fdk()
+
+    // target sanity
+    if target_60fps_us() != 16670 { panic("c_frame_drop_kpi FAIL [t60] expected=16670 got=" + to_string(target_60fps_us())) }
+    if target_120fps_us() != 8333 { panic("c_frame_drop_kpi FAIL [t120] expected=8333 got=" + to_string(target_120fps_us())) }
+
+    // synthesize 100 frames: 95 × 16000us (16ms, 60fps-on-budget) + 5 × 30000us (30ms, dropped)
+    let mut durs = []
+    let mut i = 0
+    while i < 95 {
+        durs = durs + [16000]
+        i = i + 1
+    }
+    let mut j = 0
+    while j < 5 {
+        durs = durs + [30000]
+        j = j + 1
+    }
+
+    if len(durs) != 100 { panic("c_frame_drop_kpi FAIL [n_frames] expected=100 got=" + to_string(len(durs))) }
+
+    // record a sample of frames (4 calls — keeps full ring small but exercises append path)
+    record_frame(0, 16000)
+    record_frame(1, 16000)
+    record_frame(94, 16000)
+    record_frame(95, 30000)
+    record_frame(99, 30000)
+
+    // drop count @ 60fps — 16000 < 16670 (no drop), 30000 > 16670 (drop) → exactly 5 drops
+    let d60 = drop_count_60(durs)
+    if d60 != 5 { panic("c_frame_drop_kpi FAIL [drop60] expected=5 got=" + to_string(d60)) }
+
+    // drop count @ 120fps — both 16000 and 30000 > 8333 → all 100 dropped
+    let d120 = drop_count_120(durs)
+    if d120 != 100 { panic("c_frame_drop_kpi FAIL [drop120] expected=100 got=" + to_string(d120)) }
+
+    // 1% low — top 1 worst frame = 30000us (sorted desc, take 1)
+    //   N=100, permille=10, win = 100*10/1000 = 1 → sorted[0]=30000
+    let p1 = pct_1_low_us(durs)
+    if p1 != 30000 { panic("c_frame_drop_kpi FAIL [1pct_low] expected=30000 got=" + to_string(p1)) }
+
+    // 0.1% low — top 0.1 worst → win = max(1, 100*1/1000) = 1 → also 30000
+    let p01 = pct_0_1_low_us(durs)
+    if p01 != 30000 { panic("c_frame_drop_kpi FAIL [0_1pct_low] expected=30000 got=" + to_string(p01)) }
+
+    // fps_avg — avg = (95*16000 + 5*30000)/100 = (1520000+150000)/100 = 16700us
+    //   fps = 1_000_000 / 16700 = 59 (int division)
+    //   spec note: ~50 estimate is a rough sanity range; exact integer math gives 59.
+    //   accept range [55, 65] to bracket the on-budget 60fps target.
+    let fps = fps_avg(durs)
+    if fps < 55 { panic("c_frame_drop_kpi FAIL [fps low] expected>=55 got=" + to_string(fps)) }
+    if fps > 65 { panic("c_frame_drop_kpi FAIL [fps high] expected<=65 got=" + to_string(fps)) }
+
+    // histogram bucket recording (1 emit) + summary (1 emit)
+    record_histogram_bucket(16, 95)
+    record_histogram_bucket(30, 5)
+    record_stats_summary(durs)
+
+    // edge cases — empty / single frame
+    if fps_avg([]) != 0 { panic("c_frame_drop_kpi FAIL [fps empty] expected=0") }
+    if drop_count_60([]) != 0 { panic("c_frame_drop_kpi FAIL [d60 empty]") }
+    if pct_1_low_us([42000]) != 42000 { panic("c_frame_drop_kpi FAIL [1pct single] expected=42000 got=" + to_string(pct_1_low_us([42000]))) }
+
+    // sort sanity — desc order
+    let s = fdk_sort_desc([100, 50, 200, 25])
+    if s[0] != 200 { panic("c_frame_drop_kpi FAIL [sort 0] expected=200 got=" + to_string(s[0])) }
+    if s[3] != 25 { panic("c_frame_drop_kpi FAIL [sort 3] expected=25 got=" + to_string(s[3])) }
+
+    // emit count >= 5  (5 record_frame + 2 record_histogram_bucket + 1 stats_summary + 1 final = 9)
+    r0_emit("frame_drop_self_test", "\"n\":100,\"drop60\":5,\"drop120\":100,\"fps\":" + to_string(fps))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 5 { panic("c_frame_drop_kpi FAIL [emit count] expected>=5 got=" + to_string(cnt)) }
+
+    cleanup_fdk()
+
+    println("  ✅ c_frame_drop_kpi self_test PASS (n=100, drop60=5, low_1pct=30000us, fps=" + to_string(fps) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+// ─── main — CLI dispatch ───
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "record" {
+            // record <frame_id> <duration_us>
+            if len(a) >= 5 {
+                record_frame(to_int(a[3]), to_int(a[4]))
+                println("ok")
+                return
+            }
+            println("usage: hexa run c_frame_drop_kpi.hexa record <frame_id> <duration_us>")
+            return
+        }
+        if sub == "stats" {
+            // stats <duration_us> <duration_us> ... — pass durations on CLI
+            let mut durs = []
+            let mut i = 3
+            while i < len(a) {
+                durs = durs + [to_int(a[i])]
+                i = i + 1
+            }
+            record_stats_summary(durs)
+            println("n=" + to_string(len(durs))
+                + " drop60=" + to_string(drop_count_60(durs))
+                + " drop120=" + to_string(drop_count_120(durs))
+                + " fps=" + to_string(fps_avg(durs)))
+            return
+        }
+        if sub == "lows" {
+            let mut durs = []
+            let mut i = 3
+            while i < len(a) {
+                durs = durs + [to_int(a[i])]
+                i = i + 1
+            }
+            println("low_1pct_us=" + to_string(pct_1_low_us(durs))
+                + " low_0_1pct_us=" + to_string(pct_0_1_low_us(durs)))
+            return
+        }
+        if sub == "cleanup" { cleanup_fdk(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_frame_drop_kpi.hexa { self-test | record <frame_id> <duration_us> | stats <durations...> | lows <durations...> | cleanup }")
+}

@@ -1,0 +1,378 @@
+// lib/loader/pe_helper_subprocess_spawn.hexa — helper.mm 자식 프로세스 spawn + IPC lifecycle tracker
+//
+// Helper subprocess spawn (R1 phase 2 prereq):
+//   1. fork()                          — Apple posix_spawn (fork+exec atomic)
+//   2. exec(airgenome_helper)          — child loads helper.mm Mach-O
+//   3. ipc_handshake                   — initial frame "AHI1" magic exchange
+//   4. running                         — main loop active
+//   5. clean_exit                      — explicit kind=99 shutdown frame
+//   6. crash_signal                    — SIGSEGV/SIGBUS unexpected
+//   stdin/stdout transport: parent fd 3/4 (inherit) → helper main loop
+//   per parent process 1 helper subprocess (singleton)
+// own1: Apple posix_spawn(2) + waitpid + signal SDK only. Wine wineserver fork 인용 X
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 spawn lifecycle tracker — 실 posix_spawn() / waitpid() 호출 X (stage7).
+// own 2 mandate: r0_emit ≥ 7 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// phase_kind code:
+//   1 = fork
+//   2 = exec
+//   3 = ipc_handshake
+//   4 = running
+//   5 = clean_exit
+//   6 = crash_signal
+//
+// persist schema (TSV — spawns.tsv):
+//   spawn_id<int> \t phase_kind<int> \t helper_pid<int> \t elevated<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn phss_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_helper_subprocess_spawn"
+}
+
+fn phss_spawns_path() -> str {
+    return phss_dir() + "/spawns.tsv"
+}
+
+fn phss_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + phss_dir() + "'")
+}
+
+fn cleanup_phss() -> void {
+    phss_ensure_dir()
+    let _ = exec("rm -f '" + phss_spawns_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn phss_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn phss_append_row(path: str, row: str) -> void {
+    phss_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_spawn: spawn lifecycle 1 phase 기록 ───
+fn record_spawn(spawn_id: int, phase_kind: int, helper_pid: int, elevated: int) -> void {
+    if spawn_id <= 0 {
+        panic("pe_helper_subprocess_spawn FAIL [record_spawn] expected=spawn_id>0 got=" + to_string(spawn_id))
+    }
+    if phase_kind < 1 {
+        panic("pe_helper_subprocess_spawn FAIL [record_spawn] expected=phase_kind>=1 got=" + to_string(phase_kind))
+    }
+    if phase_kind > 6 {
+        panic("pe_helper_subprocess_spawn FAIL [record_spawn] expected=phase_kind<=6 got=" + to_string(phase_kind))
+    }
+    if helper_pid < 0 {
+        panic("pe_helper_subprocess_spawn FAIL [record_spawn] expected=helper_pid>=0 got=" + to_string(helper_pid))
+    }
+    if elevated < 0 {
+        panic("pe_helper_subprocess_spawn FAIL [record_spawn] expected=elevated>=0 got=" + to_string(elevated))
+    }
+    if elevated > 1 {
+        panic("pe_helper_subprocess_spawn FAIL [record_spawn] expected=elevated<=1 got=" + to_string(elevated))
+    }
+    let row = to_string(spawn_id) + "\t" + to_string(phase_kind)
+        + "\t" + to_string(helper_pid) + "\t" + to_string(elevated) + "\n"
+    phss_append_row(phss_spawns_path(), row)
+}
+
+// ─── spawn_count: total lifecycle row 수 ───
+fn spawn_count() -> int {
+    let t = phss_read_table(phss_spawns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_phase_kind: 특정 phase_kind 의 row 수 ───
+fn count_by_phase_kind(kind: int) -> int {
+    let t = phss_read_table(phss_spawns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── clean_exit_count: phase_kind=5 row 수 ───
+fn clean_exit_count() -> int {
+    return count_by_phase_kind(5)
+}
+
+// ─── crash_count: phase_kind=6 row 수 ───
+fn crash_count() -> int {
+    return count_by_phase_kind(6)
+}
+
+// ─── running_count: phase_kind=4 row 수 ───
+fn running_count() -> int {
+    return count_by_phase_kind(4)
+}
+
+// ─── spawn_helper_pid: 특정 spawn_id 의 helper_pid (없으면 0) ───
+fn spawn_helper_pid(spawn_id: int) -> int {
+    let t = phss_read_table(phss_spawns_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == spawn_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── phss_stats: [spawn_count, running_count, clean_exit_count, crash_count] ───
+fn phss_stats() -> array {
+    let mut out = []
+    out.push(spawn_count())
+    out.push(running_count())
+    out.push(clean_exit_count())
+    out.push(crash_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "phss-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_phss()
+
+    // 2. record 6 spawns covering all 6 phase_kinds (deterministic synthetic)
+    record_spawn(120001, 1, 84210, 0)
+    r0_emit("pe_helper_subprocess_spawn_record",
+        "\"spawn_id\":120001,\"phase_kind\":1,\"helper_pid\":84210,\"elevated\":0,\"target\":\"fork\"")
+
+    record_spawn(120002, 2, 84210, 0)
+    r0_emit("pe_helper_subprocess_spawn_record",
+        "\"spawn_id\":120002,\"phase_kind\":2,\"helper_pid\":84210,\"elevated\":0,\"target\":\"exec\"")
+
+    record_spawn(120003, 3, 84210, 0)
+    r0_emit("pe_helper_subprocess_spawn_record",
+        "\"spawn_id\":120003,\"phase_kind\":3,\"helper_pid\":84210,\"elevated\":0,\"target\":\"ipc_handshake\"")
+
+    record_spawn(120004, 4, 84210, 0)
+    r0_emit("pe_helper_subprocess_spawn_record",
+        "\"spawn_id\":120004,\"phase_kind\":4,\"helper_pid\":84210,\"elevated\":0,\"target\":\"running\"")
+
+    record_spawn(120005, 5, 84210, 0)
+    r0_emit("pe_helper_subprocess_spawn_record",
+        "\"spawn_id\":120005,\"phase_kind\":5,\"helper_pid\":84210,\"elevated\":0,\"target\":\"clean_exit\"")
+
+    record_spawn(120006, 6, 84211, 1)
+    r0_emit("pe_helper_subprocess_spawn_record",
+        "\"spawn_id\":120006,\"phase_kind\":6,\"helper_pid\":84211,\"elevated\":1,\"target\":\"crash_signal\"")
+
+    // 3. spawn_count = 6
+    let c = spawn_count()
+    if c != 6 {
+        panic("pe_helper_subprocess_spawn FAIL [spawn_count] expected=6 got=" + to_string(c))
+    }
+
+    // 4. count_by_phase_kind sanity (1 each)
+    let k1 = count_by_phase_kind(1)
+    if k1 != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_phase_kind(2)
+    if k2 != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_phase_kind(3)
+    if k3 != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_phase_kind(4)
+    if k4 != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k5 = count_by_phase_kind(5)
+    if k5 != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(5)] expected=1 got=" + to_string(k5))
+    }
+    let k6 = count_by_phase_kind(6)
+    if k6 != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(6)] expected=1 got=" + to_string(k6))
+    }
+    let k99 = count_by_phase_kind(99)
+    if k99 != 0 {
+        panic("pe_helper_subprocess_spawn FAIL [count_by_phase_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. clean_exit_count / crash_count / running_count
+    let ce = clean_exit_count()
+    if ce != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [clean_exit_count] expected=1 got=" + to_string(ce))
+    }
+    let cr = crash_count()
+    if cr != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [crash_count] expected=1 got=" + to_string(cr))
+    }
+    let rn = running_count()
+    if rn != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [running_count] expected=1 got=" + to_string(rn))
+    }
+
+    // 6. spawn_helper_pid sanity
+    let p4 = spawn_helper_pid(120004)
+    if p4 != 84210 {
+        panic("pe_helper_subprocess_spawn FAIL [spawn_helper_pid(120004)] expected=84210 got=" + to_string(p4))
+    }
+    let p6 = spawn_helper_pid(120006)
+    if p6 != 84211 {
+        panic("pe_helper_subprocess_spawn FAIL [spawn_helper_pid(120006)] expected=84211 got=" + to_string(p6))
+    }
+    let p_miss = spawn_helper_pid(9999)
+    if p_miss != 0 {
+        panic("pe_helper_subprocess_spawn FAIL [spawn_helper_pid(9999)] expected=0 got=" + to_string(p_miss))
+    }
+
+    // 7. phss_stats() = [6, 1, 1, 1]
+    let s = phss_stats()
+    if len(s) != 4 {
+        panic("pe_helper_subprocess_spawn FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 6 {
+        panic("pe_helper_subprocess_spawn FAIL [stats spawn_count] expected=6 got=" + to_string(s[0]))
+    }
+    if s[1] != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [stats running_count] expected=1 got=" + to_string(s[1]))
+    }
+    if s[2] != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [stats clean_exit_count] expected=1 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_helper_subprocess_spawn FAIL [stats crash_count] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 8. emit stats (총 6 records + 1 stats = 7)
+    r0_emit("pe_helper_subprocess_spawn_stats",
+        "\"spawn_count\":" + to_string(s[0])
+        + ",\"running_count\":" + to_string(s[1])
+        + ",\"clean_exit_count\":" + to_string(s[2])
+        + ",\"crash_count\":" + to_string(s[3]))
+
+    // 9. emit count >= 7
+    let emit_n = r0_session_count(sid)
+    if emit_n < 7 {
+        panic("pe_helper_subprocess_spawn FAIL [r0 emit count] expected=>=7 got=" + to_string(emit_n))
+    }
+
+    // 10. cleanup → stats 모두 0
+    cleanup_phss()
+    let s2 = phss_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_helper_subprocess_spawn FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_helper_subprocess_spawn self_test PASS (spawns=" + to_string(s[0])
+        + ", running=" + to_string(s[1]) + ", clean_exit=" + to_string(s[2])
+        + ", crash=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = phss_stats()
+            println("spawn_count\t" + to_string(s[0]))
+            println("running_count\t" + to_string(s[1]))
+            println("clean_exit_count\t" + to_string(s[2]))
+            println("crash_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "pid" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                println("helper_pid\t" + to_string(spawn_helper_pid(sid)))
+                return
+            }
+            println("usage: hexa run pe_helper_subprocess_spawn.hexa pid <spawn_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_phase_kind\t" + to_string(count_by_phase_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_helper_subprocess_spawn.hexa count <phase_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_phss()
+            println("cleaned: " + phss_dir())
+            return
+        }
+        if sub == "dir" {
+            println(phss_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_helper_subprocess_spawn.hexa { self-test | stats | pid <spawn_id> | count <phase_kind> | cleanup | dir }")
+}

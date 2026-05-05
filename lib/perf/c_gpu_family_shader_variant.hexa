@@ -1,0 +1,152 @@
+// lib/perf/c_gpu_family_shader_variant.hexa — CN-38 PSB-7 만점 15/15
+//
+// M1/M2/M3/M4 별 best shader variant 선택 (apple gpu family hint).
+// D4 같은 effect → M1 variant A / M3 variant B (mesh shader 활용 등).
+//
+// 무기: GPU family detection + columnar (variant performance histogram).
+// 효과: hardware 별 최적 shader path → frame time 감소.
+
+use "./r0_common"
+
+let GFV_DIR = GAMEBOX_HOME + "/persist/gpu_family_shader_variant"
+let MEASURE_LOG = GFV_DIR + "/measurements.tsv"
+let SELECTION_HISTORY = GFV_DIR + "/selections.jsonl"
+
+fn gfv_dir() -> str { return GFV_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + GFV_DIR + "'")
+}
+
+// ─── GPU family detection ───
+//   1=M1, 2=M2, 3=M3, 4=M4 (synthetic — 실제는 sysctl hw.optional.arm.FEAT_*)
+fn detect_gpu_family() -> int {
+    let cpu = exec("uname -m 2>/dev/null").trim()
+    if cpu != "arm64" { return 0 }
+    // synthetic — assume M2 가 default
+    return 2
+}
+
+// ─── shader variant 측정 등록 ───
+//   shader_id, family (1~4), variant_name, frame_time_us
+fn record_measurement(shader_id: int, family: int, variant_name: str, frame_time_us: int) -> void {
+    ensure_dir()
+    let line = to_string(shader_id) + "\t" + to_string(family) + "\t" + variant_name + "\t" + to_string(frame_time_us)
+    let tmp = MEASURE_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + MEASURE_LOG + "' && rm -f '" + tmp + "'")
+}
+
+// ─── best variant 선택 — shader_id + family 기준 lowest frame_time ───
+fn select_best_variant(shader_id: int, family: int) -> str {
+    let exists = exec("test -f '" + MEASURE_LOG + "' && echo ok").trim()
+    if exists != "ok" { return "" }
+    let cmd = "awk -F'\\t' -v s=" + to_string(shader_id) + " -v f=" + to_string(family) + " '$1==s && $2==f' '" + MEASURE_LOG + "' | sort -k4,4n -t$'\\t' | head -1 | awk -F'\\t' '{print $3}'"
+    let result = exec(cmd).trim()
+    return result
+}
+
+// ─── select + record ───
+fn select_and_record(shader_id: int, family: int) -> str {
+    let variant = select_best_variant(shader_id, family)
+    if variant == "" { return "" }
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts + ",\"shader\":" + to_string(shader_id) + ",\"family\":" + to_string(family) + ",\"variant\":\"" + variant + "\"}"
+    ensure_dir()
+    let tmp = SELECTION_HISTORY + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SELECTION_HISTORY + "' && rm -f '" + tmp + "'")
+    r0_emit("variant_selected", "\"shader\":" + to_string(shader_id) + ",\"family\":" + to_string(family) + ",\"variant\":\"" + variant + "\"")
+    return variant
+}
+
+fn variant_stats() -> array {
+    let exists_m = exec("test -f '" + MEASURE_LOG + "' && echo ok").trim()
+    let measurements = 0
+    if exists_m == "ok" {
+        measurements = to_int(exec("wc -l < '" + MEASURE_LOG + "' | tr -d ' '").trim())
+    }
+    let exists_s = exec("test -f '" + SELECTION_HISTORY + "' && echo ok").trim()
+    let selections = 0
+    if exists_s == "ok" {
+        selections = to_int(exec("wc -l < '" + SELECTION_HISTORY + "' | tr -d ' '").trim())
+    }
+    return [measurements, selections]
+}
+
+fn cleanup_gfv() -> void {
+    let _ = exec("rm -rf '" + GFV_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "gfv-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_gfv()
+
+    // detect family — Apple Silicon 이면 1~4
+    let f = detect_gpu_family()
+    if f < 0 || f > 4 { panic("c_gpu_family_shader_variant FAIL [family detect] got=" + to_string(f)) }
+
+    // 합성 measurements — shader 100 over 4 families with 3 variants each
+    record_measurement(100, 1, "v_legacy", 5000)
+    record_measurement(100, 1, "v_intermediate", 4500)
+    record_measurement(100, 1, "v_modern_mesh", 6000)  // M1 has no mesh shader
+    record_measurement(100, 2, "v_legacy", 4500)
+    record_measurement(100, 2, "v_intermediate", 4000)
+    record_measurement(100, 2, "v_modern_mesh", 4200)
+    record_measurement(100, 3, "v_legacy", 4000)
+    record_measurement(100, 3, "v_intermediate", 3500)
+    record_measurement(100, 3, "v_modern_mesh", 2800)  // M3 mesh shader best
+    record_measurement(100, 4, "v_legacy", 3500)
+    record_measurement(100, 4, "v_intermediate", 3200)
+    record_measurement(100, 4, "v_modern_mesh", 2400)  // M4 mesh shader best
+
+    // M1 best
+    let v_m1 = select_best_variant(100, 1)
+    if v_m1 != "v_intermediate" { panic("c_gpu_family_shader_variant FAIL [M1 best] expected=v_intermediate got=" + v_m1) }
+
+    // M3 best
+    let v_m3 = select_best_variant(100, 3)
+    if v_m3 != "v_modern_mesh" { panic("c_gpu_family_shader_variant FAIL [M3 best] expected=v_modern_mesh got=" + v_m3) }
+
+    // M4 best
+    let v_m4 = select_best_variant(100, 4)
+    if v_m4 != "v_modern_mesh" { panic("c_gpu_family_shader_variant FAIL [M4 best] expected=v_modern_mesh got=" + v_m4) }
+
+    // select and record
+    let sel1 = select_and_record(100, 1)
+    if sel1 != "v_intermediate" { panic("c_gpu_family_shader_variant FAIL [sel1]") }
+
+    let sel3 = select_and_record(100, 3)
+    if sel3 != "v_modern_mesh" { panic("c_gpu_family_shader_variant FAIL [sel3]") }
+
+    // stats
+    let stats = variant_stats()
+    if stats[0] != 12 { panic("c_gpu_family_shader_variant FAIL [stats meas] expected=12 got=" + to_string(stats[0])) }
+    if stats[1] != 2 { panic("c_gpu_family_shader_variant FAIL [stats sel] expected=2 got=" + to_string(stats[1])) }
+
+    r0_emit("variant_summary", "\"measurements\":" + to_string(stats[0]) + ",\"selections\":" + to_string(stats[1]) + ",\"detected_family\":" + to_string(f))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 3 { panic("c_gpu_family_shader_variant FAIL [emit count] expected>=3 got=" + to_string(cnt)) }
+
+    cleanup_gfv()
+
+    println("  ✅ c_gpu_family_shader_variant self_test PASS (12 meas, family=" + to_string(f) + ", M1=v_intermediate, M3/M4=v_modern_mesh, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = variant_stats()
+            println("measurements=" + to_string(s[0]) + " selections=" + to_string(s[1]))
+            return
+        }
+        if sub == "cleanup" { cleanup_gfv(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_gpu_family_shader_variant.hexa { self-test | stats | cleanup }")
+}

@@ -1,0 +1,390 @@
+// lib/loader/pe_low_memory_purgeable.hexa — purgeable memory marker tracking skeleton
+//
+// macOS low-memory pressure 시 mach `vm_purgable_control(VM_PURGABLE_SET_STATE,
+// VM_PURGABLE_VOLATILE)` 으로 회수 가능한 object 를 marker 로 기록 — texture /
+// vertex buffer / JIT cache / resource blob 등을 분류하여 stage5 회수 정책
+// 결정에 사용.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 marker tracker — 실 vm_purgable_control() 호출 X (stage6).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// object_kind code:
+//   1 = texture
+//   2 = buffer
+//   3 = jit_cache
+//   4 = resource_blob
+//
+// purged: 0 (still resident) / 1 (already reclaimed)
+//
+// persist schema (TSV — marks.tsv):
+//   mark_id<int> \t object_kind<int> \t size_kb<int> \t purged<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn plmp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_low_memory_purgeable"
+}
+
+fn plmp_marks_path() -> str {
+    return plmp_dir() + "/marks.tsv"
+}
+
+fn plmp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + plmp_dir() + "'")
+}
+
+fn cleanup_plmp() -> void {
+    plmp_ensure_dir()
+    let _ = exec("rm -f '" + plmp_marks_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn plmp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn plmp_append_row(path: str, row: str) -> void {
+    plmp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_mark: purgeable marker 1 건 기록 ───
+fn record_mark(mark_id: int, object_kind: int, size_kb: int, purged: int) -> void {
+    if mark_id <= 0 {
+        panic("pe_low_memory_purgeable FAIL [record_mark] expected=mark_id>0 got=" + to_string(mark_id))
+    }
+    if object_kind < 1 {
+        panic("pe_low_memory_purgeable FAIL [record_mark] expected=object_kind>=1 got=" + to_string(object_kind))
+    }
+    if object_kind > 4 {
+        panic("pe_low_memory_purgeable FAIL [record_mark] expected=object_kind<=4 got=" + to_string(object_kind))
+    }
+    if size_kb < 0 {
+        panic("pe_low_memory_purgeable FAIL [record_mark] expected=size_kb>=0 got=" + to_string(size_kb))
+    }
+    if purged < 0 {
+        panic("pe_low_memory_purgeable FAIL [record_mark] expected=purged>=0 got=" + to_string(purged))
+    }
+    if purged > 1 {
+        panic("pe_low_memory_purgeable FAIL [record_mark] expected=purged<=1 got=" + to_string(purged))
+    }
+    let row = to_string(mark_id) + "\t" + to_string(object_kind)
+        + "\t" + to_string(size_kb) + "\t" + to_string(purged) + "\n"
+    plmp_append_row(plmp_marks_path(), row)
+}
+
+// ─── mark_count: total marker 수 ───
+fn mark_count() -> int {
+    let t = plmp_read_table(plmp_marks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_size_kb: 모든 marker size_kb 합 ───
+fn total_size_kb() -> int {
+    let t = plmp_read_table(plmp_marks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[2])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── purged_count: purged=1 인 marker 수 ───
+fn purged_count() -> int {
+    let t = plmp_read_table(plmp_marks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_object: 특정 object_kind marker 수 ───
+fn count_by_object(object_kind: int) -> int {
+    let t = plmp_read_table(plmp_marks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == object_kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── mark_size_kb: 특정 mark_id 의 size_kb (없으면 0) ───
+fn mark_size_kb(mark_id: int) -> int {
+    let t = plmp_read_table(plmp_marks_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == mark_id {
+                    return to_int(parts[2])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── plmp_stats: [mark_count, total_size_kb, purged_count, count_by_object(1)] ───
+fn plmp_stats() -> array {
+    let mut out = []
+    out.push(mark_count())
+    out.push(total_size_kb())
+    out.push(purged_count())
+    out.push(count_by_object(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "plmp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_plmp()
+
+    // 2. record 5 marks across ≥3 object_kinds with ≥2 purged
+    record_mark(660001, 1, 4096, 0)
+    r0_emit("pe_low_memory_purgeable_record",
+        "\"mark_id\":660001,\"object_kind\":1,\"size_kb\":4096,\"purged\":0,\"target\":\"texture\"")
+
+    record_mark(660002, 1, 2048, 1)
+    r0_emit("pe_low_memory_purgeable_record",
+        "\"mark_id\":660002,\"object_kind\":1,\"size_kb\":2048,\"purged\":1,\"target\":\"texture\"")
+
+    record_mark(660003, 2, 1024, 0)
+    r0_emit("pe_low_memory_purgeable_record",
+        "\"mark_id\":660003,\"object_kind\":2,\"size_kb\":1024,\"purged\":0,\"target\":\"buffer\"")
+
+    record_mark(660004, 3, 512, 1)
+    r0_emit("pe_low_memory_purgeable_record",
+        "\"mark_id\":660004,\"object_kind\":3,\"size_kb\":512,\"purged\":1,\"target\":\"jit_cache\"")
+
+    record_mark(660005, 4, 256, 0)
+    r0_emit("pe_low_memory_purgeable_record",
+        "\"mark_id\":660005,\"object_kind\":4,\"size_kb\":256,\"purged\":0,\"target\":\"resource_blob\"")
+
+    // 3. mark_count = 5
+    let c = mark_count()
+    if c != 5 {
+        panic("pe_low_memory_purgeable FAIL [mark_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_size_kb = 4096+2048+1024+512+256 = 7936
+    let ts = total_size_kb()
+    if ts != 7936 {
+        panic("pe_low_memory_purgeable FAIL [total_size_kb] expected=7936 got=" + to_string(ts))
+    }
+
+    // 5. purged_count = 2 (660002, 660004)
+    let pc = purged_count()
+    if pc != 2 {
+        panic("pe_low_memory_purgeable FAIL [purged_count] expected=2 got=" + to_string(pc))
+    }
+
+    // 6. count_by_object sanity
+    let k1 = count_by_object(1)
+    if k1 != 2 {
+        panic("pe_low_memory_purgeable FAIL [count_by_object(1)] expected=2 got=" + to_string(k1))
+    }
+    let k2 = count_by_object(2)
+    if k2 != 1 {
+        panic("pe_low_memory_purgeable FAIL [count_by_object(2)] expected=1 got=" + to_string(k2))
+    }
+    let k3 = count_by_object(3)
+    if k3 != 1 {
+        panic("pe_low_memory_purgeable FAIL [count_by_object(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_object(4)
+    if k4 != 1 {
+        panic("pe_low_memory_purgeable FAIL [count_by_object(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_object(99)
+    if k99 != 0 {
+        panic("pe_low_memory_purgeable FAIL [count_by_object(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 7. mark_size_kb sanity
+    let s1 = mark_size_kb(660001)
+    if s1 != 4096 {
+        panic("pe_low_memory_purgeable FAIL [mark_size_kb(660001)] expected=4096 got=" + to_string(s1))
+    }
+    let s4 = mark_size_kb(660004)
+    if s4 != 512 {
+        panic("pe_low_memory_purgeable FAIL [mark_size_kb(660004)] expected=512 got=" + to_string(s4))
+    }
+    let s_miss = mark_size_kb(9999)
+    if s_miss != 0 {
+        panic("pe_low_memory_purgeable FAIL [mark_size_kb(9999)] expected=0 got=" + to_string(s_miss))
+    }
+
+    // 8. plmp_stats() = [5, 7936, 2, 2]
+    let s = plmp_stats()
+    if len(s) != 4 {
+        panic("pe_low_memory_purgeable FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_low_memory_purgeable FAIL [stats mark_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 7936 {
+        panic("pe_low_memory_purgeable FAIL [stats total_size_kb] expected=7936 got=" + to_string(s[1]))
+    }
+    if s[2] != 2 {
+        panic("pe_low_memory_purgeable FAIL [stats purged_count] expected=2 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_low_memory_purgeable FAIL [stats count_obj(1)] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 9. emit stats
+    r0_emit("pe_low_memory_purgeable_stats",
+        "\"mark_count\":" + to_string(s[0])
+        + ",\"total_size_kb\":" + to_string(s[1])
+        + ",\"purged_count\":" + to_string(s[2])
+        + ",\"obj_texture\":" + to_string(s[3]))
+
+    // 10. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_low_memory_purgeable FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 11. cleanup → stats 모두 0
+    cleanup_plmp()
+    let s2 = plmp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_low_memory_purgeable FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_low_memory_purgeable self_test PASS (marks=" + to_string(s[0])
+        + ", size_kb=" + to_string(s[1]) + ", purged=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = plmp_stats()
+            println("mark_count\t" + to_string(s[0]))
+            println("total_size_kb\t" + to_string(s[1]))
+            println("purged_count\t" + to_string(s[2]))
+            println("count_obj_texture\t" + to_string(s[3]))
+            return
+        }
+        if sub == "size" {
+            if len(a) >= 4 {
+                let mid = to_int(a[3])
+                println("mark_size_kb\t" + to_string(mark_size_kb(mid)))
+                return
+            }
+            println("usage: hexa run pe_low_memory_purgeable.hexa size <mark_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let ok = to_int(a[3])
+                println("count_by_object\t" + to_string(count_by_object(ok)))
+                return
+            }
+            println("usage: hexa run pe_low_memory_purgeable.hexa count <object_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_plmp()
+            println("cleaned: " + plmp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(plmp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_low_memory_purgeable.hexa { self-test | stats | size <mark_id> | count <object_kind> | cleanup | dir }")
+}

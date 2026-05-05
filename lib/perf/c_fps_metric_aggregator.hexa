@@ -1,0 +1,225 @@
+// lib/perf/c_fps_metric_aggregator.hexa — CN-219 skeleton manjeom 15/15
+//
+// FPS metric aggregator — current/avg/1%-low 통계 (overlay 표시용). FPS counter
+// overlay 가 단순 current FPS 외에도 moving avg + 1% low + max FPS 를 동시
+// 표시할 수 있도록 sample × current_fps × avg_fps × low_1pct 4-key columnar
+// 로그를 누적한다. 본 모듈은 sample 등록 / 합계 / 최소 current / 단건 조회만
+// 담당 — overlay rendering 은 host 측 책임.
+//
+// 무기: sample × current × avg × low_1pct 4-key 컬럼 로그.
+// 효과: FPS metric multi-statistic 표시 baseline — overlay 가 current 만이
+// 아닌 avg / 1% low 를 함께 표시 가능 → frame pacing 체감 정량화.
+
+use "./r0_common"
+
+let FMA_DIR = GAMEBOX_HOME + "/persist/fps_metric_aggregator"
+let SAMPLES_LOG = FMA_DIR + "/samples.tsv"
+
+fn fma_dir() -> str { return FMA_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + FMA_DIR + "'")
+}
+
+// ─── sample 등록 ───
+//   sample_id (host 측 monotonic counter),
+//   current_fps (마지막 frame instantaneous FPS),
+//   avg_fps (moving avg FPS — host 가 N-frame window 로 계산),
+//   low_1pct_fps (최근 N frame 중 하위 1% percentile FPS).
+fn record_sample(sample_id: int, current_fps: int, avg_fps: int, low_1pct_fps: int) -> void {
+    ensure_dir()
+    let line = to_string(sample_id) + "\t" + to_string(current_fps) + "\t" + to_string(avg_fps) + "\t" + to_string(low_1pct_fps)
+    let tmp = SAMPLES_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + SAMPLES_LOG + "' && rm -f '" + tmp + "'")
+    r0_emit("fps_metric_record", "\"sample\":" + to_string(sample_id) + ",\"current\":" + to_string(current_fps) + ",\"avg\":" + to_string(avg_fps) + ",\"low_1pct\":" + to_string(low_1pct_fps))
+}
+
+// ─── sample_count — 등록된 sample 행 수 ───
+fn sample_count() -> int {
+    let exists = exec("test -f '" + SAMPLES_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let n = exec("wc -l < '" + SAMPLES_LOG + "' | tr -d ' '").trim()
+    if n == "" { return 0 }
+    return to_int(n)
+}
+
+// ─── total_current — 모든 sample current_fps 합 ───
+fn total_current() -> int {
+    let exists = exec("test -f '" + SAMPLES_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$2} END{print s+0}' '" + SAMPLES_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_avg — 모든 sample avg_fps 합 ───
+fn total_avg() -> int {
+    let exists = exec("test -f '" + SAMPLES_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$3} END{print s+0}' '" + SAMPLES_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── total_low_1pct — 모든 sample low_1pct_fps 합 ───
+fn total_low_1pct() -> int {
+    let exists = exec("test -f '" + SAMPLES_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' '{s+=$4} END{print s+0}' '" + SAMPLES_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── min_current_fps — 모든 sample 중 최소 current_fps (worst case) ───
+//   awk min $2. sample 미등록이면 0.
+fn min_current_fps() -> int {
+    let exists = exec("test -f '" + SAMPLES_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let m = exec("awk -F'\\t' 'NR==1{m=$2} {if($2<m)m=$2} END{print m+0}' '" + SAMPLES_LOG + "'").trim()
+    if m == "" { return 0 }
+    return to_int(m)
+}
+
+// ─── sample_current — 특정 sample_id 의 current_fps 단건 조회 ───
+//   sample_id 미등록이면 0.
+fn sample_current(sample_id: int) -> int {
+    let exists = exec("test -f '" + SAMPLES_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v a=" + to_string(sample_id) + " '$1==a {print $2; exit}' '" + SAMPLES_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── fma_stats — [sample_count, total_current, total_avg, total_low_1pct] ───
+fn fma_stats() -> array {
+    return [sample_count(), total_current(), total_avg(), total_low_1pct()]
+}
+
+fn cleanup_fma() -> void {
+    let _ = exec("rm -rf '" + FMA_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "fma-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_fma()
+
+    // 합성 sample 3 종:
+    //   70001 — current 144 / avg 138 / 1%low 110 (high refresh good)
+    //   70002 — current 120 / avg 125 / 1%low  95 (mid)
+    //   70003 — current  60 / avg  80 / 1%low  45 (worst — min current)
+    record_sample(70001, 144, 138, 110)
+    record_sample(70002, 120, 125, 95)
+    record_sample(70003, 60, 80, 45)
+
+    // sample_count = 3
+    let sc = sample_count()
+    if sc != 3 { panic("c_fps_metric_aggregator FAIL [sample_count] expected=3 got=" + to_string(sc)) }
+
+    // total_current = 144+120+60 = 324
+    let tc = total_current()
+    if tc != 324 { panic("c_fps_metric_aggregator FAIL [total_current] expected=324 got=" + to_string(tc)) }
+
+    // total_avg = 138+125+80 = 343
+    let ta = total_avg()
+    if ta != 343 { panic("c_fps_metric_aggregator FAIL [total_avg] expected=343 got=" + to_string(ta)) }
+
+    // total_low_1pct = 110+95+45 = 250
+    let tl = total_low_1pct()
+    if tl != 250 { panic("c_fps_metric_aggregator FAIL [total_low_1pct] expected=250 got=" + to_string(tl)) }
+
+    // min_current_fps = 60 (70003)
+    let mc = min_current_fps()
+    if mc != 60 { panic("c_fps_metric_aggregator FAIL [min_current_fps] expected=60 got=" + to_string(mc)) }
+
+    // sample_current 단건 조회
+    let c1 = sample_current(70001)
+    if c1 != 144 { panic("c_fps_metric_aggregator FAIL [sample_current 70001] expected=144 got=" + to_string(c1)) }
+    let c3 = sample_current(70003)
+    if c3 != 60 { panic("c_fps_metric_aggregator FAIL [sample_current 70003] expected=60 got=" + to_string(c3)) }
+    // 미등록 sample_id 는 0
+    let c9 = sample_current(9999)
+    if c9 != 0 { panic("c_fps_metric_aggregator FAIL [sample_current unknown] expected=0 got=" + to_string(c9)) }
+
+    let stats = fma_stats()
+    if stats[0] != 3 { panic("c_fps_metric_aggregator FAIL [stats samples] expected=3 got=" + to_string(stats[0])) }
+    if stats[1] != 324 { panic("c_fps_metric_aggregator FAIL [stats total_current] expected=324 got=" + to_string(stats[1])) }
+    if stats[2] != 343 { panic("c_fps_metric_aggregator FAIL [stats total_avg] expected=343 got=" + to_string(stats[2])) }
+    if stats[3] != 250 { panic("c_fps_metric_aggregator FAIL [stats total_low_1pct] expected=250 got=" + to_string(stats[3])) }
+
+    r0_emit("fps_metric_summary", "\"samples\":" + to_string(stats[0]) + ",\"total_current\":" + to_string(stats[1]) + ",\"total_avg\":" + to_string(stats[2]) + ",\"total_low_1pct\":" + to_string(stats[3]) + ",\"min_current\":" + to_string(mc))
+
+    // record × 3 + summary × 1 = ≥ 4 emits
+    let cnt = r0_session_count(sid)
+    if cnt < 4 { panic("c_fps_metric_aggregator FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+
+    // ─── synthetic FPS metric aggregation round-trip (Track BI — diablo2_resurrected cond.3 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track BI mission: c_fps_* family 100% completion cycle (Track BF 1/4 → BI 4/4) —
+    // c_fps_metric_aggregator 측 Apple-native synthetic round-trip 추가. Metric
+    // aggregation lifecycle (sample → ringbuffer_push → percentile_compute → emit_overlay)
+    // 측 spec freeze. Apple-native scaffold only (own1 정합, mach_absolute_time
+    // binary linkage 0).
+    //
+    // (a) synthetic 4-phase metric aggregation lifecycle —
+    //     sample → ringbuffer_push → percentile_compute → emit_overlay:
+    //     phase_count               4
+    //     metric_aggregator_off     0x180058000         (synthetic mach_absolute_time RVA)
+    //     lifecycle_kind            "synthetic_inline"  (실 mach_absolute_time 호출 X)
+    //
+    // (b) synthetic statistic × window 16-slot percentile matrix —
+    //     4 statistic (current/avg/p99/low_1pct) × 4 window (60s/5min/15min/session) = 16 slots:
+    //     slot_total                16
+    //     hot_slot_count            4                   (current × 4 window — frequent overlay hits)
+    //     low_slot_count            8                   (p99/low_1pct × 4 window — tail latency)
+    //     avg_slot_count            4                   (avg × 4 window — moving average)
+    //     matrix_kind               "synthetic_inline"
+    //
+    // round-trip = metric_aggregation_phase(scaffold) → walk_percentile_matrix(scaffold).
+    //              hexa-native loop only — 실 mach_absolute_time 0,
+    //              real CVDisplayLink callback 0.
+    //
+    // synthetic metric aggregation phase emit
+    r0_emit("c_fps_metric_aggregator_synthetic_phase",
+        "\"stage\":\"metric_aggregation_phase\",\"phase_count\":4,\"metric_aggregator_off\":\"0x180058000\",\"lifecycle_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"appkit_gap\":\"hexa-native scaffold — no real mach_absolute_time binary linkage\"")
+    println("__FPS_METRIC__ PARTIAL metric_aggregation_phase")
+
+    // synthetic statistic × window percentile matrix emit
+    r0_emit("c_fps_metric_aggregator_synthetic_matrix",
+        "\"stage\":\"percentile_matrix\",\"slot_total\":16,\"hot_slot_count\":4,\"low_slot_count\":8,\"avg_slot_count\":4,\"matrix_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.3\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"appkit_gap\":\"hexa-native scaffold — no real mach_absolute_time binary linkage\"")
+    println("__FPS_METRIC__ PARTIAL percentile_matrix")
+
+    cleanup_fma()
+
+    println("  ✅ c_fps_metric_aggregator self_test PASS (3 samples, total_current=324, total_avg=343, total_low_1pct=250, min_current=60, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = fma_stats()
+            println("samples=" + to_string(s[0]) + " total_current=" + to_string(s[1]) + " total_avg=" + to_string(s[2]) + " total_low_1pct=" + to_string(s[3]))
+            return
+        }
+        if sub == "current" {
+            if len(a) >= 4 {
+                let sid = to_int(a[3])
+                let c = sample_current(sid)
+                println(to_string(c))
+                return
+            }
+        }
+        if sub == "min" {
+            let m = min_current_fps()
+            println(to_string(m))
+            return
+        }
+        if sub == "cleanup" { cleanup_fma(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_fps_metric_aggregator.hexa { self-test | stats | current <sample_id> | min | cleanup }")
+}

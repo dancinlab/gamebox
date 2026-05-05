@@ -1,0 +1,167 @@
+// lib/perf/c_pe_section_perm_audit.hexa — CN-100 skeleton manjeom 15/15
+//
+// Phase 1 PE section permission audit — RWX 권한 조합 정책 위반 검출.
+// W+X (writable + executable) 동시 = self-modifying / shellcode 의심 → flag.
+//
+// 무기: section permission table + columnar (per-section policy ok/warn).
+// 효과: malicious 또는 unusual PE 즉시 검출 + macOS hardened runtime 호환성.
+
+use "./r0_common"
+
+let CPSP_DIR = GAMEBOX_HOME + "/persist/pe_section_perm_audit"
+let PERM_LOG = CPSP_DIR + "/perms.tsv"
+
+fn cpsp_dir() -> str { return CPSP_DIR }
+
+fn ensure_dir() -> void {
+    let _mk = exec("mkdir -p '" + CPSP_DIR + "'")
+}
+
+fn perm_policy(prot: str) -> str {
+    let has_w = prot.contains("W")
+    let has_x = prot.contains("X")
+    if has_w && has_x { return "warn_wx" }
+    if !has_w && has_x { return "ok_rx" }
+    if has_w && !has_x { return "ok_rw" }
+    if !has_w && !has_x { return "ok_r" }
+    return "unknown"
+}
+
+fn record_perm(section_name: str, prot: str) -> void {
+    ensure_dir()
+    let pol = perm_policy(prot)
+    let line = section_name + "\t" + prot + "\t" + pol
+    let tmp = PERM_LOG + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat '" + tmp + "' >> '" + PERM_LOG + "' && rm -f '" + tmp + "'")
+    if pol == "warn_wx" {
+        r0_emit("pe_perm_warn", "\"section\":\"" + section_name + "\",\"prot\":\"" + prot + "\"")
+    } else {
+        r0_emit("pe_perm_ok", "\"section\":\"" + section_name + "\",\"policy\":\"" + pol + "\"")
+    }
+}
+
+fn audit_count() -> int {
+    let exists = exec("test -f '" + PERM_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    return to_int(exec("wc -l < '" + PERM_LOG + "' | tr -d ' '").trim())
+}
+
+fn warn_count() -> int {
+    let exists = exec("test -f '" + PERM_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' '$3==\"warn_wx\"' '" + PERM_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn policy_count(pol: str) -> int {
+    let exists = exec("test -f '" + PERM_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v p='" + pol + "' '$3==p' '" + PERM_LOG + "' | wc -l | tr -d ' '").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn cleanup_cpsp() -> void {
+    let _ = exec("rm -rf '" + CPSP_DIR + "'")
+}
+
+fn self_test() -> void {
+    let sid = "cpsp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    cleanup_cpsp()
+
+    if perm_policy("RX") != "ok_rx" { panic("c_pe_section_perm_audit FAIL [rx]") }
+    if perm_policy("RW") != "ok_rw" { panic("c_pe_section_perm_audit FAIL [rw]") }
+    if perm_policy("R") != "ok_r" { panic("c_pe_section_perm_audit FAIL [r]") }
+    if perm_policy("RWX") != "warn_wx" { panic("c_pe_section_perm_audit FAIL [rwx]") }
+
+    // 정상 PE
+    record_perm(".text", "RX")
+    record_perm(".rdata", "R")
+    record_perm(".data", "RW")
+    record_perm(".rsrc", "R")
+    record_perm(".reloc", "R")
+
+    let n = audit_count()
+    if n != 5 { panic("c_pe_section_perm_audit FAIL [count] expected=5 got=" + to_string(n)) }
+
+    let w = warn_count()
+    if w != 0 { panic("c_pe_section_perm_audit FAIL [normal warn] got=" + to_string(w)) }
+
+    let rx = policy_count("ok_rx")
+    if rx != 1 { panic("c_pe_section_perm_audit FAIL [rx count] expected=1 got=" + to_string(rx)) }
+
+    // 의심 section
+    record_perm(".bad", "RWX")
+    let w2 = warn_count()
+    if w2 != 1 { panic("c_pe_section_perm_audit FAIL [warn detect] expected=1 got=" + to_string(w2)) }
+
+    r0_emit("pe_perm_summary", "\"sections\":" + to_string(audit_count()) + ",\"warns\":" + to_string(w2))
+
+    let cnt = r0_session_count(sid)
+    if cnt < 6 { panic("c_pe_section_perm_audit FAIL [emit] got=" + to_string(cnt)) }
+
+    // ─── synthetic PE section perm audit state machine round-trip (cond.1 EVIDENCE AUGMENT — partial 유지) ───
+    //
+    // Track AQ mission: D2R cond.1 (PE parse + IAT real-resolve + mainCRTStartup
+    // reach) 측 evidence augment. PE section IMAGE_SCN_MEM_* characteristics
+    // walk 측 W+X violation 검출 path 측 D2R cond.1 + D4 cond.1 cross-link.
+    //
+    // (a) synthetic section perm audit 4-phase state machine cycle —
+    //     parse_characteristics → classify_policy → flag_violation → tally_status:
+    //     phase_count               4                   (4 perm audit phases)
+    //     perm_table_off            0x140116000         (synthetic perm audit RVA)
+    //     characteristics_mask      0xE0000020          (R+W+X+CODE 정책 mask)
+    //     audit_kind                "synthetic_inline"  (실 characteristics walk X)
+    //
+    // (b) synthetic 4-policy distribution scaffold —
+    //     ok_rx / ok_r / ok_rw / warn_wx 분포:
+    //     policy_total              4                   (4 policy candidate)
+    //     ok_rx_count_synthetic     1                   (.text RX)
+    //     ok_r_count_synthetic      3                   (.rdata/.rsrc/.reloc)
+    //     ok_rw_count_synthetic     1                   (.data RW)
+    //     warn_wx_count_synthetic   1                   (의심 RWX 1 detect)
+    //     hardened_runtime_compat   true                (W+X 검출 시 macOS
+    //                                                   hardened runtime 위반)
+    //     dist_kind                 "synthetic_inline"  (실 awk policy tally X)
+    //
+    // round-trip = synthesize_perm_audit(scaffold) → tally_policy_distribution(scaffold).
+    //              hexa-native loop only — 실 IMAGE_SCN_MEM_* walk 0,
+    //              real W+X mmap 0.
+    //
+    // synthetic perm audit phase emit
+    r0_emit("c_pe_section_perm_audit_synthetic_phase",
+        "\"stage\":\"perm_audit_phase\",\"phase_count\":4,\"perm_table_off\":\"0x140116000\",\"characteristics_mask\":\"0xE0000020\",\"audit_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+    println("__PE_PERM__ PARTIAL perm_audit_phase")
+
+    // synthetic policy distribution emit
+    r0_emit("c_pe_section_perm_audit_synthetic_distribution",
+        "\"stage\":\"policy_distribution\",\"policy_total\":4,\"ok_rx_count_synthetic\":1,\"ok_r_count_synthetic\":3,\"ok_rw_count_synthetic\":1,\"warn_wx_count_synthetic\":1,\"hardened_runtime_compat\":true,\"dist_kind\":\"synthetic_inline\",\"shim_kind\":\"synthetic_inline\",\"cond\":\"diablo2_resurrected.cond.1\",\"verdict\":\"PARTIAL\",\"posture\":\"evidence_augment_partial_to_partial\",\"real_binary_gap\":\"permanent — Battle.net launcher install dependent\"")
+    println("__PE_PERM__ PARTIAL policy_distribution")
+
+    cleanup_cpsp()
+
+    println("  ✅ c_pe_section_perm_audit self_test PASS (5 normal sections + 1 RWX warn detect, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "audit" && len(a) >= 5 {
+            record_perm(a[3], a[4])
+            println("recorded")
+            return
+        }
+        if sub == "stats" {
+            println("sections=" + to_string(audit_count()) + " warns=" + to_string(warn_count()))
+            return
+        }
+        if sub == "cleanup" { cleanup_cpsp(); println("cleaned"); return }
+    }
+    println("usage: hexa run c_pe_section_perm_audit.hexa { self-test | audit <name> <prot> | stats | cleanup }")
+}

@@ -1,0 +1,429 @@
+// lib/loader/pe_i386_winmain_entry_real.hexa — cycle72+ i386 PE32 WinMain / mainCRTStartup entry dispatch telemetry
+//
+// i386 PE32 의 entry point 는 linker 가 결정한 CRT startup symbol —
+//   WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow).
+//   mainCRTStartup       → console subsystem, main(argc, argv) 을 Win32 환경에서 호출.
+//   WinMainCRTStartup    → GUI subsystem, ANSI WinMain dispatch (lpCmdLine = LPSTR / CP_ACP).
+//   wWinMainCRTStartup   → GUI subsystem, UTF-16 wWinMain dispatch (lpCmdLine = LPWSTR).
+//   DllMainCRTStartup    → DLL_PROCESS_ATTACH / THREAD_ATTACH / THREAD_DETACH / PROCESS_DETACH
+//                          (cycle 72 pe_tls_callback_dispatch cross-ref — TLS callback 이 먼저 실행 후 DllMain).
+// 본 module 은 entry dispatch 통계 — emulator 가 entry symbol resolve 후 host stack frame
+// 위에 hInstance / cmdshow 를 push 할 때마다 record_entry 를 호출.
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 entry dispatch tracker — 실 PE entry resolve / CRT init 호출 X (cycle80+).
+//   reference: MSDN — WinMain entry point function, _CRT_INIT.
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// entry_kind code:
+//   1 = mainCRTStartup        (console subsystem — main(argc, argv) Win32 환경)
+//   2 = WinMainCRTStartup     (GUI subsystem ANSI — WinMain LPSTR cmdline)
+//   3 = wWinMainCRTStartup    (GUI subsystem UTF-16 — wWinMain LPWSTR cmdline)
+//   4 = DllMainCRTStartup     (DLL — DLL_PROCESS_ATTACH 등, TLS callback 후속)
+//
+// cmdshow code (WinMain 4 번째 인자 nCmdShow):
+//   0 = SW_HIDE
+//   1 = SW_SHOWNORMAL
+//   2 = SW_SHOWMINIMIZED
+//   3 = SW_SHOWMAXIMIZED
+//
+// persist schema (TSV — entries.tsv):
+//   entry_id<int> \t entry_kind<int> \t hinstance_set<int> \t cmdshow<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn piwe_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_i386_winmain_entry_real"
+}
+
+fn piwe_entries_path() -> str {
+    return piwe_dir() + "/entries.tsv"
+}
+
+fn piwe_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + piwe_dir() + "'")
+}
+
+fn cleanup_piwe() -> void {
+    piwe_ensure_dir()
+    let _ = exec("rm -f '" + piwe_entries_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn piwe_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn piwe_append_row(path: str, row: str) -> void {
+    piwe_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_entry: WinMain / mainCRTStartup entry dispatch 1 건 기록 ───
+fn record_entry(entry_id: int, entry_kind: int, hinstance_set: int, cmdshow: int) -> void {
+    if entry_id <= 0 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=entry_id>0 got=" + to_string(entry_id))
+    }
+    if entry_kind < 1 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=entry_kind>=1 got=" + to_string(entry_kind))
+    }
+    if entry_kind > 4 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=entry_kind<=4 got=" + to_string(entry_kind))
+    }
+    if hinstance_set < 0 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=hinstance_set>=0 got=" + to_string(hinstance_set))
+    }
+    if hinstance_set > 1 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=hinstance_set<=1 got=" + to_string(hinstance_set))
+    }
+    if cmdshow < 0 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=cmdshow>=0 got=" + to_string(cmdshow))
+    }
+    if cmdshow > 3 {
+        panic("pe_i386_winmain_entry_real FAIL [record_entry] expected=cmdshow<=3 got=" + to_string(cmdshow))
+    }
+    let row = to_string(entry_id) + "\t" + to_string(entry_kind)
+        + "\t" + to_string(hinstance_set) + "\t" + to_string(cmdshow) + "\n"
+    piwe_append_row(piwe_entries_path(), row)
+}
+
+// ─── entry_count: total entry 수 ───
+fn entry_count() -> int {
+    let t = piwe_read_table(piwe_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_entry_kind: 특정 entry_kind 의 entry 수 ───
+fn count_by_entry_kind(kind: int) -> int {
+    let t = piwe_read_table(piwe_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == kind {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── hinstance_set_count: hInstance 가 set(1) 된 entry 수 ───
+fn hinstance_set_count() -> int {
+    let t = piwe_read_table(piwe_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[2]) == 1 {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── count_by_cmdshow: 특정 cmdshow 코드의 entry 수 ───
+fn count_by_cmdshow(cs: int) -> int {
+    let t = piwe_read_table(piwe_entries_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[3]) == cs {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── winmain_count: ANSI + UTF-16 WinMain dispatch 합계 ───
+fn winmain_count() -> int {
+    return count_by_entry_kind(2) + count_by_entry_kind(3)
+}
+
+// ─── entry_cmdshow: 특정 entry_id 의 cmdshow 코드 (없으면 -1) ───
+fn entry_cmdshow(entry_id: int) -> int {
+    let t = piwe_read_table(piwe_entries_path())
+    if t == "" {
+        return -1
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == entry_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── piwe_stats: [entry_count, winmain_count, hinstance_set_count, count_by_entry_kind(1)] ───
+fn piwe_stats() -> array {
+    let mut out = []
+    out.push(entry_count())
+    out.push(winmain_count())
+    out.push(hinstance_set_count())
+    out.push(count_by_entry_kind(1))
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "piwe-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_piwe()
+
+    // 2. record 5 entries — 4 entry_kinds (mainCRT, WinMain ANSI, wWinMain, DllMain)
+    //    WinMain ANSI 2 회 (다른 cmdshow) → ≥3 entry_kinds 충족.
+    record_entry(720001, 1, 0, 0)
+    r0_emit("pe_i386_winmain_entry_real_record",
+        "\"entry_id\":720001,\"entry_kind\":1,\"hinstance_set\":0,\"cmdshow\":0,\"target\":\"mainCRTStartup\"")
+
+    record_entry(720002, 2, 1, 1)
+    r0_emit("pe_i386_winmain_entry_real_record",
+        "\"entry_id\":720002,\"entry_kind\":2,\"hinstance_set\":1,\"cmdshow\":1,\"target\":\"WinMainCRTStartup\"")
+
+    record_entry(720003, 2, 1, 3)
+    r0_emit("pe_i386_winmain_entry_real_record",
+        "\"entry_id\":720003,\"entry_kind\":2,\"hinstance_set\":1,\"cmdshow\":3,\"target\":\"WinMainCRTStartup\"")
+
+    record_entry(720004, 3, 1, 1)
+    r0_emit("pe_i386_winmain_entry_real_record",
+        "\"entry_id\":720004,\"entry_kind\":3,\"hinstance_set\":1,\"cmdshow\":1,\"target\":\"wWinMainCRTStartup\"")
+
+    record_entry(720005, 4, 1, 0)
+    r0_emit("pe_i386_winmain_entry_real_record",
+        "\"entry_id\":720005,\"entry_kind\":4,\"hinstance_set\":1,\"cmdshow\":0,\"target\":\"DllMainCRTStartup\"")
+
+    // 3. entry_count = 5
+    let c = entry_count()
+    if c != 5 {
+        panic("pe_i386_winmain_entry_real FAIL [entry_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. count_by_entry_kind sanity
+    let k1 = count_by_entry_kind(1)
+    if k1 != 1 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_entry_kind(1)] expected=1 got=" + to_string(k1))
+    }
+    let k2 = count_by_entry_kind(2)
+    if k2 != 2 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_entry_kind(2)] expected=2 got=" + to_string(k2))
+    }
+    let k3 = count_by_entry_kind(3)
+    if k3 != 1 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_entry_kind(3)] expected=1 got=" + to_string(k3))
+    }
+    let k4 = count_by_entry_kind(4)
+    if k4 != 1 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_entry_kind(4)] expected=1 got=" + to_string(k4))
+    }
+    let k99 = count_by_entry_kind(99)
+    if k99 != 0 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_entry_kind(99)] expected=0 got=" + to_string(k99))
+    }
+
+    // 5. winmain_count = k2 + k3 = 2 + 1 = 3
+    let wm = winmain_count()
+    if wm != 3 {
+        panic("pe_i386_winmain_entry_real FAIL [winmain_count] expected=3 got=" + to_string(wm))
+    }
+
+    // 6. hinstance_set_count = 4 (id 720002,720003,720004,720005)
+    let hs = hinstance_set_count()
+    if hs != 4 {
+        panic("pe_i386_winmain_entry_real FAIL [hinstance_set_count] expected=4 got=" + to_string(hs))
+    }
+
+    // 7. count_by_cmdshow sanity
+    let cs0 = count_by_cmdshow(0)  // 720001 (SW_HIDE), 720005 (DllMain SW_HIDE)
+    if cs0 != 2 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_cmdshow(0)] expected=2 got=" + to_string(cs0))
+    }
+    let cs1 = count_by_cmdshow(1)  // 720002, 720004
+    if cs1 != 2 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_cmdshow(1)] expected=2 got=" + to_string(cs1))
+    }
+    let cs2 = count_by_cmdshow(2)
+    if cs2 != 0 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_cmdshow(2)] expected=0 got=" + to_string(cs2))
+    }
+    let cs3 = count_by_cmdshow(3)  // 720003
+    if cs3 != 1 {
+        panic("pe_i386_winmain_entry_real FAIL [count_by_cmdshow(3)] expected=1 got=" + to_string(cs3))
+    }
+
+    // 8. entry_cmdshow sanity
+    let e3 = entry_cmdshow(720003)
+    if e3 != 3 {
+        panic("pe_i386_winmain_entry_real FAIL [entry_cmdshow(720003)] expected=3 got=" + to_string(e3))
+    }
+    let e1 = entry_cmdshow(720001)
+    if e1 != 0 {
+        panic("pe_i386_winmain_entry_real FAIL [entry_cmdshow(720001)] expected=0 got=" + to_string(e1))
+    }
+    let e_miss = entry_cmdshow(9999)
+    if e_miss != -1 {
+        panic("pe_i386_winmain_entry_real FAIL [entry_cmdshow(9999)] expected=-1 got=" + to_string(e_miss))
+    }
+
+    // 9. piwe_stats() = [5, 3, 4, 1]
+    let s = piwe_stats()
+    if len(s) != 4 {
+        panic("pe_i386_winmain_entry_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_i386_winmain_entry_real FAIL [stats entry_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 3 {
+        panic("pe_i386_winmain_entry_real FAIL [stats winmain_count] expected=3 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_i386_winmain_entry_real FAIL [stats hinstance_set_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 1 {
+        panic("pe_i386_winmain_entry_real FAIL [stats count_kind(1)] expected=1 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_i386_winmain_entry_real_stats",
+        "\"entry_count\":" + to_string(s[0])
+        + ",\"winmain_count\":" + to_string(s[1])
+        + ",\"hinstance_set_count\":" + to_string(s[2])
+        + ",\"kind_mainCRTStartup\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_i386_winmain_entry_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_piwe()
+    let s2 = piwe_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_i386_winmain_entry_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_i386_winmain_entry_real self_test PASS (entries=" + to_string(s[0])
+        + ", winmain=" + to_string(s[1]) + ", hinstance_set=" + to_string(s[2])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = piwe_stats()
+            println("entry_count\t" + to_string(s[0]))
+            println("winmain_count\t" + to_string(s[1]))
+            println("hinstance_set_count\t" + to_string(s[2]))
+            println("count_kind_mainCRTStartup\t" + to_string(s[3]))
+            return
+        }
+        if sub == "cmdshow" {
+            if len(a) >= 4 {
+                let eid = to_int(a[3])
+                println("entry_cmdshow\t" + to_string(entry_cmdshow(eid)))
+                return
+            }
+            println("usage: hexa run pe_i386_winmain_entry_real.hexa cmdshow <entry_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let kind = to_int(a[3])
+                println("count_by_entry_kind\t" + to_string(count_by_entry_kind(kind)))
+                return
+            }
+            println("usage: hexa run pe_i386_winmain_entry_real.hexa count <entry_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_piwe()
+            println("cleaned: " + piwe_dir())
+            return
+        }
+        if sub == "dir" {
+            println(piwe_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_i386_winmain_entry_real.hexa { self-test | stats | cmdshow <entry_id> | count <entry_kind> | cleanup | dir }")
+}

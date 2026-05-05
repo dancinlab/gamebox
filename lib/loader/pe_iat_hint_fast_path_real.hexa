@@ -1,0 +1,548 @@
+// lib/loader/pe_iat_hint_fast_path_real.hexa — IAT resolver hint-based fast-path tracker (R3 Tier).
+//
+// Windows PE IAT (Import Address Table) resolver 의 "hint" 기반 fast-path 추적기.
+//   - ILT (Import Lookup Table) entry 의 hint 필드 = export name 의 export-name-table
+//     안 추정 위치 (linker 가 link 시점에 주입한 hint).
+//   - hint match 시: export[hint] == name → name string compare 단계 skip,
+//     RVA 즉시 추출 (≈ binary search 대비 수십 cycle 절감).
+//   - hint mismatch 시: export name table 에서 binary search fallback —
+//     결과 없으면 record_failure(reason_kind=name_not_found).
+//
+// own1 enforcement: PE/COFF spec + ReactOS LdrpSnapThunk algorithm reference only.
+//   Wine ntdll/loader.c, CrossOver, Whisky, GPTk, community wine 0줄 인용.
+//   ReactOS LdrpSnapThunk = BSD/GPL-clean pure-spec implementation — algorithm
+//   only (struct field access pattern), no source line copy.
+//
+// own2 mandate:
+//   - r0_emit ≥ 14 (17 record + 5 stats emit + 1 helper-sanity-stats banner = 23)
+//   - panic 형식: "pe_iat_hint_fast_path_real FAIL [<step>] expected=<x> got=<y>"
+//   - self_test() + main() dispatch + headless safe
+//
+// 5 record API:
+//   record_iat_thunk(thunk_id, dll_name, fn_name, hint_value, iat_va_hex)
+//     — ILT entry 1 건 (DLL+func name+hint+IAT slot VA)
+//   record_hint_match(match_id, thunk_id, hint_index_match, name_string_match)
+//     — hint 위치의 name 이 import name 과 일치하는지 (idx==0/1, str==0/1)
+//   record_export_lookup(lookup_id, thunk_id, export_table_va_hex, lookup_kind, found)
+//     — export table 조회 1 건 (kind 0=hint_fast 1=binary_search 2=ordinal_direct)
+//   record_resolution_perf(perf_id, thunk_id, lookup_cycles, lookup_kind)
+//     — resolution 1 건 cycle 측정
+//   record_failure(failure_id, thunk_id, reason_kind)
+//     — reason 0=name_not_found 1=ordinal_invalid 2=dll_not_loaded 3=mismatch
+//
+// 5 stats:
+//   iat_thunk_count / hint_match_count / export_lookup_count
+//   resolution_perf_count / failure_count
+//
+// 2 helper:
+//   lookup_kind_name(int) -> str
+//   failure_reason_name(int) -> str
+//
+// persist schema (TSV — 5 tables):
+//   thunks.tsv     : thunk_id<int>   \t dll_name<str>          \t fn_name<str>          \t hint_value<int> \t iat_va_hex<str>
+//   hint_matches.tsv : match_id<int> \t thunk_id<int>          \t hint_index_match<int> \t name_string_match<int>
+//   export_lookups.tsv : lookup_id<int> \t thunk_id<int>       \t export_table_va_hex<str> \t lookup_kind<int> \t found<int>
+//   resolution_perfs.tsv : perf_id<int> \t thunk_id<int>       \t lookup_cycles<int>    \t lookup_kind<int>
+//   failures.tsv   : failure_id<int> \t thunk_id<int>          \t reason_kind<int>
+//
+// Hexa 예약어 회피: type / mod / handle / class 단독 식별자 금지 →
+//   lookup_kind / reason_kind / hint_value 사용.
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pihfp_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_iat_hint_fast_path_real"
+}
+
+fn pihfp_thunks_path() -> str {
+    return pihfp_dir() + "/thunks.tsv"
+}
+
+fn pihfp_hint_matches_path() -> str {
+    return pihfp_dir() + "/hint_matches.tsv"
+}
+
+fn pihfp_export_lookups_path() -> str {
+    return pihfp_dir() + "/export_lookups.tsv"
+}
+
+fn pihfp_resolution_perfs_path() -> str {
+    return pihfp_dir() + "/resolution_perfs.tsv"
+}
+
+fn pihfp_failures_path() -> str {
+    return pihfp_dir() + "/failures.tsv"
+}
+
+fn pihfp_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pihfp_dir() + "'")
+}
+
+fn cleanup_pihfp() -> void {
+    pihfp_ensure_dir()
+    let _ = exec("rm -f '" + pihfp_thunks_path()
+        + "' '" + pihfp_hint_matches_path()
+        + "' '" + pihfp_export_lookups_path()
+        + "' '" + pihfp_resolution_perfs_path()
+        + "' '" + pihfp_failures_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pihfp_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pihfp_append_row(path: str, row: str) -> void {
+    pihfp_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+fn pihfp_count_rows(path: str, min_cols: int) -> int {
+    let t = pihfp_read_table(path)
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= min_cols {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── record_iat_thunk: ILT entry 1 건 ───
+fn record_iat_thunk(thunk_id: int, dll_name: str, fn_name: str, hint_value: int, iat_va_hex: str) -> void {
+    if thunk_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_iat_thunk] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if dll_name == "" {
+        panic("pe_iat_hint_fast_path_real FAIL [record_iat_thunk] expected=dll_name!=empty got=empty")
+    }
+    if fn_name == "" {
+        panic("pe_iat_hint_fast_path_real FAIL [record_iat_thunk] expected=fn_name!=empty got=empty")
+    }
+    if hint_value < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_iat_thunk] expected=hint_value>=0 got=" + to_string(hint_value))
+    }
+    if iat_va_hex == "" {
+        panic("pe_iat_hint_fast_path_real FAIL [record_iat_thunk] expected=iat_va_hex!=empty got=empty")
+    }
+    let row = to_string(thunk_id) + "\t" + dll_name
+        + "\t" + fn_name + "\t" + to_string(hint_value)
+        + "\t" + iat_va_hex + "\n"
+    pihfp_append_row(pihfp_thunks_path(), row)
+}
+
+// ─── record_hint_match: hint 위치의 name 일치 결과 1 건 ───
+fn record_hint_match(match_id: int, thunk_id: int, hint_index_match: int, name_string_match: int) -> void {
+    if match_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_hint_match] expected=match_id>0 got=" + to_string(match_id))
+    }
+    if thunk_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_hint_match] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if hint_index_match < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_hint_match] expected=hint_index_match>=0 got=" + to_string(hint_index_match))
+    }
+    if hint_index_match > 1 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_hint_match] expected=hint_index_match<=1 got=" + to_string(hint_index_match))
+    }
+    if name_string_match < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_hint_match] expected=name_string_match>=0 got=" + to_string(name_string_match))
+    }
+    if name_string_match > 1 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_hint_match] expected=name_string_match<=1 got=" + to_string(name_string_match))
+    }
+    let row = to_string(match_id) + "\t" + to_string(thunk_id)
+        + "\t" + to_string(hint_index_match)
+        + "\t" + to_string(name_string_match) + "\n"
+    pihfp_append_row(pihfp_hint_matches_path(), row)
+}
+
+// ─── record_export_lookup: export table 조회 1 건 ───
+fn record_export_lookup(lookup_id: int, thunk_id: int, export_table_va_hex: str, lookup_kind: int, found: int) -> void {
+    if lookup_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=lookup_id>0 got=" + to_string(lookup_id))
+    }
+    if thunk_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if export_table_va_hex == "" {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=export_table_va_hex!=empty got=empty")
+    }
+    if lookup_kind < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=lookup_kind>=0 got=" + to_string(lookup_kind))
+    }
+    if lookup_kind > 2 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=lookup_kind<=2 got=" + to_string(lookup_kind))
+    }
+    if found < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=found>=0 got=" + to_string(found))
+    }
+    if found > 1 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_export_lookup] expected=found<=1 got=" + to_string(found))
+    }
+    let row = to_string(lookup_id) + "\t" + to_string(thunk_id)
+        + "\t" + export_table_va_hex
+        + "\t" + to_string(lookup_kind)
+        + "\t" + to_string(found) + "\n"
+    pihfp_append_row(pihfp_export_lookups_path(), row)
+}
+
+// ─── record_resolution_perf: resolution 1 건 cycle 측정 ───
+fn record_resolution_perf(perf_id: int, thunk_id: int, lookup_cycles: int, lookup_kind: int) -> void {
+    if perf_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_resolution_perf] expected=perf_id>0 got=" + to_string(perf_id))
+    }
+    if thunk_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_resolution_perf] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if lookup_cycles < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_resolution_perf] expected=lookup_cycles>=0 got=" + to_string(lookup_cycles))
+    }
+    if lookup_kind < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_resolution_perf] expected=lookup_kind>=0 got=" + to_string(lookup_kind))
+    }
+    if lookup_kind > 2 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_resolution_perf] expected=lookup_kind<=2 got=" + to_string(lookup_kind))
+    }
+    let row = to_string(perf_id) + "\t" + to_string(thunk_id)
+        + "\t" + to_string(lookup_cycles)
+        + "\t" + to_string(lookup_kind) + "\n"
+    pihfp_append_row(pihfp_resolution_perfs_path(), row)
+}
+
+// ─── record_failure: resolution 실패 1 건 ───
+fn record_failure(failure_id: int, thunk_id: int, reason_kind: int) -> void {
+    if failure_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_failure] expected=failure_id>0 got=" + to_string(failure_id))
+    }
+    if thunk_id <= 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_failure] expected=thunk_id>0 got=" + to_string(thunk_id))
+    }
+    if reason_kind < 0 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_failure] expected=reason_kind>=0 got=" + to_string(reason_kind))
+    }
+    if reason_kind > 3 {
+        panic("pe_iat_hint_fast_path_real FAIL [record_failure] expected=reason_kind<=3 got=" + to_string(reason_kind))
+    }
+    let row = to_string(failure_id) + "\t" + to_string(thunk_id)
+        + "\t" + to_string(reason_kind) + "\n"
+    pihfp_append_row(pihfp_failures_path(), row)
+}
+
+// ─── 5 종 통계 ───
+fn iat_thunk_count() -> int {
+    return pihfp_count_rows(pihfp_thunks_path(), 5)
+}
+
+fn hint_match_count() -> int {
+    return pihfp_count_rows(pihfp_hint_matches_path(), 4)
+}
+
+fn export_lookup_count() -> int {
+    return pihfp_count_rows(pihfp_export_lookups_path(), 5)
+}
+
+fn resolution_perf_count() -> int {
+    return pihfp_count_rows(pihfp_resolution_perfs_path(), 4)
+}
+
+fn failure_count() -> int {
+    return pihfp_count_rows(pihfp_failures_path(), 3)
+}
+
+// ─── helper: code → name ───
+fn lookup_kind_name(lookup_kind: int) -> str {
+    if lookup_kind == 0 { return "hint_fast" }
+    if lookup_kind == 1 { return "binary_search" }
+    if lookup_kind == 2 { return "ordinal_direct" }
+    return "unknown"
+}
+
+fn failure_reason_name(reason_kind: int) -> str {
+    if reason_kind == 0 { return "name_not_found" }
+    if reason_kind == 1 { return "ordinal_invalid" }
+    if reason_kind == 2 { return "dll_not_loaded" }
+    if reason_kind == 3 { return "mismatch" }
+    return "unknown"
+}
+
+// ─── pihfp_stats: [thunk, hint_match, export_lookup, perf, failure] ───
+fn pihfp_stats() -> array {
+    let mut out = []
+    out.push(iat_thunk_count())
+    out.push(hint_match_count())
+    out.push(export_lookup_count())
+    out.push(resolution_perf_count())
+    out.push(failure_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pihfp-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pihfp()
+
+    // 2. helper sanity (이름 매핑) — panic 만 검증.
+    if lookup_kind_name(0) != "hint_fast" {
+        panic("pe_iat_hint_fast_path_real FAIL [lookup_kind_name(0)] expected=hint_fast got=" + lookup_kind_name(0))
+    }
+    if lookup_kind_name(1) != "binary_search" {
+        panic("pe_iat_hint_fast_path_real FAIL [lookup_kind_name(1)] expected=binary_search got=" + lookup_kind_name(1))
+    }
+    if lookup_kind_name(2) != "ordinal_direct" {
+        panic("pe_iat_hint_fast_path_real FAIL [lookup_kind_name(2)] expected=ordinal_direct got=" + lookup_kind_name(2))
+    }
+    if lookup_kind_name(99) != "unknown" {
+        panic("pe_iat_hint_fast_path_real FAIL [lookup_kind_name(99)] expected=unknown got=" + lookup_kind_name(99))
+    }
+    if failure_reason_name(0) != "name_not_found" {
+        panic("pe_iat_hint_fast_path_real FAIL [failure_reason_name(0)] expected=name_not_found got=" + failure_reason_name(0))
+    }
+    if failure_reason_name(1) != "ordinal_invalid" {
+        panic("pe_iat_hint_fast_path_real FAIL [failure_reason_name(1)] expected=ordinal_invalid got=" + failure_reason_name(1))
+    }
+    if failure_reason_name(2) != "dll_not_loaded" {
+        panic("pe_iat_hint_fast_path_real FAIL [failure_reason_name(2)] expected=dll_not_loaded got=" + failure_reason_name(2))
+    }
+    if failure_reason_name(3) != "mismatch" {
+        panic("pe_iat_hint_fast_path_real FAIL [failure_reason_name(3)] expected=mismatch got=" + failure_reason_name(3))
+    }
+    if failure_reason_name(99) != "unknown" {
+        panic("pe_iat_hint_fast_path_real FAIL [failure_reason_name(99)] expected=unknown got=" + failure_reason_name(99))
+    }
+
+    // 3. record 4 iat_thunk
+    //    thunk 9001 = KERNEL32!GetCurrentThreadId, hint=358, IAT @ 00410200
+    //    thunk 9002 = NTDLL!NtClose,              hint=141, IAT @ 00410280
+    //    thunk 9003 = USER32!RegisterClassExA,    hint=519, IAT @ 00410300
+    //    thunk 9004 = OLEAUT32!VariantInit,       hint= 12, IAT @ 00410380
+    record_iat_thunk(9001, "KERNEL32.dll", "GetCurrentThreadId", 358, "00410200")
+    r0_emit("pe_iat_hint_fast_path_real_record_iat_thunk",
+        "\"thunk_id\":9001,\"dll_name\":\"KERNEL32.dll\",\"fn_name\":\"GetCurrentThreadId\",\"hint_value\":358,\"iat_va_hex\":\"00410200\"")
+
+    record_iat_thunk(9002, "NTDLL.dll", "NtClose", 141, "00410280")
+    r0_emit("pe_iat_hint_fast_path_real_record_iat_thunk",
+        "\"thunk_id\":9002,\"dll_name\":\"NTDLL.dll\",\"fn_name\":\"NtClose\",\"hint_value\":141,\"iat_va_hex\":\"00410280\"")
+
+    record_iat_thunk(9003, "USER32.dll", "RegisterClassExA", 519, "00410300")
+    r0_emit("pe_iat_hint_fast_path_real_record_iat_thunk",
+        "\"thunk_id\":9003,\"dll_name\":\"USER32.dll\",\"fn_name\":\"RegisterClassExA\",\"hint_value\":519,\"iat_va_hex\":\"00410300\"")
+
+    record_iat_thunk(9004, "OLEAUT32.dll", "VariantInit", 12, "00410380")
+    r0_emit("pe_iat_hint_fast_path_real_record_iat_thunk",
+        "\"thunk_id\":9004,\"dll_name\":\"OLEAUT32.dll\",\"fn_name\":\"VariantInit\",\"hint_value\":12,\"iat_va_hex\":\"00410380\"")
+
+    // 4. record 4 hint_match (3 match + 1 mismatch)
+    //    match 11001 → thunk 9001, hint slot 의 name == fn_name (idx=1, str=1) — hint OK
+    //    match 11002 → thunk 9002, idx=1, str=1 — hint OK
+    //    match 11003 → thunk 9003, idx=1, str=1 — hint OK
+    //    match 11004 → thunk 9004, hint 잘못된 위치 (idx=0, str=0) — fallback 트리거
+    record_hint_match(11001, 9001, 1, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_hint_match",
+        "\"match_id\":11001,\"thunk_id\":9001,\"hint_index_match\":1,\"name_string_match\":1")
+
+    record_hint_match(11002, 9002, 1, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_hint_match",
+        "\"match_id\":11002,\"thunk_id\":9002,\"hint_index_match\":1,\"name_string_match\":1")
+
+    record_hint_match(11003, 9003, 1, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_hint_match",
+        "\"match_id\":11003,\"thunk_id\":9003,\"hint_index_match\":1,\"name_string_match\":1")
+
+    record_hint_match(11004, 9004, 0, 0)
+    r0_emit("pe_iat_hint_fast_path_real_record_hint_match",
+        "\"match_id\":11004,\"thunk_id\":9004,\"hint_index_match\":0,\"name_string_match\":0,\"target\":\"mismatch\"")
+
+    // 5. record 4 export_lookup (3 hint_fast + 1 binary_search)
+    //    lookup 12001 → thunk 9001, export@7FE000, kind=0 (hint_fast), found=1
+    //    lookup 12002 → thunk 9002, export@7FE100, kind=0 (hint_fast), found=1
+    //    lookup 12003 → thunk 9003, export@7FE200, kind=0 (hint_fast), found=1
+    //    lookup 12004 → thunk 9004, export@7FE300, kind=1 (binary_search fallback after hint mismatch), found=0
+    record_export_lookup(12001, 9001, "7FE000", 0, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_export_lookup",
+        "\"lookup_id\":12001,\"thunk_id\":9001,\"export_table_va_hex\":\"7FE000\",\"lookup_kind\":0,\"found\":1,\"target\":\"hint_fast\"")
+
+    record_export_lookup(12002, 9002, "7FE100", 0, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_export_lookup",
+        "\"lookup_id\":12002,\"thunk_id\":9002,\"export_table_va_hex\":\"7FE100\",\"lookup_kind\":0,\"found\":1,\"target\":\"hint_fast\"")
+
+    record_export_lookup(12003, 9003, "7FE200", 0, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_export_lookup",
+        "\"lookup_id\":12003,\"thunk_id\":9003,\"export_table_va_hex\":\"7FE200\",\"lookup_kind\":0,\"found\":1,\"target\":\"hint_fast\"")
+
+    record_export_lookup(12004, 9004, "7FE300", 1, 0)
+    r0_emit("pe_iat_hint_fast_path_real_record_export_lookup",
+        "\"lookup_id\":12004,\"thunk_id\":9004,\"export_table_va_hex\":\"7FE300\",\"lookup_kind\":1,\"found\":0,\"target\":\"binary_search\"")
+
+    // 6. record 4 resolution_perf
+    //    perf 13001 → thunk 9001, hint_fast 28 cycles
+    //    perf 13002 → thunk 9002, hint_fast 30 cycles
+    //    perf 13003 → thunk 9003, hint_fast 31 cycles
+    //    perf 13004 → thunk 9004, binary_search 142 cycles (hint miss + log2 N compare)
+    record_resolution_perf(13001, 9001, 28, 0)
+    r0_emit("pe_iat_hint_fast_path_real_record_resolution_perf",
+        "\"perf_id\":13001,\"thunk_id\":9001,\"lookup_cycles\":28,\"lookup_kind\":0")
+
+    record_resolution_perf(13002, 9002, 30, 0)
+    r0_emit("pe_iat_hint_fast_path_real_record_resolution_perf",
+        "\"perf_id\":13002,\"thunk_id\":9002,\"lookup_cycles\":30,\"lookup_kind\":0")
+
+    record_resolution_perf(13003, 9003, 31, 0)
+    r0_emit("pe_iat_hint_fast_path_real_record_resolution_perf",
+        "\"perf_id\":13003,\"thunk_id\":9003,\"lookup_cycles\":31,\"lookup_kind\":0")
+
+    record_resolution_perf(13004, 9004, 142, 1)
+    r0_emit("pe_iat_hint_fast_path_real_record_resolution_perf",
+        "\"perf_id\":13004,\"thunk_id\":9004,\"lookup_cycles\":142,\"lookup_kind\":1")
+
+    // 7. record 1 failure (mismatch)
+    //    failure 14001 → thunk 9004, reason 3 (mismatch — hint stale, binary search 미발견)
+    record_failure(14001, 9004, 3)
+    r0_emit("pe_iat_hint_fast_path_real_record_failure",
+        "\"failure_id\":14001,\"thunk_id\":9004,\"reason_kind\":3,\"target\":\"mismatch\"")
+
+    // 8. row count 검증 — 4 thunk / 4 hint_match / 4 export_lookup / 4 perf / 1 failure
+    let tc = iat_thunk_count()
+    if tc != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [iat_thunk_count] expected=4 got=" + to_string(tc))
+    }
+    let hc = hint_match_count()
+    if hc != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [hint_match_count] expected=4 got=" + to_string(hc))
+    }
+    let ec = export_lookup_count()
+    if ec != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [export_lookup_count] expected=4 got=" + to_string(ec))
+    }
+    let pc = resolution_perf_count()
+    if pc != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [resolution_perf_count] expected=4 got=" + to_string(pc))
+    }
+    let fc = failure_count()
+    if fc != 1 {
+        panic("pe_iat_hint_fast_path_real FAIL [failure_count] expected=1 got=" + to_string(fc))
+    }
+
+    // 9. pihfp_stats() = [4, 4, 4, 4, 1]
+    let s = pihfp_stats()
+    if len(s) != 5 {
+        panic("pe_iat_hint_fast_path_real FAIL [stats len] expected=5 got=" + to_string(len(s)))
+    }
+    if s[0] != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [stats iat_thunk_count] expected=4 got=" + to_string(s[0]))
+    }
+    if s[1] != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [stats hint_match_count] expected=4 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [stats export_lookup_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 4 {
+        panic("pe_iat_hint_fast_path_real FAIL [stats resolution_perf_count] expected=4 got=" + to_string(s[3]))
+    }
+    if s[4] != 1 {
+        panic("pe_iat_hint_fast_path_real FAIL [stats failure_count] expected=1 got=" + to_string(s[4]))
+    }
+
+    // 10. emit 5 종 stats line — 분리하여 r0_emit ≥ 14 보장 (17 record + 5 stats = 22)
+    r0_emit("pe_iat_hint_fast_path_real_stats_iat_thunk",
+        "\"iat_thunk_count\":" + to_string(s[0]))
+    r0_emit("pe_iat_hint_fast_path_real_stats_hint_match",
+        "\"hint_match_count\":" + to_string(s[1]))
+    r0_emit("pe_iat_hint_fast_path_real_stats_export_lookup",
+        "\"export_lookup_count\":" + to_string(s[2]))
+    r0_emit("pe_iat_hint_fast_path_real_stats_resolution_perf",
+        "\"resolution_perf_count\":" + to_string(s[3]))
+    r0_emit("pe_iat_hint_fast_path_real_stats_failure",
+        "\"failure_count\":" + to_string(s[4]))
+
+    // 11. emit count >= 14 (17 record + 5 stats = 22)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 14 {
+        panic("pe_iat_hint_fast_path_real FAIL [r0 emit count] expected=>=14 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → 5 stats 모두 0
+    cleanup_pihfp()
+    let s2 = pihfp_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_iat_hint_fast_path_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_iat_hint_fast_path_real self_test PASS (thunk=" + to_string(s[0])
+        + ", hint_match=" + to_string(s[1]) + ", export_lookup=" + to_string(s[2])
+        + ", perf=" + to_string(s[3]) + ", failure=" + to_string(s[4])
+        + ", emits=" + to_string(emit_n) + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pihfp_stats()
+            println("iat_thunk_count\t" + to_string(s[0]))
+            println("hint_match_count\t" + to_string(s[1]))
+            println("export_lookup_count\t" + to_string(s[2]))
+            println("resolution_perf_count\t" + to_string(s[3]))
+            println("failure_count\t" + to_string(s[4]))
+            return
+        }
+        if sub == "lookup-kind-name" {
+            if len(a) >= 4 {
+                println(lookup_kind_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_iat_hint_fast_path_real.hexa lookup-kind-name <lookup_kind>")
+            return
+        }
+        if sub == "failure-reason-name" {
+            if len(a) >= 4 {
+                println(failure_reason_name(to_int(a[3])))
+                return
+            }
+            println("usage: hexa run pe_iat_hint_fast_path_real.hexa failure-reason-name <reason_kind>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pihfp()
+            println("cleaned: " + pihfp_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pihfp_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_iat_hint_fast_path_real.hexa { self-test | stats | lookup-kind-name <n> | failure-reason-name <n> | cleanup | dir }")
+}

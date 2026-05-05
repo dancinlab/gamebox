@@ -1,0 +1,440 @@
+// lib/loader/pe_native_mprotect_real.hexa — stage7 helper.mm IPC frame for real mprotect(2)
+//
+// Win32 VirtualProtect → POSIX mprotect(2) 매핑. helper.mm 이 실제 mprotect()
+// syscall 을 수행하고, 본 module 은 protect 전환 history 를 TSV 로 추적한다.
+//
+// helper.mm IPC frame:
+//   request:  {kind: "mprotect", addr: <uintptr>, length: <size_t>, prot: <int>}
+//   response: {success: <bool>, errno: <int>}
+// Apple 제약:
+//   - PROT_WRITE|PROT_EXEC 동시 X — runtime 거부
+//   - JIT region 의 RW↔RX 토글: pthread_jit_write_protect_np(int enabled) 별도 path
+// own1 자체 구현
+//
+// own 1 enforcement: Wine / CrossOver / community 코드 0 줄.
+//   본 module 은 mprotect tracker — 실제 mprotect() 는 helper.mm 위임 (stage7).
+// own 2 mandate: r0_emit ≥ 6 + self_test() + main() dispatch + headless safe + panic 형식.
+//
+// prot bit code (POSIX):
+//   PROT_NONE = 0
+//   PROT_READ = 1
+//   PROT_WRITE = 2
+//   PROT_EXEC = 4
+//
+// persist schema (TSV — protects.tsv):
+//   protect_id<int> \t new_prot<int> \t old_prot<int> \t length_kb<int>
+
+use "../perf/r0_common"
+
+// ─── persist directory + schema paths ───
+fn pnpr_dir() -> str {
+    return GAMEBOX_HOME + "/persist/pe_native_mprotect_real"
+}
+
+fn pnpr_protects_path() -> str {
+    return pnpr_dir() + "/protects.tsv"
+}
+
+fn pnpr_ensure_dir() -> void {
+    let _ = exec("mkdir -p '" + pnpr_dir() + "'")
+}
+
+fn cleanup_pnpr() -> void {
+    pnpr_ensure_dir()
+    let _ = exec("rm -f '" + pnpr_protects_path() + "'")
+}
+
+// ─── 공통 file IO ───
+fn pnpr_read_table(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" {
+        return ""
+    }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pnpr_append_row(path: str, row: str) -> void {
+    pnpr_ensure_dir()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_protect: protect 전환 1 건 기록 ───
+fn record_protect(protect_id: int, new_prot: int, old_prot: int, length_kb: int) -> void {
+    if protect_id <= 0 {
+        panic("pe_native_mprotect_real FAIL [record_protect] expected=protect_id>0 got=" + to_string(protect_id))
+    }
+    if new_prot < 0 {
+        panic("pe_native_mprotect_real FAIL [record_protect] expected=new_prot>=0 got=" + to_string(new_prot))
+    }
+    if new_prot > 7 {
+        panic("pe_native_mprotect_real FAIL [record_protect] expected=new_prot<=7 got=" + to_string(new_prot))
+    }
+    if old_prot < 0 {
+        panic("pe_native_mprotect_real FAIL [record_protect] expected=old_prot>=0 got=" + to_string(old_prot))
+    }
+    if old_prot > 7 {
+        panic("pe_native_mprotect_real FAIL [record_protect] expected=old_prot<=7 got=" + to_string(old_prot))
+    }
+    if length_kb < 0 {
+        panic("pe_native_mprotect_real FAIL [record_protect] expected=length_kb>=0 got=" + to_string(length_kb))
+    }
+    let row = to_string(protect_id) + "\t" + to_string(new_prot)
+        + "\t" + to_string(old_prot) + "\t" + to_string(length_kb) + "\n"
+    pnpr_append_row(pnpr_protects_path(), row)
+}
+
+// ─── protect_count: total protect 건 수 ───
+fn protect_count() -> int {
+    let t = pnpr_read_table(pnpr_protects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                cnt = cnt + 1
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── total_length_kb: 모든 protect 의 length_kb 합 ───
+fn total_length_kb() -> int {
+    let t = pnpr_read_table(pnpr_protects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut sum = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                sum = sum + to_int(parts[3])
+            }
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// ─── count_by_new_prot: 특정 new_prot bit set 의 건 수 ───
+fn count_by_new_prot(prot: int) -> int {
+    let t = pnpr_read_table(pnpr_protects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) == prot {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── transition_count: new_prot != old_prot 인 건 수 ───
+fn transition_count() -> int {
+    let t = pnpr_read_table(pnpr_protects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[1]) != to_int(parts[2]) {
+                    cnt = cnt + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── executable_grant_count: PROT_EXEC 신규 부여 건 수 ───
+//   (new_prot AND 4) != 0 AND (old_prot AND 4) == 0
+fn executable_grant_count() -> int {
+    let t = pnpr_read_table(pnpr_protects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                let np = to_int(parts[1])
+                let op = to_int(parts[2])
+                let new_has_exec = (np / 4) % 2
+                let old_has_exec = (op / 4) % 2
+                if new_has_exec == 1 {
+                    if old_has_exec == 0 {
+                        cnt = cnt + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ─── protect_length_kb: 특정 protect_id 의 length_kb (없으면 0) ───
+fn protect_length_kb(protect_id: int) -> int {
+    let t = pnpr_read_table(pnpr_protects_path())
+    if t == "" {
+        return 0
+    }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if line != "" {
+            let parts = line.split("\t")
+            if len(parts) >= 4 {
+                if to_int(parts[0]) == protect_id {
+                    return to_int(parts[3])
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── pnpr_stats: [protect_count, total_length_kb, transition_count, executable_grant_count] ───
+fn pnpr_stats() -> array {
+    let mut out = []
+    out.push(protect_count())
+    out.push(total_length_kb())
+    out.push(transition_count())
+    out.push(executable_grant_count())
+    return out
+}
+
+// ─── self_test ───
+fn self_test() -> void {
+    let sid = "pnpr-" + exec("date +%s").trim()
+    r0_session_set(sid)
+
+    // 1. cleanup
+    cleanup_pnpr()
+
+    // 2. record 5 protects: RW→RX transition + RX→R + new mappings
+    //    prot bits: NONE=0, R=1, W=2, X=4
+    //
+    //    p1: new mapping  R+W   (3) ← NONE  (0), 64 KB        — fresh data page
+    //    p2: RW → RX       R+X   (5) ← R+W   (3), 128 KB       — JIT codegen flip
+    //    p3: RX → R        R     (1) ← R+X   (5), 128 KB       — code freeze
+    //    p4: new mapping  R+X   (5) ← NONE  (0), 256 KB       — exec map
+    //    p5: idempotent   R     (1) ← R     (1), 32 KB        — no-op (non-transition)
+    record_protect(220001, 3, 0, 64)
+    r0_emit("pe_native_mprotect_real_record",
+        "\"protect_id\":220001,\"new_prot\":3,\"old_prot\":0,\"length_kb\":64,\"target\":\"data_page\"")
+
+    record_protect(220002, 5, 3, 128)
+    r0_emit("pe_native_mprotect_real_record",
+        "\"protect_id\":220002,\"new_prot\":5,\"old_prot\":3,\"length_kb\":128,\"target\":\"jit_flip\"")
+
+    record_protect(220003, 1, 5, 128)
+    r0_emit("pe_native_mprotect_real_record",
+        "\"protect_id\":220003,\"new_prot\":1,\"old_prot\":5,\"length_kb\":128,\"target\":\"code_freeze\"")
+
+    record_protect(220004, 5, 0, 256)
+    r0_emit("pe_native_mprotect_real_record",
+        "\"protect_id\":220004,\"new_prot\":5,\"old_prot\":0,\"length_kb\":256,\"target\":\"exec_map\"")
+
+    record_protect(220005, 1, 1, 32)
+    r0_emit("pe_native_mprotect_real_record",
+        "\"protect_id\":220005,\"new_prot\":1,\"old_prot\":1,\"length_kb\":32,\"target\":\"noop\"")
+
+    // 3. protect_count = 5
+    let c = protect_count()
+    if c != 5 {
+        panic("pe_native_mprotect_real FAIL [protect_count] expected=5 got=" + to_string(c))
+    }
+
+    // 4. total_length_kb = 64+128+128+256+32 = 608
+    let tl = total_length_kb()
+    if tl != 608 {
+        panic("pe_native_mprotect_real FAIL [total_length_kb] expected=608 got=" + to_string(tl))
+    }
+
+    // 5. count_by_new_prot sanity
+    //    new_prot=1 → p3, p5 (2)
+    //    new_prot=3 → p1 (1)
+    //    new_prot=5 → p2, p4 (2)
+    //    new_prot=7 → 0
+    let cnp1 = count_by_new_prot(1)
+    if cnp1 != 2 {
+        panic("pe_native_mprotect_real FAIL [count_by_new_prot(1)] expected=2 got=" + to_string(cnp1))
+    }
+    let cnp3 = count_by_new_prot(3)
+    if cnp3 != 1 {
+        panic("pe_native_mprotect_real FAIL [count_by_new_prot(3)] expected=1 got=" + to_string(cnp3))
+    }
+    let cnp5 = count_by_new_prot(5)
+    if cnp5 != 2 {
+        panic("pe_native_mprotect_real FAIL [count_by_new_prot(5)] expected=2 got=" + to_string(cnp5))
+    }
+    let cnp7 = count_by_new_prot(7)
+    if cnp7 != 0 {
+        panic("pe_native_mprotect_real FAIL [count_by_new_prot(7)] expected=0 got=" + to_string(cnp7))
+    }
+
+    // 6. transition_count = 4 (p1, p2, p3, p4 — p5 is no-op)
+    let tc = transition_count()
+    if tc != 4 {
+        panic("pe_native_mprotect_real FAIL [transition_count] expected=4 got=" + to_string(tc))
+    }
+
+    // 7. executable_grant_count = 2 (p2: 3→5, p4: 0→5)
+    let eg = executable_grant_count()
+    if eg != 2 {
+        panic("pe_native_mprotect_real FAIL [executable_grant_count] expected=2 got=" + to_string(eg))
+    }
+
+    // 8. protect_length_kb sanity
+    let lp2 = protect_length_kb(220002)
+    if lp2 != 128 {
+        panic("pe_native_mprotect_real FAIL [protect_length_kb(220002)] expected=128 got=" + to_string(lp2))
+    }
+    let lp4 = protect_length_kb(220004)
+    if lp4 != 256 {
+        panic("pe_native_mprotect_real FAIL [protect_length_kb(220004)] expected=256 got=" + to_string(lp4))
+    }
+    let lp_miss = protect_length_kb(9999)
+    if lp_miss != 0 {
+        panic("pe_native_mprotect_real FAIL [protect_length_kb(9999)] expected=0 got=" + to_string(lp_miss))
+    }
+
+    // 9. pnpr_stats() = [5, 608, 4, 2]
+    let s = pnpr_stats()
+    if len(s) != 4 {
+        panic("pe_native_mprotect_real FAIL [stats len] expected=4 got=" + to_string(len(s)))
+    }
+    if s[0] != 5 {
+        panic("pe_native_mprotect_real FAIL [stats protect_count] expected=5 got=" + to_string(s[0]))
+    }
+    if s[1] != 608 {
+        panic("pe_native_mprotect_real FAIL [stats total_length_kb] expected=608 got=" + to_string(s[1]))
+    }
+    if s[2] != 4 {
+        panic("pe_native_mprotect_real FAIL [stats transition_count] expected=4 got=" + to_string(s[2]))
+    }
+    if s[3] != 2 {
+        panic("pe_native_mprotect_real FAIL [stats executable_grant_count] expected=2 got=" + to_string(s[3]))
+    }
+
+    // 10. emit stats
+    r0_emit("pe_native_mprotect_real_stats",
+        "\"protect_count\":" + to_string(s[0])
+        + ",\"total_length_kb\":" + to_string(s[1])
+        + ",\"transition_count\":" + to_string(s[2])
+        + ",\"executable_grant_count\":" + to_string(s[3]))
+
+    // 11. emit count >= 6 (5 records + 1 stats = 6)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 6 {
+        panic("pe_native_mprotect_real FAIL [r0 emit count] expected=>=6 got=" + to_string(emit_n))
+    }
+
+    // 12. cleanup → stats 모두 0
+    cleanup_pnpr()
+    let s2 = pnpr_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 {
+            panic("pe_native_mprotect_real FAIL [cleanup stats[" + to_string(i)
+                + "]] expected=0 got=" + to_string(s2[i]))
+        }
+        i = i + 1
+    }
+
+    println("  ✅ pe_native_mprotect_real self_test PASS (protects=" + to_string(s[0])
+        + ", length_kb=" + to_string(s[1]) + ", transitions=" + to_string(s[2])
+        + ", exec_grants=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" {
+            self_test()
+            return
+        }
+        if sub == "stats" {
+            let s = pnpr_stats()
+            println("protect_count\t" + to_string(s[0]))
+            println("total_length_kb\t" + to_string(s[1]))
+            println("transition_count\t" + to_string(s[2]))
+            println("executable_grant_count\t" + to_string(s[3]))
+            return
+        }
+        if sub == "length" {
+            if len(a) >= 4 {
+                let pid = to_int(a[3])
+                println("protect_length_kb\t" + to_string(protect_length_kb(pid)))
+                return
+            }
+            println("usage: hexa run pe_native_mprotect_real.hexa length <protect_id>")
+            return
+        }
+        if sub == "count" {
+            if len(a) >= 4 {
+                let prot = to_int(a[3])
+                println("count_by_new_prot\t" + to_string(count_by_new_prot(prot)))
+                return
+            }
+            println("usage: hexa run pe_native_mprotect_real.hexa count <new_prot>")
+            return
+        }
+        if sub == "cleanup" {
+            cleanup_pnpr()
+            println("cleaned: " + pnpr_dir())
+            return
+        }
+        if sub == "dir" {
+            println(pnpr_dir())
+            return
+        }
+    }
+    println("usage: hexa run pe_native_mprotect_real.hexa { self-test | stats | length <protect_id> | count <new_prot> | cleanup | dir }")
+}
