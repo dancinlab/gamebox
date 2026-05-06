@@ -1,0 +1,371 @@
+// pe_battlenet_apple_network_http.hexa — Phase CQ-P1 instrumentation sink
+//
+// CT spec authoring (Track DB): honest instrumentation surface that a real
+// Apple Network framework (Network.framework) HTTP/TLS client would emit
+// into. This module IS the schema-validated sink; it is NOT the actual
+// Apple Network framework binding (G-4 deliverable, separate).
+//
+// 3 TSV tables under persist/pe_battlenet_apple_network_http/:
+//   request.tsv  — request-side events (open / send / complete)
+//   tls.tsv      — TLS handshake-side events (open / handshake_done / close)
+//   response.tsv — response-side events (headers / body chunk / complete)
+// All three linked by exchange_id (one HTTP exchange = N rows across tables).
+//
+// Foreign keys (optional, 0 = unlinked):
+//   link_chunk_id    → pe_battle_net_download_track.chunks.tsv (CDN chunk)
+//   link_oauth_op_id → pe_battle_net_oauth_token.ops.tsv (bearer-attached OAuth op)
+//
+// Honest constraints (per CT spec §3.5):
+//   - NO real token bytes  (only token_size_bytes per oauth_token precedent)
+//   - NO real cipher key material / session keys (only cipher_suite_class enum)
+//   - NO real certificate bytes / private keys (only cert_chain_depth)
+//   - NO real bearer token values (only bearer_attached: 0/1)
+//   - NO real response body bytes (only bytes_received + sha256_hex when applicable)
+//   - NO Apple-private SPI (Network framework public API only)
+//
+// CT-Q1 resolution: cipher_suite_class = string-class enum
+//   ("aead_gcm" / "aead_chacha20" / "cbc_sha" / "other")
+// CT-Q2 resolution: body_sha256_hex length invariant len ∈ {0, 64}
+// CT-Q3 resolution: NO foreign-key validation at record time
+//
+// own1: Apple SDK only (Network.framework public API direction-reference);
+//       Wine wininet 0, OpenSSL/BoringSSL code lift 0, Apple-private SPI 0.
+// own2: r0_emit ≥ 19, panic format honest, validated_manjeom=0 carries.
+
+use "../perf/r0_common"
+
+// ─── persist directory + table paths ───
+fn pbanh_dir() -> str { return GAMEBOX_HOME + "/persist/pe_battlenet_apple_network_http" }
+fn pbanh_request_path() -> str { return pbanh_dir() + "/request.tsv" }
+fn pbanh_tls_path() -> str { return pbanh_dir() + "/tls.tsv" }
+fn pbanh_response_path() -> str { return pbanh_dir() + "/response.tsv" }
+
+fn pbanh_ensure() -> void { let _ = exec("mkdir -p '" + pbanh_dir() + "'") }
+fn cleanup_pbanh() -> void {
+    pbanh_ensure()
+    let _ = exec("rm -f '" + pbanh_request_path() + "' '" + pbanh_tls_path()
+        + "' '" + pbanh_response_path() + "'")
+}
+
+// ─── common file IO ───
+fn pbanh_read(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn pbanh_append(path: str, row: str) -> void {
+    pbanh_ensure()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_request: request-side row ───
+// host_kind: 1=login.battle.net 2=us.api.blizzard.com 3=eu.api.blizzard.com
+//            4=kr.api.blizzard.com 5=bnetcdn 6=akamaihd 7=agent_local 8=other
+// purpose_kind: 1=oauth_authorize 2=oauth_token 3=oauth_revoke 4=api_call
+//               5=manifest_fetch 6=chunk_download 7=patch_apply 8=agent_rest 9=other
+fn record_request(exchange_id: int, request_open_id: int,
+                  host_kind: int, purpose_kind: int,
+                  method: str, path: str,
+                  header_count: int, body_size: int,
+                  bytes_sent_total: int) -> void {
+    if exchange_id <= 0 { panic("pe_battlenet_apple_network_http FAIL [request] exchange_id>0") }
+    if request_open_id <= 0 { panic("pe_battlenet_apple_network_http FAIL [request] request_open_id>0") }
+    if host_kind < 1 || host_kind > 8 { panic("pe_battlenet_apple_network_http FAIL [request] host_kind 1-8") }
+    if purpose_kind < 1 || purpose_kind > 9 { panic("pe_battlenet_apple_network_http FAIL [request] purpose_kind 1-9") }
+    if method == "" || path == "" { panic("pe_battlenet_apple_network_http FAIL [request] method/path non-empty") }
+    if header_count < 0 { panic("pe_battlenet_apple_network_http FAIL [request] header_count>=0") }
+    if body_size < 0 { panic("pe_battlenet_apple_network_http FAIL [request] body_size>=0") }
+    if bytes_sent_total < 0 { panic("pe_battlenet_apple_network_http FAIL [request] bytes_sent_total>=0") }
+    let row = to_string(exchange_id) + "\t" + to_string(request_open_id)
+        + "\t" + to_string(host_kind) + "\t" + to_string(purpose_kind)
+        + "\t" + method + "\t" + path
+        + "\t" + to_string(header_count) + "\t" + to_string(body_size)
+        + "\t" + to_string(bytes_sent_total) + "\n"
+    pbanh_append(pbanh_request_path(), row)
+}
+
+// ─── record_tls: TLS-handshake row ───
+// tls_version: "1.2" / "1.3" (string)
+// cipher_suite_class: "aead_gcm" / "aead_chacha20" / "cbc_sha" / "other"
+// alpn_selected: "h2" / "http/1.1" / "" (empty when ALPN not negotiated)
+// close_kind: "graceful" / "abort" / "timeout"
+fn record_tls(exchange_id: int, tls_id: int,
+              target_host: str, sni_host: str,
+              tls_version: str, cipher_suite_class: str,
+              cert_chain_depth: int, alpn_selected: str,
+              close_kind: str) -> void {
+    if exchange_id <= 0 { panic("pe_battlenet_apple_network_http FAIL [tls] exchange_id>0") }
+    if tls_id <= 0 { panic("pe_battlenet_apple_network_http FAIL [tls] tls_id>0") }
+    if target_host == "" || sni_host == "" { panic("pe_battlenet_apple_network_http FAIL [tls] host/sni non-empty") }
+    if tls_version != "1.2" && tls_version != "1.3" { panic("pe_battlenet_apple_network_http FAIL [tls] version 1.2/1.3") }
+    if cipher_suite_class != "aead_gcm" && cipher_suite_class != "aead_chacha20"
+        && cipher_suite_class != "cbc_sha" && cipher_suite_class != "other" {
+        panic("pe_battlenet_apple_network_http FAIL [tls] cipher_suite_class enum")
+    }
+    if cert_chain_depth < 0 { panic("pe_battlenet_apple_network_http FAIL [tls] cert_chain_depth>=0") }
+    if close_kind != "graceful" && close_kind != "abort" && close_kind != "timeout" {
+        panic("pe_battlenet_apple_network_http FAIL [tls] close_kind enum")
+    }
+    let row = to_string(exchange_id) + "\t" + to_string(tls_id)
+        + "\t" + target_host + "\t" + sni_host
+        + "\t" + tls_version + "\t" + cipher_suite_class
+        + "\t" + to_string(cert_chain_depth) + "\t" + alpn_selected
+        + "\t" + close_kind + "\n"
+    pbanh_append(pbanh_tls_path(), row)
+}
+
+// ─── record_response: response-side row ───
+// transfer_encoding: "chunked" / "identity"
+// cache_kind: "cdn-hit" / "cdn-miss" / "origin" / "local"
+// body_sha256_hex: 64-char lowercase hex when verified, empty when unverified (CT-Q2)
+// link_chunk_id: foreign key to download_track.chunks.tsv (0 = unlinked)
+// link_oauth_op_id: foreign key to oauth_token.ops.tsv (0 = unlinked)
+// bearer_attached: 0 = no bearer, 1 = bearer attached
+fn record_response(exchange_id: int, response_id: int,
+                   status_code: int, content_length: int,
+                   content_type: str, transfer_encoding: str,
+                   cache_kind: str, bytes_received_total: int,
+                   body_sha256_hex: str,
+                   link_chunk_id: int, link_oauth_op_id: int,
+                   bearer_attached: int) -> void {
+    if exchange_id <= 0 { panic("pe_battlenet_apple_network_http FAIL [response] exchange_id>0") }
+    if response_id <= 0 { panic("pe_battlenet_apple_network_http FAIL [response] response_id>0") }
+    if status_code < 0 || status_code > 599 { panic("pe_battlenet_apple_network_http FAIL [response] status 0-599") }
+    if content_length < 0 { panic("pe_battlenet_apple_network_http FAIL [response] content_length>=0") }
+    if content_type == "" { panic("pe_battlenet_apple_network_http FAIL [response] content_type non-empty") }
+    if transfer_encoding != "chunked" && transfer_encoding != "identity" {
+        panic("pe_battlenet_apple_network_http FAIL [response] transfer_encoding enum")
+    }
+    if cache_kind != "cdn-hit" && cache_kind != "cdn-miss" && cache_kind != "origin" && cache_kind != "local" {
+        panic("pe_battlenet_apple_network_http FAIL [response] cache_kind enum")
+    }
+    if bytes_received_total < 0 { panic("pe_battlenet_apple_network_http FAIL [response] bytes_received_total>=0") }
+    let sha_n = len(body_sha256_hex)
+    if sha_n != 0 && sha_n != 64 { panic("pe_battlenet_apple_network_http FAIL [response] sha256 len 0|64") }
+    if link_chunk_id < 0 { panic("pe_battlenet_apple_network_http FAIL [response] link_chunk_id>=0") }
+    if link_oauth_op_id < 0 { panic("pe_battlenet_apple_network_http FAIL [response] link_oauth_op_id>=0") }
+    if bearer_attached < 0 || bearer_attached > 1 { panic("pe_battlenet_apple_network_http FAIL [response] bearer_attached 0/1") }
+    let row = to_string(exchange_id) + "\t" + to_string(response_id)
+        + "\t" + to_string(status_code) + "\t" + to_string(content_length)
+        + "\t" + content_type + "\t" + transfer_encoding
+        + "\t" + cache_kind + "\t" + to_string(bytes_received_total)
+        + "\t" + body_sha256_hex
+        + "\t" + to_string(link_chunk_id) + "\t" + to_string(link_oauth_op_id)
+        + "\t" + to_string(bearer_attached) + "\n"
+    pbanh_append(pbanh_response_path(), row)
+}
+
+// ─── counters ───
+fn count_rows(path: str, min_cols: int) -> int {
+    let t = pbanh_read(path)
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= min_cols { cnt = cnt + 1 }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn request_count() -> int { return count_rows(pbanh_request_path(), 9) }
+fn tls_count() -> int { return count_rows(pbanh_tls_path(), 9) }
+fn response_count() -> int { return count_rows(pbanh_response_path(), 12) }
+
+// ─── distinct exchange_id count across all 3 tables ───
+fn count_distinct_exchanges() -> int {
+    let mut seen = []
+    let paths = [pbanh_request_path(), pbanh_tls_path(), pbanh_response_path()]
+    let mut p_idx = 0
+    while p_idx < len(paths) {
+        let t = pbanh_read(paths[p_idx])
+        if t != "" {
+            let lines = t.split("\n")
+            let n = len(lines)
+            let i = 0
+            while i < n {
+                if lines[i] != "" {
+                    let parts = lines[i].split("\t")
+                    if len(parts) >= 1 {
+                        let xid = to_int(parts[0])
+                        let mut found = 0
+                        let j = 0
+                        while j < len(seen) {
+                            if seen[j] == xid { found = 1; break }
+                            j = j + 1
+                        }
+                        if found == 0 { seen.push(xid) }
+                    }
+                }
+                i = i + 1
+            }
+        }
+        p_idx = p_idx + 1
+    }
+    return len(seen)
+}
+
+// ─── enum name helpers ───
+fn host_kind_name(k: int) -> str {
+    if k == 1 { return "login.battle.net" }
+    if k == 2 { return "us.api.blizzard.com" }
+    if k == 3 { return "eu.api.blizzard.com" }
+    if k == 4 { return "kr.api.blizzard.com" }
+    if k == 5 { return "bnetcdn" }
+    if k == 6 { return "akamaihd" }
+    if k == 7 { return "agent_local" }
+    if k == 8 { return "other" }
+    return ""
+}
+
+fn purpose_kind_name(k: int) -> str {
+    if k == 1 { return "oauth_authorize" }
+    if k == 2 { return "oauth_token" }
+    if k == 3 { return "oauth_revoke" }
+    if k == 4 { return "api_call" }
+    if k == 5 { return "manifest_fetch" }
+    if k == 6 { return "chunk_download" }
+    if k == 7 { return "patch_apply" }
+    if k == 8 { return "agent_rest" }
+    if k == 9 { return "other" }
+    return ""
+}
+
+fn pbanh_stats() -> array {
+    let mut out = []
+    out.push(request_count())
+    out.push(tls_count())
+    out.push(response_count())
+    out.push(count_distinct_exchanges())
+    return out
+}
+
+// ─── self_test (CT spec §4.3 paper-mode targets) ───
+fn self_test() -> void {
+    let sid = "pbanh-" + exec("date +%s").trim()
+    r0_session_set(sid)
+    cleanup_pbanh()
+
+    // 6 exchanges × 3 rows each = 18 records, mirrors CT §4.3 alternative
+    // (6 exchanges of 3 rows). Each exchange has request + tls + response.
+    //
+    // exchange 1 — login.battle.net OAuth authorize (host=1, purpose=1, TLS 1.3, GET 200)
+    record_request(1, 1, 1, 1, "GET", "/oauth/authorize", 8, 0, 256)
+    r0_emit("pbanh_request", "\"xid\":1,\"host\":1,\"purpose\":1")
+    record_tls(1, 1, "login.battle.net", "login.battle.net", "1.3", "aead_gcm", 3, "h2", "graceful")
+    r0_emit("pbanh_tls", "\"xid\":1,\"version\":\"1.3\"")
+    record_response(1, 1, 200, 1024, "text/html", "identity", "origin", 1024, "", 0, 0, 0)
+    r0_emit("pbanh_response", "\"xid\":1,\"status\":200")
+
+    // exchange 2 — login.battle.net OAuth token exchange (host=1, purpose=2, TLS 1.3, POST 200, bearer NOT yet attached)
+    record_request(2, 2, 1, 2, "POST", "/oauth/token", 6, 128, 256)
+    r0_emit("pbanh_request", "\"xid\":2,\"host\":1,\"purpose\":2")
+    record_tls(2, 2, "login.battle.net", "login.battle.net", "1.3", "aead_chacha20", 3, "h2", "graceful")
+    r0_emit("pbanh_tls", "\"xid\":2,\"version\":\"1.3\"")
+    // link_oauth_op_id=2 (oauth_token's token_exchange op)
+    record_response(2, 2, 200, 512, "application/json", "identity", "origin", 512, "", 0, 2, 0)
+    r0_emit("pbanh_response", "\"xid\":2,\"status\":200,\"oauth_link\":2")
+
+    // exchange 3 — us.api.blizzard.com api_call with bearer (host=2, purpose=4, TLS 1.2 cbc_sha legacy, GET 200, bearer attached)
+    record_request(3, 3, 2, 4, "GET", "/d3/data/character", 7, 0, 384)
+    r0_emit("pbanh_request", "\"xid\":3,\"host\":2,\"purpose\":4")
+    record_tls(3, 3, "us.api.blizzard.com", "us.api.blizzard.com", "1.2", "cbc_sha", 4, "http/1.1", "graceful")
+    r0_emit("pbanh_tls", "\"xid\":3,\"version\":\"1.2\"")
+    // link_oauth_op_id=3 (bearer_attach op), bearer_attached=1
+    record_response(3, 3, 200, 2048, "application/json", "identity", "origin", 2048, "", 0, 3, 1)
+    r0_emit("pbanh_response", "\"xid\":3,\"status\":200,\"bearer\":1")
+
+    // exchange 4 — bnetcdn manifest_fetch (host=5, purpose=5, TLS 1.3, GET 206 partial)
+    record_request(4, 4, 5, 5, "GET", "/cdn/manifest/d2r-build-12345.bin", 5, 0, 192)
+    r0_emit("pbanh_request", "\"xid\":4,\"host\":5,\"purpose\":5")
+    record_tls(4, 4, "level3.blizzard.com", "level3.blizzard.com", "1.3", "aead_gcm", 2, "h2", "graceful")
+    r0_emit("pbanh_tls", "\"xid\":4,\"version\":\"1.3\"")
+    // link_chunk_id=1 (download_track chunks row 1), body_sha256_hex 64-char (verified)
+    record_response(4, 4, 206, 65536, "application/octet-stream", "chunked", "cdn-hit", 65536,
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", 1, 0, 0)
+    r0_emit("pbanh_response", "\"xid\":4,\"status\":206,\"chunk_link\":1,\"sha256\":1")
+
+    // exchange 5 — akamaihd chunk_download cdn-miss (host=6, purpose=6, TLS 1.2 aead_gcm, GET 200)
+    record_request(5, 5, 6, 6, "GET", "/cdn/chunk/d2r-build-12345-c0042.bin", 5, 0, 192)
+    r0_emit("pbanh_request", "\"xid\":5,\"host\":6,\"purpose\":6")
+    record_tls(5, 5, "a248.e.akamai.net", "a248.e.akamai.net", "1.2", "aead_gcm", 4, "http/1.1", "graceful")
+    r0_emit("pbanh_tls", "\"xid\":5,\"version\":\"1.2\"")
+    record_response(5, 5, 200, 1048576, "application/octet-stream", "chunked", "cdn-miss", 1048576,
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", 2, 0, 0)
+    r0_emit("pbanh_response", "\"xid\":5,\"status\":200,\"chunk_link\":2,\"sha256\":1")
+
+    // exchange 6 — kr.api.blizzard.com api_call 404 with bearer (host=4, purpose=4, TLS 1.3, abort close, bearer attached)
+    record_request(6, 6, 4, 4, "GET", "/sc2/profile/12345/missing", 7, 0, 384)
+    r0_emit("pbanh_request", "\"xid\":6,\"host\":4,\"purpose\":4")
+    record_tls(6, 6, "kr.api.blizzard.com", "kr.api.blizzard.com", "1.3", "aead_gcm", 3, "h2", "abort")
+    r0_emit("pbanh_tls", "\"xid\":6,\"version\":\"1.3\",\"close\":\"abort\"")
+    record_response(6, 6, 404, 128, "application/json", "identity", "origin", 128, "", 0, 4, 1)
+    r0_emit("pbanh_response", "\"xid\":6,\"status\":404,\"bearer\":1")
+
+    // counters ≥6 each
+    let rc = request_count()
+    if rc != 6 { panic("pe_battlenet_apple_network_http FAIL [count req] expected=6 got=" + to_string(rc)) }
+    let tc = tls_count()
+    if tc != 6 { panic("pe_battlenet_apple_network_http FAIL [count tls] expected=6 got=" + to_string(tc)) }
+    let resp_c = response_count()
+    if resp_c != 6 { panic("pe_battlenet_apple_network_http FAIL [count resp] expected=6 got=" + to_string(resp_c)) }
+
+    // distinct exchanges = 6
+    let xc = count_distinct_exchanges()
+    if xc != 6 { panic("pe_battlenet_apple_network_http FAIL [distinct xid] expected=6 got=" + to_string(xc)) }
+
+    // enum sanity
+    if host_kind_name(1) != "login.battle.net" { panic("pe_battlenet_apple_network_http FAIL [enum host 1]") }
+    if host_kind_name(5) != "bnetcdn" { panic("pe_battlenet_apple_network_http FAIL [enum host 5]") }
+    if purpose_kind_name(2) != "oauth_token" { panic("pe_battlenet_apple_network_http FAIL [enum purpose 2]") }
+    if purpose_kind_name(6) != "chunk_download" { panic("pe_battlenet_apple_network_http FAIL [enum purpose 6]") }
+
+    // emit stats
+    let s = pbanh_stats()
+    r0_emit("pbanh_stats", "\"req\":" + to_string(s[0]) + ",\"tls\":" + to_string(s[1])
+        + ",\"resp\":" + to_string(s[2]) + ",\"distinct_xid\":" + to_string(s[3]))
+
+    // r0_emit total ≥ 19 (18 per-row + 1 stats)
+    let emit_n = r0_session_count(sid)
+    if emit_n < 19 { panic("pe_battlenet_apple_network_http FAIL [emit] expected>=19 got=" + to_string(emit_n)) }
+
+    cleanup_pbanh()
+    let s2 = pbanh_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 { panic("pe_battlenet_apple_network_http FAIL [cleanup]") }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battlenet_apple_network_http self_test PASS (req=" + to_string(s[0])
+        + ", tls=" + to_string(s[1]) + ", resp=" + to_string(s[2])
+        + ", distinct_xid=" + to_string(s[3]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = pbanh_stats()
+            println("req\t" + to_string(s[0]))
+            println("tls\t" + to_string(s[1]))
+            println("resp\t" + to_string(s[2]))
+            println("distinct_xid\t" + to_string(s[3]))
+            return
+        }
+        if sub == "cleanup" { cleanup_pbanh(); println("cleaned: " + pbanh_dir()); return }
+        if sub == "dir" { println(pbanh_dir()); return }
+    }
+    println("usage: hexa run pe_battlenet_apple_network_http.hexa { self-test | stats | cleanup | dir }")
+}
