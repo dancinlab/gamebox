@@ -1,0 +1,464 @@
+// pe_battlenet_tact_ngdp_casc_track.hexa — Phase CQ-P2 instrumentation sink
+//
+// CW spec authoring (Track DC): TACT/NGDP/CASC parser skeleton — TSV-persisted
+// phase tracker for: BLP/manifest fetch → BLTE chunk parse → MD5 verify →
+// LZMA inflate → install_path write. Public-spec implementation direction
+// only (Apple Compression LZMA + CommonCrypto MD5 + Network.framework HTTPS);
+// NO Wine cab / wininet code lift, NO Apple-private SPI, NO real archive
+// bytes / real content key bytes / real BLP pixel data recorded.
+//
+// 5 TSV tables under persist/pe_battlenet_tact_ngdp_casc_track/:
+//   manifest.tsv — manifest fetch + encoding_table size + root hash kind
+//   blte.tsv     — BLTE chunk header + per-chunk codec + integrity_pass
+//   md5.tsv      — content/encoding key MD5 verify (length-only hex)
+//   lzma.tsv     — LZMA inflate per BLTE chunk
+//   install.tsv  — install_path write per game_kind / stage
+// All five linked by session_id.
+//
+// Foreign keys (intra-module + cross-module, optional 0=unlinked):
+//   blte.tsv.blte_id ← lzma.tsv.blte_id_link
+//   manifest.tsv encoding row ← md5.tsv.key_kind_link_id
+//   pe_battle_net_download_track.chunks.tsv ← install.tsv.link_chunk_id
+//
+// CW-Q1 resolution: encoding_kind enum 6-value
+//   (raw / zlib / lzma / encrypted / passthrough / frame_recursive)
+// CW-Q2 resolution: expected_md5_hex always 32-char, computed_md5_hex in {0, 32}
+// CW-Q3 resolution: target_subpath root-relative only (no platform prefix)
+// CW-Q4 resolution: d4 in game_kind enum for completeness but self_test
+//                   exercises d2r only (D4 retired_intentional per Track P)
+// CW-Q5 resolution: NO foreign-key validation at record time
+//
+// own1: hexa pure / Apple SDK direction-reference only / Wine 0 / SPI 0.
+// own2: r0_emit ≥ 18, panic format honest, validated_manjeom=0 carries.
+
+use "../perf/r0_common"
+
+// ─── persist directory + table paths ───
+fn ptnct_dir() -> str { return GAMEBOX_HOME + "/persist/pe_battlenet_tact_ngdp_casc_track" }
+fn ptnct_manifest_path() -> str { return ptnct_dir() + "/manifest.tsv" }
+fn ptnct_blte_path() -> str { return ptnct_dir() + "/blte.tsv" }
+fn ptnct_md5_path() -> str { return ptnct_dir() + "/md5.tsv" }
+fn ptnct_lzma_path() -> str { return ptnct_dir() + "/lzma.tsv" }
+fn ptnct_install_path() -> str { return ptnct_dir() + "/install.tsv" }
+
+fn ptnct_ensure() -> void { let _ = exec("mkdir -p '" + ptnct_dir() + "'") }
+fn cleanup_ptnct() -> void {
+    ptnct_ensure()
+    let _ = exec("rm -f '" + ptnct_manifest_path() + "' '" + ptnct_blte_path()
+        + "' '" + ptnct_md5_path() + "' '" + ptnct_lzma_path()
+        + "' '" + ptnct_install_path() + "'")
+}
+
+fn ptnct_read(path: str) -> str {
+    let exists = exec("test -f '" + path + "' && echo y || echo n").trim()
+    if exists != "y" { return "" }
+    return exec("cat '" + path + "' 2>/dev/null")
+}
+
+fn ptnct_append(path: str, row: str) -> void {
+    ptnct_ensure()
+    let tmp = path + ".add.tmp"
+    write_file(tmp, row)
+    let _ = exec("cat '" + tmp + "' >> '" + path + "' && rm -f '" + tmp + "'")
+}
+
+// ─── record_manifest: BLP/manifest fetch row ───
+// archive_kind: 1=blp_manifest, 2=encoding_table, 3=root, 4=install, 5=indices, 6=data
+// game_kind:    1=d2r (exercised), 2=d4 (in enum but retired_intentional NOT exercised in self_test)
+// region:       "us" / "eu" / "kr" / "cn" / "sea" (string)
+// root_hash_kind: 1=md5, 2=sha1, 3=other
+fn record_manifest(session_id: int, manifest_id: int,
+                   archive_kind: int, game_kind: int,
+                   region: str, version_id: int,
+                   entry_count: int, encoding_table_size: int,
+                   root_hash_kind: int) -> void {
+    if session_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] session_id>0") }
+    if manifest_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] manifest_id>0") }
+    if archive_kind < 1 || archive_kind > 6 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] archive_kind 1-6") }
+    if game_kind < 1 || game_kind > 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] game_kind 1-2") }
+    if region == "" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] region non-empty") }
+    if version_id < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] version_id>=0") }
+    if entry_count < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] entry_count>=0") }
+    if encoding_table_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] encoding_table_size>=0") }
+    if root_hash_kind < 1 || root_hash_kind > 3 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [manifest] root_hash_kind 1-3") }
+    let row = to_string(session_id) + "\t" + to_string(manifest_id)
+        + "\t" + to_string(archive_kind) + "\t" + to_string(game_kind)
+        + "\t" + region + "\t" + to_string(version_id)
+        + "\t" + to_string(entry_count) + "\t" + to_string(encoding_table_size)
+        + "\t" + to_string(root_hash_kind) + "\n"
+    ptnct_append(ptnct_manifest_path(), row)
+}
+
+// ─── record_blte: BLTE chunk header row ───
+// encoding_kind: 1=raw, 2=zlib, 3=lzma, 4=encrypted, 5=passthrough, 6=frame_recursive
+// integrity_pass: 0=fail, 1=pass
+fn record_blte(session_id: int, blte_id: int,
+               header_size: int, chunk_count_in_block: int,
+               encoding_kind: int, chunk_index: int,
+               encoded_size: int, decoded_size: int,
+               total_decoded_size: int, integrity_pass: int) -> void {
+    if session_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] session_id>0") }
+    if blte_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] blte_id>0") }
+    if header_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] header_size>=0") }
+    if chunk_count_in_block < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] chunk_count>=0") }
+    if encoding_kind < 1 || encoding_kind > 6 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] encoding_kind 1-6") }
+    if chunk_index < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] chunk_index>=0") }
+    if encoded_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] encoded_size>=0") }
+    if decoded_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] decoded_size>=0") }
+    if total_decoded_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] total_decoded_size>=0") }
+    if integrity_pass < 0 || integrity_pass > 1 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [blte] integrity_pass 0/1") }
+    let row = to_string(session_id) + "\t" + to_string(blte_id)
+        + "\t" + to_string(header_size) + "\t" + to_string(chunk_count_in_block)
+        + "\t" + to_string(encoding_kind) + "\t" + to_string(chunk_index)
+        + "\t" + to_string(encoded_size) + "\t" + to_string(decoded_size)
+        + "\t" + to_string(total_decoded_size) + "\t" + to_string(integrity_pass) + "\n"
+    ptnct_append(ptnct_blte_path(), row)
+}
+
+// ─── record_md5: MD5 verify row ───
+// key_kind: 1=ekey (encoding key), 2=ckey (content key)
+// expected_md5_hex: always 32-char lowercase hex
+// computed_md5_hex: 32-char hex when computed, empty when not computed yet
+// match_result: 0=mismatch (or not yet computed), 1=match
+//               (named match_result because hexa-lang upstream reserves `match` keyword)
+// key_kind_link_id: optional intra-module FK to manifest encoding row (0=unlinked)
+fn record_md5(session_id: int, md5_id: int,
+              key_kind: int, expected_md5_hex: str,
+              computed_md5_hex: str, match_result: int,
+              key_kind_link_id: int) -> void {
+    if session_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] session_id>0") }
+    if md5_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] md5_id>0") }
+    if key_kind < 1 || key_kind > 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] key_kind 1-2") }
+    if len(expected_md5_hex) != 32 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] expected_md5_hex len 32") }
+    let cn = len(computed_md5_hex)
+    if cn != 0 && cn != 32 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] computed_md5_hex len 0|32") }
+    if match_result < 0 || match_result > 1 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] match_result 0/1") }
+    if key_kind_link_id < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [md5] key_kind_link_id>=0") }
+    let row = to_string(session_id) + "\t" + to_string(md5_id)
+        + "\t" + to_string(key_kind) + "\t" + expected_md5_hex
+        + "\t" + computed_md5_hex + "\t" + to_string(match_result)
+        + "\t" + to_string(key_kind_link_id) + "\n"
+    ptnct_append(ptnct_md5_path(), row)
+}
+
+// ─── record_lzma: LZMA inflate row ───
+// blte_id_link: foreign key to blte.tsv.blte_id (0=unlinked)
+// inflate_status_code: 0=ok, negative=error (libcompression style)
+fn record_lzma(session_id: int, lzma_id: int,
+               blte_id_link: int, input_size: int,
+               expected_output_size: int, actual_output_size: int,
+               inflate_status_code: int) -> void {
+    if session_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [lzma] session_id>0") }
+    if lzma_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [lzma] lzma_id>0") }
+    if blte_id_link < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [lzma] blte_id_link>=0") }
+    if input_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [lzma] input_size>=0") }
+    if expected_output_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [lzma] expected_output_size>=0") }
+    if actual_output_size < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [lzma] actual_output_size>=0") }
+    let row = to_string(session_id) + "\t" + to_string(lzma_id)
+        + "\t" + to_string(blte_id_link) + "\t" + to_string(input_size)
+        + "\t" + to_string(expected_output_size) + "\t" + to_string(actual_output_size)
+        + "\t" + to_string(inflate_status_code) + "\n"
+    ptnct_append(ptnct_lzma_path(), row)
+}
+
+// ─── record_install: install_path write row ───
+// stage_kind: 1=fetch, 2=decode, 3=verify, 4=inflate, 5=write
+// target_subpath: root-relative (no platform prefix; CW-Q3)
+// link_chunk_id: foreign key to pe_battle_net_download_track.chunks.tsv (0=unlinked)
+fn record_install(session_id: int, install_id: int,
+                  game_kind: int, stage_kind: int,
+                  target_subpath: str, bytes_to_write: int,
+                  bytes_written: int, write_status_code: int,
+                  link_chunk_id: int) -> void {
+    if session_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] session_id>0") }
+    if install_id <= 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] install_id>0") }
+    if game_kind < 1 || game_kind > 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] game_kind 1-2") }
+    if stage_kind < 1 || stage_kind > 5 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] stage_kind 1-5") }
+    if target_subpath == "" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] target_subpath non-empty") }
+    // CW-Q3: root-relative — reject leading slash (platform absolute) and Windows drive letter
+    let prefix = target_subpath.substring(0, 1)
+    if prefix == "/" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] target_subpath root-relative no_leading_slash") }
+    let tn = len(target_subpath)
+    if tn >= 2 {
+        let p2 = target_subpath.substring(1, 2)
+        if p2 == ":" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] target_subpath root-relative no_drive_letter") }
+    }
+    if bytes_to_write < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] bytes_to_write>=0") }
+    if bytes_written < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] bytes_written>=0") }
+    if link_chunk_id < 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [install] link_chunk_id>=0") }
+    let row = to_string(session_id) + "\t" + to_string(install_id)
+        + "\t" + to_string(game_kind) + "\t" + to_string(stage_kind)
+        + "\t" + target_subpath + "\t" + to_string(bytes_to_write)
+        + "\t" + to_string(bytes_written) + "\t" + to_string(write_status_code)
+        + "\t" + to_string(link_chunk_id) + "\n"
+    ptnct_append(ptnct_install_path(), row)
+}
+
+// ─── counters ───
+fn count_rows(path: str, min_cols: int) -> int {
+    let t = ptnct_read(path)
+    if t == "" { return 0 }
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    let mut cnt = 0
+    while i < n {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= min_cols { cnt = cnt + 1 }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn manifest_count() -> int { return count_rows(ptnct_manifest_path(), 9) }
+fn blte_count() -> int { return count_rows(ptnct_blte_path(), 10) }
+fn md5_count() -> int { return count_rows(ptnct_md5_path(), 7) }
+fn lzma_count() -> int { return count_rows(ptnct_lzma_path(), 7) }
+fn install_count() -> int { return count_rows(ptnct_install_path(), 9) }
+
+// distinct session_id across all 5 tables
+fn count_distinct_sessions() -> int {
+    let mut seen = []
+    let paths = [ptnct_manifest_path(), ptnct_blte_path(), ptnct_md5_path(), ptnct_lzma_path(), ptnct_install_path()]
+    let mut p_idx = 0
+    while p_idx < len(paths) {
+        let t = ptnct_read(paths[p_idx])
+        if t != "" {
+            let lines = t.split("\n")
+            let n = len(lines)
+            let i = 0
+            while i < n {
+                if lines[i] != "" {
+                    let parts = lines[i].split("\t")
+                    if len(parts) >= 1 {
+                        let sid_v = to_int(parts[0])
+                        let mut found = 0
+                        let j = 0
+                        while j < len(seen) {
+                            if seen[j] == sid_v { found = 1; break }
+                            j = j + 1
+                        }
+                        if found == 0 { seen.push(sid_v) }
+                    }
+                }
+                i = i + 1
+            }
+        }
+        p_idx = p_idx + 1
+    }
+    return len(seen)
+}
+
+// distinct values in a specific column index of a table (for enum coverage check)
+fn count_distinct_in_col(path: str, col_idx: int, min_cols: int) -> int {
+    let t = ptnct_read(path)
+    if t == "" { return 0 }
+    let mut seen = []
+    let lines = t.split("\n")
+    let n = len(lines)
+    let i = 0
+    while i < n {
+        if lines[i] != "" {
+            let parts = lines[i].split("\t")
+            if len(parts) >= min_cols && col_idx < len(parts) {
+                let v = to_int(parts[col_idx])
+                let mut found = 0
+                let j = 0
+                while j < len(seen) {
+                    if seen[j] == v { found = 1; break }
+                    j = j + 1
+                }
+                if found == 0 { seen.push(v) }
+            }
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+fn count_blte_encoding_kinds() -> int { return count_distinct_in_col(ptnct_blte_path(), 4, 10) }
+fn count_md5_key_kinds() -> int { return count_distinct_in_col(ptnct_md5_path(), 2, 7) }
+fn count_install_stage_kinds() -> int { return count_distinct_in_col(ptnct_install_path(), 3, 9) }
+fn count_manifest_archive_kinds() -> int { return count_distinct_in_col(ptnct_manifest_path(), 2, 9) }
+
+fn ptnct_stats() -> array {
+    let mut out = []
+    out.push(manifest_count())
+    out.push(blte_count())
+    out.push(md5_count())
+    out.push(lzma_count())
+    out.push(install_count())
+    out.push(count_distinct_sessions())
+    return out
+}
+
+// ─── enum name helpers ───
+fn archive_kind_name(k: int) -> str {
+    if k == 1 { return "blp_manifest" }
+    if k == 2 { return "encoding_table" }
+    if k == 3 { return "root" }
+    if k == 4 { return "install" }
+    if k == 5 { return "indices" }
+    if k == 6 { return "data" }
+    return ""
+}
+fn encoding_kind_name(k: int) -> str {
+    if k == 1 { return "raw" }
+    if k == 2 { return "zlib" }
+    if k == 3 { return "lzma" }
+    if k == 4 { return "encrypted" }
+    if k == 5 { return "passthrough" }
+    if k == 6 { return "frame_recursive" }
+    return ""
+}
+fn key_kind_name(k: int) -> str {
+    if k == 1 { return "ekey" }
+    if k == 2 { return "ckey" }
+    return ""
+}
+fn stage_kind_name(k: int) -> str {
+    if k == 1 { return "fetch" }
+    if k == 2 { return "decode" }
+    if k == 3 { return "verify" }
+    if k == 4 { return "inflate" }
+    if k == 5 { return "write" }
+    return ""
+}
+
+// ─── self_test (CW spec expected_self_test_thresholds_paper_mode targets) ───
+fn self_test() -> void {
+    let sid = "ptnct-" + exec("date +%s").trim()
+    r0_session_set(sid)
+    cleanup_ptnct()
+
+    // 2 distinct sessions exercising d2r game_kind only (D4 retired_intentional per CW-Q4)
+
+    // session 1001 — d2r us region build 14000, archive kinds 1+2+3
+    record_manifest(1001, 1, 1, 1, "us", 14000, 4096, 65536, 1)  // blp_manifest, root_hash=md5
+    r0_emit("ptnct_manifest", "\"sid\":1001,\"archive\":1,\"game\":1,\"region\":\"us\"")
+    record_manifest(1001, 2, 2, 1, "us", 14000, 256, 32768, 1)   // encoding_table
+    r0_emit("ptnct_manifest", "\"sid\":1001,\"archive\":2")
+    record_manifest(1001, 3, 3, 1, "us", 14000, 1024, 16384, 1)  // root
+    r0_emit("ptnct_manifest", "\"sid\":1001,\"archive\":3")
+
+    // session 1002 — d2r eu region build 14000, archive kinds 4+5
+    record_manifest(1002, 4, 4, 1, "eu", 14000, 64, 8192, 1)     // install archive
+    r0_emit("ptnct_manifest", "\"sid\":1002,\"archive\":4,\"game\":1,\"region\":\"eu\"")
+
+    // BLTE chunks across 2 sessions, 4 distinct encoding_kinds (raw/zlib/lzma/passthrough)
+    record_blte(1001, 1, 8, 4, 1, 0, 1024, 1024, 4096, 1)   // raw, integrity_pass=1
+    r0_emit("ptnct_blte", "\"sid\":1001,\"blte\":1,\"enc\":1")
+    record_blte(1001, 2, 8, 4, 2, 1, 768, 1024, 4096, 1)    // zlib, integrity_pass=1
+    r0_emit("ptnct_blte", "\"sid\":1001,\"blte\":2,\"enc\":2")
+    record_blte(1001, 3, 8, 4, 3, 2, 256, 1024, 4096, 0)    // lzma, integrity_pass=0 (mismatch exercised)
+    r0_emit("ptnct_blte", "\"sid\":1001,\"blte\":3,\"enc\":3,\"integrity\":0")
+    record_blte(1002, 4, 8, 1, 5, 0, 512, 512, 512, 1)      // passthrough, integrity_pass=1
+    r0_emit("ptnct_blte", "\"sid\":1002,\"blte\":4,\"enc\":5")
+
+    // MD5 verify rows — 2 key_kinds (ekey/ckey), match=0 and 1 both exercised, computed empty/non-empty both exercised
+    record_md5(1001, 1, 1, "abcdef0123456789abcdef0123456789", "abcdef0123456789abcdef0123456789", 1, 2)  // ekey match, link to manifest_id=2
+    r0_emit("ptnct_md5", "\"sid\":1001,\"md5\":1,\"key\":1,\"match\":1")
+    record_md5(1001, 2, 2, "fedcba9876543210fedcba9876543210", "fedcba9876543210fedcba9876543210", 1, 0)  // ckey match
+    r0_emit("ptnct_md5", "\"sid\":1001,\"md5\":2,\"key\":2,\"match\":1")
+    record_md5(1001, 3, 2, "0011223344556677001122334455ffff", "", 0, 0)                                  // ckey not yet computed
+    r0_emit("ptnct_md5", "\"sid\":1001,\"md5\":3,\"key\":2,\"match\":0,\"computed_empty\":1")
+    record_md5(1002, 4, 1, "11223344556677889900aabbccddeeff", "11223344556677889900aabbccdd0000", 0, 0)  // ekey mismatch
+    r0_emit("ptnct_md5", "\"sid\":1002,\"md5\":4,\"key\":1,\"match\":0")
+
+    // LZMA inflate rows linked to BLTE chunks
+    record_lzma(1001, 1, 3, 256, 1024, 1024, 0)   // blte_id_link=3 (lzma chunk), ok
+    r0_emit("ptnct_lzma", "\"sid\":1001,\"lzma\":1,\"blte_link\":3")
+    record_lzma(1001, 2, 2, 768, 1024, 1024, 0)   // blte_id_link=2 (zlib chunk treated as recursive), ok
+    r0_emit("ptnct_lzma", "\"sid\":1001,\"lzma\":2,\"blte_link\":2")
+    record_lzma(1002, 3, 0, 0, 0, 0, -1)          // unlinked, error path (corrupt input simulated)
+    r0_emit("ptnct_lzma", "\"sid\":1002,\"lzma\":3,\"status\":-1")
+
+    // install rows — d2r only (D4 retired_intentional per CW-Q4), stages fetch/verify/write
+    record_install(1001, 1, 1, 1, "Diablo II Resurrected/Data/global.mpq.idx", 4096, 4096, 0, 1)   // d2r fetch, link_chunk_id=1
+    r0_emit("ptnct_install", "\"sid\":1001,\"install\":1,\"stage\":1,\"chunk_link\":1")
+    record_install(1001, 2, 1, 5, "Diablo II Resurrected/Data/global.mpq.idx", 4096, 4096, 0, 1)   // d2r write, link_chunk_id=1
+    r0_emit("ptnct_install", "\"sid\":1001,\"install\":2,\"stage\":5,\"chunk_link\":1")
+    record_install(1002, 3, 1, 3, "Diablo II Resurrected/Data/sound.mpq", 8192, 0, 0, 0)           // d2r verify, no chunk link, partial
+    r0_emit("ptnct_install", "\"sid\":1002,\"install\":3,\"stage\":3")
+
+    // counters meet/exceed CW spec
+    let mc = manifest_count()
+    if mc < 3 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [count manifest] expected>=3 got=" + to_string(mc)) }
+    let bc = blte_count()
+    if bc < 4 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [count blte] expected>=4 got=" + to_string(bc)) }
+    let md_c = md5_count()
+    if md_c < 4 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [count md5] expected>=4 got=" + to_string(md_c)) }
+    let lc = lzma_count()
+    if lc < 3 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [count lzma] expected>=3 got=" + to_string(lc)) }
+    let ic = install_count()
+    if ic < 3 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [count install] expected>=3 got=" + to_string(ic)) }
+
+    // distinct_sessions >= 2
+    let ds = count_distinct_sessions()
+    if ds < 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [distinct sid] expected>=2 got=" + to_string(ds)) }
+
+    // encoding_kinds_covered >= 3
+    let ek = count_blte_encoding_kinds()
+    if ek < 3 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [encoding_kinds] expected>=3 got=" + to_string(ek)) }
+    // key_kinds_covered >= 2
+    let kk = count_md5_key_kinds()
+    if kk < 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [key_kinds] expected>=2 got=" + to_string(kk)) }
+    // stage_kinds_covered >= 2
+    let sk = count_install_stage_kinds()
+    if sk < 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [stage_kinds] expected>=2 got=" + to_string(sk)) }
+    // archive_kinds_covered >= 2
+    let ak = count_manifest_archive_kinds()
+    if ak < 2 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [archive_kinds] expected>=2 got=" + to_string(ak)) }
+
+    // enum sanity
+    if archive_kind_name(1) != "blp_manifest" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [enum archive 1]") }
+    if encoding_kind_name(3) != "lzma" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [enum encoding 3]") }
+    if key_kind_name(1) != "ekey" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [enum key 1]") }
+    if stage_kind_name(5) != "write" { panic("pe_battlenet_tact_ngdp_casc_track FAIL [enum stage 5]") }
+
+    let s = ptnct_stats()
+    r0_emit("ptnct_stats", "\"manifest\":" + to_string(s[0]) + ",\"blte\":" + to_string(s[1])
+        + ",\"md5\":" + to_string(s[2]) + ",\"lzma\":" + to_string(s[3])
+        + ",\"install\":" + to_string(s[4]) + ",\"distinct_sid\":" + to_string(s[5]))
+
+    // r0_emit total >= 18
+    let emit_n = r0_session_count(sid)
+    if emit_n < 18 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [emit] expected>=18 got=" + to_string(emit_n)) }
+
+    cleanup_ptnct()
+    let s2 = ptnct_stats()
+    let i = 0
+    while i < len(s2) {
+        if s2[i] != 0 { panic("pe_battlenet_tact_ngdp_casc_track FAIL [cleanup]") }
+        i = i + 1
+    }
+
+    println("  ✅ pe_battlenet_tact_ngdp_casc_track self_test PASS (manifest=" + to_string(s[0])
+        + ", blte=" + to_string(s[1]) + ", md5=" + to_string(s[2])
+        + ", lzma=" + to_string(s[3]) + ", install=" + to_string(s[4])
+        + ", distinct_sid=" + to_string(s[5]) + ", emits=" + to_string(emit_n)
+        + ", sid=" + sid + ")")
+}
+
+fn main() -> void {
+    let a = args()
+    if len(a) >= 3 {
+        let sub = a[2]
+        if sub == "self-test" { self_test(); return }
+        if sub == "stats" {
+            let s = ptnct_stats()
+            println("manifest\t" + to_string(s[0]))
+            println("blte\t" + to_string(s[1]))
+            println("md5\t" + to_string(s[2]))
+            println("lzma\t" + to_string(s[3]))
+            println("install\t" + to_string(s[4]))
+            println("distinct_sid\t" + to_string(s[5]))
+            return
+        }
+        if sub == "cleanup" { cleanup_ptnct(); println("cleaned: " + ptnct_dir()); return }
+        if sub == "dir" { println(ptnct_dir()); return }
+    }
+    println("usage: hexa run pe_battlenet_tact_ngdp_casc_track.hexa { self-test | stats | cleanup | dir }")
+}
