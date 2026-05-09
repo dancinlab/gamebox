@@ -13,32 +13,31 @@ set -eu
 cd "$(dirname "$0")"
 
 CC="${CC:-clang}"
-TARGET="pe_to_macho_shim"
-SOURCES="pe_to_macho_shim.c pe_parse.c"
+SDK="$(xcrun --sdk macosx --show-sdk-path)"
+CFLAGS="-arch arm64 -isysroot $SDK -O2 -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-gnu-zero-variadic-macro-arguments -std=c11"
 ENTITLEMENTS="entitlements.plist"
 
-echo "[build] compiling $TARGET (arch=arm64, sdk=macosx)"
-"$CC" \
-    -arch arm64 \
-    -isysroot "$(xcrun --sdk macosx --show-sdk-path)" \
-    -O2 \
-    -Wall -Wextra -Wpedantic \
-    -Wno-unused-parameter \
-    -std=c11 \
-    -o "$TARGET" \
-    $SOURCES
+build_signed() {
+    local target="$1"
+    shift
+    echo "[build] compiling $target (arch=arm64, sdk=macosx)"
+    "$CC" $CFLAGS -o "$target" "$@"
+    echo "[build] codesigning $target (ad-hoc + entitlements)"
+    codesign \
+        --force \
+        --sign - \
+        --entitlements "$ENTITLEMENTS" \
+        --options runtime \
+        --timestamp=none \
+        "$target"
+}
 
-echo "[build] codesigning $TARGET (ad-hoc + entitlements)"
-codesign \
-    --force \
-    --sign - \
-    --entitlements "$ENTITLEMENTS" \
-    --options runtime \
-    --timestamp=none \
-    "$TARGET"
+build_signed "pe_to_macho_shim" pe_to_macho_shim.c pe_parse.c
+build_signed "i386_decode_test" i386_decode_test.c i386_decode.c pe_parse.c
 
-echo "[build] verifying signature"
-codesign --verify --verbose=2 "$TARGET" || true
-codesign -d --entitlements - "$TARGET" 2>&1 | head -20 || true
+echo "[build] verifying signatures"
+codesign --verify --verbose=2 pe_to_macho_shim || true
+codesign --verify --verbose=2 i386_decode_test || true
+codesign -d --entitlements - pe_to_macho_shim 2>&1 | head -10 || true
 
-echo "[build] done — ./$TARGET <pe.exe>"
+echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]"
