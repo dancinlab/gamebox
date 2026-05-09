@@ -144,13 +144,23 @@ closure = 다음 모두 ✓:
 | CM-23 | M11 Sprint 2 측정 + PSB-2 | C | +16 달 | planned |
 | CM-24 | M15 Sprint 3 측정 + PSB-3 | C | +17 달 | planned |
 | **CM-25** | **Phase 10 D4 첫 frame (D3D12 + DXR)** | A:10 | **+18 달** | planned |
+| CM-25a | **native pe_to_macho_shim E1 harness scaffold** (real Battle.net-Setup.exe parse + 5-section mmap, no execution) | A:native | done 2026-05-09 (Track DL) | **done** |
+| CM-25b | **native i386 decoder E2** (Intel SDM read-only subset; entry block 9/9 zero unknowns) | A:native | done 2026-05-09 (Track DM) | **done** |
+| CM-25c | native i386 minimal interpreter E3 (stop on first IAT call) | A:native | +session-3..5 | planned |
+| CM-25d | native Win32 kernel32 startup shim E4 (~30 fns + TEB/PEB) | A:native | +session-8..13 | planned |
+| **CM-25e** | **native first NSWindow E5** — `validated_manjeom > 0` candidate | A:native | +session-13..21 | planned |
 | CM-26 | M1 D4 baseline + 만점 18 D4 검증 | C | +18.5 달 | planned |
 | CM-27 | PSB-4 (D4-input) | C | +19 달 | planned |
 | CM-28 | PSB-5+ 반복 (새 만점 0 × 3 sprint 까지) | C | +19-21 달 | planned |
 | CM-29 | EXHAUSTION 인정 | C | +21 달 | planned |
 | **CM-30** | **closure** — docs/EXHAUSTION_<date>.md + final commit + push | — | **+21 달** | planned |
 
-**현재 진행률**: CM-0~CM-20 모두 done = **21/31 = 67% complete**. CM-21~CM-30 (10 stages) 은 game install 후 측정 dependent.
+**현재 진행률**: CM-0~CM-20 모두 done + CM-25a/25b done (native shim E1+E2) = **23/35 = 66% complete** (분모 변경 — native phasing 추가). CM-21~CM-30 (게임 install 측정) + CM-25c~25e (native E3..E5 → first NSWindow) 모두 게이트.
+
+**Native shim phasing (Track DL/DM 후 추가, 2026-05-09)**:
+- CM-25a/25b done — PE parse + section mmap (DL) + i386 decoder (DM) 양쪽 모두 실 Battle.net-Setup.exe 검증.
+- CM-25c~25e gated — i386 interpreter (E3) → kernel32 shim (E4) → 첫 NSWindow (E5). E5 가 validated_manjeom > 0 첫 후보.
+- Plan SSOT: [docs/PE_TO_MACHO_SHIM_PLAN.ai.md](PE_TO_MACHO_SHIM_PLAN.ai.md) §3.
 
 총 ETA: **~21 달** (1 년 9 달, full-time 단일 개발자, D2R + D4 + PSB 6-10 회).
 <!-- DEPRECATED: see AI-native ETA SSOT at top of file (0.22d). Static "+N 달" column retained for historical / human-baseline parity comparison only. -->
@@ -311,7 +321,7 @@ closure 선언 전 모두 ✓:
 
 1. **lib/perf/c_pe_parse_cache.hexa** 작성 — Phase 0a 자산 (pe_parser.hexa) 위에 columnar cache (PE path → DOS magic / e_lfanew / NT header summary 캐시). 1 일 작업, **만점 +1 = 11**.
 2. **CLOSURE_ROADMAP / SCORING / PERF_PLAN / IMPLEMENTATION_ROADMAP** 갱신 (만점 14 + 신규 axis A 정의).
-3. **HEXA upstream RFC A1-A3 PR** github.com/need-singularity/hexa-lang 으로 submit (병렬 track B).
+3. **HEXA upstream RFC A1-A3 PR** github.com/dancinlab/hexa-lang 으로 submit (병렬 track B).
 4. **Phase 0b PE memory loader** skeleton 작성 — mmap sections + base relocations + IAT 패치 (track A critical path).
 5. commit + push.
 
