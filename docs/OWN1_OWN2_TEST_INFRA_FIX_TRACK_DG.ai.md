@@ -138,8 +138,7 @@ invocations only.
 
 ## §2 Verification — 3 of 3 tests PASS
 
-All under `HEXA_SHIM_NO_DARWIN_LANDING=1 hexa run <test> ; .resource-off
-local mode`:
+All under `HEXA_SHIM_NO_DARWIN_LANDING=1 hexa run <test>` local mode:
 
 | # | Test | Verdict | Summary |
 |---|---|---|---|
@@ -234,7 +233,7 @@ Total diff: 4 lines added, 4 lines edited across 2 test files.
 | 4 | iter (3) | blocked on macOS user-process fork limit exhaustion |
 | 5 | save state | project memory `track_df_loop_state_2026_05_09` saved (resume protocol) |
 | 6 | (user fixes fork starvation) | "fork starvation 문제 수정중" + "gogo" |
-| 7 | iter (4) | TCP server down — switch to local hexa via `~/.resource-off` |
+| 7 | iter (4) | TCP server down — switch to local hexa |
 | 8 | iter (4) verify | 3 of 3 tests PASS, FAIL=0 throughout |
 | 9 | document + commit | (this Track DG doc + commit landing) |
 
