@@ -77,7 +77,7 @@ modules unchanged.
 
 ## Source repo
 
-- Sibling: <https://github.com/need-singularity/sim-universe>
+- Sibling: <https://github.com/dancinlab/sim-universe>
 - Branch: `main` (final closure session post Track CJ).
 
 Predecessor releases:

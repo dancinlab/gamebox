@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CY D4 D3D12-to-Metal router skeleton inventory).
 - Predecessor (immediate): Track CY (D4 D3D12-to-Metal router skeleton inventory).
 - Predecessor (semantic, parent roadmap): Track CQ (battle.net roadmap;

@@ -13,7 +13,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track DD CQ-P4 full closure).
 - Predecessor (immediate): Track DD.
 - Forensic verdict (UNCHANGED at top tier): `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`.

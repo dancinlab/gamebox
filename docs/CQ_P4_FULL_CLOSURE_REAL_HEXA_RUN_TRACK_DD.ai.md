@@ -11,7 +11,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track DC CQ-P2 module landing).
 - Predecessor (immediate): Track DC.
 - Predecessor (semantic, Phase CQ-P4 partial): Track DA.

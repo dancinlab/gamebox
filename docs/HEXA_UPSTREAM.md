@@ -180,7 +180,7 @@ fn process_children(pid: int) -> [int]              // child PIDs
 
 ## 4. 보고 / propose 채널
 
-hexa-lang upstream repo (per `.raw-ref`): `github.com/need-singularity/hexa-lang`.
+hexa-lang upstream repo (per `.raw-ref`): `github.com/dancinlab/hexa-lang`.
 
 각 Phase 별 PR 또는 RFC 문서:
 - `hexa-lang/rfc/<NNN>_<title>.md` — 문제 / 우회 비용 / 제안 API

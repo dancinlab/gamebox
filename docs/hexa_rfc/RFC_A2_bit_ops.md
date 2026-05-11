@@ -1,7 +1,7 @@
 # RFC A2 — bit operations (& | ^ << >>)
 
 > **status**: draft, pre-PR (2026-04-30)
-> **target repo**: github.com/need-singularity/hexa-lang
+> **target repo**: github.com/dancinlab/hexa-lang
 > **discovered by**: airgenome-gamebox M4 C-PSO (SHBF 구현) / M6 (APBF) / M9 (DXIL hash) / M10 (cache index)
 > **priority**: HIGH — filter playbook 자산 (SHBF/APBF/AC trie/hash) 의 효율 차단
 

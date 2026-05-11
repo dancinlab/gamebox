@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main`.
 - Predecessor: Track CN (hexa interp closure perpetual deferral ack 2026-05-05).
 - v1.0.3 (Track CI): paper-mode validation + inventory cleanup + v3 aggregate 2026-05-05.

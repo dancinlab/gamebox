@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CL EAC kernel honest freeze 2026-05-05).
 - Predecessor (immediate): Track CL (EAC kernel + anti-tamper honest spec freeze; covers nightreign blk.1 inherited).
 - Predecessor (semantic): Track BY documentation-only fan-out (loader_count: 0 + perf_count: 0; lib module fan-out deferred to future cycle).

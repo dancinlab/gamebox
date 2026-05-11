@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CP final session closure marker 2026-05-05).
 - Predecessor (immediate): Track CP (final session closure marker — zero remaining items).
 - Predecessor (release bundle): Track CO (v1.0.4 release notes bundling CK/CL/CM/CN).

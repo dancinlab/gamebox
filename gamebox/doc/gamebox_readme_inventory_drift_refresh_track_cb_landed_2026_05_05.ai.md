@@ -1,6 +1,6 @@
 # gamebox README Inventory Drift Refresh — Track CB Landed (2026-05-05)
 
-> Track CB on gamebox standalone repo (`need-singularity/gamebox`), branch
+> Track CB on gamebox standalone repo (`dancinlab/gamebox`), branch
 > `bg/layout-migration-2026-05-05`. Doc-only README inventory accuracy
 > refresh after Tracks BU through CA accumulated drift in 5 places.
 > First track authored under the new `<feature>/doc/` layout (commit `1d28b4c`
@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `bg/layout-migration-2026-05-05` (post layout migration `1d28b4c`).
 - Predecessor: layout migration commit `1d28b4c refactor(layout 2026-05-05): docs/ flat → <feature>/doc/ feature-grouped`.
 - Predecessor (semantic): Track CA (RFC 016 reassessment, 0 hits reaffirmed).

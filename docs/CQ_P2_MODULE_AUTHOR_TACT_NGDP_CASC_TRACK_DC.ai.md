@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track DB CQ-P1 module landing).
 - Predecessor (immediate): Track DB.
 - Predecessor (semantic, parent roadmap): Track CQ.

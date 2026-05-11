@@ -1,11 +1,11 @@
 # RFC Submit Guide — hexa-lang upstream PR
 
-> RFC A1/A2/A3 를 github.com/need-singularity/hexa-lang 으로 제출하는 절차.
+> RFC A1/A2/A3 를 github.com/dancinlab/hexa-lang 으로 제출하는 절차.
 
 ## 사전 준비
 
 1. **github.com 계정** + Personal Access Token (gh CLI 권한)
-2. **fork** github.com/need-singularity/hexa-lang
+2. **fork** github.com/dancinlab/hexa-lang
 3. **gh CLI** 설치 확인: `gh auth status`
 
 ## RFC 제출 (각 RFC 동일)

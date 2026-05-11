@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CJ closure cycle 2026-05-05).
 - Predecessor (immediate): Track CJ closure (4 release tags pushed; main synced; v1.0.3 published).
 - Predecessor (semantic): Track CC §9 (cs2 per_game §9 noted `docs/VAC_HONEST_FREEZE.md` mk1 narrative deferred future-cycle).

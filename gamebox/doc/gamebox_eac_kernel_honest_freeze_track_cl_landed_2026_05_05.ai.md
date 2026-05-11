@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CK VAC freeze 2026-05-05).
 - Predecessor (immediate): Track CK (VAC honest freeze; sibling cycle).
 - Predecessor (semantic): Track CC §9 (delta_force + elden_ring §9 noted `docs/EAC_KERNEL_HONEST_FREEZE.md` mk1 narrative deferred future-cycle).

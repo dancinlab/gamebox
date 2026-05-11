@@ -30,7 +30,7 @@ lands.
 
 ## Source repo
 
-Sibling: <https://github.com/need-singularity/sim-universe>
+Sibling: <https://github.com/dancinlab/sim-universe>
 Predecessor (DELETED): `dancinlife/airgenome-gamebox` (history not transferred
 per D3 fresh-start policy).
 

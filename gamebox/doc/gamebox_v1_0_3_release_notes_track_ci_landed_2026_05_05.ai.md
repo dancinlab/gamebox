@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main`.
 - Predecessor: Track CH (session aggregate v3 narrative 2026-05-05).
 - v1.0.2 (Track CD): layout migration + inventory refresh + per_game §9 closure 2026-05-05.

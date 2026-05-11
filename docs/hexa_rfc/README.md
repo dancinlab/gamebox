@@ -1,7 +1,7 @@
 # HEXA upstream RFCs — Phase A
 
 > **scope**: gamebox 가 발견한 hexa-lang stage1 limitations 의 upstream proposal 모음.
-> **target repo**: github.com/need-singularity/hexa-lang
+> **target repo**: github.com/dancinlab/hexa-lang
 > **source project**: github.com/dancinlife/airgenome-gamebox (DIY hexa Win32 emulation)
 > **discovered during**: M0 R0 instrumentation + M2-M14 만점 컴포넌트 sprint + Phase 0a PE parser
 
@@ -23,7 +23,7 @@
 ## PR submit 절차
 
 1. **각 RFC 검토** — `RFC_A{1,2,3}_*.md` 의 PR-ready summary 섹션 확인
-2. **upstream fork** — github.com/need-singularity/hexa-lang fork
+2. **upstream fork** — github.com/dancinlab/hexa-lang fork
 3. **branch** — `rfc/A1-float-stage1`, `rfc/A2-bit-ops`, `rfc/A3-dict-literal`
 4. **commit** — 각 RFC 를 hexa-lang 의 적절한 RFC 디렉토리로 (예: `doc/rfcs/<NNN>-*.md` 또는 동등 위치)
 5. **PR description** — RFC 의 PR-ready summary 섹션을 PR description 으로 사용

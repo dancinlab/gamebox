@@ -1,6 +1,6 @@
 # gamebox README Game Coverage Section + Win32 Checkpoint Cached Status Flip — Track BU Landed (2026-05-05)
 
-> Track BU on gamebox standalone repo (`need-singularity/gamebox`). Two sub-missions:
+> Track BU on gamebox standalone repo (`dancinlab/gamebox`). Two sub-missions:
 > BU1 — README.md NEW "Game Coverage" section (additive insertion).
 > BU2 — `.checkpoint.win32_50pct_coverage` + `.checkpoint.win32_full_coverage` cached
 > header status field flip `unmet` → `met` (drift fix per Track BO snapshot v2 + Track BR
@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0, sim-universe sibling layout.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0, sim-universe sibling layout.
 - Predecessor: Track BT closure (full standalone separation 2026-05-05 — `gamebox_initial_extraction_landed.marker`).
 - Concurrent-prior: Track BP (Win32 cycle 60-62 — 91.49% → 100.00% milestone breach skeleton-tier).
 - Concurrent-prior: Track BR (pre-emptive derivation guard for `.checkpoint.win32_full_coverage` cached `unmet` → `met` transition criteria documented).

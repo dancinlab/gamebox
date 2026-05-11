@@ -1,6 +1,6 @@
 # gamebox v1.0.1 Release Notes + CHANGELOG + Version Bump — Track BW Landed (2026-05-05)
 
-> Track BW on gamebox standalone repo (`need-singularity/gamebox`). Patch
+> Track BW on gamebox standalone repo (`dancinlab/gamebox`). Patch
 > release bundles BU + BV deltas under v1.0.1. Three sub-missions:
 > BW1 — `RELEASE_NOTES_v1.0.1.md` NEW file authored.
 > BW2 — `CHANGELOG.md` v1.0.1 section additive insertion.
@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Predecessor: Track BV (lineage_classic_r28 drift resolution, drift_count 1 → 0).
 - Predecessor: Track BU (Game Coverage section + 2 win32 checkpoint flips, drift_count 3 → 1).
 - v1.0.0 (Track BT): initial extraction from airgenome-gamebox 67 BG cycles 2026-05-05.

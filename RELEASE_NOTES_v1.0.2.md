@@ -107,7 +107,7 @@ external consumers should mirror.
 
 ## Source repo
 
-Sibling: <https://github.com/need-singularity/sim-universe>
+Sibling: <https://github.com/dancinlab/sim-universe>
 Branch: `bg/layout-migration-2026-05-05` (CB+CC+CD landed here; merge to `main` at user discretion).
 
 Predecessor releases:

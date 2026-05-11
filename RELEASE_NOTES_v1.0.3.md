@@ -77,7 +77,7 @@ JSONL schema unchanged. Loader/perf/tool inventory unchanged.
 
 ## Source repo
 
-- Sibling: <https://github.com/need-singularity/sim-universe>
+- Sibling: <https://github.com/dancinlab/sim-universe>
 - Branch: `main` (post fast-forward merge of `bg/layout-migration-2026-05-05`).
 
 Predecessor releases:

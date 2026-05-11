@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track DA CQ-P4 partial closure).
 - Predecessor (immediate): Track DA (CQ-P4 partial; G-1 override path).
 - Predecessor (semantic, parent roadmap): Track CQ.

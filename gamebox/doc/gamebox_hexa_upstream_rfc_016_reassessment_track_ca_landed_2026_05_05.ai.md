@@ -1,6 +1,6 @@
 # gamebox hexa-lang RFC 016 Reassessment — Track CA Landed (2026-05-05)
 
-> Track CA on gamebox standalone repo (`need-singularity/gamebox`). Doc-only
+> Track CA on gamebox standalone repo (`dancinlab/gamebox`). Doc-only
 > reassessment cycle: re-audit RFC 016 candidate inventory (predecessor: Track
 > BS, 2026-05-05, 0 hits) covering 7 BG cycles that landed post-BS within the
 > same day (BT through BZ). Conclusion: BS finding reaffirmed (0 new candidates,
@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Predecessor: Track BS (`docs/HEXA_UPSTREAM_RFC_016_CANDIDATE_INVENTORY_2026_05_05.md`, 0 hits).
 - Predecessor: Track BZ (closure_orchestrator paper invocation, 0 new stdlib gap surfaced).
 - Forensic verdict (UNCHANGED): `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`.

@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main`.
 - Predecessor: Track CO (v1.0.4 release 2026-05-05).
 - User closure directive (paraphrase per BR_NO_USER_VERBATIM): "execute hooks 1+2+4 (skip 3) and complete closure with no remaining items, then session terminates".
@@ -53,7 +53,7 @@ $ git rev-list --left-right --count origin/main...main
 5 release tags total (v1.0.0 through v1.0.4) published to origin.
 
 GitHub Releases page expected to show 5 tag-based releases at:
-<https://github.com/need-singularity/gamebox/releases>
+<https://github.com/dancinlab/gamebox/releases>
 
 ---
 

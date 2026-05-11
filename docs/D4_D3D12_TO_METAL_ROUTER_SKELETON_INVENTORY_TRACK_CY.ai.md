@@ -16,7 +16,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CX 2026-05-05).
 - Direct predecessor (alphabetic): Track CX.
 - Direct predecessor (parallel sibling): Track CW (CW + CX ran in parallel

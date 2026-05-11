@@ -1,6 +1,6 @@
 # gamebox lineage_classic_r28 Drift Resolution — Track BV Landed (2026-05-05)
 
-> Track BV on gamebox standalone repo (`need-singularity/gamebox`).
+> Track BV on gamebox standalone repo (`dancinlab/gamebox`).
 > Single sub-mission: resolve last drift item from Track BO checkpoint snapshot
 > (drift_count 1 → 0) via cascading cond status flip in `.roadmap.lineage_classic_r28`
 > + cached header status flip in `.checkpoint.lineage_classic_r28_play`.
@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Predecessor: Track BU (Game Coverage section + 2 win32 checkpoint flips, drift_count 3 → 1).
 - Concurrent-prior: Track BO (snapshot v2, derived `unmet` for lineage_classic_r28 under strict AND with retired_intentional required and partial actual; flagged drift item 3 of 3 with explicit deferred resolution path).
 - Concurrent-prior: Track BR (derivation guard pattern — pre-emptive transition criteria documented for win32_full; BV applies the analogous `cached_header_status_field_refresh` post cascading flip).

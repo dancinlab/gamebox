@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CM nightreign skeleton-tier fan-out 2026-05-05).
 - Predecessor (immediate): Track CM (nightreign lib module fan-out).
 - Predecessor (semantic): Track CJ §11 hook 4 ("real-run validation of orchestrator + cli/gamebox.hexa launch post hexa interp closure CM-26..CM-30 land").

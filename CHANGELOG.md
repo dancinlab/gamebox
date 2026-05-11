@@ -142,7 +142,7 @@ All notable changes to `gamebox` are documented in this file.
 
 - **Forensic verdict**: `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`
 - **Source**: `dancinlife/airgenome-gamebox` 67-cycle session (2026-05-03 to 2026-05-05; deleted 2026-05-05 per closure-cycle directive, history not transferred per D3 fresh-start policy)
-- **Reference layout**: `need-singularity/sim-universe` v1.0.0 (sibling repo)
+- **Reference layout**: `dancinlab/sim-universe` v1.0.0 (sibling repo)
 
 ### Inventory
 

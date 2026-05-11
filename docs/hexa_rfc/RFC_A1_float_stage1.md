@@ -1,7 +1,7 @@
 # RFC A1 — stage1 float arithmetic 안정화
 
 > **status**: draft, pre-PR (2026-04-30)
-> **target repo**: github.com/need-singularity/hexa-lang
+> **target repo**: github.com/dancinlab/hexa-lang
 > **discovered by**: airgenome (probe.hexa workaround) + airgenome-gamebox (M2-M14 자율 sprint)
 > **priority**: CRITICAL — D-list 만점 컴포넌트 대부분 차단
 

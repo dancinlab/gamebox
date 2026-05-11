@@ -1,7 +1,7 @@
 # RFC A3 — dict / record literal stage1 fix
 
 > **status**: draft, pre-PR (2026-04-30)
-> **target repo**: github.com/need-singularity/hexa-lang
+> **target repo**: github.com/dancinlab/hexa-lang
 > **discovered by**: airgenome-gamebox M6 C-SHADER-AGING (자율 sprint)
 > **priority**: HIGH — record-style data 가 복잡한 컴포넌트 차단
 

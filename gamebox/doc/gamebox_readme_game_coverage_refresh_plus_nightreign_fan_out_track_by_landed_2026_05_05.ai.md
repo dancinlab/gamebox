@@ -1,6 +1,6 @@
 # gamebox README Game Coverage Refresh + Nightreign Fan-out — Track BY Landed (2026-05-05)
 
-> Track BY on gamebox standalone repo (`need-singularity/gamebox`).
+> Track BY on gamebox standalone repo (`dancinlab/gamebox`).
 > User-directed cycle:
 > (a) remove wow from active Game Coverage table (preserve files as historical),
 > (b) indicate elden_ring scope includes Shadow of the Erdtree DLC,
@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Predecessor: Track BX (per_game README §9 update for offline-relevant subset).
 - User directives (verbatim paraphrase per BR_NO_USER_VERBATIM):
   - "wow는 빼줘" — remove wow from README Game Coverage table

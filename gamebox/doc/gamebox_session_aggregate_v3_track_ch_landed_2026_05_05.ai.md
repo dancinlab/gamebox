@@ -13,7 +13,7 @@
 **purpose**: 2026-05-05 walltime 동안의 10 standalone-repo cycle (Track BT → CG)
 진척 통합 narrative v3 1건 land. Predecessor v1 (Track AN, 35 BG cycle, 2026-05-03 → 04)
 + v2 (Track BK, ~58 BG cycle, 2026-05-03 → 05) = airgenome-gamebox 측 narrative —
-v3 측 standalone-repo (need-singularity/gamebox) 측 post-extraction cycle 측 첫 aggregate.
+v3 측 standalone-repo (dancinlab/gamebox) 측 post-extraction cycle 측 첫 aggregate.
 
 **aggregate kind**:
 - v1 + v2 측 airgenome-gamebox 측 predecessor session 측 narrative (preserved verbatim under `airgenome/doc/`)
@@ -58,7 +58,7 @@ v3 측 standalone-repo (need-singularity/gamebox) 측 post-extraction cycle 측 
 
 | # | track | commit | scope | kind |
 |---|---|---|---|---|
-| 1 | BT | `c35ca1b` | Initial extraction marker land (Track BT closure cycle — extraction from airgenome-gamebox to need-singularity/gamebox standalone) | extraction baseline |
+| 1 | BT | `c35ca1b` | Initial extraction marker land (Track BT closure cycle — extraction from airgenome-gamebox to dancinlab/gamebox standalone) | extraction baseline |
 | 2 | (emoji) | `9faf309` | README emoji 🎮 prefix add (cosmetic) | cosmetic |
 | 3 | BU | `f352f00` | README Game Coverage section (+40 LOC, 11 .roadmap targets table) + 2 win32 checkpoint flips (win32_50pct + win32_full unmet → met cached) | feature additive + JSONL field flips |
 | 4 | BV | `2f60475` | lineage_classic_r28 cond.1/.2/.3 cascading flip partial → retired_intentional + checkpoint sideways-PASS met 0/3 → 3/3 (BO drift_count 1 → 0) | drift fix |

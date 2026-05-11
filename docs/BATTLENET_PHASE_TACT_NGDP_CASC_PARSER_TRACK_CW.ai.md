@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CV D4 D3D12 surface honesty audit).
 - Predecessor (immediate): Track CV (D4 D3D12 surface honesty audit; depends_on=[CS]).
 - Predecessor (semantic, parent roadmap): Track CQ (battle.net roadmap; SSOT

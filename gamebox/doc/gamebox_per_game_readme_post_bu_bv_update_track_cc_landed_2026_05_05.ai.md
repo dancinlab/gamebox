@@ -1,6 +1,6 @@
 # gamebox per_game §9 Closure for Remaining 4 retired_intentional Games — Track CC Landed (2026-05-05)
 
-> Track CC on gamebox standalone repo (`need-singularity/gamebox`), branch
+> Track CC on gamebox standalone repo (`dancinlab/gamebox`), branch
 > `bg/layout-migration-2026-05-05`. Closes BX scope gap by appending §9
 > sections to the 4 per_game READMEs that BX explicitly excluded
 > (retired_intentional games: cs2 / delta_force / diablo4 / elden_ring).
@@ -11,7 +11,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `bg/layout-migration-2026-05-05`.
 - Predecessor: Track CB (README inventory drift refresh 2026-05-05).
 - Driver: BX explicitly excluded the 5 retired_intentional games (cs2 / delta_force / elden_ring / wow / diablo4) from §9 append. `wow` removed from active table per Track BY direction. CC closes the remaining 4.

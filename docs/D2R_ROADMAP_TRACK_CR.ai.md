@@ -13,7 +13,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CQ battle.net roadmap; depends_on=[CQ]).
 - Predecessor (immediate): Track CQ (battle.net agent + bnet runtime forward roadmap).
 - Predecessor (semantic): Track L (D2R realm protocol honest freeze 2026-05-03), Track CN (perpetual deferral ack), Track CO (v1.0.4 release).

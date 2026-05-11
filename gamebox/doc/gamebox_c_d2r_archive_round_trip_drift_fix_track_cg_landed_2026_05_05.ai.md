@@ -1,6 +1,6 @@
 # gamebox c_d2r_archive_round_trip Drift Fix (option b) — Track CG Landed (2026-05-05)
 
-> Track CG on gamebox standalone repo (`need-singularity/gamebox`), branch `main`.
+> Track CG on gamebox standalone repo (`dancinlab/gamebox`), branch `main`.
 > Fix Track CF deferred drift item. Investigation revealed orphan reference;
 > chose option (b) — remove stale references from `hexa.toml [modules]` +
 > README perf families table. The actual D2R MPQ archive round-trip
@@ -11,7 +11,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post fast-forward merge of `bg/layout-migration-2026-05-05`).
 - Predecessor: Track CF (hexa.toml audit identified the drift item).
 - Forensic verdict (UNCHANGED): `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`.

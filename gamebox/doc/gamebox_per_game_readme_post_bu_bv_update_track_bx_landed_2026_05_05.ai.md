@@ -1,6 +1,6 @@
 # gamebox per_game README §9 Post-Track-BU/BV Update — Track BX Landed (2026-05-05)
 
-> Track BX on gamebox standalone repo (`need-singularity/gamebox`). Doc-only
+> Track BX on gamebox standalone repo (`dancinlab/gamebox`). Doc-only
 > additive cycle: 6 per_game/<game>_README.ai.md files extended with NEW §9
 > sections documenting post-Track-BU + post-Track-BV state changes that affect
 > each game (direct impact for lineage_classic_r28; indirect impact via
@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Predecessor: Track BW (v1.0.1 release notes; surfaced BU + BV deltas at package level).
 - BX scope: per-game documentation refresh — surface BU + BV at the per-game
   level so cross-link traceability is complete (each game's README.ai.md

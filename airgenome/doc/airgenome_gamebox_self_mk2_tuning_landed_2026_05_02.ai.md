@@ -191,7 +191,7 @@ priority order = (A loader_pe → A loader_win32 → A loader_dx) → (B helper 
 ### §4.1 기존 cross-link
 
 - `plugin.json` `target_games` = ["d2r", "d4"] — airgenome plugin contract 진입점
-- README.md mention `[airgenome]` (parent) + `[hexa-lang]` (substrate) + `[need-singularity]` (org)
+- README.md mention `[airgenome]` (parent) + `[hexa-lang]` (substrate) + `[dancinlab]` (org)
 - 본 repo 는 anima sister 가 아님 (independent gaming domain). cross-link 은 정책 (own/raw) layer 만.
 
 ### §4.2 권고 cross-link 추가 (사용자 lock-in 대기)

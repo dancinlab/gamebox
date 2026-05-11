@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin: `https://github.com/need-singularity/gamebox.git`).
+- Repo: `dancinlab/gamebox` (origin: `https://github.com/dancinlab/gamebox.git`).
 - Branch: `main`.
 - Predecessor: Track CI (v1.0.3 release 2026-05-05).
 - User direction: "해줘. 모두 안전하게 closure" (paraphrase per BR_NO_USER_VERBATIM: closure-cycle grant — execute all deferred actions safely).
@@ -83,11 +83,11 @@ refs published.
 
 ## §3 GitHub release surface (auto-publishable)
 
-Per README badge `[![GitHub release](https://img.shields.io/github/v/release/need-singularity/gamebox?...)]`, the badge will pick up the latest pushed tag automatically. After CJ:
+Per README badge `[![GitHub release](https://img.shields.io/github/v/release/dancinlab/gamebox?...)]`, the badge will pick up the latest pushed tag automatically. After CJ:
 
 - Latest tag: `v1.0.3`
 - Badge expected to render: `v1.0.3`
-- 4 tags total visible at <https://github.com/need-singularity/gamebox/releases>
+- 4 tags total visible at <https://github.com/dancinlab/gamebox/releases>
 
 If user wants formal GitHub Releases (separate from tags) authored, that remains
 a separate cycle decision — out of CJ scope (CJ closure scope = local + origin
@@ -171,7 +171,7 @@ surface remains blocked by hexa interp closure CM-26..CM-30 (multi-year horizon)
 - `git branch -a` → only `main` + `remotes/origin/HEAD` + `remotes/origin/main`
 - Latest commit on main: `789b574` (CI v1.0.3)
 - README badge `version-1.0.3` displays correctly
-- GitHub Releases page expected to show 4 tag-based releases at <https://github.com/need-singularity/gamebox/releases>
+- GitHub Releases page expected to show 4 tag-based releases at <https://github.com/dancinlab/gamebox/releases>
 
 ---
 

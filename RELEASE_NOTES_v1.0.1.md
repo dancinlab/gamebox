@@ -73,11 +73,11 @@ JSONL schema unchanged. Loader/perf/tool inventory unchanged.
 
 ## Source repo
 
-Sibling: <https://github.com/need-singularity/sim-universe>
+Sibling: <https://github.com/dancinlab/sim-universe>
 Predecessor sessions:
 
 - v1.0.0 — `dancinlife/airgenome-gamebox` 67 BG cycles (DELETED 2026-05-05)
-- v1.0.1 — `need-singularity/gamebox` standalone Tracks BU + BV (2026-05-05)
+- v1.0.1 — `dancinlab/gamebox` standalone Tracks BU + BV (2026-05-05)
 
 ## Author
 

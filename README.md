@@ -9,16 +9,16 @@
 > honest C3: validated_manjeom = 0 (no real game frames evidenced).
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.4-informational.svg)](CHANGELOG.md)
-[![GitHub release](https://img.shields.io/github/v/release/need-singularity/gamebox?display_name=tag&sort=semver)](https://github.com/need-singularity/gamebox/releases)
+[![Version](https://img.shields.io/badge/version-1.0.5-informational.svg)](CHANGELOG.md)
+[![GitHub release](https://img.shields.io/github/v/release/dancinlab/gamebox?display_name=tag&sort=semver)](https://github.com/dancinlab/gamebox/releases)
 [![Forensic: SKELETON_TIER_100PCT_WIN32](https://img.shields.io/badge/forensic-SKELETON__TIER__100PCT__WIN32-brightgreen.svg)](#forensic-verdict)
 [![Win32 fn coverage: 435/435](https://img.shields.io/badge/win32__fn__coverage-435%2F435-success.svg)](#module-inventory)
 [![Perf families 100%: 18+](https://img.shields.io/badge/perf__families__100pct-18%2B-success.svg)](#module-inventory)
 [![hexa-lang RFCs merged: 4](https://img.shields.io/badge/hexa--lang__rfcs__merged-4-blue.svg)](#hexa-lang-upstream)
 
-> **Distribution**: GitHub canonical at <https://github.com/need-singularity/gamebox>.
+> **Distribution**: GitHub canonical at <https://github.com/dancinlab/gamebox>.
 > CLI tooling installed via `hx install gamebox` from the hexa-lang registry,
-> or `git clone` directly. (Sibling repo: <https://github.com/need-singularity/sim-universe>.)
+> or `git clone` directly. (Sibling repo: <https://github.com/dancinlab/sim-universe>.)
 
 ---
 
@@ -144,13 +144,13 @@ gamebox --version           # → 1.0.0
 
 > gamebox is registered alongside sibling `sim-universe` in the hexa-lang
 > package registry. `hx install gamebox` pulls from
-> <https://github.com/need-singularity/gamebox> and installs the standalone CLI
+> <https://github.com/dancinlab/gamebox> and installs the standalone CLI
 > under `$HX_HOME/bin/gamebox`.
 
 ### Via git clone (works today)
 
 ```bash
-git clone https://github.com/need-singularity/gamebox.git ~/.gamebox
+git clone https://github.com/dancinlab/gamebox.git ~/.gamebox
 export GAMEBOX_ROOT=~/.gamebox
 export PATH="$GAMEBOX_ROOT/cli:$PATH"
 
@@ -331,7 +331,7 @@ Honest scope (raw#10 C3): **0 games run a real frame yet (validated_manjeom = 0)
 
 ## hexa-lang upstream
 
-4 RFCs merged this session into <https://github.com/need-singularity/hexa-lang>:
+4 RFCs merged this session into <https://github.com/dancinlab/hexa-lang>:
 
 - **rfc_012**: snake_case enforcement (PR #47)
 - **rfc_013**: silent_error_ban (PR #47)
@@ -400,4 +400,4 @@ SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0
 Apache-2.0 — see [LICENSE](LICENSE).
 
 Author: 박민우 <nerve011235@gmail.com>
-Repository: <https://github.com/need-singularity/gamebox>
+Repository: <https://github.com/dancinlab/gamebox>

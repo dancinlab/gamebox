@@ -8,7 +8,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `bg/layout-migration-2026-05-05`.
 - Predecessor: Track CC (per_game §9 closure 2026-05-05).
 - v1.0.1 (Track BW): drift resolution + win32 milestone bundle 2026-05-05.

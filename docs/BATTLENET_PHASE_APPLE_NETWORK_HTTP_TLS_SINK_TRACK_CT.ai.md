@@ -9,7 +9,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CR D2R roadmap, post Track CQ battle.net roadmap).
 - Predecessor (immediate): Track CR (D2R roadmap; depends_on=[CQ]).
 - Predecessor (semantic): Track CQ (battle.net roadmap; SSOT for the 5-phase plan

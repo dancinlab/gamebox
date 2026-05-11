@@ -11,7 +11,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `main` (post Track CZ Agent HTTP REST 4-verb PARTIAL augment).
 - Predecessor (immediate): Track CZ (Phase CQ-P3 4-verb PARTIAL augment).
 - Predecessor (semantic, parent roadmap): Track CQ (battle.net roadmap;

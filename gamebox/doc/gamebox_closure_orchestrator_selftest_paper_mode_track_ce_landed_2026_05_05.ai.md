@@ -10,7 +10,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Branch: `bg/layout-migration-2026-05-05`.
 - Predecessor: Track CD (v1.0.2 release 2026-05-05).
 - Predecessor (semantic): Track BZ §11 next-cycle hook — "Track CA+ candidate: tool/closure_orchestrator.hexa selftest --quick real invocation".

@@ -1,6 +1,6 @@
 # gamebox closure_orchestrator Paper-Mode Invocation — Track BZ Landed (2026-05-05)
 
-> Track BZ on gamebox standalone repo (`need-singularity/gamebox`). Doc-only
+> Track BZ on gamebox standalone repo (`dancinlab/gamebox`). Doc-only
 > cycle: attempted real `tool/closure_orchestrator.hexa status` invocation,
 > hit hexa interp closure blocker (CM-26..CM-30 missing per README §Caveats
 > item 5); fell back to paper-mode derivation per orchestrator's documented
@@ -12,7 +12,7 @@
 
 ## Context
 
-- Repo: `need-singularity/gamebox` (origin), Apache-2.0.
+- Repo: `dancinlab/gamebox` (origin), Apache-2.0.
 - Predecessor: Track BY (README Game Coverage refresh + nightreign fan-out).
 - Predecessor (semantic): Track BO §6 C6 — "No closure_orchestrator invocation in this cycle. The §6 derivation uses Track AG documented semantics on paper; no actual run of closure_orchestrator was performed (sibling-repo subagent boundary, doc-only mode). Validation that the orchestrator outputs the same derivation is left to a follow-up cycle that invokes the orchestrator."
 - Forensic verdict (UNCHANGED): `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0`.
