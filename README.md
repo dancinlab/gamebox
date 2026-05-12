@@ -135,11 +135,11 @@ raw#9 STRICT (hexa-only, no .py creation in this repo).
 ## Install
 
 ```bash
-# 1. Install hexa-lang (ships `hexa` + `hx` package manager)
+# 1. Install hexa-lang (gives you `hexa` + `hx` package manager)
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/dancinlab/hexa-lang/main/install.sh)"
 
 # 2. Install gamebox
-hx install gamebox          # global, pulls latest from registry
+hx install gamebox
 ```
 
 > gamebox is Apple-native; the canonical platform is macOS Apple Silicon (arm64)
