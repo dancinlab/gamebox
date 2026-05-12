@@ -132,60 +132,32 @@ raw#9 STRICT (hexa-only, no .py creation in this repo).
 
 ---
 
-## Installation
-
-### Via `hx` (recommended)
+## Install
 
 ```bash
+# 1. Install hexa-lang (ships `hexa` + `hx` package manager)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/dancinlab/hexa-lang/main/install.sh)"
+
+# 2. Install gamebox
 hx install gamebox          # global, pulls latest from registry
-hx install gamebox@1.0.0    # pin specific version
-gamebox --version           # → 1.0.0
 ```
 
-> gamebox is registered alongside sibling `sim-universe` in the hexa-lang
-> package registry. `hx install gamebox` pulls from
-> <https://github.com/dancinlab/gamebox> and installs the standalone CLI
-> under `$HX_HOME/bin/gamebox`.
-
-### Via git clone (works today)
-
-```bash
-git clone https://github.com/dancinlab/gamebox.git ~/.gamebox
-export GAMEBOX_ROOT=~/.gamebox
-export PATH="$GAMEBOX_ROOT/cli:$PATH"
-
-# Run any subcommand:
-hexa run $GAMEBOX_ROOT/cli/gamebox.hexa selftest --quick
-```
-
-### Apple platform requirement
-
-gamebox is Apple-native; the canonical platform is macOS Apple Silicon (arm64)
-with Game Porting Toolkit / D3DMetal SDK installed. Skeleton-tier loaders /
-perf modules import as a hexa lib without D3DMetal — only real launches require
-D3DMetal. Set `GAMEBOX_D3DMETAL_SDK=/path/to/D3DMetal` for explicit override.
+> gamebox is Apple-native; the canonical platform is macOS Apple Silicon (arm64)
+> with Game Porting Toolkit / D3DMetal SDK installed. Skeleton-tier loaders /
+> perf modules import as a hexa lib without D3DMetal — only real launches require
+> D3DMetal. Set `GAMEBOX_D3DMETAL_SDK=/path/to/D3DMetal` for explicit override.
 
 ---
 
-## Quickstart
+## Run
 
 ```bash
-# Package version + forensic verdict + inventory snapshot
-gamebox status
-
-# Enumerate loaders / perf families / tools
-gamebox list loaders
-gamebox list perf
-gamebox list tools
-
-# Skeleton-tier import probe (own2 PARTIAL emit)
-gamebox probe
-
-# Real launch dispatch (RETIRED_INTENTIONAL skeleton-tier — own1 + validated_manjeom 0)
-gamebox launch d2r
-
-# Quick self-validation (own2 PASS/FAIL emit)
-gamebox selftest --quick
+gamebox status                     # package version + forensic verdict + inventory snapshot
+gamebox list [filter]              # enumerate loaders/perf/tools/roadmaps/checkpoints
+gamebox probe                      # skeleton-tier import probe (own2 PARTIAL emit)
+gamebox launch <game>              # real launch dispatch (RETIRED_INTENTIONAL skeleton-tier)
+gamebox selftest [--quick]         # self-validation (own2 PASS/FAIL emit)
+gamebox help                       # print this help
 ```
 
 For machine-parseable output, every subcmd emits:
