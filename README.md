@@ -1,24 +1,42 @@
-# 🎮 gamebox — Apple-native Win32 Game Runtime
+<p align="center">
+  <img src="docs/logo.svg" width="140" alt="gamebox">
+</p>
+
+<h1 align="center">🎮 gamebox</h1>
+
+<p align="center"><strong>Apple-Native Win32 Game Runtime</strong> — hexa-only · Wine 0 · D3DMetal-pinned · own1-posture</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <a href="https://github.com/dancinlab/gamebox/releases"><img alt="Release" src="https://img.shields.io/github/v/release/dancinlab/gamebox?display_name=tag&sort=semver"></a>
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.5-success">
+  <img alt="Win32 coverage" src="https://img.shields.io/badge/win32-435%2F435-informational">
+  <img alt="Perf families" src="https://img.shields.io/badge/perf%20families-18%2B-informational">
+  <img alt="Parent" src="https://img.shields.io/badge/parent-dancinlab-blueviolet">
+</p>
+
+<p align="center">PE-loader · D3DMetal · Battle.net · hexa-only · own1 · skeleton-tier</p>
+
+---
 
 > Apple-native Win32 game runtime. Hexa-only, Wine 0, D3DMetal-pinned.
 > Skeleton-tier 100% Win32 fn coverage (435/435) + 18+ perf families at 100%
 > manjeom + 15 .roadmap.* SSOT (14 active + 1 historical wow) + 7 .checkpoint.*
 > (3 met post Track BV) + 4 hexa-lang upstream RFCs merged.
 > **Forensic verdict (2026-05-05): SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0**
-> — 67 BG cycles (2026-05-03 to 2026-05-05) cumulative skeleton work; raw#10
 > honest C3: validated_manjeom = 0 (no real game frames evidenced).
-
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.5-informational.svg)](CHANGELOG.md)
-[![GitHub release](https://img.shields.io/github/v/release/dancinlab/gamebox?display_name=tag&sort=semver)](https://github.com/dancinlab/gamebox/releases)
-[![Forensic: SKELETON_TIER_100PCT_WIN32](https://img.shields.io/badge/forensic-SKELETON__TIER__100PCT__WIN32-brightgreen.svg)](#forensic-verdict)
-[![Win32 fn coverage: 435/435](https://img.shields.io/badge/win32__fn__coverage-435%2F435-success.svg)](#module-inventory)
-[![Perf families 100%: 18+](https://img.shields.io/badge/perf__families__100pct-18%2B-success.svg)](#module-inventory)
-[![hexa-lang RFCs merged: 4](https://img.shields.io/badge/hexa--lang__rfcs__merged-4-blue.svg)](#hexa-lang-upstream)
 
 > **Distribution**: GitHub canonical at <https://github.com/dancinlab/gamebox>.
 > CLI tooling installed via `hx install gamebox` from the hexa-lang registry,
 > or `git clone` directly. (Sibling repo: <https://github.com/dancinlab/sim-universe>.)
+
+## Status
+
+- v1.0.5 — Skeleton-tier 100% Win32 fn coverage (435/435) across 32 PE_core modules
+- 18+ perf families at 100% manjeom; 242 c_*_*.hexa modules across 104 unique families
+- 15 .roadmap.* SSOT (14 active + 1 historical wow), 7 .checkpoint.* (3 met post Track BV)
+- 4 hexa-lang upstream RFCs merged
+- Forensic verdict: `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0` — honest C3, no real game frames evidenced
 
 ---
 
@@ -41,7 +59,6 @@ It combines:
 3. **DirectX bridge** — d3d11 / d3d12 stage1 / stage2 dispatch; D3DMetal-pinned
    path (no Wine).
 4. **Perf layer** — 242 c_*_*.hexa modules across 104 unique families;
-   18+ families at 100% manjeom (skeleton-tier; validated_manjeom = 0 per raw#10).
 5. **Tools** — `roadmap_op.hexa` (14 subcmd, anima parity broken intentional per
    own1) + `closure_orchestrator.hexa` (weighted_threshold awareness, mk2
    checkpoint integration).
@@ -76,7 +93,6 @@ for full honesty disclosure.
    │  └ advapi32    │          │  d3d11_stage1      │         │ 18+ families     │
    │  └ kernel32    │          │  d3d12             │         │  at 100% manjeom │
    │  └ ntdll       │          │  d3d12_stage1      │         │  (skeleton-tier) │
-   │  └ user32      │          │  d3d12_stage2      │         │ raw#10 honest C3:│
    │  └ ws2_32      │          └────────┬───────────┘         │  validated_manjeom│
    │  └ wininet     │                   │                     │  = 0             │
    │  └ etc.        │                   │                     └────────┬─────────┘
@@ -128,7 +144,6 @@ mandate, now under `airgenome/doc/` + `state/markers/` per Track 2026-05-05
 layout migration) + **8** `gamebox_*` native markers (Tracks BT through CA) +
 gitignored hexa-resolver telemetry (`closure_orchestrator_<ts>` /
 `remote_preflight_<ts>` / `resource_lint_<ts>`).
-raw#9 STRICT (hexa-only, no .py creation in this repo).
 
 ---
 
@@ -297,7 +312,6 @@ Per-game README index: [docs/per_game/](docs/per_game/) — 12 sub-page READMEs 
 | [.checkpoint.win32_50pct_coverage](.checkpoint.win32_50pct_coverage) | weighted_threshold | **met** (100/50) | 1st checkpoint reached (Track BL+BO) |
 | [.checkpoint.win32_full_coverage](.checkpoint.win32_full_coverage) | weighted_threshold | **met** (100/100) | Track BP Win32 100% achieved (Track BU cached flip) |
 
-Honest scope (raw#10 C3): **0 games run a real frame yet (validated_manjeom = 0).** All cond/checkpoint progression is skeleton-tier (synthetic round-trip + scaffold logic). Real-game first-frame requires production smoke gate (Track AU recommended path A own1, multi-year horizon).
 
 ---
 
@@ -314,7 +328,6 @@ PR #47 squash-merged 2026-05-04 (Track AY). PR #48 merged 2026-05-04 (Track BD/B
 
 ---
 
-## Caveats (raw#10 honest C3)
 
 > The forensic verdict `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0` carries
 > 5 explicit honesty caveats. **Read these before assuming gamebox runs games.**
@@ -366,6 +379,32 @@ SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0
   policy).
 
 ---
+
+## Repo layout
+
+```
+gamebox/
+├── README.md
+├── LICENSE                          Apache-2.0
+├── CHANGELOG.md
+├── hexa.toml                        hx manifest (name, version, entry)
+├── install.hexa                     hx build hook
+├── cli/
+│   └── gamebox.hexa                 CLI entry (status / list / probe / launch / selftest)
+├── lib/
+│   ├── detect.hexa                  game detection
+│   ├── dispatch.hexa                subcommand dispatcher
+│   └── loader/                      PE loader (stage1, imports, relocations)
+├── native/                          Apple-native helpers
+├── airgenome/                       AI-native session artifacts (doc/)
+├── gamebox/                         per-game artifacts
+├── docs/                            roadmaps, freezes, forensic reports
+├── tests/                           hexa selftest
+├── tool/                            roadmap_op, closure_orchestrator
+├── .roadmap.*                       per-game SSOT (14 active + 1 historical)
+├── .checkpoint.*                    forensic checkpoint snapshots
+└── RELEASE_NOTES_v*.md              per-version notes
+```
 
 ## License
 
