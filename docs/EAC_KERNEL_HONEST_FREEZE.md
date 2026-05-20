@@ -267,7 +267,6 @@ C8. **EAC kernel callback bypass 0건**. PsSetCreateProcessNotifyRoutine* / imag
 
 C9. **`c_elden_eac_kernel_driver_avoid_track` 측 own1 explicit "avoid" posture**. bypass 아닌 honest detection avoid; gamebox 측 EAC kernel driver 측 통과 시도 X.
 
-C10. **`c_anticheat_detection_track` 측 cross-class scaffold**. VAC + GameGuard + EAC + Warden 모두 cross-link. own1 detection-only (Track BL/BM forensic 100% manjeom skeleton-tier — `validated_manjeom = 0` per raw#10 honest C3, 실 frame 측 측정 X).
 
 C11. **본 doc 의 스타일 + 구조 측 GAMEGUARD_HONEST_FREEZE.md + VAC_HONEST_FREEZE.md mirror**. own2 traceability + cross-link consistency.
 

@@ -225,7 +225,6 @@ NCSOFT 게임 family 측 lineage_classic_r28 의 위치 — Lineage 시리즈 �
 
 ---
 
-## 7. 정직성 메모 (raw#10 honest C3)
 
 - 본 검토는 외부 공개 자료 (NCSOFT 공식 patch note + binary observation) 기반. 실 LineageClassic.exe 분해 / live server connect 0건.
 - "manjeom 10/15" 수치는 axis A/B/C 추정 — D2R first-frame validated 비용과 비슷하다는 추정 근거는 OpenGL 4.3 path 우호도 (D2R DX11 path 와 동등 또는 우호) + GameGuard 측 axis B = 0 영구 lock.

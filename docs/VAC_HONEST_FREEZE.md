@@ -198,7 +198,6 @@ C5. **Trusted Mode bypass 0건**. CS2 lobby/matchmaking 측 Trusted Mode 측 영
 
 C6. **delayed ban window 측 reference만**. delayed ban 자체는 Valve 측 정책 — 본 doc 측 evasion target 아님 (단순 reference).
 
-C7. **c_anticheat_detection_track skeleton-tier**. own1 detection-only posture (Track BL/BM forensic 100% manjeom skeleton-tier — `validated_manjeom = 0` per raw#10 honest C3, 실 frame 측 측정 X).
 
 C8. **CS2 macOS native build 부재 측 Valve 측 platform priority 결정 사항**. Apple Silicon 측 future port 가능성은 현재 alpha priority 낮음 (외부 공개 community discussion); gamebox 측 wait-and-see retired_intentional posture 정합.
 

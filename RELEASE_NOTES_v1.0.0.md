@@ -20,7 +20,6 @@ Extracted from `dancinlife/airgenome-gamebox` after 67 BG cycles (2026-05-03 to 
 - **own2**: honest PASS/FAIL/PARTIAL emit; `validated_manjeom = 0` explicit (skeleton-only)
 - **L1-L5 online expansion lock-in carries** per `.roadmap.battlenet`
 
-## Caveats (raw#10 C3)
 
 5 explicit honesty caveats — see [README §Caveats](README.md#caveats-raw10-c3).
 TL;DR: skeleton-tier means modules compile/probe individually; no real game

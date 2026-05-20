@@ -124,7 +124,6 @@ representative 15 외 216 module 측 own1 정합 family-inheritance 추정 PASS 
 - `closure_orchestrator` (rank C) — 별도 cycle 권고
 - `battlenet_bypass` (self) — Track-P 측 land 완료
 
-## §7 raw#10 honest C3 caveats (12 항목)
 
 **C1**. doc-only land — `lib/perf/c_*.hexa` module touch 0건, lib/loader/ / tool/ / native/ / tests/ touch 0건 (read-only audit only).
 

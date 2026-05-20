@@ -67,7 +67,6 @@ freeze_doc:
   path: docs/WARDEN_HONEST_FREEZE.md
   loc: 390
   bytes: 32537
-  sections: 10   # §0 (목적/한계) + §1 (vendor/product/GG차이) + §2 (Apple-only + lock-in posture) + §3 (research direction reference) + §4 (own1/own2 alignment) + §5 (cross-link) + §6 (future-cycle non-goals + in-scope) + §7 (EULA/ToS lock-in SSOT L1-L5) + §8 (raw#10 honest C3 caveats) + §9 (출처)
   bypass_code_lines: 0
   evasion_code_lines: 0
   circumvention_code_lines: 0
@@ -177,7 +176,6 @@ friendly preset / silent-land marker.
 | §5 | cross-link table | battlenet family + sister freeze docs (3 cluster: GG/Warden/D2R-realm) + retired_intentional vs online expansion lock-in family + predecessor markers |
 | §6 | future-cycle non-goals + in-scope | user-mode bypass work 영구 X + platform-level work 영구 X + in-scope = 자연 환경 정합 (long-horizon, Track-K) + honest detection-vector tracking emit |
 | §7 | EULA/ToS risk acknowledgment (L1+L2 lock-in SSOT) | 5 항목 표 (L1-L5) + lockin_iso 2026-05-03 + marker cross-reference |
-| §8 | raw#10 honest C3 caveats | 14 caveats inline (C1-C14, ≥ 10 정합 — higher risk surface 반영) |
 | §9 | 출처 | vendor 공식 + Wikipedia + OS textbook + Glider lawsuit (MDY v. Blizzard) — community bypass 자료 cite 0건 |
 
 ### §3.3 bypass / evasion / circumvent / hook-chain shim / NOP-patch / memory-scan dodge occurrence audit
@@ -265,7 +263,6 @@ negation context only (NO / X / 0줄 / 영구 out-of-scope / forbidden list / ho
 NOT BYPASS / cite 영역 부정). bypass code lines = 0, evasion code lines = 0, circumvention code
 lines = 0, hook-chain shim lines = 0, NOP-patch lines = 0, memory-scan dodge lines = 0.
 
-## §7 raw#10 honest C3 caveats (≥ 10 items, higher risk surface 반영)
 
 C1 — **bypass / evasion / circumvention / hook-chain shim / NOP-patch / memory-scan dodge 0건**: 본 cycle 측 freeze doc + perf module + handoff + marker 측 6 keyword 모두 negation context only. 회피 방법 / 회피 코드 / 회피 pattern 측 본 cycle 영구 0줄.
 
@@ -289,7 +286,6 @@ C10 — **외부 cite 측 vendor 공식 + 공개 textbook + 공식 lawsuit 한�
 
 C11 — **Track J/K/L parallel scope 측 file scope disjoint**: 본 cycle (Track-J) 의 file scope = 본 prompt 명시 5 file 한정 (`lib/perf/c_bnet_warden_environment_compat.hexa` + `docs/WARDEN_HONEST_FREEZE.md` + 본 handoff + marker + `.roadmap.battlenet` cond.3 surgical edit). Track-K (loader 측) + Track-L (D2R realm 측) 측 file 영구 untouched 정합.
 
-C12 — **friendly preset 정합 (raw 270 ai-native readme triplet)**: 본 handoff doc only (freeze doc + module 자체는 mk1 narrative + module reference). TL;DR 최상단 + 모든 §-section 표 우선 + raw#10 caveats inline + next step 명시 + cross-link section 명시.
 
 C13 — **env() lazy + 절대 path 회피 (raw 15)**: 모든 path 는 repo-relative — `docs/...`, `.roadmap.<game>`, `state/markers/...`, `lib/...`. 사용자별 절대 path 0건. predecessor pattern 동일.
 

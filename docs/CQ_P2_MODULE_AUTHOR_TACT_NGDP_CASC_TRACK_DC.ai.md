@@ -146,7 +146,6 @@ All CW spec targets met or exceeded.
 
 ### §4.3 raw
 
-raw#9 / raw#11 / raw#12 / raw#15 / raw#175 / raw#270 / raw#271 — all enforce.
 
 ### §4.4 BR_NO_USER_VERBATIM
 

@@ -95,7 +95,6 @@ Track AU production smoke gate design (2026-05-04) recommended **path A own1-mai
 
 **Total real-run blocked surface**: ~700+ .hexa files, 27+ subcmds across CLI + tools.
 
-All retain `validated_manjeom = 0` per raw#10 honest C3.
 
 ---
 

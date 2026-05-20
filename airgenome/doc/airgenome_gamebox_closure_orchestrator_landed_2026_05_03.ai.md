@@ -122,7 +122,6 @@ baseline 은 SSOT scrape 실패 시 fallback — 정상 path 는 SSOT scrape (cl
 | **closure_orchestrator** | **C** | ✓ **landed (본 cycle)** | tool + design doc + handoff + marker |
 | battlenet_bypass | (self) | landed (Track P) | own1 verdict PASS lock-in |
 
-## §7 raw#10 honest C3 caveats (10 items)
 
 1. **C1 — closure_pct 측 advance 0건 명시**: 본 cycle 측 closure_pct (25%) 측 advance 0건 lock-in. 본 cycle 은 TRACKER 만 land — 사용자 측 closure 본체 work 측 본 tool 측 emit 만으로 진행 안됨 명시.
 2. **C2 — baseline cycle 37 pin staleness**: BASELINE_* 상수 측 cycle 37 시점 pin. 다음 cycle 측 SSOT update 시 본 baseline 도 별도 cycle 측 sync 필요 (additive_only 정합 — 본 tool 측 자동 update 0).

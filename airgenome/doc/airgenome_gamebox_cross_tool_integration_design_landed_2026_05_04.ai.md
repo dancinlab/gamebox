@@ -97,7 +97,6 @@ common envelope: `__<TOOL>__ <verdict> <subcmd> <reason> [<cross_ref>]`
 - 기존 .roadmap.* / docs / lib / tool / native / tests 측 modification 0건 (read-only reference for emit format only)
 - 후속 implementation cycle 측 NEW file (`tool/integration_report.hexa`) 1개 land — 기존 3 tool/module untouched
 
-## §5 raw#10 honest C3 caveats summary (12 항목)
 
 본 cycle 측 design doc §8 측 inline 12 honest C3 caveats:
 

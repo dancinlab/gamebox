@@ -38,7 +38,6 @@ Section content:
 - **Per-game README index pointer**: `docs/per_game/` (11 sub-page READMEs, raw 270 triplet T1 baseline 2026-05-03).
 - **3 cross-cutting loader roadmap pointers**: loader_pe / loader_win32 (435/435 = 100% skeleton-tier cycle 27→62) / loader_dx (D3DMetal binary licence transitive blocker).
 - **7 cross-roadmap checkpoint table**: 5 partial AND-aggregated game/launcher integration checkpoints + 2 weighted_threshold win32_*pct_coverage now both **met** post-BU flip.
-- **Honest scope footer**: validated_manjeom = 0 explicit (raw#10 C3 — 0 games run a real frame yet; all skeleton-tier, real-game first-frame requires production smoke gate Track AU recommended path A own1 multi-year horizon).
 
 ---
 

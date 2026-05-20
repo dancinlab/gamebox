@@ -99,7 +99,6 @@ BG subagent — Track-P own1 disambiguation land for airgenome-gamebox: `lib/loa
 | §4 | Future-cycle non-goals (영구 out-of-scope) — 5 카테고리 (DRM evasion / account auth bypass / Warden bypass / GameGuard bypass / Wine staging patch import) |
 | §5 | Cross-link — sister freeze docs cluster 4 + module + battlenet family + 3 posture 비교 |
 | §6 | 6 BG-AGB rank B+C unblock confirmation |
-| §7 | raw#10 honest C3 caveats (10 items) |
 | §8 | 출처 |
 
 ### §4.3 honest C3 caveats count
@@ -148,7 +147,6 @@ unblock 의 NOT 의미:
 - 6 candidates 측 본 cycle 측 implementation 0건
 - 6 candidates 측 별도 marker / handoff land 시점 측 own1 verdict 별도 명시 권고
 
-## §7 raw#10 honest C3 caveats (≥6 items, naming disambiguation specific)
 
 C1 — **본 cycle = 첫 honest naming disambiguation cycle**: airgenome-gamebox 측 첫 honest naming disambiguation. 다른 module 측 동일 disambiguation 권고 (e.g. 다른 module 측 "bypass" / "shim" / "hack" 단어 occurrence audit) 는 별도 cycle 측 evaluate. 본 cycle 측 그 영역 측 X.
 

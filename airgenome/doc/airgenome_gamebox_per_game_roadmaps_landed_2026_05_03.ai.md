@@ -321,7 +321,6 @@ directive 반영.
 | **lineage_w** | (loader sub-module 미land) | (.NET WinForms) | UE4 D3D11+D3D12 | — | required |
 | **purple_launcher** | — | (.NET WinForms) | WebView2 + Android emul | (analog launcher pattern) | (self) |
 
-## §5 raw#10 honest C3 (12 caveat)
 
 C1 — 본 land 는 **JSONL header 만**. 11 .roadmap.<game> cond.N entries (`{"type":"entry",...}`) 추가는 0건.
 사용자 lock-in 후 별도 cycle (verifier 실행 + status met 전환).
@@ -360,7 +359,6 @@ C11 — BR-NO-USER-VERBATIM (raw 175) — 본 doc + 11 신규 .roadmap + 1 신�
 verbatim 으로 인용하지 않음. 사용자 directive ("airgenome-gamebox per-game roadmap fan-out" 등) paraphrase 만
 기록.
 
-C12 — friendly preset 적용 (handoff doc only) — TL;DR 최상단 + 모든 §-section 표 우선 + raw#10 caveats inline
 + next step 명시. 사용자 응답 X (BG subagent → 메인 monitor pattern).
 
 ## §6 own1 + own2 reflect 정합 audit

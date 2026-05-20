@@ -41,7 +41,6 @@ Skeleton vs validated semantics (per `project_skeleton_vs_validated_tier.md`):
 surface coverage = 100% across the 6 modules (round-trip emit fan-out, byte-equal
 synthetic verdicts, all paper-mode invariants honored), but **no real game frame
 observable on darwin/arm64**. validated_manjeom carries forward = 0 per
-raw#10 honest C3.
 
 ---
 

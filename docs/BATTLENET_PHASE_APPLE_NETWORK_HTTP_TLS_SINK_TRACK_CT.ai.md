@@ -60,7 +60,6 @@ spec; CT+1 (or later) can author against it.
 - **Honest tier at exit**: **skeleton-tier** (paper-mode validated, real-run
   blocked by G-1).
 - **Invariant impact**: validated_manjeom=0 carries. Wine 0 carries.
-  raw#9/11/12/15/175/270/271 enforce.
 
 Track CT does NOT extend this scope. Track CT does NOT write the module.
 Track CT writes the spec and resolves Q1 with a recommendation.
@@ -81,7 +80,6 @@ Five TSV tables under `persist/pe_battlenet_agent_http_rest/`:
 | `install.tsv` | state_id, game_uid, state_kind (0–5), progress_pct (0–100) | `record_install_state` | state_kind in {not_installed, downloading, installing, installed, updating, error} |
 | `response.tsv` | response_id, endpoint, response_size_bytes, content_type | `record_endpoint_response` | size ≥ 0; content_type non-empty |
 
-`self_test` emits ≥14 r0 rows (5 req + 4 oauth + 3 launch + 4 install + 4 resp + 1 stats = 21 typically). Method enum: `GET / POST / HEAD / PUT / DELETE`. Endpoint surface: `/agent`, `/agent/uid/<uid>`, `/agent/install`, `/agent/uninstall`, `/agent/version`. Bearer token = **hash only** (no real token bytes; raw#11 honest emit).
 
 **Observation for CQ-P1**: agent_http_rest has no TLS-handshake table, no request→response correlation key, no chunk index, no SHA-256 column. The "request" + "response" pair is independent rows. CQ-P1 must add the orthogonal axis: **transport-level evidence** (TLS handshake state, cipher suite class, certificate chain depth, response body integrity hash).
 

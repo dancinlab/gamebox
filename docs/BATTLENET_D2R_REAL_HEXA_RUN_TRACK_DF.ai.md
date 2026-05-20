@@ -180,7 +180,6 @@ carries unchanged.
 
 No code changes. DF is a real-run sweep + documentation track only —
 existing modules executed under the established override path. Per
-own1 + raw#168 minimum-viable, no module rewrites, no orchestrator
 patches, no roadmap edits.
 
 ---

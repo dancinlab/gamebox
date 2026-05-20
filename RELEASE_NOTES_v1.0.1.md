@@ -45,7 +45,6 @@ All 3 drift items from Track BO snapshot v2 now resolved (drift_count 3 → 0).
 - **own2**: `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0` honest verdict carries; status flip rationale per checkpoint cited; sideways-PASS semantics explicit; skeleton vs validated distinction preserved.
 - **L1-L5 online expansion lock-in carries** per `.roadmap.battlenet`.
 
-## Caveats (raw#10 C3)
 
 5 explicit honesty caveats unchanged from v1.0.0 — see [README §Caveats](README.md#caveats-raw10-c3).
 

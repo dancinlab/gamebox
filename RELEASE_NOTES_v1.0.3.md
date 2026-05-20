@@ -50,7 +50,6 @@ Patch release bundling post-v1.0.2 work:
 - **own1**: Wine 0 / hexa-only / DRM bypass 0 / Warden bypass 0 / anti-cheat bypass 0 / anima clone 0 / `destructive_ops: 0` (maintained throughout CE-CH; CG was reference-removal not file-deletion).
 - **own2**: PASS/FAIL/PARTIAL/RETIRED_INTENTIONAL emit honest. validated_manjeom = 0 carries. Paper-mode vs real-run distinction explicit in CE + BZ. Drift fix rationale per option documented in CG.
 
-## Caveats (raw#10 C3) — UNCHANGED from v1.0.0
 
 5 explicit honesty caveats unchanged. CE adds an honest-deferred-run posture
 to the orchestrator selftest surface (same blocker class as `cli/gamebox.hexa

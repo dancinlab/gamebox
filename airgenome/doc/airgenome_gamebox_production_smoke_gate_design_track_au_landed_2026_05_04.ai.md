@@ -74,7 +74,6 @@ BG subagent — Track AU production smoke gate design land for airgenome-gamebox
 - 기존 `state/markers/*.marker` 측 modification 0건 (read-only reference)
 - 본 cycle 측 NEW file 3건만 (design doc + handoff + marker)
 
-## §4 raw#10 honest C3 caveats summary (14 항목)
 
 본 cycle 측 design doc §10 측 inline 14 honest C3 caveats:
 

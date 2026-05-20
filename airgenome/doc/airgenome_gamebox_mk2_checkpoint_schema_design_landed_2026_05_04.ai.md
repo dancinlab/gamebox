@@ -84,7 +84,6 @@ BG subagent — Track AA mk2 checkpoint schema design land for airgenome-gamebox
 - 기존 docs / lib / tool / native / tests 측 modification 0건 (read-only reference for schema reuse only)
 - 후속 implementation cycle 측 NEW kind (`.checkpoint.<name>`) 측 land — 기존 14 .roadmap.* 측 untouched
 
-## §5 raw#10 honest C3 caveats summary (14 항목)
 
 본 cycle 측 design doc §12 측 inline 14 honest C3 caveats:
 

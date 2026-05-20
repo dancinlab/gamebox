@@ -204,7 +204,6 @@ closure_orchestrator / battlenet_bypass) cross-link symmetry:
 
 3 land 도메인 ↔ 6 spec-only 후보 간 cross-link 모두 evidence array 또는 cross_link object 안에 명시.
 
-## §5 raw#10 honest C3 (10 caveat)
 
 C1 — 본 land 는 **JSONL header 만**. 3 cond.N entries (`{"type":"entry",...}`) 추가는 0건. 사용자 lock-in 후
 별도 cycle (verifier 실행 + status met 전환).
@@ -252,7 +251,6 @@ C10 — env() lazy + <user> placeholder convention (raw 15) — 3 신규 .roadma
 - TL;DR 최상단 5 줄
 - 모든 §-section 표 (table) 우선
 - 3 land 도메인 summary table 통일 형식
-- raw#10 caveats (C1-C10) inline
 - 마지막 next step 명시 (사용자 lock-in 대기)
 
 ## §8 marker emit

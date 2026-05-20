@@ -157,7 +157,6 @@ CS proposes only phases that respect own1 + the always-online retired_intentiona
 - **Inputs**: 9 `pe_d3d12_*` modules + `dx_d3d12_stage{1,2}` + `pe_dxgi_swapchain` + `pe_swapchain_present_track`.
 - **Exit criteria**: 1 audit doc landed (`docs/D4_D3D12_SURFACE_HONESTY_AUDIT.md` candidate); each module annotated skeleton/stage1/stage2; validated_manjeom column = 0 across the board.
 - **Honest tier**: documentation-tier (no code emission, no validated_manjeom promotion).
-- **Invariant impact**: own1 carries (Wine 0); own2 carries (honest tier explicit); raw#9/11/12/15/175/270/271 enforce.
 
 ### §4.2 Phase D4-CS-β — D3D12-to-Metal router skeleton inventory (doc-tier)
 
@@ -165,7 +164,6 @@ CS proposes only phases that respect own1 + the always-online retired_intentiona
 - **Inputs**: §4.1 output + `docs/LOADER_NATIVE_HELPER_BRIDGE.md` + `docs/D3D_TO_METAL_SHADER_MANJEOM_REVIEW.md`.
 - **Exit criteria**: 1 router inventory doc landed; gap list with priority + own1-compatible resolution path per gap; explicit "no Apple D3DMetal embedding" reaffirmation.
 - **Honest tier**: documentation-tier.
-- **Invariant impact**: own1 (no D3DMetal embed) explicit; own2 honest; raw#9/11/12/15/175/270/271 enforce.
 
 ### §4.3 Phase D4-CS-γ — Always-online posture freeze (doc-tier)
 
@@ -173,7 +171,6 @@ CS proposes only phases that respect own1 + the always-online retired_intentiona
 - **Inputs**: `docs/D4_MANJEOM_REVIEW.md` (predecessor) + Track CQ output (Battle.net forward roadmap) + `docs/EAC_KERNEL_HONEST_FREEZE.md` (template).
 - **Exit criteria**: 1 honest-freeze doc landed (`docs/D4_ALWAYS_ONLINE_HONEST_FREEZE.md` candidate); 0 bypass code; 0 evasion phase; explicit declaration of non-pursuit.
 - **Honest tier**: documentation-tier (honest freeze).
-- **Invariant impact**: own1 (Wine 0 / DRM bypass 0 / anti-cheat bypass 0) explicit; own2 honest; raw#9/11/12/15/175/270/271 enforce.
 
 ### §4.4 Phase D4-CS-δ — Skeleton perf cluster c_d4_* honest annotation (doc-tier)
 
@@ -181,7 +178,6 @@ CS proposes only phases that respect own1 + the always-online retired_intentiona
 - **Inputs**: 27 `c_d4_*` modules (already landed at skeleton level per predecessor cycles).
 - **Exit criteria**: 1 annotation table doc landed; every module's honest tier explicit; validated_manjeom = 0 for all 27.
 - **Honest tier**: documentation-tier.
-- **Invariant impact**: own1 carries; own2 honest; raw#9/11/12/15/175/270/271 enforce.
 
 ### §4.5 Phases NOT proposed (and why)
 

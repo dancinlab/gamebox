@@ -240,7 +240,6 @@ SESSION_FINAL_SUMMARY 등 75 file) 에서 mk2 entry 추출 가능 후보:
 verifier=`""` (공란) 도 mk2 schema 상 valid (anima clm/eeg 등 다수 entry 가 그렇게 land) — script 없을 때 manual
 override 경로 (`state/<domain>_verify_manual_review.jsonl`) 만 land 도 ok.
 
-## §6 raw#10 honest C3 (10 caveat)
 
 C1 — 본 audit 는 **spec emit only**. .roadmap.<domain> 신규 파일 0건 생성, README.ai.md 0건 추가, native/lib
 무수정. 사용자 lock-in 후 별도 cycle 필요.
@@ -290,7 +289,6 @@ prompt 직접 인용 0건.
 - TL;DR 최상단 5 줄
 - 모든 §-section 표 (table) 우선
 - 9 후보 priority rank A/B/C 으로 actionable
-- raw#10 caveats (C1-C10) inline
 - 마지막 next step 명시 (사용자 lock-in 대기)
 
 ## §9 Marker 1개 emit

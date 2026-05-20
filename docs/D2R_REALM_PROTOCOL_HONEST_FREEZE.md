@@ -348,7 +348,6 @@ own1 enforcement 정합 — gamebox 측 Wine / CrossOver / Whisky / GPTK / commu
 
 ---
 
-## 8. raw#10 honest C3 caveats (≥ 10 items, high-risk surface 측 특별 명시)
 
 C1 — **wire-protocol implementation / packet construction / MITM / replay / private server / traffic shaping evasion / packet decryption 0건 명시**: 본 doc 의 어떤 부분도 위 카테고리 중 어느 것도 implement / cite / encourage 하지 않음. 본 doc 의 §1-§3 측 layer 명칭 / packet category 명칭 / stage 전이 명칭 reference 는 OS textbook 수준 + vendor 공식 자료 수준 + name-level only. 본 doc 측 위 forbidden 단어들의 등장은 **항상 negation context** (NO / 영구 X / 영구 out-of-scope / forbidden list / not provided) 에서만 사용. realm protocol 직접 시도는 ToS violation 직격 path 이므로 본 caveat 는 freeze doc 류에서 가장 강한 stance 로 명시됨.
 

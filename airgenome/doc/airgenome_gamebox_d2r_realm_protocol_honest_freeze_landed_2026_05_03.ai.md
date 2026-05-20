@@ -117,7 +117,6 @@ online expansion (a+) path 측 D2R online single-target lock-in 의 Track L cycl
 | §5 | cross-link table | sister freeze docs (Track E GameGuard + Track J Warden + 본 Track L) + .roadmap.battlenet/diablo2_resurrected reference + Track K loader skeleton + predecessor markers |
 | §6 | future-cycle non-goals (영구 out-of-scope) | wire-protocol / MITM / replay / injection / private server / traffic / token 측 영구 X + in-scope (영구 영역) |
 | §7 | EULA/ToS risk acknowledgment (L1-L5 SSOT) | L1 EULA + L2 Warden + L3 multi-year + L4 D2R single-target + L5 Track J/K/L 병행 — 사용자 acknowledged 영구 record |
-| §8 | raw#10 honest C3 caveats | 13 caveats inline (C1-C13, ≥ 10 정합, high-risk surface 특별 강조) |
 | §9 | 출처 | vendor 공식 + Wikipedia level only — community OSS server / community wrapper / Wine staging patch / CrossOver bottle 측 cite 0건 |
 
 ### §2.3 forbidden term occurrence audit (negation context only)
@@ -257,7 +256,6 @@ freeze doc §3.2 측 7 카테고리 (auth / realm-list / character / game-create
 - 본 cycle 측 lib/ + tests/ + native/ + tool/ + plugin.json + entry + README.md + .gitignore 측 untouched, baseline preserved (직접 verify X — schema-validated only, raw 168 minimum-viable additive land).
 - in_place_writes=0 (Track I `roadmap_op_self_impl` 측 동일 posture).
 
-## §7 raw#10 honest C3 caveats (≥ 10 items, high-risk surface 특별 강조)
 
 C1 — **wire-protocol implementation / packet construction / MITM / replay / private server / traffic shaping evasion / packet decryption 0건 명시**: 본 doc 와 freeze doc 의 어떤 부분도 위 카테고리 중 어느 것도 implement / cite / encourage 하지 않음. 모든 forbidden 단어 occurrence 는 negation context (NO / 영구 X / 영구 out-of-scope / forbidden list / not provided) 에서만 사용.
 

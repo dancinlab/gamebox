@@ -193,10 +193,6 @@ Two distinctness flags:
 
 ### §3.3 raw enforcement
 
-raw#9 (Wine 0) / raw#11 (honest emit) / raw#12 (validated_manjeom=0
-carries) / raw#15 (env lazy resolve / repo-relative paths — no new env
-references) / raw#175 (silent-land + minimum-viable additive) / raw#270
-(skeleton-tier vs validated-tier distinction) / raw#271 (retired_intentional
 + sideways-PASS posture preserved). All seven enforce.
 
 ### §3.4 BR_NO_USER_VERBATIM

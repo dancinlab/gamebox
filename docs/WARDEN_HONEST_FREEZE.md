@@ -337,7 +337,6 @@ D2R online = 첫 online expansion lock-in 정식 채택 사례. retired_intentio
 
 ---
 
-## 8. raw#10 honest C3 caveats (≥ 10 items, 더 높은 risk surface 반영)
 
 C1 — **bypass / evasion / circumvention / hook-chain shim / NOP-patch / memory-scan dodge 0건 명시**: 본 doc 의 어떤 부분도 Warden 우회 / 회피 / circumvent / hook chain shim / NOP-patch / memory scan dodge 방법을 제공하지 않음. §3 의 detection category / user-mode hook category reference 는 OS textbook + Glider lawsuit 공개 자료 수준의 명칭과 일반 설명만이며, 회피 방법 / 회피 코드 / 회피 pattern 0건. 모든 `bypass` / `evasion` / `circumvent` / `nop-patch` / `hook chain shim` / `memory scan dodge` 단어는 negation context 에서만 사용.
 

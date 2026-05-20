@@ -46,7 +46,6 @@ Patch release bundling post-v1.0.3 work — final closure cycle of the standalon
 - **own1**: Wine 0 / hexa-only / DRM bypass 0 / Warden bypass 0 / VAC bypass 0 / Trusted Mode bypass 0 / EAC kernel bypass 0 / EAC anti-tamper bypass 0 / GameGuard bypass 0 / EOS handshake circumvention 0 / FromSoft matchmaking bypass 0 / co-op session emul 0 / handshake spoof 0 / anima clone 0 / `destructive_ops: 0` (maintained throughout CK-CN).
 - **own2**: PASS/FAIL/PARTIAL/RETIRED_INTENTIONAL emit honest. validated_manjeom = 0 carries. Skeleton-tier vs real-tier distinction explicit. CM 4 modules each emit RETIRED_INTENTIONAL posture annotation. CN explicit no-fake-PASS / no-fake-real-run-completion declaration.
 
-## Caveats (raw#10 C3) — UNCHANGED from v1.0.0
 
 5 explicit honesty caveats unchanged. CM modules are skeleton-tier — synthetic
 self_test PASSes with hardcoded data; real `nightreign.exe` binary measurement

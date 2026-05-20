@@ -300,7 +300,6 @@ track_b_done emits=6 chain=purple_to_lineage_offline_shim
 ✅ test_purple_lineage_offline_shim self_test PASS (..., emits=6)
 ```
 
-## §7 raw#10 honest C3 caveats (≥ 8 items)
 
 C1 — hexa CLI absence — `which hexa` 측 미존재 환경에서는 schema-validated only (runtime emit unverified). predecessor cycle 측 동일 posture (raw 168 minimum-viable additive land).
 
@@ -320,7 +319,6 @@ C8 — env() lazy + 절대 path 회피 (raw 15) 정합 — 모든 신규 path �
 
 C9 — BR-NO-USER-VERBATIM (raw 175) 정합 — 본 doc + 4 .roadmap 수정 + mk1 narrative + marker 측 사용자 prompt verbatim 인용 0건. paraphrase only.
 
-C10 — friendly preset (handoff doc only) — TL;DR 최상단 + 모든 §-section 표 우선 + raw#10 caveats inline + next step 명시. 사용자 응답 X (BG subagent → 메인 monitor pattern).
 
 C11 — predecessor lib_loader_count 414 → 415 (1 신규 loader land), lib_loader_extended_self_test 0 → 1 (pe_lineage_classic_r28_track), lib_perf_extended_self_test 0 → 3 (purple_dotnet_clr / purple_webview2 / purple_android_emul). 기존 self_test row 0건 변경, append-only.
 

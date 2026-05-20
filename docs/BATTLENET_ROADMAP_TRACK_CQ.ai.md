@@ -133,7 +133,6 @@ Each phase: scope, inputs, exit criteria, **honest tier expected at exit**, inva
 - **Inputs**: pe_battlenet_agent_http_rest.hexa (REST round-trip schema), pe_battle_net_download_track.hexa (chunk schema), pe_battle_net_oauth_token.hexa (op schema). All three already landed.
 - **Exit criteria**: New module schema-validates self_test under paper-mode. own1 verdict PASS (no Wine wininet, no Apple-private API misuse). own2 emit count meets r0 threshold. CHANGELOG additive entry.
 - **Honest tier at exit**: **skeleton-tier** (paper-mode validated, real-run blocked by G-1).
-- **Invariant impact**: validated_manjeom=0 carries. Wine 0 carries. raw#9/11/12/15/175/270/271 enforce.
 
 ### Phase CQ-P2 — TACT/NGDP/CASC parser skeleton
 

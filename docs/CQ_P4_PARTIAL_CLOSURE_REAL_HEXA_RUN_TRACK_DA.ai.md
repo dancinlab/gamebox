@@ -210,7 +210,6 @@ are surfaces of CQ-P5 (per-surface validated-tier flips).
 
 ### §4.3 raw enforcement
 
-raw#9 / raw#11 / raw#12 / raw#15 / raw#175 / raw#270 / raw#271 — all enforce. The closure_orchestrator emit confirms raw_compliance: `[9, 11, 12, 15, 175]` in the marker.
 
 ### §4.4 BR_NO_USER_VERBATIM
 

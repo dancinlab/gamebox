@@ -89,7 +89,6 @@ BG subagent — Track-R `loader_native_helper` rank B+C cycle land for airgenome
 | §2 | own1 정합 (Apple platform component = OK, Wine/CrossOver wrapper 0) | own1 정합 verdict PASS + 8 evidence + NOT-IN-SCOPE 영구 |
 | §3 | Future-cycle non-goals (영구 out-of-scope) | Wine source / CrossOver patch / DXVK / VKD3D-Proton / MoltenVK / Mono / CoreCLR / Vulkan SDK / 3rd-party D3D-to-Metal binding 영구 out-of-scope |
 | §4 | Cross-link to loader_dx + loader_pe + loader_win32 | 4 cross-link + 5 sister freeze cluster + 6 BG-AGB rank B+C unblock confirmation |
-| §5 | raw#10 honest C3 caveats (8 items) | C1-C8 honest 인정 |
 | §6 | 출처 | Apple official references + sister mk1 narrative |
 
 ### §3.3 8 honest C3 caveats summary
@@ -137,7 +136,6 @@ Wine / CrossOver / Whisky / GPTK / Mono / CoreCLR / Vulkan / MoltenVK / 3rd-part
 
 **bg_agb_rank_b_c_unblock_predecessor**: `state/markers/airgenome_gamebox_battlenet_bypass_own1_disambiguation_landed.marker` (Track-P, 본 cycle 측 unblock source).
 
-## §6 raw#10 honest C3 caveats (10 items)
 
 ### C1 — bridge layer = surface declaration only
 

@@ -65,7 +65,6 @@ Patch release bundling post-v1.0.1 work:
 - **own2**: PASS/FAIL/PARTIAL/RETIRED_INTENTIONAL emit honest; status flip rationale per checkpoint cited; sideways-PASS semantics explicit; skeleton vs validated distinction preserved across all docs; `validated_manjeom = 0` carries.
 - **L1-L5 online expansion lock-in carries** per `.roadmap.battlenet`.
 
-## Caveats (raw#10 C3) — UNCHANGED from v1.0.0
 
 5 explicit honesty caveats unchanged from v1.0.0 — see [README §Caveats](README.md#caveats-raw10-c3).
 

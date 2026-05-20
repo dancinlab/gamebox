@@ -290,11 +290,9 @@ lineage_classic_r28 = 5 게임 candidate 중 정식 adopted 첫 사례 (Track-B 
 - ✓ external public reference 의 high-level naming summary (본 doc 의 §3 수준)
 - ✓ mk1 narrative + mk2 .roadmap retired_intentional rationale documentation
 - ✓ cross-link maintenance (다른 retired_intentional candidate 게임 측 family precedent)
-- ✓ raw#10 honest C3 caveat 명시 (본 doc §7)
 
 ---
 
-## 7. raw#10 honest C3 caveats (≥ 8 items)
 
 C1 — **bypass / evasion / circumvention 0건 명시**: 본 doc 의 어떤 부분도 GameGuard 우회 / 회피 / circumvent 방법을 제공하지 않음. §3 의 hook category / detection vector reference 는 OS textbook 수준의 명칭과 일반 설명만이며, 회피 방법 / 회피 코드 / 회피 pattern 0건. 모든 `bypass` / `evasion` / `circumvent` 단어는 negation context 에서만 사용.
 

@@ -216,7 +216,6 @@ predecessor marker mutation.
 
 ### §6.3 raw
 
-raw#9 / raw#11 / raw#12 / raw#15 / raw#175 / raw#270 / raw#271 — all
 enforce. The closure_progress marker carries `raw_compliance: [9, 11, 12,
 15, 175]`.
 

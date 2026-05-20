@@ -59,7 +59,6 @@ freeze_doc:
   path: docs/GAMEGUARD_HONEST_FREEZE.md
   loc: 343
   bytes: 24243
-  sections: 9   # §0 (목적/한계) + §1 (vendor/product) + §2 (Apple-only constraint) + §3 (research-direction reference) + §4 (own1/own2 alignment) + §5 (cross-link) + §6 (future-cycle non-goals) + §7 (raw#10 honest C3 caveats) + §8 (출처)
   bypass_code_lines: 0
   evasion_code_lines: 0
   circumvention_code_lines: 0
@@ -131,7 +130,6 @@ BR-NO-USER-VERBATIM / friendly preset / silent-land marker.
 | §4 | own1 + own2 alignment 재확인 | own1 enforcement 표 + own2 honest emit + block-acknowledged posture |
 | §5 | cross-link table | lineage_classic_r28 family + retired_intentional adoption family (5 게임) + predecessor markers + sister manjeom |
 | §6 | future-cycle non-goals (영구 out-of-scope) | kernel-level work 영구 X + user-mode bypass work 영구 X + platform-level work 영구 X + in-scope (영구 영역) |
-| §7 | raw#10 honest C3 caveats | 12 caveats inline (C1-C12, ≥ 8 정합) |
 | §8 | 출처 | vendor 공식 + Wikipedia + OS textbook level only — community bypass 자료 cite 0건 |
 
 ### §2.3 bypass / evasion / circumvent occurrence audit
@@ -228,7 +226,6 @@ cond.3 desc = "GameGuard kernel block honest spec freeze documentation". 본 cyc
 
 `airgenome_gamebox_4game_retired_intentional_adoption_landed.marker` (가칭) 은 본 cycle 시점 **미존재** — 향후 cycle 측 D4 외 4 게임 (CS2 / Delta Force / Elden Ring / + N) lock-in 시 land 권고.
 
-## §6 raw#10 honest C3 caveats (≥ 6 items)
 
 C1 — **freeze doc 의 reference 영역 + bypass 영역 명확 구분**: freeze doc §3 측 hook category / detection vector 는 OS textbook 수준의 명칭과 일반 설명만이며, 회피 방법 / 회피 코드 / 회피 pattern 0건. 모든 `bypass` / `evasion` / `circumvent` 단어는 negation context 에서만 사용 (총 26 occurrence audit 완료).
 
@@ -246,7 +243,6 @@ C7 — **hexa CLI absence**: `which hexa` 측 미존재 환경에서는 schema-v
 
 C8 — **BR-NO-USER-VERBATIM 정합 (raw 175)**: 본 doc + freeze doc + 1 .roadmap surgical edit + marker 측 사용자 prompt verbatim 인용 0건. paraphrase only.
 
-C9 — **friendly preset 정합 (raw 270 ai-native readme triplet 의 일부)**: 본 handoff doc only (freeze doc 자체는 mk1 narrative reference). TL;DR 최상단 + 모든 §-section 표 우선 + raw#10 caveats inline + next step 명시 + cross-link section 명시.
 
 C10 — **env() lazy + 절대 path 회피 (raw 15)**: 모든 path 는 repo-relative — `docs/...`, `.roadmap.<game>`, `state/markers/...`, `lib/...`. 사용자별 절대 path 0건. predecessor pattern 동일.
 

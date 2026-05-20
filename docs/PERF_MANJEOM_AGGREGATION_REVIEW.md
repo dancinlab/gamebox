@@ -258,7 +258,6 @@
 
 ---
 
-## §7 caveats (raw#10 honest C3 — 12 항목)
 
 **C1**. 본 cycle 측 doc-only land — `lib/perf/c_*.hexa` module 측 modification / new perf module 작성 / `lib/loader/` / `tool/` / `native/` / `tests/` touch 0건 (read-only audit only). 본 doc 측 narrative spec freeze, 실 module 변경 X.
 

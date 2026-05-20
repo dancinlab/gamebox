@@ -238,7 +238,6 @@ __NATIVE_BRIDGE__ PARTIAL <surface>
 
 ---
 
-## 5. raw#10 honest C3 caveats (8 items)
 
 ### C1 — bridge layer = surface declaration only, 실 syscall 발동 X
 

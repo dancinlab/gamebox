@@ -66,7 +66,6 @@ executes Phase 2 of CQ at doc-tier.
   honest. own1 verdict PASS.
 - **Honest tier at exit**: **skeleton-tier**.
 - **Invariant impact**: identical to CQ-P1 — validated_manjeom=0 carries.
-  Wine 0 carries. raw#9/11/12/15/175/270/271 enforce.
 
 Track CW does NOT extend this scope. Track CW does NOT write the module.
 Track CW writes the spec and resolves Q2 with a recommendation.

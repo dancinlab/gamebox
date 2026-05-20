@@ -166,7 +166,6 @@ cross-link from `docs/D4_MANJEOM_REVIEW.md` §6/§7 측 Track A/B 측 reference:
 - §6 (downstream Battle.net launcher relationship): D4 측 retired_intentional 정식 채택 = Battle.net launcher 측 retired_intentional 채택 여부와 **독립적** (Track A scope 별도 결정)
 - §7 (peer D2R offline mode): D2R 측 offline mode 정식 path = D4 측 always-online retired_intentional posture 와 **상호 보완 (peer relationship)** — 본 repo design decision
 
-## §6 raw#10 honest C3 (≥6 caveat)
 
 C1 — 본 cycle 은 D4 단독 retired_intentional 정식 채택 + mk1 narrative spec freeze 만. 27 c_d4_* perf module 측
 self_test() validation 측 추가 0건 (별도 future cycle scope, retired_intentional posture 측 synthetic-data only).

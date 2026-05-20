@@ -19,7 +19,6 @@
 | **own 1 enforcement** | ✅ 21/21 PASS | tests/test_apple_only.hexa |
 | **own 2 enforcement** (log/error/emit/headless) | ✅ 8/8 PASS | tests/test_own2.hexa |
 | **gamebox plugin** | ✅ done | airgenome plugin manager + private repo push |
-| **raw#9 hexa-only 전환** | ✅ done | bash → hexa, entry 5-line shim 만 |
 | **lib/dispatch.hexa** | ✅ done | main subcommand dispatcher |
 | **lib/detect.hexa** | ✅ done | Apple-native env + own 1 violation 검출 |
 | **M0 R0 instrumentation** | ✅ 5/5 synthetic PASS | lib/perf/r0_*.hexa |
