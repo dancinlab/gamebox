@@ -3,11 +3,17 @@
 
 @goal: Lineage Classic R28 native bring-up on macOS: native first-frame path + R28-specific loader track. ✅ lineage_classic_r28 play checkpoint landed.
 
-## prerequisites (engine subsystems · native client — no launcher)
+## prerequisites (phase-split: download via PURPLE · runtime native)
 
-- GAMEBOX-LOADER — PE load (pe_lineage_classic_r28_track) ✅ code present
+- GAMEBOX-PURPLE — DOWNLOAD/INSTALL only: plaync PURPLE is the SOLE acquisition channel
+  for the client (no other download path). Runtime does NOT need Purple.
+- GAMEBOX-LOADER — PE load of LineageClassic.exe (pe_lineage_classic_r28_track) ✅ code present
 - GAMEBOX-WIN32  — Win32 client API shim ✅ code present
 - GAMEBOX-GFX    — Metal first frame (c_lineage_classic_r28_native_first_frame) ✅ code present
+
+Runtime model (roadmap): "Native client (no Purple shell) — direct executable".
+Runtime blocker = GameGuard (INCA Internet) kernel anti-cheat → retired_intentional /
+honest-freeze (docs/LINEAGE_CLASSIC_R28_MANJEOM_REVIEW.md), NOT a Purple dependency.
 
 (edit me — describe current state in completed-form; no history, no changelog inside this file)
 - [x] R28-specific loader track + native first-frame (pe_lineage_classic_r28_track · c_lineage_classic_r28_native_first_frame · 12 markers)

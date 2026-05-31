@@ -13,3 +13,12 @@ Append-only history sister of `GAMEBOX-LINEAGE-CLASSIC.md`. Each entry starts wi
 - [x] Wired engine prerequisite @uses edges in DOMAINS.tape: LINEAGE-CLASSIC --uses--> LOADER · WIN32 · GFX (native client — no launcher dep).
 - [x] Reconciled milestones to evidence: r28 loader track + native first-frame (12 markers) + play checkpoint + drift-resolution track bv landed → 3/4 [x]. Client protocol/login left open.
 - [x] Prerequisite readiness: LOADER/WIN32/GFX code present. LINEAGE-CLASSIC is startable (native first-frame already checkpointed).
+
+## 2026-05-31 — correction: PURPLE is the download channel (runtime native)
+
+- [x] CORRECTED prior "no launcher dep" claim. User domain knowledge: Lineage Classic
+      client is DOWNLOADABLE ONLY via plaync PURPLE (sole acquisition channel).
+- [x] Runtime confirmed native by roadmap: "Native client (no Purple shell) — direct
+      executable". So execution does NOT require Purple; runtime blocker = GameGuard
+      kernel AC (INCA Internet) → retired_intentional / honest-freeze.
+- [x] Wired @link LINEAGE-CLASSIC --uses--> PURPLE scoped to download/install in DOMAINS.tape.
