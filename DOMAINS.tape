@@ -81,4 +81,5 @@
 @link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-LOADER  # pe_lineage_classic_r28_track (PE load)
 @link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-WIN32   # Win32 client API shim
 @link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-GFX     # c_lineage_classic_r28_native_first_frame (Metal first frame)
+@link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-NET     # ONLINE MMO: server login / realm connection (playable requires online; GameGuard kernel AC gates it)
 @link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-PURPLE  # DOWNLOAD/INSTALL only (plaync PURPLE is the sole acquisition channel); runtime is native direct .exe "no Purple shell" (roadmap) — runtime blocker = GameGuard kernel AC, not Purple

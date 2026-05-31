@@ -22,3 +22,11 @@ Append-only history sister of `GAMEBOX-LINEAGE-CLASSIC.md`. Each entry starts wi
       executable". So execution does NOT require Purple; runtime blocker = GameGuard
       kernel AC (INCA Internet) → retired_intentional / honest-freeze.
 - [x] Wired @link LINEAGE-CLASSIC --uses--> PURPLE scoped to download/install in DOMAINS.tape.
+
+## 2026-05-31 — correction: Classic is an ONLINE MMO (not offline)
+
+- [x] CORRECTED offline framing. Lineage Classic R28 is an online game — playable requires
+      live server login/realm connection. Native client renders locally but is NOT offline-playable.
+- [x] Wired @link LINEAGE-CLASSIC --uses--> GAMEBOX-NET (online login/realm).
+- [x] Reframed playable gate: GameGuard (INCA) kernel AC guards the ONLINE login → honest-freeze.
+      first-frame checkpoint = local render proxy only, NOT online play.
