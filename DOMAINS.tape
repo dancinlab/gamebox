@@ -20,6 +20,9 @@
 @domain GAMEBOX-BNET   := "domains/GAMEBOX-BNET.md"
 @domain GAMEBOX-PURPLE := "domains/GAMEBOX-PURPLE.md"
 
+# 🛫 sprint meta-domain (composition · `+`)
+@domain GAMEBOX-LAUNCHPAD+ := "domains/GAMEBOX-LAUNCHPAD+.md"
+
 # 🎮 게임 (per-game)
 @domain GAMEBOX-D2R             := "domains/GAMEBOX-D2R.md"
 @domain GAMEBOX-D4              := "domains/GAMEBOX-D4.md"
@@ -53,6 +56,11 @@
 @link GAMEBOX --has--> GAMEBOX-DELTA-FORCE       # 게임: Delta Force
 @link GAMEBOX --has--> GAMEBOX-WOT               # 게임: World of Tanks (BigWorld)
 @link GAMEBOX --has--> GAMEBOX-WOWS              # 게임: World of Warships (BigWorld)
+@link GAMEBOX --has--> GAMEBOX-LAUNCHPAD+        # sprint meta: D2R + Classic 빠른 플레이 도달
+
+# --- sprint meta-domain target edges (LAUNCHPAD+ --targets--> title · g67) ---
+@link GAMEBOX-LAUNCHPAD+ --targets--> GAMEBOX-D2R              # near-ready: offline+online checkpoint
+@link GAMEBOX-LAUNCHPAD+ --targets--> GAMEBOX-LINEAGE-CLASSIC  # near-ready: native first-frame checkpoint
 
 # --- consumer edges (games/launchers --uses--> subsystems · g67) ---
 @link GAMEBOX-D2R   --uses--> GAMEBOX-BNET       # launches via Battle.net

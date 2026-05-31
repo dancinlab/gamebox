@@ -29,6 +29,9 @@ GAMEBOX  (meta-root)
    ├─ GAMEBOX-DELTA-FORCE      Delta Force
    ├─ GAMEBOX-WOT              World of Tanks (BigWorld)
    └─ GAMEBOX-WOWS             World of Warships (BigWorld)
+
+🛫 sprint (meta · composition)
+└─ GAMEBOX-LAUNCHPAD+   targets → D2R + LINEAGE-CLASSIC (빠른 플레이 도달)
 ```
 
 Edges (`DOMAINS.tape` `@link`): `GAMEBOX --has--> <child>` for the tree above; plus
