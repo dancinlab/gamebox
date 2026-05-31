@@ -62,3 +62,14 @@
 @link GAMEBOX-LINEAGE-W --uses--> GAMEBOX-PURPLE
 @link GAMEBOX-NIGHTREIGN --uses--> GAMEBOX-ELDEN # shares Elden Ring engine base
 @link GAMEBOX-WOWS  --uses--> GAMEBOX-WOT         # shares BigWorld engine + WG net stack
+
+# --- engine prerequisite edges (game --uses--> subsystem · what a game must stand on) ---
+# D2R prerequisites (all subsystem code present: mapper/IAT/SEH/TLS real · kernel32 stage2 · d2r_d3d11 · winsock · launch orchestrator)
+@link GAMEBOX-D2R --uses--> GAMEBOX-LOADER       # pe_d2r_mpq_archive_load · pe_d2r_savegame_d2s_format (PE map + file)
+@link GAMEBOX-D2R --uses--> GAMEBOX-WIN32        # kernel32/user32/ntdll API shim
+@link GAMEBOX-D2R --uses--> GAMEBOX-GFX          # pe_d2r_d3d11_renderer_init · c_d2r_dx11_pipeline_warm (D3D11→Metal)
+@link GAMEBOX-D2R --uses--> GAMEBOX-NET          # realm protocol / winsock (online play · honest-freeze where blocked)
+# LINEAGE-CLASSIC prerequisites (native client — no launcher)
+@link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-LOADER  # pe_lineage_classic_r28_track (PE load)
+@link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-WIN32   # Win32 client API shim
+@link GAMEBOX-LINEAGE-CLASSIC --uses--> GAMEBOX-GFX     # c_lineage_classic_r28_native_first_frame (Metal first frame)
