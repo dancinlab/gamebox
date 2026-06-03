@@ -2,6 +2,16 @@
 
 Append-only history sister of `C-PORT.md`. Each entry starts with `## <ISO timestamp> — <header>` (newest on top); body = `- [x]` (done) / `- [ ]` (pending) checkbox tasks.
 
+## 2026-06-03 — Milestone-4: Tier-A stateful unit — i386_decode_one → hexa (compose M2/M3 leaves), RUNEQ PORT-EQ
+
+- [x] Ported the STATEFUL single-instruction decoder `i386_decode_one` (C 154-303, ~150 LOC) into `native/i386_decode.hexa`. Composes the M2 leaf (decode_modrm_disp via a `modrm_tail` base-slice helper) + M3 leaves (decode_prefixes inlined against a base index, rd_s32, rd_s16, sx8) + the full 1-byte/2-byte opcode dispatch (NOP/RET/INT/HLT, mov-imm B8-BF, push/pop/inc/dec 40-5F, push-imm, call/jmp rel, Jcc 70-7F + 0F 80-8F, the /r ModR/M family 89/8B/8D/01/03/29/2B/31/33/39/3B/85, group-5 0xFF, UNKNOWN).
+- [x] The C out-param `i386_insn_t` struct is modeled as a 12-tuple in struct-field order: (taken, op, len, prefixes, reg_a, reg_b, imm, has_imm, has_disp, disp, modrm, sib). eip (=eip_base+off, trivial) and bytes[] (=input slice of length len) omitted — every decode-bearing field compared bit-exact.
+- [x] C RUNEQ harness `native/i386_decode_one_runeq.c` — `#include`s i386_decode.c to drive the REAL public i386_decode_one (reuse of the M2/M3 #include-the-.c pattern), dumping the same tab-sep tuple over an identical corpus.
+- [x] RUNEQ corpus 1042 rows: A (all 256 opcodes, buf_len=15) + B (0x8B over all 256 ModR/M) + C (0xFF group-5 over all 256 ModR/M) + D (0x0F two-byte, all 256 second bytes) + E (18: prefix composition × 11 kinds + prefix-only + short-buffer truncation family + off>=buf_len edge).
+- [x] First run DIFFERED on 1 row (real, honest): 0x8B-disp32 short-buffer (sub-corpus E) — C's decode_modrm_disp writes *modrm_out via out-param BEFORE its own short-buffer `return 0` (M2 write-before-fail contract), so the struct holds modrm=0x85 despite the failed composed call. Fixed by capturing m_modrm/m_sib/m_disp/m_has BEFORE the m_n==0 guard in BOTH ModR/M branches.
+- [x] Re-run: byte-identical 1042/1042. sha256 match b2853d0a. self_test extended with 6 M4 assertions (NOP, mov-imm32, mov r,r/m reg-direct, prefix-only, group-5 CALL r/m, short-buffer return-0) — PASS. Verdict `.verdicts/c-port/M4-decode_one.txt`.
+- [ ] Next: i386_format_insn (C 305-end) — libc snprintf disassembly-string formatter; RUNEQ on rendered strings if disasm parity is later needed.
+
 ## 2026-06-03 — Milestone-3: Tier-A leaf batch — decode_prefixes + i386_op_name + rd_s32/rd_s16 → hexa, RUNEQ PORT-EQ
 
 - [x] Picked the next 4 PURE leaves from tier-A i386_decode.c (deterministic input→output, no I/O): `decode_prefixes` (C 72-95, ~24 LOC, prefix-byte run → (n, bitmask)), `i386_op_name` (C 34-70, ~37 LOC, op enum→mnemonic), `rd_s32` (C 143-148) + `rd_s16` (C 150-152, ~10 LOC, little-endian signed readers). ~71 LOC total.
