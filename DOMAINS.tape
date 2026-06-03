@@ -15,6 +15,7 @@
 @domain GAMEBOX-NET    := "domains/GAMEBOX-NET.md"
 @domain GAMEBOX-PERF   := "domains/GAMEBOX-PERF.md"
 @domain GAMEBOX-NATIVE := "domains/GAMEBOX-NATIVE.md"
+@domain C-PORT         := "domains/C-PORT.md"
 
 # 🚀 런처/플랫폼 (launchers)
 @domain GAMEBOX-BNET   := "domains/GAMEBOX-BNET.md"
@@ -43,6 +44,7 @@
 @link GAMEBOX --has--> GAMEBOX-NET               # 메인구조: winsock · IPC · TLS · OAuth · TACT/NGDP/CASC
 @link GAMEBOX --has--> GAMEBOX-PERF              # 메인구조: FPS overlay · frame pacing · display mode · metal opt
 @link GAMEBOX --has--> GAMEBOX-NATIVE            # 메인구조: C helpers (i386_decode · pe_parse · pe_to_macho)
+@link GAMEBOX-NATIVE --has--> C-PORT             # 메인구조: native C → hexa 이식 (Tier A 포팅 · C irreducible FFI 유지)
 @link GAMEBOX --has--> GAMEBOX-BNET              # 런처: Battle.net (D2R · D4 · CS2 host)
 @link GAMEBOX --has--> GAMEBOX-PURPLE            # 런처: plaync PURPLE (Lineage M/W host)
 @link GAMEBOX --has--> GAMEBOX-D2R               # 게임: Diablo II Resurrected
