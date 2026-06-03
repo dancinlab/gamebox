@@ -1,0 +1,194 @@
+// native/i386_decode.hexa — hexa-native port of native/i386_decode.c leaves.
+//
+// C-PORT domain · Milestone-2. Tier-A pure-logic port, RUNEQ-gated against
+// the C baseline (native/i386_decode.c). See domains/C-PORT.md.
+//
+// Ported leaf (M2): decode_modrm_disp — the ModR/M + SIB + displacement
+// field extractor. Pure: bytes in → (n, modrm, sib, disp, has_disp) out.
+// No I/O, no syscalls, deterministic. C source lines 99–141.
+//
+// Also ports the two trivial lookup leaves used by disassembly:
+//   i386_reg32_name (C 25–32) and a ModR/M field splitter helper.
+//
+// own1: written from Intel SDM Vol.2 + the in-repo C baseline. No Wine.
+//
+// Semantics match C exactly:
+//   - all arithmetic in hexa `int` (64-bit); disp values are MANUALLY
+//     sign-extended to int32 range so they byte-match C's int32_t.
+//   - decode_modrm_disp returns n=0 (failure) on short buffer, exactly
+//     as the C returns 0.
+//   - `bytes` is a list of int (0..255), `avail` = bytes available from
+//     the ModR/M byte onward (caller passes `avail - 1`, as the C does).
+
+// ─── register-name lookup (C lines 25–32) ───────────────────────
+fn i386_reg32_name(r: int) -> str {
+    if r < 0 { return "?" }
+    if r > 7 { return "?" }
+    let names = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"]
+    return names[r]
+}
+
+// ─── sign-extend an unsigned byte (0..255) to int32 range ───────
+fn sx8(b: int) -> int {
+    if b >= 128 { return b - 256 }
+    return b
+}
+
+// ─── sign-extend an unsigned 32-bit value to int32 range ────────
+fn sx32(u: int) -> int {
+    if u >= 2147483648 { return u - 4294967296 }
+    return u
+}
+
+// ─── decode_modrm_disp (C lines 99–141) ─────────────────────────
+// Returns a 5-tuple: (n, modrm, sib, disp, has_disp).
+//   n         = bytes consumed (0 = failure / short buffer)
+//   modrm     = the ModR/M byte (0 on failure)
+//   sib       = the SIB byte (0 if none)
+//   disp      = displacement, sign-extended to int32 (0 if none)
+//   has_disp  = 1 if a displacement was decoded, else 0
+//
+// `p` is the byte list starting AT the ModR/M byte; `avail` is how many
+// bytes are available from there (== C's `avail - 1` passed by caller).
+fn decode_modrm_disp(p: [int], avail: int) -> (int, int, int, int, int) {
+    let mut has_disp = 0
+    let mut disp = 0
+    let mut sib = 0
+    if avail < 1 { return (0, 0, 0, 0, 0) }
+    let modrm = p[0]
+    let mut n = 1
+    let mod_f = (modrm >> 6) & 3
+    let rm = modrm & 7
+    let has_sib = (mod_f != 3) && (rm == 4)
+    if has_sib {
+        // C semantics: modrm_out is ALREADY written before this SIB-avail
+        // check (C i386_decode.c line 107), so on the n>=avail failure C
+        // returns 0 but leaves modrm_out set. Match that exactly.
+        if n >= avail { return (0, modrm, 0, 0, 0) }
+        sib = p[n]
+        n = n + 1
+    }
+    let mut disp_size = 0
+    if mod_f == 0 {
+        if rm == 5 {
+            disp_size = 4
+        } else if has_sib && ((sib & 7) == 5) {
+            disp_size = 4
+        }
+    } else if mod_f == 1 {
+        disp_size = 1
+    } else if mod_f == 2 {
+        disp_size = 4
+    }
+    if disp_size > 0 {
+        // C: modrm_out + sib_out already written before the disp-avail
+        // check (C line 127); on failure C returns 0 with those set.
+        if (n + disp_size) > avail { return (0, modrm, sib, 0, 0) }
+        if disp_size == 1 {
+            disp = sx8(p[n])
+        } else {
+            let u = p[n] | (p[n+1] << 8) | (p[n+2] << 16) | (p[n+3] << 24)
+            disp = sx32(u)
+        }
+        has_disp = 1
+        n = n + disp_size
+    }
+    return (n, modrm, sib, disp, has_disp)
+}
+
+// ─── self-test: a few hand-checked ModR/M cases ─────────────────
+fn self_test() -> int {
+    let mut fails = 0
+
+    // mod=3 reg-direct: modrm=0xC0, no sib, no disp, n=1
+    let (n1, m1, s1, d1, h1) = decode_modrm_disp([0xC0, 0, 0, 0, 0], 5)
+    if n1 != 1 { fails = fails + 1; println("FAIL c0 n=" + to_string(n1)) }
+    if h1 != 0 { fails = fails + 1; println("FAIL c0 has_disp") }
+
+    // mod=0 rm=5: [disp32]. modrm=0x05 + 4 disp bytes. n=5, has_disp=1
+    let (n2, m2, s2, d2, h2) = decode_modrm_disp([0x05, 0x78, 0x56, 0x34, 0x12], 5)
+    if n2 != 5 { fails = fails + 1; println("FAIL 05 n=" + to_string(n2)) }
+    if h2 != 1 { fails = fails + 1; println("FAIL 05 has_disp") }
+    if d2 != 0x12345678 { fails = fails + 1; println("FAIL 05 disp=" + to_string(d2)) }
+
+    // mod=1 disp8 sign-extended: modrm=0x45 (rm=5 mod=1), disp=0x80 -> -128
+    let (n3, m3, s3, d3, h3) = decode_modrm_disp([0x45, 0x80, 0, 0, 0], 5)
+    if n3 != 2 { fails = fails + 1; println("FAIL 45 n=" + to_string(n3)) }
+    if d3 != (0 - 128) { fails = fails + 1; println("FAIL 45 disp=" + to_string(d3)) }
+
+    // mod=0 rm=4 (SIB), sib base=5 -> disp32: modrm=0x04 sib=0x05 + 4 disp
+    let (n4, m4, s4, d4, h4) = decode_modrm_disp([0x04, 0x05, 0x01, 0x00, 0x00, 0x00], 6)
+    if n4 != 6 { fails = fails + 1; println("FAIL 04/05 n=" + to_string(n4)) }
+    if s4 != 0x05 { fails = fails + 1; println("FAIL 04/05 sib=" + to_string(s4)) }
+    if d4 != 1 { fails = fails + 1; println("FAIL 04/05 disp=" + to_string(d4)) }
+
+    // short buffer: mod=2 disp32 but only 2 bytes avail -> n=0
+    let (n5, m5, s5, d5, h5) = decode_modrm_disp([0x85, 0x00], 2)
+    if n5 != 0 { fails = fails + 1; println("FAIL 85-short n=" + to_string(n5)) }
+
+    // reg name lookup
+    if i386_reg32_name(0) != "eax" { fails = fails + 1; println("FAIL reg0") }
+    if i386_reg32_name(4) != "esp" { fails = fails + 1; println("FAIL reg4") }
+    if i386_reg32_name(8) != "?" { fails = fails + 1; println("FAIL reg8") }
+
+    if fails == 0 {
+        println("__GAMEBOX__ PASS i386_decode.self_test all-cases-ok")
+    } else {
+        println("__GAMEBOX__ FAIL i386_decode.self_test fails=" + to_string(fails))
+    }
+    return fails
+}
+
+// ─── RUNEQ harness: dump (n modrm sib disp has_disp) for a corpus ─
+// One line per corpus entry, tab-separated, identical format to the C
+// harness (native/i386_decode_modrm_runeq.c). Reads no input — the
+// corpus is generated deterministically here AND in C identically.
+fn runeq_dump() -> void {
+    // Corpus = every ModR/M byte 0..255, each followed by a fixed
+    // 5-byte tail (sib + 4 disp bytes), avail = 6 (always enough).
+    // Tail bytes chosen to exercise sign bits: sib=0x25 (base=5),
+    // disp bytes 0x78 0x9A 0xBC 0xFE.
+    let mut modrm = 0
+    while modrm < 256 {
+        let bytes = [modrm, 0x25, 0x78, 0x9A, 0xBC, 0xFE]
+        let (n, m, s, d, h) = decode_modrm_disp(bytes, 6)
+        println(to_string(modrm) + "\t" + to_string(n) + "\t" + to_string(m)
+              + "\t" + to_string(s) + "\t" + to_string(d) + "\t" + to_string(h))
+        modrm = modrm + 1
+    }
+    // Short-buffer family: each ModR/M byte with avail=1 (only the
+    // modrm byte present) — exercises the return-0 / no-disp paths.
+    let mut mr2 = 0
+    while mr2 < 256 {
+        let bytes2 = [mr2, 0, 0, 0, 0, 0]
+        let (n, m, s, d, h) = decode_modrm_disp(bytes2, 1)
+        println("S1\t" + to_string(mr2) + "\t" + to_string(n) + "\t" + to_string(m)
+              + "\t" + to_string(s) + "\t" + to_string(d) + "\t" + to_string(h))
+        mr2 = mr2 + 1
+    }
+    // mod=1 disp8 family across all sign values: modrm=0x45, disp 0..255
+    let mut db = 0
+    while db < 256 {
+        let bytes3 = [0x45, db, 0, 0, 0, 0]
+        let (n, m, s, d, h) = decode_modrm_disp(bytes3, 6)
+        println("D8\t" + to_string(db) + "\t" + to_string(n) + "\t" + to_string(d))
+        db = db + 1
+    }
+}
+
+fn main() -> int {
+    // Run modes: "runeq" anywhere in argv → RUNEQ corpus dump; else self-test.
+    // (arg index differs between `hexa-run` and `hexa` launch, so we scan.)
+    let argv = args()
+    let mut want_runeq = false
+    let mut ai = 0
+    while ai < len(argv) {
+        if argv[ai] == "runeq" { want_runeq = true }
+        ai = ai + 1
+    }
+    if want_runeq {
+        runeq_dump()
+        return 0
+    }
+    return self_test()
+}
