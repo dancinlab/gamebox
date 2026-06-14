@@ -2,6 +2,22 @@
 
 All notable changes to `gamebox` are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- chore(harness): perfect harness setup — engine submodule bumped to latest on
+  `harness-hardcore`; authored `ARCHITECTURE.md` SSOT (overview + component map +
+  data flow + governance/verify, English) over the stub; authored harness-standard
+  `CLAUDE.md` (H1 + blurb + `## Structure` tree + governance + `## Harness` +
+  quick reference) over the SPECKIT stub; added a `docs` discipline block to
+  `harness.config.json` (`architecture`/`log`/`scratchDir` + `scopeDirs: [""]`
+  root-only + `allow` list covering README/CHANGELOG/ARCHITECTURE/CLAUDE/AGENTS
+  plus `RELEASE_NOTES_v1.0.*` and `TAPE-AUDIT.md`). `harness docs check` now
+  reports `docs: ok` with 0 CLAUDE-MD violations. `.claude/settings.json` already
+  carried the full guarded harness hook set (pre bash / pre write / post edit /
+  prompt / prefs · easy · recommend inject / SessionStart) — preserved as-is.
+
 ## [1.0.4] — 2026-05-05
 
 ### Added
