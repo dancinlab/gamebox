@@ -1,8 +1,12 @@
 # gamebox — Architecture (SSOT · update-in-place)
 
-> Single source of truth for the **final** architecture. Update (overwrite) this
-> file in place when the design changes — it is **not** append-only. History and
-> per-change decisions live in [CHANGELOG.md](CHANGELOG.md).
+> Single source of truth for the **final** architecture (component-level prose).
+> Update (overwrite) this file in place when the design changes — it is **not**
+> append-only. History and per-change decisions live in
+> [CHANGELOG.md](CHANGELOG.md). The **domain tree** (per-subsystem / per-game
+> goals + milestones) is `ARCHITECTURE.json` (tree SSOT, human viewer
+> `ARCHITECTURE.html` via `python3 serve.py`) — it retired the former
+> `DOMAINS.tape` + `domains/` snapshots on 2026-06-18.
 
 ## Overview
 
