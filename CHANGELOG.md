@@ -2,6 +2,56 @@
 
 All notable changes to `gamebox` are documented in this file.
 
+## [Unreleased]
+
+### Changed — architecture SSOT migration (2026-06-18)
+
+- Migrated off the retired `harness domain` machinery to a single **`ARCHITECTURE.json`**
+  tree SSOT + **`ARCHITECTURE.html`** human viewer (served via **`serve.py`**, c4 standard,
+  adapted from the dancinlab/anima viewer).
+- `DOMAINS.tape` (roster + `@has`/`@uses`/`@targets`/`--uses-->` tree graph) **scrubbed**
+  (`git rm`); its 22-node GAMEBOX tree + all edges folded into `ARCHITECTURE.json`.
+- `domains/*.md` domain snapshots (22 files: GAMEBOX meta-root + 6 메인구조 + 2 런처 +
+  11 게임 + LAUNCHPAD+ sprint meta + C-PORT) **retired** (`git rm`); each domain's `@goal`,
+  milestones, prerequisites, status, and checkpoints folded into `ARCHITECTURE.json` nodes.
+- `domains/*.log.md` append-only step logs **retired** (`git rm`); their substantive history
+  folded into this CHANGELOG (below). Most were identical "domain init" boilerplate; the
+  non-trivial entries are preserved here.
+- `CLAUDE.md` left as-is (SPECKIT plan pointer; carried no DOMAINS/architecture pointer).
+  No `harness.config.json` / `hexa.toml` docs.architecture pointer existed to repoint.
+- Preserved untouched: `README.md`, `CHANGELOG.md`, `CLAUDE.md`, `LICENSE`, `CITATION.cff`,
+  `AGENTS.tape` (agent guide, not a domain doc), `TAPE-AUDIT.md`, `RELEASE_NOTES_v1.0.*.md`,
+  `.roadmap.*`, `.checkpoint.*`, all code (`lib/`, `native/`, `cli/`, `tool/`, `tests/`).
+
+#### Folded domain step-log history (from `domains/*.log.md`, newest-first per domain)
+
+- **C-PORT** (native C → hexa port, RUNEQ-gated):
+  - 2026-06-03 M3 — Tier-A leaf batch (`decode_prefixes` + `i386_op_name` + `rd_s32`/`rd_s16`,
+    ~71 LOC) → `native/i386_decode.hexa`; RUNEQ byte-identical 1069/1069, sha256 8e6acbb8
+    (`.verdicts/c-port/M3-*.txt`).
+  - 2026-06-03 M2 — Tier-A leaf `decode_modrm_disp` (+ `i386_reg32_name`) → hexa; first run
+    DIFFERED on the write-before-fail output-param contract, fixed → RUNEQ 768/768 byte-identical,
+    sha256 b4388479 (`.verdicts/c-port/M2-decode_modrm_disp.txt`).
+  - 2026-06-03 M1 — live `native/*.c` inventory + classification (4 files, 869 LOC; Tier A 437 /
+    Tier B 113 / Tier C 319); registered C-PORT under GAMEBOX-NATIVE (`.verdicts/c-port/INVENTORY.txt`).
+- **GAMEBOX-LINEAGE-CLASSIC** corrections (2026-05-31): client is DOWNLOADABLE only via plaync
+  PURPLE (sole acquisition channel) but runtime is native ("no Purple shell"); it is an ONLINE MMO
+  (not offline) — playable needs live server login/realm; playable gate = GameGuard (INCA) kernel
+  AC honest-freeze; local first-frame checkpoint = local render proxy only, NOT online play.
+- **GAMEBOX-BNET** reconcile (2026-05-31): 10 pe_battle(_)net_* modules + orchestrator present;
+  D2R offline+online checkpoints prove the full launch path end-to-end → BNET non-blocking for D2R;
+  open = extend launch to D4/CS2; online realm honest-freeze where Warden/anti-cheat blocks.
+- **GAMEBOX-PURPLE** reconcile (2026-05-31): 7 c_purple_* modules + Lineage M/W purple play
+  checkpoints → 4/4 done; PURPLE serves Lineage M/W; Classic depends on it for download only.
+- **GAMEBOX-D2R** prereq wiring (2026-05-31): wired D2R `--uses-->` LOADER·WIN32·GFX·NET; all 5
+  subsystems have real code → D2R is startable; D3D11/MPQ/savegame + offline/online checkpoints
+  landed (3/4), gameplay tracks (26 c_d2r_*) left open pending per-track e2e verify.
+- **GAMEBOX-LAUNCHPAD+** meta-domain init (2026-05-31): sprint meta (`+` composition) targeting
+  D2R + LINEAGE-CLASSIC; defined the "playable" smoke bar (boot→title→char→in-world), online/AC
+  content under honest-freeze (Warden / GameGuard).
+- **All 22 domains** init (2026-05-31): scaffolded as nodes of the GAMEBOX tree, @goal + milestones
+  seeded from `.roadmap.*` SSOT + repo survey (lib/loader · lib/perf · native).
+
 ## [1.0.4] — 2026-05-05
 
 ### Added
