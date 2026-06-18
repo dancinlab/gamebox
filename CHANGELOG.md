@@ -6,6 +6,20 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Changed
 
+- docs(architecture): restructure `ARCHITECTURE.json` into a deeper `children`
+  tree per harness governance rule c4 — a LOSSLESS re-shape (restructure only,
+  no content change). Decomposed 10 over-long dump cells (root `summary` 527c +
+  root `note` 731c + 8 node `summary` fields 263–531c) that piled multiple
+  distinct facts / ` · `-joined lists into one field. Each piled fact is now its
+  own child node (short role line stays on the parent `summary`; each remaining
+  sentence/list becomes a `{name, summary}` `ℹ️` info child). Node count
+  26 → 47. The two C-PORT milestones >250c are single coherent done-records
+  (`milestones[]` is already the per-item list) and stay intact — not dumps.
+  Losslessness verified by non-whitespace char-multiset before vs after =
+  identical (0 lost / 0 added; only scaffolding node-name labels added).
+  `ARCHITECTURE.html` viewer + `python3 serve.py` stay renderable (generic over
+  the `children` tree; new nodes use only `name`+`summary`).
+
 - chore(architecture): retire `DOMAINS.tape` + `domains/` (22 domain `.md`
   snapshots + 22 `.log.md` logs) into a single `ARCHITECTURE.json` tree SSOT
   (hexa-codex/anima pattern), with the `ARCHITECTURE.html` viewer +
