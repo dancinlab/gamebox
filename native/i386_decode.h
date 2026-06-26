@@ -93,6 +93,14 @@ typedef enum {
     I386_OP_IMUL_R_RM_IMM,    // 69 /r id / 6B /r ib — imul r32, r/m32, imm (3-operand)
     I386_OP_CPUID,            // 0F A2     — CPUID (synthetic feature set into eax/ebx/ecx/edx)
     I386_OP_RDTSC,            // 0F 31     — RDTSC (synthetic monotonic counter into edx:eax)
+    // ── E5 r8 additions (ordinals 61+; appended) — bit-test family (BT/BTS/BTR/
+    // BTC, register-second-operand /r forms). The CRT-startup / __scrt_common_main
+    // path bit-tests feature/flag words. CF ← selected bit; BTS/BTR/BTC also write
+    // the modified bit back. Plain Intel SDM Vol.2 ops — no protection mechanism.
+    I386_OP_BT_RM_R,          // 0F A3 /r  — bt  r/m32, r32 (CF ← bit; no write-back)
+    I386_OP_BTS_RM_R,         // 0F AB /r  — bts r/m32, r32 (CF ← bit; set  bit)
+    I386_OP_BTR_RM_R,         // 0F B3 /r  — btr r/m32, r32 (CF ← bit; clear bit)
+    I386_OP_BTC_RM_R,         // 0F BB /r  — btc r/m32, r32 (CF ← bit; flip  bit)
 } i386_op_t;
 
 #define I386_PREFIX_OPSZ   0x01u
