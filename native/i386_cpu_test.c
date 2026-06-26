@@ -14,12 +14,22 @@
 //
 // The hermetic image embeds the binary's REAL entry bytes (E8 AE 09 00 00
 // = `call 0x539259`, etc.). The byte sitting AT the CALL target 0x539259
-// is, in the real binary, the prologue of __scrt_common_main — which the
-// E2 decoder does NOT yet cover (group-1 imm arith 0x83/0x81/0x80, etc.,
-// per r1). We therefore plant a representative uncovered opcode (0x83) at
-// that VA so the hermetic run reproduces the exact measured outcome: one
-// real instruction executed, branch to the real VA 0x539259, HALT at the
-// decoder-coverage wall. own1: our own bytes, Intel SDM semantics only.
+// is, in the real binary, the prologue of __scrt_common_main.
+//
+// E5 r3 — the decoder + interpreter were extended to cover the documented
+// __scrt_common_main prologue opcode set (group-1 imm arith 0x83/0x81/0x80,
+// mov r/m,imm 0xC7/0xC6, byte mov 0x88/0x8A, test 0x84/0x85, and/or/xor
+// 0x09/0x0B 0x21/0x23 0x31/0x33), with an EFLAGS model. We therefore plant a
+// representative __scrt_common_main-shaped prologue at 0x539259 (own1: a
+// documented prologue SHAPE built from the named families — the real binary
+// is absent on this host, so these are our own SDM-correct bytes, not the
+// verbatim image). Execution now advances PAST the r2 1-instruction wall,
+// THROUGH the prologue, and halts honestly at the first IAT-style indirect
+// CALL `FF 15 [disp32]` — the E4 kernel32 boundary the interpreter does not
+// (and must not, own1) dereference. The two other reachable targets keep a
+// still-uncovered sentinel (0xC1 shift-group, the next r4 decoder gap) so
+// runs B/D continue to halt at the decoder-coverage wall.
+// own1: our own bytes, Intel SDM semantics only — no Wine, no IAT resolution.
 
 #include "i386_cpu.h"
 
@@ -56,15 +66,42 @@ static void put_at(uint8_t *img, uint32_t va, const uint8_t *src, size_t n) {
     memcpy(img + (va - IMG_BASE), src, n);
 }
 
-// Build the hermetic flat image: entry block + uncovered-opcode sentinels
-// at the three real CALL/JMP targets the entry block can reach.
+// A representative __scrt_common_main prologue (own1: documented SHAPE built
+// from the E5-r3 opcode families; SDM-correct, register-only so it runs from
+// any entry state). It exercises group-1 imm (sub/or/cmp/and/add), MOV r,imm,
+// XOR r,r/m, TEST r/m,r — all newly executed — then reaches the first
+// IAT-style indirect CALL, the honest E4 boundary.
+//
+//   0x539259  83 EC 28              sub  esp, 0x28        ; group-1 /5 imm8
+//   0x53925C  33 C0                 xor  eax, eax         ; XOR_R_RM → eax=0
+//   0x53925E  83 C8 01              or   eax, 0x1         ; group-1 /1 imm8 → eax=1
+//   0x539261  83 F8 01              cmp  eax, 0x1         ; group-1 /7 → ZF=1
+//   0x539264  B9 EF BE AD DE        mov  ecx, 0xDEADBEEF  ; MOV_R_IMM
+//   0x539269  81 E1 FF 00 00 00     and  ecx, 0xFF        ; group-1 /4 imm32 → ecx=0xEF
+//   0x53926F  85 C9                 test ecx, ecx         ; TEST_RM_R → flags
+//   0x539271  83 C4 28              add  esp, 0x28        ; group-1 /0 → esp restored
+//   0x539274  FF 15 00 80 53 00     call [0x538000]       ; IAT indirect call → E4 wall
+static const uint8_t SCRT_PROLOGUE[] = {
+    0x83, 0xEC, 0x28,
+    0x33, 0xC0,
+    0x83, 0xC8, 0x01,
+    0x83, 0xF8, 0x01,
+    0xB9, 0xEF, 0xBE, 0xAD, 0xDE,
+    0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00,
+    0x85, 0xC9,
+    0x83, 0xC4, 0x28,
+    0xFF, 0x15, 0x00, 0x80, 0x53, 0x00,
+};
+
+// Build the hermetic flat image: entry block + the __scrt_common_main
+// prologue at the insn-1 CALL target + still-uncovered sentinels elsewhere.
 static void build_hermetic(uint8_t *img) {
     memset(img, 0, IMG_SIZE);
     put_at(img, ENTRY_VA, ENTRY_BYTES, sizeof(ENTRY_BYTES));
-    // 0x83 = group-1 r/m32,imm8 (e.g. `sub esp,imm`) — a real, very common
-    // prologue opcode the E2 decoder does not cover yet → I386_OP_UNKNOWN.
-    uint8_t wall[] = { 0x83, 0xEC, 0x28 };         // representative `sub esp,0x28`
-    put_at(img, 0x539259u, wall, sizeof(wall));    // CALL target (insn 1)
+    put_at(img, 0x539259u, SCRT_PROLOGUE, sizeof(SCRT_PROLOGUE));  // CALL target (insn 1)
+    // 0xC1 = group-2 shift r/m,imm8 — still uncovered after r3 (the next r4
+    // decoder gap) → I386_OP_UNKNOWN. Keeps the B/D walls honest.
+    uint8_t wall[] = { 0xC1, 0xE0, 0x04 };         // representative `shl eax,4`
     put_at(img, 0x538BABu, wall, sizeof(wall));    // CALL target (insn 6)
     put_at(img, 0x53872Au, wall, sizeof(wall));    // JMP  target (insn 2)
 }
@@ -85,8 +122,8 @@ int main(int argc, char **argv) {
             cpu.gpr[I386_REG_ESP] = pe.base + pe.size - 0x100;  // writable top of image
             i386_run_result_t r;
             i386_cpu_run(&cpu, &pe, 100000, &r);
-            printf("__SHIM__ PARTIAL phase=entry_block_executed insns=%u halted=%s halt_va=0x%X\n",
-                   r.insns, i386_halt_name(r.halt), r.halt_va);
+            printf("__SHIM__ PARTIAL phase=scrt_common_main_prologue insns=%u halted=%s halt_va=0x%X halt_op=%s\n",
+                   r.insns, i386_halt_name(r.halt), r.halt_va, i386_op_name(r.halt_op));
             i386_image_free(&pe);
             emitted = 1;
         } else {
@@ -101,10 +138,13 @@ int main(int argc, char **argv) {
     i386_image_t img = { img_buf, IMG_BASE, IMG_SIZE, 0 };
 
     // === Run A — MILESTONE: execute from the real entry VA ===============
-    // First real EXECUTION of game-binary bytes. insn 1 (CALL rel32) must
-    // push the return addr and branch to the real VA 0x539259, then HALT at
-    // the decoder-coverage wall (0x83, uncovered).
-    printf("\n[cpu] Run A — execute from entry 0x%X (real entry block)\n", ENTRY_VA);
+    // E5 r3 — execution now advances PAST the r2 one-instruction wall. insn 1
+    // (CALL rel32) branches to 0x539259, then the __scrt_common_main prologue
+    // (sub/xor/or/cmp/mov/and/test/add — 8 real instructions, all newly
+    // executed with EFLAGS) runs, and the loop HALTS at the first IAT-style
+    // indirect CALL `FF 15 [0x538000]` (the E4 kernel32 boundary), decoded as
+    // CALL_RM but deliberately NOT executed (own1 — no IAT resolution).
+    printf("\n[cpu] Run A — execute from entry 0x%X (entry block → __scrt_common_main prologue)\n", ENTRY_VA);
     build_hermetic(img_buf);
     {
         i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
@@ -114,21 +154,24 @@ int main(int argc, char **argv) {
         i386_run_result_t r;
         i386_cpu_run(&cpu, &img, 1000, &r);
 
-        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X\n",
-               r.insns, i386_halt_name(r.halt), r.halt_va, cpu.eip, cpu.gpr[I386_REG_ESP]);
+        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ecx=0x%X\n",
+               r.insns, i386_halt_name(r.halt), r.halt_va, cpu.eip, cpu.gpr[I386_REG_ESP],
+               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_ECX]);
         uint32_t pushed = 0;
         i386_mem_read32(&img, cpu.gpr[I386_REG_ESP], &pushed);
 
-        CHECK(r.insns == 1,                 "exactly 1 real instruction executed (the CALL)");
-        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 4, "CALL decremented esp by 4");
+        CHECK(r.insns == 9,                 "9 real instructions executed (CALL + 8 prologue ops)");
         CHECK(pushed == 0x5388ABu,          "CALL pushed return addr 0x5388AB");
-        CHECK(cpu.eip == 0x539259u,         "CALL set eip to real target 0x539259");
-        CHECK(r.halt == I386_HALT_UNKNOWN,  "halted at decoder-coverage wall (UNKNOWN)");
-        CHECK(r.halt_va == 0x539259u,       "wall VA == 0x539259");
+        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 4, "esp restored after sub/add 0x28 (== esp0-4)");
+        CHECK(cpu.gpr[I386_REG_EAX] == 0x1u,     "prologue: eax = 1 (xor eax,eax; or eax,1)");
+        CHECK(cpu.gpr[I386_REG_ECX] == 0xEFu,    "prologue: ecx = 0xEF (mov 0xDEADBEEF; and 0xFF)");
+        CHECK(r.halt == I386_HALT_UNSUPPORTED,   "halted at IAT indirect CALL (E4 boundary, UNSUPPORTED)");
+        CHECK(r.halt_op == I386_OP_CALL_RM,      "wall op == CALL_RM (FF /2 [disp32])");
+        CHECK(r.halt_va == 0x539274u,            "wall VA == 0x539274 (the FF 15 IAT call)");
 
         if (!emitted) {
-            printf("__SHIM__ PARTIAL phase=entry_block_executed insns=%u halted=%s halt_va=0x%X\n",
-                   r.insns, i386_halt_name(r.halt), r.halt_va);
+            printf("__SHIM__ PARTIAL phase=scrt_common_main_prologue insns=%u halted=%s halt_va=0x%X halt_op=%s\n",
+                   r.insns, i386_halt_name(r.halt), r.halt_va, i386_op_name(r.halt_op));
         }
     }
 

@@ -14,7 +14,19 @@
 //   PUSH r32 (50+rd) · POP r32 (58+rd) · PUSH imm (68/6A) ·
 //   PUSH r/m32 (FF /6, [reg+disp]) · MOV r32,r/m32 (8B) ·
 //   MOV r/m32,r32 (89) · CALL rel32 (E8) · JMP rel (E9/EB) · RET (C3/C2).
-// Anything else halts honestly (UNKNOWN / UNSUPPORTED) with the wall VA.
+//
+// Coverage (E5 r3 — the __scrt_common_main prologue set, with an EFLAGS
+// model — CF/PF/AF/ZF/SF/OF set per SDM ADD/SUB/CMP/logic):
+//   MOV r32,imm32 (B8+rd) · MOV r/m32,imm32 (C7 /0) · LEA (8D) ·
+//   INC/DEC r32 (40+/48+, CF-preserving) ·
+//   ALU r/m,r + r,r/m for ADD/SUB/CMP/XOR/OR/AND + TEST (01/03/29/2B/39/3B/
+//     31/33/09/0B/21/23/85) ·
+//   group-1 r/m32,imm  ADD/OR/ADC/SBB/AND/SUB/XOR/CMP (81 id / 83 ib).
+// Byte-width forms (80, C6, 88, 8A, 84) decode but are NOT executed (width
+// not modeled) → honest UNSUPPORTED. Indirect IAT CALL (FF /2 [disp32]) is
+// decoded (CALL_RM) but deliberately NOT executed — the E4 kernel32 boundary
+// (own1: no IAT resolution / no DRM interaction). Anything else halts
+// honestly (UNKNOWN / UNSUPPORTED) with the wall VA.
 
 #ifndef GAMEBOX_I386_CPU_H
 #define GAMEBOX_I386_CPU_H

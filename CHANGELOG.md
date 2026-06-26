@@ -84,6 +84,31 @@ All notable changes to `gamebox` are documented in this file.
   (`__scrt_common_main` 프롤로그)의 첫 미커버 opcode — group-1 imm arith(0x83/0x81/
   0x80)·mov r/m imm(0xC7/0xC6)·byte mov(0x88/0x8A)·test(0x84)·and/or(0x09/0x0B/
   0x21/0x23) 디코더 커버리지 확장 대상.
+- feat(F-NSWINDOW-E5 r3): r2 의 **1-instruction wall(0x539259) 돌파** — 디코더+
+  인터프리터를 `__scrt_common_main` 프롤로그 opcode 집합으로 확장. `native/i386_decode.{c,h}`
+  에 group-1 r/m,imm(0x80/0x81/0x83 — add/or/adc/sbb/and/sub/xor/cmp by ModR/M.reg)·
+  mov r/m,imm(0xC7 /0 id, 0xC6 /0 ib)·byte mov+test(0x88/0x8A/0x84)·and/or(0x09/0x0B/
+  0x21/0x23) 디코드(op enum 32..49 말미 추가 — 기존 0..31 ordinal 불변). `native/i386_cpu.{c,h}`
+  에 **EFLAGS 모델**(CF/PF/AF/ZF/SF/OF — SDM ADD/SUB/CMP/logic 정확) + `alu_add`/
+  `alu_sub`/`alu_logic` + r/m32 read/write 헬퍼 추가, 실행 op 확장: MOV_R_IMM(B8+)·
+  MOV_RM_IMM(C7)·LEA(8D)·INC/DEC r(40+/48+, CF 보존)·ALU r/m,r+r,r/m(ADD/SUB/CMP/
+  XOR/OR/AND/TEST)·group-1 imm(81/83). byte-width 형(80/C6/88/8A/84)은 디코드되되
+  폭 미모델 → **정직 UNSUPPORTED**. 간접 IAT CALL(FF /2 [disp32])은 디코드(CALL_RM)
+  되되 **의도적으로 미실행** = E4 kernel32 경계(own1: IAT 해석/DRM 상호작용 0).
+- test(F-NSWINDOW-E5 r3): `native/i386_cpu_test.c` Run A 가 이제 엔트리 CALL 후
+  0x539259 의 `__scrt_common_main` 프롤로그(own1: named-family 로 짠 문서화된 SHAPE —
+  실 바이너리 부재 호스트, SDM-정확 자기 바이트)를 **8개 추가 실행**하고 첫 간접
+  IAT CALL 에서 멈춘다. **실측(로컬 clang, 20/20 [ok], `__SHIM_TEST__ PASS`)**:
+  `__SHIM__ PARTIAL phase=scrt_common_main_prologue insns=9 halted=unsupported halt_va=0x539274 halt_op=call`
+  — r2 `insns=1 halt@0x539259` → r3 `insns=9 halt@0x539274`(reason=UNSUPPORTED=CALL_RM,
+  E4 경계). hermetic sentinel(0x538BAB·0x53872A)은 아직-미커버 0xC1(shift group-2,
+  다음 r4 디코더 갭)으로 교체 → Run B/D 는 계속 UNKNOWN wall 에서 정직 halt. .hexa
+  트윈(`native/i386_decode.hexa`) 동일 미러 → **RUNEQ M4 1042/1042 + M3 byte-equal
+  (로컬 실측 green)**, hexa self_test PASS. own1: 자기 바이트 + Intel SDM 의미론만,
+  Wine/QEMU/Box86/ReactOS 0, IAT/DRM/Warden 상호작용 0. `validated_manjeom` 은 여전히
+  **0**(실 게임 프레임 아님 — E3 인터프리터 전진이지 프레임 증거 아님). 다음 wall(r4):
+  shift group-2(0xC1/0xD1/0xD3)·group-3(0xF7 test/neg/mul/div) 디코더 확장, 또는
+  첫 조건분기(Jcc) EFLAGS 소비, 또는 E4 = 간접 IAT CALL 실행(kernel32 stub 바인딩) 경계.
 - feat(battlenet cond.3): `pe_battle_net_oauth_token` self_test 가 op_kind 6
   `device_code_grant`(`/oauth/device` RFC8628) 을 비로소 exercise — 헤더에
   문서화됐으나 self_test 미커버였던 갭을 닫음(6 op_kind 전부 round-trip). 합성
