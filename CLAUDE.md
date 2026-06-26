@@ -3,10 +3,11 @@
 Apple-native Win32 game runtime — run unmodified Win32 PE binaries on macOS
 Apple Silicon **without Wine** (Wine 0), via D3DMetal graphics + a hexa-only
 loader / perf / dispatch layer, under a strict **own1** posture (no DRM /
-Warden / anti-cheat bypass, no anima clone). Skeleton-tier: modules compile and
-probe, but no real game frames are evidenced (`validated_manjeom = 0`). Full
-design lives in [ARCHITECTURE.md](ARCHITECTURE.md); history in
-[CHANGELOG.md](CHANGELOG.md).
+Warden / anti-cheat bypass, no anima clone). The PE→D3D11→Metal pipeline is
+proven end-to-end with a self-authored own1 D3D11 PE (`validated_manjeom =
+first_own1_authored_d3d11_pe_to_metal_frame`, an infrastructure milestone) — but
+**no commercial game frame is evidenced yet**. Full design lives in
+[ARCHITECTURE.md](ARCHITECTURE.md); history in [CHANGELOG.md](CHANGELOG.md).
 
 ## Structure
 
@@ -31,7 +32,7 @@ gamebox/
 ├─ ARCHITECTURE.md         — architecture SSOT (update-in-place)
 ├─ CHANGELOG.md            — append-only history
 ├─ harness.config.json     — harness config (lockdown, lint, docs discipline)
-├─ .github/workflows/      — CI (ci.yml — Blacksmith macOS build+test)
+├─ .github/workflows/      — CI (ci.yml — github-hosted macOS build+test)
 └─ .harness-engine/        — dancinlab harness submodule (governance engine)
 ```
 
