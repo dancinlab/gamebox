@@ -78,14 +78,26 @@ int pe_parse_file(const char *path, pe_image_t *out) {
     out->opt_magic = rd_u16_le(opt + 0);
     if (out->opt_magic == 0x10B) {
         // PE32 — ImageBase at offset 28 (32-bit), AddressOfEntryPoint at 16, SizeOfImage at 56.
+        // DataDirectory[0] = Export (offset 96); DataDirectory[1] = Import (offset 104).
         out->entry_point_rva = rd_u32_le(opt + 16);
         out->image_base = (uint64_t)rd_u32_le(opt + 28);
         out->size_of_image = rd_u32_le(opt + 56);
+        // Import Directory (DataDirectory entry 1, PE32 offset 104 / 0x68).
+        if (opt_size >= 112 && (size_t)(opt + 112 - buf) <= sz) {
+            out->import_dir_rva  = rd_u32_le(opt + 104);
+            out->import_dir_size = rd_u32_le(opt + 108);
+        }
     } else if (out->opt_magic == 0x20B) {
         // PE32+ — ImageBase at offset 24 (64-bit), AddressOfEntryPoint at 16, SizeOfImage at 56.
+        // DataDirectory[0] = Export (offset 112); DataDirectory[1] = Import (offset 120).
         out->entry_point_rva = rd_u32_le(opt + 16);
         out->image_base = rd_u64_le(opt + 24);
         out->size_of_image = rd_u32_le(opt + 56);
+        // Import Directory (DataDirectory entry 1, PE32+ offset 120 / 0x78).
+        if (opt_size >= 128 && (size_t)(opt + 128 - buf) <= sz) {
+            out->import_dir_rva  = rd_u32_le(opt + 120);
+            out->import_dir_size = rd_u32_le(opt + 124);
+        }
     } else {
         munmap(map, sz);
         return -1;

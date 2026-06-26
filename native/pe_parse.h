@@ -35,6 +35,9 @@ typedef struct {
     uint64_t image_base;         // ImageBase (low 32 if PE32)
     uint32_t size_of_image;
     uint32_t entry_point_rva;    // AddressOfEntryPoint
+    // ── Import Directory (Data Directory entry 1, r9 IAT name-based autobind) ──
+    uint32_t import_dir_rva;     // RVA of Import Directory (0 if absent)
+    uint32_t import_dir_size;    // size of Import Directory in bytes
     pe_section_t sections[PE_MAX_SECTIONS];
 } pe_image_t;
 

@@ -96,6 +96,8 @@ const char *i386_op_name(i386_op_t op) {
         case I386_OP_BTS_RM_R:    return "bts";
         case I386_OP_BTR_RM_R:    return "btr";
         case I386_OP_BTC_RM_R:    return "btc";
+        case I386_OP_CMPXCHG_RM8_R8:
+        case I386_OP_CMPXCHG_RM_R: return "cmpxchg";
         case I386_OP_PREFIX_ONLY: return "(prefix-only)";
         case I386_OP_UNKNOWN:
         default:                return "(unknown)";
@@ -366,6 +368,17 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
                 case 0xB3: out->op = I386_OP_BTR_RM_R; break;
                 case 0xBB: out->op = I386_OP_BTC_RM_R; break;
             }
+            taken += 1 + m_n;   // +1 for op2, +m_n for ModR/M
+        } else if (op2 == 0xB0 || op2 == 0xB1) {
+            // CMPXCHG r/m8,r8 (0F B0) / r/m32,r32 (0F B1) — E5 r9.
+            // Same /r ModR/M shape as BT family. Intel SDM Vol.2 — plain CPU op.
+            int m_n = decode_modrm_disp(p + 2, avail - 2,
+                                        &out->modrm, &out->sib,
+                                        &out->disp, &out->has_disp);
+            if (m_n == 0) return 0;
+            out->reg_a = (int8_t)((out->modrm >> 3) & 7);
+            if (((out->modrm >> 6) & 3) == 3) out->reg_b = (int8_t)(out->modrm & 7);
+            out->op = (op2 == 0xB0) ? I386_OP_CMPXCHG_RM8_R8 : I386_OP_CMPXCHG_RM_R;
             taken += 1 + m_n;   // +1 for op2, +m_n for ModR/M
         } else {
             out->op = I386_OP_UNKNOWN;
