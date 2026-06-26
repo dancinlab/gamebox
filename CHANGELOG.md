@@ -6,6 +6,24 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Fixed
 
+- test(purple cond.3): 2FA TOTP state machine 의 **window-drift / RFC 6238 §5.2 ±1
+  resync leg** gap 종결 — `c_purple_2fa_totp_proxy.hexa` 는 `window_idx`(=unix_time/30)
+  를 device 별로 기록하지만, 합성 시나리오는 거의 동일한 window(58000000/58000001)만
+  써서 **동일 device 가 clock drift 로 인접 window(N, N+1)에 걸쳐 코드를 생성** 하는
+  documented-but-unmodeled 축(RFC 6238 §5.2 — 서버 ±1 resync window 수용)을 한 번도
+  행사하지 않았다. 합성 행 `record_totp(5004, 860, 58000010, 6)` +
+  `record_totp(5004, 870, 58000011, 6)`(인접 window) 추가로 drift transition 을
+  행사하고, 헬퍼 `count_by_window(idx)`(r1 의 `count_by_stage` 거울) +
+  `device_window_span(device_id)`(max−min window = ±1 resync 정량) 추가, 의존
+  assertion 전부 내부정합 갱신(totp_count 3→5, total_hmac_us 2550→4280, avg_hmac_us
+  850→856, valid_code_len 2→4, stats[0..3] 동일 갱신, emit ≥4→≥7) + 새 emit 마커
+  `totp_window_drift`(span=1, resync=accepted_pm1) 발신. CI 8파일 중
+  `test_purple_lineage_offline_shim.hexa` 에 `check_purple_cond3_totp_drift()`
+  추가(grep 마커 + live `out.contains("drift_span=1")`) + `track_b_purple_cond3_totp_drift`
+  emit 배선(test emit ≥6→≥7) → 변경이 dead 가 아니라 CI 검증됨. **cond.3 status 는
+  partial 유지**(purple_launcher.blk.1 — plaync online endpoint network-gated). own1:
+  합성 데이터만, 실제 plaync account/network/TOTP secret 0건, **GameGuard
+  blocked-not-bypassed**.
 - fix(ci): CI 가 **아무것도 검증하지 않던** 공허 통과를 root-cause 교정 —
   8 테스트 파일은 전부 `fn self_test()` + `main()` dispatch(own2 mandate)이고
   `@test` fn 은 0개인데, CI 가 `hexa test <file>`(=@test 러너)을 써서 0개 실행 →
