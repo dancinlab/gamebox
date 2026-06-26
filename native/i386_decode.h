@@ -78,6 +78,13 @@ typedef enum {
     I386_OP_SHIFT_RM_IMM8,    // C1 /r ib — group-2 r/m32, imm8 count
     I386_OP_SHIFT_RM_1,       // D1 /r    — group-2 r/m32, 1
     I386_OP_SHIFT_RM_CL,      // D3 /r    — group-2 r/m32, CL
+    // ── E5 r6 additions (ordinals 53+; appended) — two-byte (0F) MOVZX/MOVSX.
+    // Zero/sign-extend a byte (B6/BE) or word (B7/BF) r/m source into a 32-bit
+    // dst register (ModR/M.reg). These do NOT affect EFLAGS (Intel SDM Vol.2).
+    I386_OP_MOVZX_RM8,        // 0F B6 /r — movzx r32, r/m8  (zero-extend)
+    I386_OP_MOVZX_RM16,       // 0F B7 /r — movzx r32, r/m16 (zero-extend)
+    I386_OP_MOVSX_RM8,        // 0F BE /r — movsx r32, r/m8  (sign-extend)
+    I386_OP_MOVSX_RM16,       // 0F BF /r — movsx r32, r/m16 (sign-extend)
 } i386_op_t;
 
 #define I386_PREFIX_OPSZ   0x01u

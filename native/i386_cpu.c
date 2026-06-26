@@ -80,6 +80,35 @@ uint32_t i386_shim_QueryPerformanceCounter(i386_cpu_t *cpu, const struct i386_im
     return 1;                                       // BOOL success
 }
 
+// IsProcessorFeaturePresent(DWORD ProcessorFeature) — WINAPI/stdcall, 1 arg,
+// returns BOOL. own1: deterministically claim the queried feature is present.
+// The CRT startup probes this (e.g. PF_XMMI64_INSTRUCTIONS) to pick code paths;
+// it is a capability query on the OS API surface, not a protection mechanism.
+uint32_t i386_shim_IsProcessorFeaturePresent(i386_cpu_t *cpu, const struct i386_image *img) {
+    (void)cpu; (void)img;
+    return 1;                                       // feature present (deterministic)
+}
+
+// InitializeSListHead(PSLIST_HEADER ListHead) — WINAPI/stdcall, 1 ptr arg,
+// returns void. Buffer-writing: zeroes the 8-byte SLIST header in image memory
+// at the pushed pointer ([esp]). own1: a CRT-startup OS-API call initializing
+// the program's OWN list head — loading, not a bypass.
+uint32_t i386_shim_InitializeSListHead(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t phead;                                // PSLIST_HEADER arg
+    if (!i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &phead)) return 0;
+    i386_mem_write32(img, phead + 0, 0u);          // zero the 8-byte (x86) header
+    i386_mem_write32(img, phead + 4, 0u);
+    return 0;                                       // void → EAX irrelevant
+}
+
+// GetModuleHandleW(LPCWSTR lpModuleName) — WINAPI/stdcall, 1 ptr arg, returns
+// HMODULE. own1: with NULL (the common startup call) this returns the calling
+// module's base — which the LOADER knows exactly: the image base. Not a bypass.
+uint32_t i386_shim_GetModuleHandleW(i386_cpu_t *cpu, const struct i386_image *img) {
+    (void)cpu;
+    return img->base;                               // HMODULE == loaded image base
+}
+
 const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va) {
     if (!iat || !iat->imports) return NULL;
     for (uint32_t i = 0; i < iat->count; i++) {
@@ -106,9 +135,24 @@ int i386_mem_write32(const i386_image_t *img, uint32_t va, uint32_t val) {
     return 1;
 }
 
+// Byte / word little-endian reads (E5 r6 — for MOVZX/MOVSX r/m8|r/m16 sources).
+static int mem_read8(const i386_image_t *img, uint32_t va, uint8_t *out) {
+    if (va < img->base || (uint64_t)va + 1 > (uint64_t)img->base + img->size) return 0;
+    *out = img->host[va - img->base];
+    return 1;
+}
+static int mem_read16(const i386_image_t *img, uint32_t va, uint16_t *out) {
+    if (va < img->base || (uint64_t)va + 2 > (uint64_t)img->base + img->size) return 0;
+    const uint8_t *p = img->host + (va - img->base);
+    *out = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    return 1;
+}
+
 // Compute the effective address for a memory-form ModR/M (mod != 3).
 // Supports the [reg+disp] / [disp32] forms the entry block uses; SIB is
-// not yet modeled (returns 0 → caller halts UNSUPPORTED).
+// not yet modeled (returns 0 → caller halts UNSUPPORTED). E5 r6: an FS
+// segment-override prefix redirects the address into the synthetic TEB
+// (own1: our own block, not the OS TEB — see i386_cpu.h teb_base).
 static int i386_ea(const i386_cpu_t *cpu, const i386_insn_t *insn, uint32_t *out) {
     int mod = (insn->modrm >> 6) & 3;
     int rm  = insn->modrm & 7;
@@ -120,7 +164,38 @@ static int i386_ea(const i386_cpu_t *cpu, const i386_insn_t *insn, uint32_t *out
     } else {
         addr = cpu->gpr[rm] + (insn->has_disp ? (uint32_t)insn->disp : 0);
     }
+    if (insn->prefixes & I386_PREFIX_FS) {
+        addr += cpu->teb_base;                        // fs:[disp] → synthetic TEB
+    }
     *out = addr;
+    return 1;
+}
+
+// Read an 8-bit r/m operand. Register-direct uses the x86 byte-register map
+// (rm 0..3 = low byte of eax/ecx/edx/ebx; rm 4..7 = high byte ah/ch/dh/bh).
+static int rm_get8(const i386_cpu_t *cpu, const i386_image_t *img,
+                   const i386_insn_t *insn, uint8_t *val, i386_halt_t *why) {
+    int mod = (insn->modrm >> 6) & 3;
+    if (mod == 3) {
+        int rm = insn->modrm & 7;
+        if (rm < 4) *val = (uint8_t)(cpu->gpr[rm] & 0xFFu);
+        else        *val = (uint8_t)((cpu->gpr[rm - 4] >> 8) & 0xFFu);
+        return 1;
+    }
+    uint32_t a;
+    if (!i386_ea(cpu, insn, &a)) { *why = I386_HALT_UNSUPPORTED; return 0; }
+    if (!mem_read8(img, a, val)) { *why = I386_HALT_OOB; return 0; }
+    return 1;
+}
+
+// Read a 16-bit r/m operand. Register-direct = low word of gpr[rm].
+static int rm_get16(const i386_cpu_t *cpu, const i386_image_t *img,
+                    const i386_insn_t *insn, uint16_t *val, i386_halt_t *why) {
+    int mod = (insn->modrm >> 6) & 3;
+    if (mod == 3) { *val = (uint16_t)(cpu->gpr[insn->modrm & 7] & 0xFFFFu); return 1; }
+    uint32_t a;
+    if (!i386_ea(cpu, insn, &a)) { *why = I386_HALT_UNSUPPORTED; return 0; }
+    if (!mem_read16(img, a, val)) { *why = I386_HALT_OOB; return 0; }
     return 1;
 }
 
@@ -508,6 +583,35 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                 if (!rm_set32(cpu, img, &insn, out_v, &why)) {
                     res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
                 }
+                break;
+            }
+            // ── MOVZX / MOVSX r32, r/m8|r/m16 (E5 r6) — 0F B6/B7/BE/BF ──────
+            // Zero/sign-extend a byte or word source into the 32-bit dst
+            // register (ModR/M.reg). No EFLAGS change (Intel SDM Vol.2).
+            case I386_OP_MOVZX_RM8:
+            case I386_OP_MOVSX_RM8: {
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint8_t b;
+                if (!rm_get8(cpu, img, &insn, &b, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint32_t v = (insn.op == I386_OP_MOVSX_RM8)
+                           ? (uint32_t)(int32_t)(int8_t)b   // sign-extend
+                           : (uint32_t)b;                   // zero-extend
+                cpu->gpr[(insn.modrm >> 3) & 7] = v;
+                break;
+            }
+            case I386_OP_MOVZX_RM16:
+            case I386_OP_MOVSX_RM16: {
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint16_t w;
+                if (!rm_get16(cpu, img, &insn, &w, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint32_t v = (insn.op == I386_OP_MOVSX_RM16)
+                           ? (uint32_t)(int32_t)(int16_t)w  // sign-extend
+                           : (uint32_t)w;                   // zero-extend
+                cpu->gpr[(insn.modrm >> 3) & 7] = v;
                 break;
             }
             // ── E4 kernel32 boundary — indirect IAT call / jump ───────────

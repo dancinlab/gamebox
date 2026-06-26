@@ -38,13 +38,24 @@
 // stub — reads the caller's pushed pointer arg and writes an 8-byte FILETIME
 // into image memory), QueryPerformanceCounter (buffer write, → 1), GetTickCount;
 // between them a `shl edx,4` exercises the freshly-decoded group-2 shift
-// (0xC1 /4) with full CF/OF/ZF/SF flags. Execution advances PAST the r4 wall
-// (insns 11 → 18) and halts at a SIXTH, UNregistered IAT call @0x5392A1 (the
-// next import to bind, r6). The B/D walls now use a `0F B6` (movzx) sentinel —
-// the next genuinely-uncovered decoder gap (0xC1 is no longer a wall).
+// (0xC1 /4) with full CF/OF/ZF/SF flags.
+//
+// E5 r6 — DRAIN 3 more CRT-security imports, CLOSE the 0F B6/B7/BE/BF MOVZX/MOVSX
+// decoder gap, and model a BOUNDED-SYNTHETIC TEB. After GetTickCount the prologue
+// now binds IsProcessorFeaturePresent (1-arg → 1), InitializeSListHead (buffer-
+// zeroes an 8-byte SLIST header), and GetModuleHandleW (→ the loaded image base),
+// runs a `movzx ecx,al` + `movsx edx,cl` (the freshly-decoded two-byte extends),
+// then reads a synthetic TEB self-pointer via `mov ecx, fs:[0x18]` (the FS
+// segment-override redirects to teb_base) and walks TEB→PEB→ImageBaseAddress.
+// Execution advances PAST the r5 wall (insns 18 → 30) and halts at a NINTH,
+// UNregistered IAT call @0x5392D4 (slot 0x538020, the next import to bind, r7).
+// The B/D walls now use a `0F A2` (cpuid) sentinel — the next genuinely-
+// uncovered decoder gap (0F B6 movzx is no longer a wall).
 // own1: binding the program's OWN imports to native impls is LOADING (what
-// every PE loader does), NOT a bypass. kernel32 is the OS API, not DRM/Warden.
-// Our own bytes, Intel SDM semantics, native shim — no Wine, no protection.
+// every PE loader does), NOT a bypass; the TEB here is OUR OWN synthetic block
+// (a few fields), NOT the OS TEB and NOT a protection structure. kernel32 is the
+// OS API, not DRM/Warden. Our own bytes, Intel SDM semantics, native shims — no
+// Wine, no protection.
 
 #include "i386_cpu.h"
 
@@ -107,7 +118,21 @@ static void put_at(uint8_t *img, uint32_t va, const uint8_t *src, size_t n) {
 //                                                         ;   (buffer write 8B → [0x539F10], → 1)
 //   0x539298  C1 E2 04              shl  edx, 4           ; group-2 SHIFT (r5): edx = TID<<4
 //   0x53929B  FF 15 10 80 53 00     call [0x538010]       ; slot 10 → GetTickCount (r5)
-//   0x5392A1  FF 15 14 80 53 00     call [0x538014]       ; slot 14 → UNBOUND (the new r6 wall)
+// E5 r6 continuation — drain 3 more CRT-security imports, exercise MOVZX/MOVSX,
+// and read a BOUNDED-SYNTHETIC TEB→PEB→ImageBase chain via an fs: override:
+//   0x5392A1  6A 0A                 push 0x0A             ; arg for next call
+//   0x5392A3  FF 15 14 80 53 00     call [0x538014]       ; slot 14 → IsProcessorFeaturePresent (r6, →1)
+//   0x5392A9  0F B6 C8              movzx ecx, al         ; 0F B6 (r6 decoder) → ecx=1
+//   0x5392AC  0F BE D1              movsx edx, cl         ; 0F BE (r6 decoder) → edx=1
+//   0x5392AF  68 20 9F 53 00        push 0x539F20         ; &SLIST head
+//   0x5392B4  FF 15 18 80 53 00     call [0x538018]       ; slot 18 → InitializeSListHead (r6, zero 8B)
+//   0x5392BA  6A 00                 push 0                ; GetModuleHandleW(NULL)
+//   0x5392BC  FF 15 1C 80 53 00     call [0x53801C]       ; slot 1C → GetModuleHandleW (r6, → image base)
+//   0x5392C2  64 8B 0D 18 00 00 00  mov ecx, fs:[0x18]    ; synthetic TEB self (fs override → teb_base)
+//   0x5392C9  8B 51 30              mov edx, [ecx+0x30]   ; [TEB+0x30] → synthetic PEB
+//   0x5392CC  8B 42 08              mov eax, [edx+8]      ; [PEB+8]    → ImageBaseAddress (= image base)
+//   0x5392CF  68 30 9F 53 00        push 0x539F30         ; &STARTUPINFOW
+//   0x5392D4  FF 15 20 80 53 00     call [0x538020]       ; slot 20 → UNBOUND (the new r7 wall)
 static const uint8_t SCRT_PROLOGUE[] = {
     0x83, 0xEC, 0x28,
     0x33, 0xC0,
@@ -126,38 +151,68 @@ static const uint8_t SCRT_PROLOGUE[] = {
     0xFF, 0x15, 0x0C, 0x80, 0x53, 0x00,   // 0x539292 call [0x53800C] → QueryPerformanceCounter
     0xC1, 0xE2, 0x04,                     // 0x539298 shl edx, 4   (group-2 shift)
     0xFF, 0x15, 0x10, 0x80, 0x53, 0x00,   // 0x53929B call [0x538010] → GetTickCount
-    0xFF, 0x15, 0x14, 0x80, 0x53, 0x00,   // 0x5392A1 call [0x538014] → UNBOUND (r6 wall)
+    // ── E5 r6 continuation ──
+    0x6A, 0x0A,                           // 0x5392A1 push 0x0A   (IsProcessorFeaturePresent arg)
+    0xFF, 0x15, 0x14, 0x80, 0x53, 0x00,   // 0x5392A3 call [0x538014] → IsProcessorFeaturePresent
+    0x0F, 0xB6, 0xC8,                     // 0x5392A9 movzx ecx, al   (0F B6 — r6 decoder gap closed)
+    0x0F, 0xBE, 0xD1,                     // 0x5392AC movsx edx, cl   (0F BE — r6)
+    0x68, 0x20, 0x9F, 0x53, 0x00,         // 0x5392AF push 0x539F20  (&SLIST head)
+    0xFF, 0x15, 0x18, 0x80, 0x53, 0x00,   // 0x5392B4 call [0x538018] → InitializeSListHead (buffer-zero)
+    0x6A, 0x00,                           // 0x5392BA push 0       (GetModuleHandleW NULL)
+    0xFF, 0x15, 0x1C, 0x80, 0x53, 0x00,   // 0x5392BC call [0x53801C] → GetModuleHandleW (→ image base)
+    0x64, 0x8B, 0x0D, 0x18, 0x00, 0x00, 0x00, // 0x5392C2 mov ecx, fs:[0x18]  (synthetic TEB self)
+    0x8B, 0x51, 0x30,                     // 0x5392C9 mov edx, [ecx+0x30]      ([TEB+0x30] → synthetic PEB)
+    0x8B, 0x42, 0x08,                     // 0x5392CC mov eax, [edx+8]         ([PEB+8] → ImageBaseAddress)
+    0x68, 0x30, 0x9F, 0x53, 0x00,         // 0x5392CF push 0x539F30  (&STARTUPINFOW)
+    0xFF, 0x15, 0x20, 0x80, 0x53, 0x00,   // 0x5392D4 call [0x538020] → UNBOUND (the new r7 wall)
 };
 
-// The native kernel32 imports bound across IAT slots 0x538000..0x538010 (r4+r5).
+// The native kernel32 imports bound across IAT slots 0x538000..0x53801C (r4-r6).
 // own1: loading the OS API surface to native impls, not a protection bypass.
-// The buffer-writing pair (slots 8 / C) take one stdcall pointer arg (4 bytes,
-// callee-popped) and write 8 bytes into image memory; the rest are 0-arg.
+// The buffer-writing trio (slots 8 / C / 18) take one stdcall pointer arg
+// (4 bytes, callee-popped) and write into image memory; IsProcessorFeaturePresent
+// (14) / GetModuleHandleW (1C) take 1 arg too; the rest are 0-arg.
 static const i386_import_t K32_IMPORTS[] = {
-    { 0x538000u, "GetCurrentThreadId",      i386_shim_GetCurrentThreadId,      0 },
-    { 0x538004u, "GetCurrentProcessId",     i386_shim_GetCurrentProcessId,     0 },
-    { 0x538008u, "GetSystemTimeAsFileTime", i386_shim_GetSystemTimeAsFileTime, 4 },
-    { 0x53800Cu, "QueryPerformanceCounter", i386_shim_QueryPerformanceCounter, 4 },
-    { 0x538010u, "GetTickCount",            i386_shim_GetTickCount,            0 },
+    { 0x538000u, "GetCurrentThreadId",        i386_shim_GetCurrentThreadId,        0 },
+    { 0x538004u, "GetCurrentProcessId",       i386_shim_GetCurrentProcessId,       0 },
+    { 0x538008u, "GetSystemTimeAsFileTime",   i386_shim_GetSystemTimeAsFileTime,   4 },
+    { 0x53800Cu, "QueryPerformanceCounter",   i386_shim_QueryPerformanceCounter,   4 },
+    { 0x538010u, "GetTickCount",              i386_shim_GetTickCount,              0 },
+    { 0x538014u, "IsProcessorFeaturePresent", i386_shim_IsProcessorFeaturePresent, 4 },
+    { 0x538018u, "InitializeSListHead",       i386_shim_InitializeSListHead,       4 },
+    { 0x53801Cu, "GetModuleHandleW",          i386_shim_GetModuleHandleW,          4 },
 };
-static const i386_iat_t K32_IAT = { K32_IMPORTS, 5 };
+static const i386_iat_t K32_IAT = { K32_IMPORTS, 8 };
 #define SHIM_TID  0x00001A2Bu   // GetCurrentThreadId stub return
 #define SHIM_PID  0x00000D04u   // GetCurrentProcessId stub return
 #define SHIM_TICK 0x0001D4C0u   // GetTickCount stub return
 #define FT_BUF    0x539F00u     // FILETIME scratch (above the stack base, in-image)
 #define QPC_BUF   0x539F10u     // LARGE_INTEGER scratch
+#define SLIST_BUF 0x539F20u     // SLIST_HEADER scratch (InitializeSListHead zeroes 8B)
+// ── BOUNDED-SYNTHETIC TEB/PEB (E5 r6) — OUR own block, NOT the OS TEB ────────
+// A few fields, just enough for the security-cookie / CRT-startup chain to read
+// fs:[0x18] (TEB self) → [TEB+0x30] (PEB) → [PEB+8] (ImageBaseAddress). own1:
+// synthetic, labeled, not a protection structure.
+#define TEB_BASE  0x539C00u     // synthetic TEB linear base
+#define PEB_BASE  0x539C80u     // synthetic PEB linear base
 
 // Build the hermetic flat image: entry block + the __scrt_common_main
-// prologue at the insn-1 CALL target + still-uncovered sentinels elsewhere.
+// prologue at the insn-1 CALL target + the synthetic TEB/PEB + still-uncovered
+// sentinels elsewhere.
 static void build_hermetic(uint8_t *img) {
     memset(img, 0, IMG_SIZE);
     put_at(img, ENTRY_VA, ENTRY_BYTES, sizeof(ENTRY_BYTES));
     put_at(img, 0x539259u, SCRT_PROLOGUE, sizeof(SCRT_PROLOGUE));  // CALL target (insn 1)
-    // 0F B6 = MOVZX r32, r/m8 — still uncovered after r5 (0xC1 shift is now
-    // decoded+executed). The 0x0F two-byte map only recognizes Jcc (80..8F),
-    // so 0F B6 → I386_OP_UNKNOWN. Keeps the B/D walls honest and names the
-    // next real decoder gap (movzx, ubiquitous in CRT) for r6.
-    uint8_t wall[] = { 0x0F, 0xB6, 0xC0 };         // representative `movzx eax, al`
+    // Synthetic TEB/PEB fields (own1: our own block, labeled, not the OS TEB).
+    i386_image_t m = { img, IMG_BASE, IMG_SIZE, 0 };
+    i386_mem_write32(&m, TEB_BASE + 0x18, TEB_BASE);   // TEB self-pointer (NtCurrentTeb shape)
+    i386_mem_write32(&m, TEB_BASE + 0x30, PEB_BASE);   // TEB→PEB
+    i386_mem_write32(&m, PEB_BASE + 0x08, IMG_BASE);   // PEB→ImageBaseAddress
+    // 0F A2 = CPUID — still uncovered after r6 (0F B6/B7/BE/BF movzx/movsx now
+    // decode+execute). The 0x0F two-byte map recognizes Jcc (80..8F) + the
+    // movzx/movsx family only, so 0F A2 → I386_OP_UNKNOWN. Keeps the B/D walls
+    // honest and names the next real decoder gap (cpuid, ubiquitous in CRT) for r7.
+    uint8_t wall[] = { 0x0F, 0xA2 };               // representative `cpuid`
     put_at(img, 0x538BABu, wall, sizeof(wall));    // CALL target (insn 6)
     put_at(img, 0x53872Au, wall, sizeof(wall));    // JMP  target (insn 2)
 }
@@ -177,9 +232,10 @@ int main(int argc, char **argv) {
             cpu.eip = entry;
             cpu.gpr[I386_REG_ESP] = pe.base + pe.size - 0x100;  // writable top of image
             cpu.iat = &K32_IAT;                                 // native kernel32 binding
+            cpu.teb_base = TEB_BASE;                            // synthetic TEB (own1: our block)
             i386_run_result_t r;
             i386_cpu_run(&cpu, &pe, 100000, &r);
-            printf("__SHIM__ PARTIAL phase=e4_kernel32_iat_bind insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+            printf("__SHIM__ PARTIAL phase=e4_crt_security_teb insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
                    i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
             i386_image_free(&pe);
@@ -195,23 +251,28 @@ int main(int argc, char **argv) {
     uint8_t *img_buf = (uint8_t *)malloc(IMG_SIZE);
     i386_image_t img = { img_buf, IMG_BASE, IMG_SIZE, 0 };
 
-    // === Run A — MILESTONE: drain 5 CRT-init kernel32 imports + shift ====
-    // E5 r5 — execution runs the entry CALL (insn 1) → __scrt_common_main
-    // prologue (sub/xor/or/cmp/mov/and/test/add — 8 insns, with EFLAGS) → then
-    // binds FIVE kernel32 imports in a row: GetCurrentThreadId (insn 10) →
-    // mov edx,eax (11) → GetCurrentProcessId (12) → push (13) →
-    // GetSystemTimeAsFileTime (14, BUFFER WRITE to [FT_BUF]) → push (15) →
-    // QueryPerformanceCounter (16, buffer write to [QPC_BUF]) → shl edx,4 (17,
-    // group-2 shift) → GetTickCount (18) → HALTS at the SIXTH, UNregistered IAT
-    // call @0x5392A1 (UNBOUND_IMPORT — slot 0x538014, the next import, r6).
-    printf("\n[cpu] Run A — drain 5 CRT kernel32 imports + group-2 shift (entry → prologue → binds)\n");
+    // === Run A — MILESTONE: 8 CRT imports + MOVZX/MOVSX + synthetic TEB =====
+    // E5 r6 — execution runs the entry CALL (insn 1) → __scrt_common_main
+    // prologue (sub/xor/or/cmp/mov/and/test/add — 8 insns, with EFLAGS) → binds
+    // FIVE kernel32 imports (GetCurrentThreadId..GetTickCount, with a buffer-
+    // writing FILETIME/QPC pair + a shl) → then the r6 continuation: push (19) →
+    // IsProcessorFeaturePresent (20) → movzx ecx,al (21) → movsx edx,cl (22) →
+    // push (23) → InitializeSListHead (24, BUFFER-ZERO [SLIST_BUF]) → push (25) →
+    // GetModuleHandleW (26, → image base) → mov ecx,fs:[0x18] (27, SYNTHETIC TEB
+    // self) → mov edx,[ecx+0x30] (28, → synthetic PEB) → mov eax,[edx+8] (29, →
+    // ImageBaseAddress) → push (30) → HALTS at the NINTH, UNregistered IAT call
+    // @0x5392D4 (UNBOUND_IMPORT — slot 0x538020, the next import, r7).
+    printf("\n[cpu] Run A — 8 CRT imports + MOVZX/MOVSX + synthetic TEB→PEB→ImageBase chain\n");
     build_hermetic(img_buf);
     {
         i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
         cpu.eip = ENTRY_VA;
         cpu.gpr[I386_REG_ESP] = 0x539E00u;          // stack inside the image
         cpu.iat = &K32_IAT;                         // register the native kernel32 binding
+        cpu.teb_base = TEB_BASE;                     // synthetic TEB (own1: our block, not OS TEB)
         uint32_t esp0 = cpu.gpr[I386_REG_ESP];
+        i386_mem_write32(&img, SLIST_BUF + 0, 0xFFFFFFFFu);  // pre-dirty → prove the zeroing
+        i386_mem_write32(&img, SLIST_BUF + 4, 0xFFFFFFFFu);
         i386_run_result_t r;
         i386_cpu_run(&cpu, &img, 1000, &r);
 
@@ -219,36 +280,39 @@ int main(int argc, char **argv) {
                r.insns, i386_halt_name(r.halt), r.halt_va, cpu.eip, cpu.gpr[I386_REG_ESP],
                cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_ECX], cpu.gpr[I386_REG_EDX],
                r.imports_bound, r.last_import ? r.last_import : "-", r.import_slot);
-        uint32_t pushed = 0;
-        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP], &pushed);
-        uint32_t ft_lo = 0, ft_hi = 0, qpc_lo = 0, qpc_hi = 0;
+        uint32_t entry_ret = 0;
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 4, &entry_ret);  // [esp+4] (under final push)
+        uint32_t ft_lo = 0, ft_hi = 0, qpc_lo = 0, qpc_hi = 0, sl_lo = 0, sl_hi = 0;
         i386_mem_read32(&img, FT_BUF + 0, &ft_lo);
         i386_mem_read32(&img, FT_BUF + 4, &ft_hi);
         i386_mem_read32(&img, QPC_BUF + 0, &qpc_lo);
         i386_mem_read32(&img, QPC_BUF + 4, &qpc_hi);
+        i386_mem_read32(&img, SLIST_BUF + 0, &sl_lo);
+        i386_mem_read32(&img, SLIST_BUF + 4, &sl_hi);
 
-        CHECK(r.insns == 18,                "18 insns (CALL + 8 prologue + 5 binds + mov + 2 push + shl)");
-        CHECK(r.insns > 11,                 "advanced PAST the r4 11-insn / 0x53927C wall");
-        CHECK(pushed == 0x5388ABu,          "entry CALL return addr 0x5388AB intact under the stdcall pops");
-        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 4, "esp net == esp0-4 (sub/add 0x28; 2 pushes callee-popped)");
-        CHECK(cpu.gpr[I386_REG_ECX] == 0xEFu,    "prologue preserved: ecx = 0xEF");
-        CHECK(cpu.gpr[I386_REG_EAX] == SHIM_TICK, "last bind: eax = GetTickCount() stub");
-        CHECK(cpu.gpr[I386_REG_EDX] == (SHIM_TID << 4), "shl edx,4 executed: edx = TID<<4 = 0x1A2B0");
+        CHECK(r.insns == 30,                "30 insns (18 r5 + push/IPFP/movzx/movsx/push/ISLH/push/GMHW/3×mov/push)");
+        CHECK(r.insns > 18,                 "advanced PAST the r5 18-insn / 0x5392A1 wall");
+        CHECK(entry_ret == 0x5388ABu,       "entry CALL return addr 0x5388AB intact under the stdcall pops");
+        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 8, "esp net == esp0-8 (entry retaddr + final unpopped push)");
+        CHECK(cpu.gpr[I386_REG_EAX] == IMG_BASE, "[PEB+8] → eax = ImageBaseAddress (synthetic TEB chain)");
+        CHECK(cpu.gpr[I386_REG_ECX] == TEB_BASE, "mov ecx,fs:[0x18] → ecx = synthetic TEB self");
+        CHECK(cpu.gpr[I386_REG_EDX] == PEB_BASE, "mov edx,[ecx+0x30] → edx = synthetic PEB");
         CHECK(ft_lo == 0xC3D4E5F6u && ft_hi == 0x01D7A1B2u,
                                             "GetSystemTimeAsFileTime wrote 8B FILETIME via the pushed ptr");
         CHECK(qpc_lo == 0x12345678u && qpc_hi == 0x00000000u,
                                             "QueryPerformanceCounter wrote 8B counter via the pushed ptr");
-        CHECK(r.imports_bound == 5,              "five IAT calls dispatched to native shims");
-        CHECK(r.last_import && strcmp(r.last_import, "GetTickCount") == 0,
-                                                 "most-recent bound import == GetTickCount");
-        CHECK(r.halt == I386_HALT_UNBOUND_IMPORT, "halt: sixth IAT call is UNbound (r6 boundary)");
+        CHECK(sl_lo == 0u && sl_hi == 0u,   "InitializeSListHead zeroed the 8B SLIST header (was 0xFFFFFFFF)");
+        CHECK(r.imports_bound == 8,              "eight IAT calls dispatched to native shims");
+        CHECK(r.last_import && strcmp(r.last_import, "GetModuleHandleW") == 0,
+                                                 "most-recent bound import == GetModuleHandleW");
+        CHECK(r.halt == I386_HALT_UNBOUND_IMPORT, "halt: ninth IAT call is UNbound (r7 boundary)");
         CHECK(r.halt_op == I386_OP_CALL_RM,      "wall op == CALL_RM (FF 15 [disp32])");
-        CHECK(r.halt_va == 0x5392A1u,            "wall VA == 0x5392A1 (the sixth IAT call)");
-        CHECK(r.import_slot == 0x538014u,        "unbound slot reported == 0x538014 (next import, r6)");
-        (void)SHIM_PID;
+        CHECK(r.halt_va == 0x5392D4u,            "wall VA == 0x5392D4 (the ninth IAT call)");
+        CHECK(r.import_slot == 0x538020u,        "unbound slot reported == 0x538020 (next import, r7)");
+        (void)SHIM_PID; (void)SHIM_TID; (void)SHIM_TICK;
 
         if (!emitted) {
-            printf("__SHIM__ PARTIAL phase=e4_kernel32_iat_bind insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+            printf("__SHIM__ PARTIAL phase=e4_crt_security_teb insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
                    i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
         }
