@@ -74,9 +74,12 @@ on a Blacksmith cloud Apple-Silicon runner instead.
 - **Toolchain** — the released `hexa` binary, installed via the canonical
   one-liner (`install.sh` → `~/.hx/bin`). gamebox is a downstream consumer, not
   the compiler repo, so it installs the release — it does not build hexa.
-- **What it runs** — `hexa test` over the 8 `[test].files` in `hexa.toml`
-  (own2 PASS/FAIL honest), then a gamebox CLI smoke (`status` / `selftest
-  --quick`, warn-only since D3DMetal SDK is absent on the runner).
+- **What it runs** — `hexa run <file> self-test` over the 8 `[test].files` in
+  `hexa.toml` (NOT `hexa test`, which runs `@test` fns — these files are
+  `self_test()`/`main()` and would pass vacuously); then the native i386
+  interpreter test (`native/i386_cpu_test`, the E3 first-execution gate, clang
+  on the runner); then a gamebox CLI smoke (`status` / `selftest --quick`,
+  warn-only since D3DMetal SDK is absent on the runner).
 
 **Rule for working here**: don't run heavy `hexa test` / builds on the local
 Mac — just `git push` and let Blacksmith build. The dev box should only ever

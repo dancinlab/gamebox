@@ -34,10 +34,13 @@ build_signed() {
 
 build_signed "pe_to_macho_shim" pe_to_macho_shim.c pe_parse.c
 build_signed "i386_decode_test" i386_decode_test.c i386_decode.c pe_parse.c
+build_signed "i386_cpu_test" i386_cpu_test.c i386_cpu.c i386_decode.c pe_parse.c
 
 echo "[build] verifying signatures"
 codesign --verify --verbose=2 pe_to_macho_shim || true
 codesign --verify --verbose=2 i386_decode_test || true
 codesign -d --entitlements - pe_to_macho_shim 2>&1 | head -10 || true
 
-echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]"
+codesign --verify --verbose=2 i386_cpu_test || true
+
+echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]"
