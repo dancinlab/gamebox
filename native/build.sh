@@ -54,4 +54,17 @@ codesign -d --entitlements - pe_to_macho_shim 2>&1 | head -10 || true
 codesign --verify --verbose=2 i386_cpu_test || true
 codesign --verify --verbose=2 metal_offscreen_smoke || true
 
-echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]  /  ./metal_offscreen_smoke"
+# d3d11_metal_bridge_test — D3D11-interface-shaped Metal bridge test (E5 r11).
+# own1: gamebox's own D3D11 *interface shape* over Apple Metal.
+# No Wine, no DXVK, no d3d11.dll source. Plain Metal backend.
+# 구현됨·미배선 (dead-until-wired to PE via interpreter, r12 target).
+echo "[build] compiling d3d11_metal_bridge_test (arch=arm64, sdk=macosx, ObjC+Metal)"
+"$CC" -arch arm64 -isysroot "$SDK" -fobjc-arc -O2 -Wall -Wextra \
+    -framework Metal -framework Foundation \
+    -o d3d11_bridge_test \
+    d3d11_metal_bridge_test.c d3d11_metal_bridge.m
+echo "[build] codesigning d3d11_bridge_test (ad-hoc)"
+codesign --force --sign - --timestamp=none d3d11_bridge_test
+codesign --verify --verbose=2 d3d11_bridge_test || true
+
+echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]  /  ./metal_offscreen_smoke  /  ./d3d11_bridge_test"

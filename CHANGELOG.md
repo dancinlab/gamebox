@@ -6,6 +6,51 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r11): **D3D11→Metal 브리지 + 네이티브 드라이버 테스트 (구현됨·미배선)**
+  — r10 이 증명한 헤드리스 Metal 오프스크린 렌더 서브스트레이트 위에, D3D11-인터페이스-형상의
+  Metal 브리지를 구축하고 네이티브 드라이버 테스트로 검증한다.
+  **own1**: gamebox 자체 D3D11 인터페이스 형상 → Apple Metal 라우팅. Wine 0·DXVK 0·
+  d3d11.dll 소스 0·DRM 0·Warden 0·게임 애셋 0. **validated_manjeom 여전히 0** — 브리지는
+  네이티브 테스트로 증명됐으나 아직 i386 인터프리터를 통해 PE가 구동하지 않음.
+  **구현됨·미배선 (dead-until-wired)** 라벨: r12에서 인터프리터 IAT autobind 배선 예정.
+  (1) **`native/d3d11_metal_bridge.h`** — COM 형상 C 헤더: `ID3D11Device`·
+  `ID3D11DeviceContext`·`IDXGISwapChain`·`ID3D11RenderTargetView`·`ID3D11Texture2D`
+  각 COM 오브젝트를 앞단 vtable 포인터(`lpVtbl`) + `_impl`(opaque bridge-retained
+  GBMetalContext\*)로 정의. vtable은 구현된 메서드 부분집합만(컴팩트): Device[0-2]=
+  IUnknown 스텁/Release·[3]=CreateRenderTargetView(실 d3d11.dll 인덱스:9);
+  Context[3]=OMSetRenderTargets(33)·[4]=ClearRenderTargetView(50)·[5]=Draw(13);
+  SwapChain[3]=GetBuffer(9)·[4]=Present(8). `gamebox_D3D11CreateDeviceAndSwapChain`
+  (12-파라미터 실 시그니처를 width+height로 단순화·매핑 문서화) + 픽셀 readback 헬퍼
+  `gamebox_d3d11_readback`. Win32 타입(HRESULT·UINT·FLOAT 등) gamebox-local 정의
+  (windows.h 의존 없음). r12 wiring 노트: vtable 인덱스가 실 d3d11.dll과 다름(컴팩트);
+  자작 r12 테스트 PE는 이 인덱스를 써야 함.
+  (2) **`native/d3d11_metal_bridge.m`** (Objective-C + Metal + Foundation, ARC):
+  `GBMetalContext`(ObjC 클래스) — MTLDevice·queue·library·PSO·backBuffer(64×64
+  MTLPixelFormatBGRA8Unorm·RenderTarget|ShaderRead·StorageModeShared)·triColorBuf
+  (red=1,0,0,1) 보유. 각 COM 오브젝트 `_impl` = `CFBridgingRetain(ctx)`(공유 컨텍스트
+  에 대한 명시적 strong ref; Release() 시 CFBridgingRelease + free). MSL 인라인 소스
+  (r10 smoke와 동일 셰이더). ClearRenderTargetView → loadAction=Clear 독립 렌더 패스
+  (CallerRGBA 색상, 0 드로우); Draw → loadAction=Load 렌더 패스(클리어 보존 + 삼각형 드로우);
+  Present → no-op(헤드리스); gamebox_d3d11_readback → [MTLTexture getBytes:].
+  (3) **`native/d3d11_metal_bridge_test.c`** (순수 C) — D3D11 앱이 호출하는 것과 동일한
+  vtable 포인터 경로: CreateDeviceAndSwapChain → sc→GetBuffer → dev→CreateRenderTargetView
+  → ctx→OMSetRenderTargets → ctx→ClearRenderTargetView(blue) → ctx→Draw(3,0) →
+  sc→Present → readback → 픽셀 어서션. MTLDevice nil → `__D3D11_BRIDGE__ SKIP
+  reason=no_device` + exit 0(정직·warn-only). 통과 시 `__D3D11_BRIDGE__ PASS
+  px_clear=0x0000FFFF px_triangle=0xFF0000FF nonuniform=1` + exit 0. 어서션 실패 시
+  `__D3D11_BRIDGE__ FAIL reason=...` + exit 1. **로컬 M4 결과(빌드 clean·-Wall -Wextra
+  경고 없음)**: `__D3D11_BRIDGE__ PASS px_clear=0x0000FFFF px_triangle=0xFF0000FF
+  nonuniform=1`. (4) **`native/build.sh`** — `d3d11_bridge_test` 타깃 추가(ObjC ARC·
+  Metal/Foundation; `-std=c11`·`-Wpedantic` 제외). ad-hoc codesign. (5)
+  **`.github/workflows/ci.yml`** — `Smoke — D3D11→Metal bridge (E5 r11)` 스텝 추가:
+  r10 Metal 서브스트레이트 스텝 직후·CLI smoke 직전. compile+run → `__D3D11_BRIDGE__`
+  파싱 → PASS/SKIP/FAIL 각 로그. **warn-only**(컴파일 실패·GPU 없음·어서션 실패 모두
+  `::warning::`, 빌드 red 없음). r10과 동일 패턴.
+  **r12 정의**: 최소 D3D11 테스트 PE(own1 자작 i386 PE·own2 클린·게임 애셋 0) + 인터프리터
+  IAT autobind 배선 → D3D11 import(CreateDeviceAndSwapChain·Present 등)를 이 브리지 shim에
+  바인딩 → PE가 vtable 호출 → Metal 오프스크린 렌더 → readback 픽셀 어서션 =
+  **validated_manjeom>0 달성 게이트**. r12 이름: `feat(F-NSWINDOW-E5 r12): 최소 D3D11 테스트 PE + 인터프리터 end-to-end 배선 (validated_manjeom>0 게이트)`.
+
 - feat(F-NSWINDOW-E5 r10): **헤드리스 Metal 오프스크린 렌더 + 픽셀 readback 스모크 (E5 서브스트레이트 증명)**
   — r9 가 명시한 다음 과제(`r10 표적 = DX→Metal 브리지(헤드리스 Metal 오프스크린 readback smoke 먼저 CI 검증)`)를
   완료한다. **서브스트레이트 증명 — 게임 프레임 아님; `validated_manjeom` 여전히 0.** (1) **`native/metal_offscreen_smoke.m`**
