@@ -29,6 +29,18 @@ All notable changes to `gamebox` are documented in this file.
   배선 → 변경이 dead 가 아니라 CI 검증됨. **cond.3 status 는 partial 유지**
   (purple_launcher.blk.1 — plaync online endpoint network-gated). own1: 합성 데이터만,
   실제 plaync account/network/token 0건, **GameGuard blocked-not-bypassed**.
+- test(battlenet cond.3): `test_d2r_archive_round_trip` 에
+  `check_battlenet_cond_3_state_machines()` 추가 — cond.3 4개 모듈 중 그동안
+  `pe_battle_net_oauth_token` 하나만 CI-pin 되어 있었고, 나머지 3개 perf 모듈의
+  synthetic 상태기계 마커(`__BNET_LOGIN__ PARTIAL …` / `__BNET_TOKEN__ PARTIAL …` /
+  `__BNET_CHAT__ PARTIAL …`)는 **각 모듈 자체 self_test 안에서만** 실행될 뿐 8 CI
+  `[test].files` 어디서도 grep/검증되지 않던 "CI-dead" 갭을 닫음. 세 모듈의 종단
+  상태(`TOKEN_EXPIRY` / `REFRESH_FAIL_RETRY` / `OFFLINE`)를 live self_test + grep
+  fallback 으로 skeleton-validate → login_state / token_refresh / chat_presence
+  상태기계가 CI 에서 실제 검증된다. 각 모듈 self_test 의 문서화된 상태(login 5,
+  token 5, chat 4)는 이미 전부 exercise 되어 있어(self_test 축 고갈) 모듈 자체는
+  무변경 — 갭은 CI-검증 부재였다. own1: 실 OAuth endpoint 0 / 실 XMPP 0 / socket 0 /
+  network 0. cond.3 status 는 partial 유지(network-gated = blk.1, 정직).
 
 ### Added
 
