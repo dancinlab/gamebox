@@ -88,6 +88,10 @@ const char *i386_op_name(i386_op_t op) {
         case I386_OP_MOVZX_RM16:  return "movzx";
         case I386_OP_MOVSX_RM8:
         case I386_OP_MOVSX_RM16:  return "movsx";
+        case I386_OP_IMUL_R_RM:
+        case I386_OP_IMUL_R_RM_IMM: return "imul";
+        case I386_OP_CPUID:       return "cpuid";
+        case I386_OP_RDTSC:       return "rdtsc";
         case I386_OP_PREFIX_ONLY: return "(prefix-only)";
         case I386_OP_UNKNOWN:
         default:                return "(unknown)";
@@ -254,6 +258,26 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
         out->imm = (int32_t)(int8_t)p[1];
         out->has_imm = 1;
         taken += 1;
+    } else if (op == 0x69 || op == 0x6B) {
+        // IMUL r32, r/m32, imm (E5 r7). 0x69 = imm32, 0x6B = imm8(sx).
+        // dst = ModR/M.reg, src1 = r/m32, src2 = imm. Intel SDM Vol.2.
+        int m_n = decode_modrm_disp(p + 1, avail - 1,
+                                    &out->modrm, &out->sib,
+                                    &out->disp, &out->has_disp);
+        if (m_n == 0) return 0;
+        out->reg_a = (int8_t)((out->modrm >> 3) & 7);   // dst register (reg field)
+        if (((out->modrm >> 6) & 3) == 3) out->reg_b = (int8_t)(out->modrm & 7);
+        int imm_size = (op == 0x69) ? 4 : 1;
+        size_t imm_off = (size_t)(1 + m_n);
+        if (imm_off + (size_t)imm_size > avail) return 0;
+        if (imm_size == 1) {
+            out->imm = (int32_t)(int8_t)p[imm_off];     // sign-extended imm8
+        } else {
+            out->imm = rd_s32(p + imm_off);
+        }
+        out->has_imm = 1;
+        out->op = I386_OP_IMUL_R_RM_IMM;
+        taken += m_n + imm_size;
     } else if (op == 0xE8) {
         if (avail < 5) return 0;
         out->op = I386_OP_CALL_REL;
@@ -307,6 +331,22 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
                 case 0xBF: out->op = I386_OP_MOVSX_RM16; break;
             }
             taken += 1 + m_n;   // +1 for op2, +m_n for ModR/M (0F already in taken)
+        } else if (op2 == 0xAF) {
+            // IMUL r32 (ModR/M.reg), r/m32 (E5 r7) — 2-operand signed multiply.
+            int m_n = decode_modrm_disp(p + 2, avail - 2,
+                                        &out->modrm, &out->sib,
+                                        &out->disp, &out->has_disp);
+            if (m_n == 0) return 0;
+            out->reg_a = (int8_t)((out->modrm >> 3) & 7);
+            if (((out->modrm >> 6) & 3) == 3) out->reg_b = (int8_t)(out->modrm & 7);
+            out->op = I386_OP_IMUL_R_RM;
+            taken += 1 + m_n;   // +1 for op2, +m_n for ModR/M
+        } else if (op2 == 0xA2) {
+            out->op = I386_OP_CPUID;     // 0F A2 (E5 r7) — no operands
+            taken += 1;                  // +1 for op2 (0F already in taken)
+        } else if (op2 == 0x31) {
+            out->op = I386_OP_RDTSC;     // 0F 31 (E5 r7) — no operands
+            taken += 1;
         } else {
             out->op = I386_OP_UNKNOWN;
             taken = n + 1;  // skip 0x0F only

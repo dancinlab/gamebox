@@ -43,6 +43,19 @@
 //   address into a few-field synthetic TEB/PEB (teb_base; self@+0x18, PEB@+0x30,
 //   ImageBase@PEB+8) so the security-cookie / CRT-startup `fs:[..]` chain runs.
 //   own1: synthetic block, NOT the OS TEB and NOT a protection structure.
+//
+// Coverage (E5 r7 — security cookie + CPU-identity ops, deeper into CRT init):
+//   IMUL r32,r/m32 (0F AF) + IMUL r32,r/m32,imm (69 id / 6B ib) — 32-bit signed
+//   multiply, low result to dst, CF/OF set if it overflows int32 ·
+//   CPUID (0F A2) — writes a SYNTHETIC feature set (leaf 0 vendor "GenuineIntel"
+//   + max-leaf; leaf 1 family/feature bits) into eax/ebx/ecx/edx ·
+//   RDTSC (0F 31) — writes a SYNTHETIC monotonic counter (cpu->tsc += step) into
+//   edx:eax · three more kernel32 shims (GetStartupInfoW [buffer-write cb=0x44] /
+//   GetSystemInfo [bounded-synthetic SYSTEM_INFO] / GetProcAddress [→ synthetic
+//   in-image stub addr]). The prologue now runs the MSVC __security_init_cookie
+//   shape: load the FILETIME entropy, xor, imul-mix, and store a non-default
+//   cookie to a global slot. own1: CPUID/RDTSC are plain CPU instructions (no
+//   protection); the cookie is OUR arithmetic over OUR buffers; no Wine.
 
 #ifndef GAMEBOX_I386_CPU_H
 #define GAMEBOX_I386_CPU_H
@@ -100,7 +113,15 @@ struct i386_cpu {
     // and NOT a protection structure — just enough for the cookie math to run.
     // 0 → no TEB modeled (an fs: access then halts OOB honestly).
     uint32_t teb_base;
+    // ── E5 r7 SYNTHETIC timestamp counter (NOT the real CPU TSC) ─────────────
+    // RDTSC (0F 31) returns a deterministic monotonic value: each rdtsc adds
+    // I386_TSC_STEP and writes the running 64-bit count to edx:eax. own1: a
+    // plausible synthetic counter, NOT the host TSC and NOT a protection clock.
+    uint64_t tsc;
 };
+
+// Per-rdtsc increment for the synthetic timestamp counter (plausible, fixed).
+#define I386_TSC_STEP 0x000000178B4D159EULL
 
 // Native kernel32 shim — GetCurrentThreadId (WINAPI/stdcall, 0 args, → DWORD).
 // own1: returns a deterministic plausible thread id. This is the OS API
@@ -129,6 +150,18 @@ uint32_t i386_shim_QueryPerformanceCounter(i386_cpu_t *cpu, const struct i386_im
 uint32_t i386_shim_IsProcessorFeaturePresent(i386_cpu_t *cpu, const struct i386_image *img);
 uint32_t i386_shim_InitializeSListHead(i386_cpu_t *cpu, const struct i386_image *img);
 uint32_t i386_shim_GetModuleHandleW(i386_cpu_t *cpu, const struct i386_image *img);
+
+// CRT-startup kernel32 shims (E5 r7). own1: native re-impls of the OS API
+// surface bound to the program's OWN imports — loading, not a bypass.
+//   GetStartupInfoW(LPSTARTUPINFOW)  — 1 ptr arg, void; zeroes a STARTUPINFOW
+//       and stamps cb = 0x44 (sizeof) at image memory at the pushed pointer.
+//   GetSystemInfo(LPSYSTEM_INFO)     — 1 ptr arg, void; writes a BOUNDED-
+//       SYNTHETIC SYSTEM_INFO (page size / processor count / arch) buffer.
+//   GetProcAddress(HMODULE,LPCSTR)   — 2 ptr/str args, returns a synthetic
+//       in-image stub address (the loader hands back its own thunk).
+uint32_t i386_shim_GetStartupInfoW(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_GetSystemInfo(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_GetProcAddress(i386_cpu_t *cpu, const struct i386_image *img);
 
 // Look up an IAT slot VA in the registry. Returns NULL if `iat` is NULL or
 // the slot is not bound (→ the caller halts UNBOUND_IMPORT honestly).
