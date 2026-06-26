@@ -19,6 +19,28 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5): i386 **인터프리터** 최초 도입 — 디코드만 하던 E2 를 넘어
+  실제 Win32 게임 바이너리 바이트를 **실행**(상태 변이)한다. `native/i386_cpu.{c,h}`
+  = 레지스터 파일(`gpr[8]`/eip/eflags, esp=gpr[4]) + 플랫 VA→host 메모리 모델
+  (`mem_read32`/`mem_write32`, 경계검사) + fetch→decode→**execute**→advance 루프.
+  실행 op: PUSH_R / POP_R / PUSH_IMM / PUSH_RM([reg+disp]) / MOV_R_RM(8B) /
+  MOV_RM_R(89) / CALL_REL(E8) / JMP_REL(E9·EB) / RET(C3·C2). 미커버 opcode 는
+  `I386_OP_UNKNOWN` 으로 **정직하게 halt**(wall VA 기록). 분기 타깃은 디스어셈블러와
+  동일한 `eip+len+imm` 공식 재사용. own1: 프로그램 자기 바이트 + Intel SDM 의미론만,
+  Wine/CrossOver/Box86/QEMU/ReactOS 소스 0.
+- test(F-NSWINDOW-E5): `native/i386_cpu_test.c` — Battle.net-Setup.exe 의 실제
+  9-insn 엔트리 블록(entry_va 0x5388A6) 을 hermetic 플랫 이미지에 박아 CI 에서
+  바이너리 없이 실행(파일 인자 주면 실 PE 도 로드·실행). 실측(로컬 clang 빌드,
+  19/19 [ok], `__SHIM_TEST__ PASS`): Run A(엔트리에서 실행) → CALL_REL 1개 실행,
+  리턴주소 0x5388AB push, eip=실타깃 0x539259 로 분기 후 디코더 커버리지 wall 에서
+  halt → `__SHIM__ PARTIAL phase=entry_block_executed insns=1 halted=unknown halt_va=0x539259`.
+  Run B(push/mov/push-rm), Run C(pop/pop/ret), Run D(jmp) 가 PUSH_R·MOV_R_RM·
+  PUSH_RM·POP_R·RET·JMP_REL 의미론을 실 바이트로 검증. `native/build.sh` 에
+  `i386_cpu_test` 타깃 등록(clang arm64 + ad-hoc codesign, 기존 빌드 재사용).
+  → **게임 바이너리 바이트 최초 실 EXECUTION 마일스톤**. 다음 wall(r3): VA 0x539259
+  (`__scrt_common_main` 프롤로그)의 첫 미커버 opcode — group-1 imm arith(0x83/0x81/
+  0x80)·mov r/m imm(0xC7/0xC6)·byte mov(0x88/0x8A)·test(0x84)·and/or(0x09/0x0B/
+  0x21/0x23) 디코더 커버리지 확장 대상.
 - feat(battlenet cond.3): `pe_battle_net_oauth_token` self_test 가 op_kind 6
   `device_code_grant`(`/oauth/device` RFC8628) 을 비로소 exercise — 헤더에
   문서화됐으나 self_test 미커버였던 갭을 닫음(6 op_kind 전부 round-trip). 합성
