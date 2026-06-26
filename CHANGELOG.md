@@ -6,6 +6,44 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r12): **PE→D3D11→Metal end-to-end: 첫 own1 D3D11 PE → Metal 프레임 (인프라 마일스톤)**
+  — r11 이 증명한 D3D11→Metal 브리지를 인터프리터에 배선하고, 자작 최소 i386 PE 를 실행하여
+  실제 Metal 렌더 프레임을 픽셀로 읽어 검증한다.
+  **정직한 평가(own2)**: 이것은 인프라 마일스톤 — gamebox 런타임이 자작 own1 D3D11 PE 를 인터프리터로
+  실행해 Metal 렌더 프레임을 픽셀로 증명한 *첫 번째* 케이스다. 실 상업 게임(디아블로·리니지 등)
+  실행과 동일하지 않다: 전체 Win32/D3D11 API 서피스·실 애셋·실 게임 PE 가 필요하다.
+  **validated_manjeom**: `first_own1_authored_d3d11_pe_to_metal_frame` (정확한 라벨,
+  "상업 게임 프레임" 아님). **own1**: Wine 0·DXVK 0·d3d11.dll 소스 0·DRM 0·Warden 0·
+  게임 애셋 0·anima clone 0.
+  **로컬 M4 실측 결과**:
+  `__E5__ PASS pe_executed=1 frame_rendered=1 px_clear=0x0000FFFF px_triangle=0xFF0000FF nonuniform=1 insns=11 imports=7`
+  (1) **`native/e5_end_to_end_test.c`** — E5 r12 end-to-end 테스트 (순수 C):
+  (a) 브리지 오브젝트 테이블(g_sc·g_dev·g_ctx·g_tex·g_rtv 정적 전역,
+  g_skip/g_fail 상태 플래그); (b) 7개 브리지 shim(d3d11_create 2-arg stdcall 8B
+  pop·get_buffer/create_rtv/omset/clear_blue/draw/present 0-arg; 각각 gamebox
+  D3D11→Metal 브리지 C API 래핑); (c) D3D11_SHIMS 레지스트리 7엔트리 → i386_iat_autobind;
+  (d) `build_e5_pe_flat()` — i386 PE32 평탄 이미지 빌더: .text(RVA 0x1000,
+  49바이트 코드)+.idata(RVA 0x2000, d3d11.dll 7 named import; IMAGE_IMPORT_DESCRIPTOR
+  +INT+IAT+IBN 레이아웃) in-memory 구성; (e) main(): PE 빌드→autobind(total=7 bound=7
+  unbound=0)→CPU 설정+실행(insns=11 halt=ret)→readback→픽셀 어서션→`__E5__ PASS/PARTIAL/SKIP`
+  출력 프로토콜. (2) **`native/fixtures/d3d11_triangle_min.pe.txt`** — 자작 PE 완전 레이아웃
+  문서(파일 오프셋·VA·섹션·IAT 슬롯·import 이름→shim 매핑·정직 평가). (3) PE 엔트리 코드 (49바이트,
+  i386 hand-assembled, Intel SDM 명시): `6A 40 6A 40`(push height/width=64) +
+  `FF 15 [slot]`×7(IAT call; 기존 인터프리터 커버리지) + `33 C0 C3`(xor+ret).
+  디코더 확장 없음(기존 PUSH_IMM8·CALL_RM·XOR_R_RM·RET 그대로 사용). (4) IAT 슬롯 VA:
+  0x402080(create)·0x402084(get_buf)·0x402088(rtv)·0x40208C(omset)·0x402090(clear)·
+  0x402094(draw)·0x402098(present). (5) **`native/build.sh`** — `e5_end_to_end_test` 타깃
+  추가(ObjC ARC·Metal/Foundation). (6) **`.github/workflows/ci.yml`** —
+  `Smoke — E5 end-to-end (PE→D3D11→Metal)` 스텝 추가: D3D11 브리지 스텝 직후.
+  `__E5__ PASS/SKIP/PARTIAL/FAIL` 파싱, warn-only(r10/r11 패턴). ARCHITECTURE.json
+  blocking-frontiers r12 실측 기록.
+  **체인 설명(정직)**: own1 자작 i386 PE(9명령·49바이트) → i386 인터프리터(i386_cpu.c)
+  IAT autobind(by name, own 임포트 로딩=로딩이지 바이패스 아님) → 브리지 shim layer →
+  gamebox D3D11→Metal 브리지(d3d11_metal_bridge.m) → Apple Metal 헤드리스 오프스크린
+  렌더(64×64 BGRA8 MTLTexture) → 픽셀 readback(getBytes) → 어서션(blue clear ∧ red
+  triangle ∧ nonuniform). **다음 상업 게임 방향**: Win32 API 서피스 확장·opcode 커버리지
+  확장·vtable 디스패치([reg+offset] 간접 call)·실 게임 PE IAT 추적.
+
 - feat(F-NSWINDOW-E5 r11): **D3D11→Metal 브리지 + 네이티브 드라이버 테스트 (구현됨·미배선)**
   — r10 이 증명한 헤드리스 Metal 오프스크린 렌더 서브스트레이트 위에, D3D11-인터페이스-형상의
   Metal 브리지를 구축하고 네이티브 드라이버 테스트로 검증한다.
