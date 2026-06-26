@@ -50,6 +50,27 @@ typedef enum {
     I386_OP_DEC_R,            // 48+rd
     I386_OP_HLT,              // F4
     I386_OP_PREFIX_ONLY,      // standalone prefix run with no opcode (not a valid program; flag)
+    // ── E5 r3 additions (ordinals 32+; appended so existing values stay) ──
+    // Group-1 r/m32, imm (0x81 /r id, 0x83 /r ib sign-extended). The
+    // sub-operation is selected by ModR/M.reg (0..7) → these 8 enums.
+    I386_OP_ADD_RM_IMM,       // 81/83 /0 — add r/m32, imm
+    I386_OP_OR_RM_IMM,        // 81/83 /1 — or  r/m32, imm
+    I386_OP_ADC_RM_IMM,       // 81/83 /2 — adc r/m32, imm
+    I386_OP_SBB_RM_IMM,       // 81/83 /3 — sbb r/m32, imm
+    I386_OP_AND_RM_IMM,       // 81/83 /4 — and r/m32, imm
+    I386_OP_SUB_RM_IMM,       // 81/83 /5 — sub r/m32, imm
+    I386_OP_XOR_RM_IMM,       // 81/83 /6 — xor r/m32, imm
+    I386_OP_CMP_RM_IMM,       // 81/83 /7 — cmp r/m32, imm
+    I386_OP_GRP1_RM8_IMM8,    // 80 /r ib — byte group-1 (width not modeled; UNSUPPORTED)
+    I386_OP_MOV_RM_IMM,       // C7 /0 id — mov r/m32, imm32
+    I386_OP_MOV_RM8_IMM8,     // C6 /0 ib — mov r/m8, imm8 (byte; UNSUPPORTED)
+    I386_OP_MOV_RM8_R8,       // 88 /r    — mov r/m8, r8 (byte; UNSUPPORTED)
+    I386_OP_MOV_R8_RM8,       // 8A /r    — mov r8, r/m8 (byte; UNSUPPORTED)
+    I386_OP_TEST_RM8_R8,      // 84 /r    — test r/m8, r8 (byte; UNSUPPORTED)
+    I386_OP_OR_RM_R,          // 09 /r    — or  r/m32, r32
+    I386_OP_OR_R_RM,          // 0B /r    — or  r32, r/m32
+    I386_OP_AND_RM_R,         // 21 /r    — and r/m32, r32
+    I386_OP_AND_R_RM,         // 23 /r    — and r32, r/m32
 } i386_op_t;
 
 #define I386_PREFIX_OPSZ   0x01u

@@ -63,6 +63,24 @@ const char *i386_op_name(i386_op_t op) {
         case I386_OP_INC_R:     return "inc";
         case I386_OP_DEC_R:     return "dec";
         case I386_OP_HLT:       return "hlt";
+        case I386_OP_ADD_RM_IMM: return "add";
+        case I386_OP_OR_RM_IMM:  return "or";
+        case I386_OP_ADC_RM_IMM: return "adc";
+        case I386_OP_SBB_RM_IMM: return "sbb";
+        case I386_OP_AND_RM_IMM: return "and";
+        case I386_OP_SUB_RM_IMM: return "sub";
+        case I386_OP_XOR_RM_IMM: return "xor";
+        case I386_OP_CMP_RM_IMM: return "cmp";
+        case I386_OP_GRP1_RM8_IMM8: return "grp1b";
+        case I386_OP_MOV_RM_IMM: return "mov";
+        case I386_OP_MOV_RM8_IMM8: return "mov";
+        case I386_OP_MOV_RM8_R8: return "mov";
+        case I386_OP_MOV_R8_RM8: return "mov";
+        case I386_OP_TEST_RM8_R8: return "test";
+        case I386_OP_OR_RM_R:
+        case I386_OP_OR_R_RM:   return "or";
+        case I386_OP_AND_RM_R:
+        case I386_OP_AND_R_RM:  return "and";
         case I386_OP_PREFIX_ONLY: return "(prefix-only)";
         case I386_OP_UNKNOWN:
         default:                return "(unknown)";
@@ -273,7 +291,10 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
             || op == 0x29 || op == 0x2B
             || op == 0x31 || op == 0x33
             || op == 0x39 || op == 0x3B
-            || op == 0x85) {
+            || op == 0x85
+            || op == 0x88 || op == 0x8A || op == 0x84   // E5 r3: byte mov + test
+            || op == 0x09 || op == 0x0B                 // E5 r3: or
+            || op == 0x21 || op == 0x23) {              // E5 r3: and
         // Common /r ModR/M instructions.
         int m_n = decode_modrm_disp(p + 1, avail - 1,
                                     &out->modrm, &out->sib,
@@ -298,6 +319,73 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
             case 0x39: out->op = I386_OP_CMP_RM_R; break;
             case 0x3B: out->op = I386_OP_CMP_R_RM; break;
             case 0x85: out->op = I386_OP_TEST_RM_R; break;
+            case 0x88: out->op = I386_OP_MOV_RM8_R8; break;
+            case 0x8A: out->op = I386_OP_MOV_R8_RM8; break;
+            case 0x84: out->op = I386_OP_TEST_RM8_R8; break;
+            case 0x09: out->op = I386_OP_OR_RM_R;  break;
+            case 0x0B: out->op = I386_OP_OR_R_RM;  break;
+            case 0x21: out->op = I386_OP_AND_RM_R; break;
+            case 0x23: out->op = I386_OP_AND_R_RM; break;
+        }
+        taken += m_n;
+    } else if (op == 0x80 || op == 0x81 || op == 0x83) {
+        // Group-1 r/m, imm (add/or/adc/sbb/and/sub/xor/cmp by ModR/M.reg).
+        //   0x80 = r/m8, imm8   0x81 = r/m32, imm32   0x83 = r/m32, imm8(sx)
+        // Intel SDM Vol.2 — own1, no Wine.
+        int m_n = decode_modrm_disp(p + 1, avail - 1,
+                                    &out->modrm, &out->sib,
+                                    &out->disp, &out->has_disp);
+        if (m_n == 0) return 0;
+        int reg_field = (out->modrm >> 3) & 7;
+        // reg_a carries the r/m base register (interpreter reads modrm directly).
+        out->reg_a = (int8_t)(out->modrm & 7);
+        int imm_size = (op == 0x81) ? 4 : 1;
+        size_t imm_off = (size_t)(1 + m_n);
+        if (imm_off + (size_t)imm_size > avail) return 0;
+        if (imm_size == 1) {
+            out->imm = (int32_t)(int8_t)p[imm_off];   // sign-extended imm8
+        } else {
+            out->imm = rd_s32(p + imm_off);
+        }
+        out->has_imm = 1;
+        if (op == 0x80) {
+            out->op = I386_OP_GRP1_RM8_IMM8;          // byte width — not executed
+        } else {
+            switch (reg_field) {
+                case 0: out->op = I386_OP_ADD_RM_IMM; break;
+                case 1: out->op = I386_OP_OR_RM_IMM;  break;
+                case 2: out->op = I386_OP_ADC_RM_IMM; break;
+                case 3: out->op = I386_OP_SBB_RM_IMM; break;
+                case 4: out->op = I386_OP_AND_RM_IMM; break;
+                case 5: out->op = I386_OP_SUB_RM_IMM; break;
+                case 6: out->op = I386_OP_XOR_RM_IMM; break;
+                case 7: out->op = I386_OP_CMP_RM_IMM; break;
+            }
+        }
+        taken += m_n + imm_size;
+    } else if (op == 0xC7 || op == 0xC6) {
+        // MOV r/m, imm — group-11 /0 (other reg fields are undefined → UNKNOWN).
+        //   0xC7 = r/m32, imm32   0xC6 = r/m8, imm8
+        int m_n = decode_modrm_disp(p + 1, avail - 1,
+                                    &out->modrm, &out->sib,
+                                    &out->disp, &out->has_disp);
+        if (m_n == 0) return 0;
+        int reg_field = (out->modrm >> 3) & 7;
+        out->reg_a = (int8_t)(out->modrm & 7);
+        if (reg_field != 0) {
+            out->op = I386_OP_UNKNOWN;                // only /0 is MOV
+        } else {
+            int imm_size = (op == 0xC7) ? 4 : 1;
+            size_t imm_off = (size_t)(1 + m_n);
+            if (imm_off + (size_t)imm_size > avail) return 0;
+            if (imm_size == 1) {
+                out->imm = (int32_t)(int8_t)p[imm_off];
+            } else {
+                out->imm = rd_s32(p + imm_off);
+            }
+            out->has_imm = 1;
+            out->op = (op == 0xC7) ? I386_OP_MOV_RM_IMM : I386_OP_MOV_RM8_IMM8;
+            taken += imm_size;
         }
         taken += m_n;
     } else if (op == 0xFF) {
