@@ -41,22 +41,61 @@ enum {
     I386_REG_ESP = 4, I386_REG_EBP = 5, I386_REG_ESI = 6, I386_REG_EDI = 7,
 };
 
+struct i386_image;   // fwd (memory model — defined below)
+
+// ── E4 kernel32 IAT binding (E5 r4) ─────────────────────────────────────────
+// A native import stub: invoked when execution reaches an indirect IAT call
+// `FF 15 [slot_va]` whose slot is registered. It reads its arguments off the
+// emulated stack (Win32 stdcall: arg1 at [esp], arg2 at [esp+4], …; there is
+// NO return address on top because we intercept AT the call, before it would
+// be pushed) and returns the EAX value the call yields.
+//
+// own1: this is a PE LOADER binding its OWN process's imports to native
+// implementations — exactly what every loader does. kernel32 is the OS API
+// surface, NOT a protection. Binding GetCurrentThreadId etc. to a native shim
+// is LOADING, not bypassing. No DRM / Warden / anti-cheat is touched.
+typedef struct i386_cpu i386_cpu_t;
+typedef uint32_t (*i386_import_stub_fn)(i386_cpu_t *cpu, const struct i386_image *img);
+
 typedef struct {
+    uint32_t            slot_va;    // IAT slot VA == the disp32 of `FF 15 [disp32]`
+    const char         *name;      // imported symbol (e.g. "GetCurrentThreadId")
+    i386_import_stub_fn fn;        // native shim
+    uint32_t            arg_bytes; // stdcall callee-pop bytes (0 for 0-arg / cdecl)
+} i386_import_t;
+
+typedef struct {
+    const i386_import_t *imports;
+    uint32_t             count;
+} i386_iat_t;
+
+struct i386_cpu {
     uint32_t gpr[8];
     uint32_t eip;
     uint32_t eflags;
-} i386_cpu_t;
+    const i386_iat_t *iat;   // optional import registry (NULL → no bindings)
+};
+
+// Native kernel32 shim — GetCurrentThreadId (WINAPI/stdcall, 0 args, → DWORD).
+// own1: returns a deterministic plausible thread id. This is the OS API
+// surface bound to a native impl (loading), not a protection bypass.
+uint32_t i386_shim_GetCurrentThreadId(i386_cpu_t *cpu, const struct i386_image *img);
+
+// Look up an IAT slot VA in the registry. Returns NULL if `iat` is NULL or
+// the slot is not bound (→ the caller halts UNBOUND_IMPORT honestly).
+const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va);
 
 // Flat memory image: a single contiguous host buffer covering the VA
 // window [base, base+size). VA→host is host + (va - base). Simple and
 // low-risk; the PE loader fills it section-by-section (see
 // i386_cpu_load_pe), and the hermetic test fills it by hand.
-typedef struct {
+struct i386_image {
     uint8_t *host;
     uint32_t base;   // VA of host[0]
     uint32_t size;   // bytes mapped
     int      owns;   // free(host) on destroy if set
-} i386_image_t;
+};
+typedef struct i386_image i386_image_t;
 
 // Why the run loop stopped.
 typedef enum {
@@ -67,13 +106,19 @@ typedef enum {
     I386_HALT_OOB,         // eip / mem access outside the mapped image
     I386_HALT_TRUNC,       // decode_one returned 0 (truncated)
     I386_HALT_GUARD,       // hit the max-step guard
+    I386_HALT_UNBOUND_IMPORT, // indirect IAT call FF 15 [slot] to an UNregistered
+                              // kernel32 import — the next import to bind (own1:
+                              // honest stop, we never invent the function)
 } i386_halt_t;
 
 typedef struct {
-    uint32_t   insns;    // instructions fully executed
+    uint32_t   insns;          // instructions fully executed
     i386_halt_t halt;
-    uint32_t   halt_va;  // VA where execution stopped
-    i386_op_t  halt_op;  // op at the wall (meaningful for UNKNOWN/UNSUPPORTED)
+    uint32_t   halt_va;        // VA where execution stopped
+    i386_op_t  halt_op;        // op at the wall (meaningful for UNKNOWN/UNSUPPORTED)
+    uint32_t   imports_bound;  // count of IAT calls dispatched to a native shim
+    const char *last_import;   // name of the most recent bound import (NULL if none)
+    uint32_t   import_slot;    // slot VA at an UNBOUND_IMPORT halt (else 0)
 } i386_run_result_t;
 
 // Little-endian 32-bit memory accessors. Return 1 on success, 0 if the

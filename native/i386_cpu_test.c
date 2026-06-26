@@ -23,13 +23,21 @@
 // representative __scrt_common_main-shaped prologue at 0x539259 (own1: a
 // documented prologue SHAPE built from the named families — the real binary
 // is absent on this host, so these are our own SDM-correct bytes, not the
-// verbatim image). Execution now advances PAST the r2 1-instruction wall,
-// THROUGH the prologue, and halts honestly at the first IAT-style indirect
-// CALL `FF 15 [disp32]` — the E4 kernel32 boundary the interpreter does not
-// (and must not, own1) dereference. The two other reachable targets keep a
-// still-uncovered sentinel (0xC1 shift-group, the next r4 decoder gap) so
-// runs B/D continue to halt at the decoder-coverage wall.
-// own1: our own bytes, Intel SDM semantics only — no Wine, no IAT resolution.
+// verbatim image). r3 execution advanced PAST the r2 1-instruction wall,
+// THROUGH the prologue, and HALTED at the first IAT-style indirect CALL
+// `FF 15 [0x538000]` @0x539274 — the E4 kernel32 boundary.
+//
+// E5 r4 — CROSS that boundary. The interpreter now BINDS the IAT slot to a
+// native kernel32 shim (GetCurrentThreadId — one of the CRT security-cookie
+// init calls): on `FF 15 [slot]` it looks the slot VA up in a registry, and
+// if bound, dispatches to the native C stub, places its result in EAX, and
+// CONTINUES. The r3 wall @0x539274 is now executed (insn 10); execution runs
+// on (mov edx,eax — insn 11) and reaches a SECOND, deliberately UNregistered
+// IAT call @0x53927C, the new honest wall (UNBOUND_IMPORT — the next import to
+// bind, r5). The B/D 0xC1 shift sentinels are unchanged.
+// own1: binding the program's OWN imports to native impls is LOADING (what
+// every PE loader does), NOT a bypass. kernel32 is the OS API, not DRM/Warden.
+// Our own bytes, Intel SDM semantics, native shim — no Wine, no protection.
 
 #include "i386_cpu.h"
 
@@ -80,7 +88,11 @@ static void put_at(uint8_t *img, uint32_t va, const uint8_t *src, size_t n) {
 //   0x539269  81 E1 FF 00 00 00     and  ecx, 0xFF        ; group-1 /4 imm32 → ecx=0xEF
 //   0x53926F  85 C9                 test ecx, ecx         ; TEST_RM_R → flags
 //   0x539271  83 C4 28              add  esp, 0x28        ; group-1 /0 → esp restored
-//   0x539274  FF 15 00 80 53 00     call [0x538000]       ; IAT indirect call → E4 wall
+//   0x539274  FF 15 00 80 53 00     call [0x538000]       ; IAT slot 0x538000 → BOUND
+//                                                         ;   GetCurrentThreadId (r4) → eax
+//   0x53927A  89 C2                 mov  edx, eax         ; capture returned TID
+//   0x53927C  FF 15 04 80 53 00     call [0x538004]       ; IAT slot 0x538004 → UNBOUND
+//                                                         ;   (the r5 wall)
 static const uint8_t SCRT_PROLOGUE[] = {
     0x83, 0xEC, 0x28,
     0x33, 0xC0,
@@ -90,8 +102,18 @@ static const uint8_t SCRT_PROLOGUE[] = {
     0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00,
     0x85, 0xC9,
     0x83, 0xC4, 0x28,
-    0xFF, 0x15, 0x00, 0x80, 0x53, 0x00,
+    0xFF, 0x15, 0x00, 0x80, 0x53, 0x00,   // 0x539274 call [0x538000] → bound
+    0x89, 0xC2,                           // 0x53927A mov edx, eax
+    0xFF, 0x15, 0x04, 0x80, 0x53, 0x00,   // 0x53927C call [0x538004] → unbound (r5)
 };
+
+// The native kernel32 import bound at IAT slot 0x538000 (r4). own1: loading
+// the OS API surface to a native impl, not a protection bypass.
+static const i386_import_t K32_IMPORTS[] = {
+    { 0x538000u, "GetCurrentThreadId", i386_shim_GetCurrentThreadId, 0 /*0-arg stdcall*/ },
+};
+static const i386_iat_t K32_IAT = { K32_IMPORTS, 1 };
+#define SHIM_TID 0x00001A2Bu   // i386_shim_GetCurrentThreadId's deterministic return
 
 // Build the hermetic flat image: entry block + the __scrt_common_main
 // prologue at the insn-1 CALL target + still-uncovered sentinels elsewhere.
@@ -120,10 +142,12 @@ int main(int argc, char **argv) {
             i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
             cpu.eip = entry;
             cpu.gpr[I386_REG_ESP] = pe.base + pe.size - 0x100;  // writable top of image
+            cpu.iat = &K32_IAT;                                 // native kernel32 binding
             i386_run_result_t r;
             i386_cpu_run(&cpu, &pe, 100000, &r);
-            printf("__SHIM__ PARTIAL phase=scrt_common_main_prologue insns=%u halted=%s halt_va=0x%X halt_op=%s\n",
-                   r.insns, i386_halt_name(r.halt), r.halt_va, i386_op_name(r.halt_op));
+            printf("__SHIM__ PARTIAL phase=e4_kernel32_iat_bind insns=%u bound=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+                   r.insns, r.last_import ? r.last_import : "-", r.halt_va,
+                   i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
             i386_image_free(&pe);
             emitted = 1;
         } else {
@@ -137,41 +161,50 @@ int main(int argc, char **argv) {
     uint8_t *img_buf = (uint8_t *)malloc(IMG_SIZE);
     i386_image_t img = { img_buf, IMG_BASE, IMG_SIZE, 0 };
 
-    // === Run A — MILESTONE: execute from the real entry VA ===============
-    // E5 r3 — execution now advances PAST the r2 one-instruction wall. insn 1
-    // (CALL rel32) branches to 0x539259, then the __scrt_common_main prologue
-    // (sub/xor/or/cmp/mov/and/test/add — 8 real instructions, all newly
-    // executed with EFLAGS) runs, and the loop HALTS at the first IAT-style
-    // indirect CALL `FF 15 [0x538000]` (the E4 kernel32 boundary), decoded as
-    // CALL_RM but deliberately NOT executed (own1 — no IAT resolution).
-    printf("\n[cpu] Run A — execute from entry 0x%X (entry block → __scrt_common_main prologue)\n", ENTRY_VA);
+    // === Run A — MILESTONE: cross the E4 kernel32 IAT boundary ===========
+    // E5 r4 — execution runs the entry CALL (insn 1) → __scrt_common_main
+    // prologue (sub/xor/or/cmp/mov/and/test/add — 8 insns, with EFLAGS) → then
+    // CROSSES the r3 wall: the indirect IAT call `FF 15 [0x538000]` @0x539274
+    // (insn 10) is BOUND to the native GetCurrentThreadId shim (EAX ← stub TID),
+    // execution continues (mov edx,eax — insn 11) and HALTS at a SECOND,
+    // UNregistered IAT call @0x53927C (UNBOUND_IMPORT — the next import, r5).
+    printf("\n[cpu] Run A — cross E4 IAT boundary (entry → prologue → bind GetCurrentThreadId)\n");
     build_hermetic(img_buf);
     {
         i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
         cpu.eip = ENTRY_VA;
         cpu.gpr[I386_REG_ESP] = 0x539E00u;          // stack inside the image
+        cpu.iat = &K32_IAT;                         // register the native kernel32 binding
         uint32_t esp0 = cpu.gpr[I386_REG_ESP];
         i386_run_result_t r;
         i386_cpu_run(&cpu, &img, 1000, &r);
 
-        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ecx=0x%X\n",
+        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ecx=0x%X edx=0x%X bound=%u(%s) slot=0x%X\n",
                r.insns, i386_halt_name(r.halt), r.halt_va, cpu.eip, cpu.gpr[I386_REG_ESP],
-               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_ECX]);
+               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_ECX], cpu.gpr[I386_REG_EDX],
+               r.imports_bound, r.last_import ? r.last_import : "-", r.import_slot);
         uint32_t pushed = 0;
         i386_mem_read32(&img, cpu.gpr[I386_REG_ESP], &pushed);
 
-        CHECK(r.insns == 9,                 "9 real instructions executed (CALL + 8 prologue ops)");
-        CHECK(pushed == 0x5388ABu,          "CALL pushed return addr 0x5388AB");
-        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 4, "esp restored after sub/add 0x28 (== esp0-4)");
-        CHECK(cpu.gpr[I386_REG_EAX] == 0x1u,     "prologue: eax = 1 (xor eax,eax; or eax,1)");
-        CHECK(cpu.gpr[I386_REG_ECX] == 0xEFu,    "prologue: ecx = 0xEF (mov 0xDEADBEEF; and 0xFF)");
-        CHECK(r.halt == I386_HALT_UNSUPPORTED,   "halted at IAT indirect CALL (E4 boundary, UNSUPPORTED)");
-        CHECK(r.halt_op == I386_OP_CALL_RM,      "wall op == CALL_RM (FF /2 [disp32])");
-        CHECK(r.halt_va == 0x539274u,            "wall VA == 0x539274 (the FF 15 IAT call)");
+        CHECK(r.insns == 11,                "11 insns executed (CALL + 8 prologue + bound IAT call + mov)");
+        CHECK(r.insns > 9,                  "crossed the r3 9-insn / 0x539274 wall");
+        CHECK(pushed == 0x5388ABu,          "entry CALL pushed return addr 0x5388AB");
+        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 4, "esp restored (sub/add 0x28; 0-arg stdcall == esp0-4)");
+        CHECK(cpu.gpr[I386_REG_ECX] == 0xEFu,    "prologue preserved: ecx = 0xEF");
+        CHECK(cpu.gpr[I386_REG_EAX] == SHIM_TID, "IAT bind: eax = GetCurrentThreadId() stub TID");
+        CHECK(cpu.gpr[I386_REG_EDX] == SHIM_TID, "post-call: edx captured the returned TID");
+        CHECK(r.imports_bound == 1,              "exactly one IAT call dispatched to a native shim");
+        CHECK(r.last_import && strcmp(r.last_import, "GetCurrentThreadId") == 0,
+                                                 "bound import == GetCurrentThreadId");
+        CHECK(r.halt == I386_HALT_UNBOUND_IMPORT, "new halt: second IAT call is UNbound (r5 boundary)");
+        CHECK(r.halt_op == I386_OP_CALL_RM,      "new wall op == CALL_RM (FF 15 [disp32])");
+        CHECK(r.halt_va == 0x53927Cu,            "new wall VA == 0x53927C (the second IAT call)");
+        CHECK(r.import_slot == 0x538004u,        "unbound slot reported == 0x538004 (next import to bind)");
 
         if (!emitted) {
-            printf("__SHIM__ PARTIAL phase=scrt_common_main_prologue insns=%u halted=%s halt_va=0x%X halt_op=%s\n",
-                   r.insns, i386_halt_name(r.halt), r.halt_va, i386_op_name(r.halt_op));
+            printf("__SHIM__ PARTIAL phase=e4_kernel32_iat_bind insns=%u bound=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+                   r.insns, r.last_import ? r.last_import : "-", r.halt_va,
+                   i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
         }
     }
 

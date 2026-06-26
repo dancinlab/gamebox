@@ -23,8 +23,29 @@ const char *i386_halt_name(i386_halt_t h) {
         case I386_HALT_OOB:         return "oob";
         case I386_HALT_TRUNC:       return "trunc";
         case I386_HALT_GUARD:       return "guard";
+        case I386_HALT_UNBOUND_IMPORT: return "unbound_import";
         default:                    return "?";
     }
+}
+
+// ── E4 kernel32 native shim layer (E5 r4) ───────────────────────────────────
+// own1: these are native re-implementations of the OS API surface, bound by
+// the loader to the program's OWN imports — what every PE loader does. They
+// are NOT a protection bypass (kernel32 is the platform API, not DRM/Warden).
+// Values are deterministic + plausible and documented as STUBS (not the real
+// kernel call), so the run is honest about being a loader probe, not a frame.
+
+uint32_t i386_shim_GetCurrentThreadId(i386_cpu_t *cpu, const struct i386_image *img) {
+    (void)cpu; (void)img;
+    return 0x00001A2Bu;   // stub TID — deterministic; not the real OS thread id
+}
+
+const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va) {
+    if (!iat || !iat->imports) return NULL;
+    for (uint32_t i = 0; i < iat->count; i++) {
+        if (iat->imports[i].slot_va == slot_va) return &iat->imports[i];
+    }
+    return NULL;
 }
 
 int i386_mem_read32(const i386_image_t *img, uint32_t va, uint32_t *out) {
@@ -143,10 +164,13 @@ static int rm_set32(i386_cpu_t *cpu, const i386_image_t *img,
 
 void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                   uint32_t max_steps, i386_run_result_t *res) {
-    res->insns   = 0;
-    res->halt    = I386_HALT_NONE;
-    res->halt_va = cpu->eip;
-    res->halt_op = I386_OP_UNKNOWN;
+    res->insns         = 0;
+    res->halt          = I386_HALT_NONE;
+    res->halt_va       = cpu->eip;
+    res->halt_op       = I386_OP_UNKNOWN;
+    res->imports_bound = 0;
+    res->last_import   = NULL;
+    res->import_slot   = 0;
 
     for (uint32_t step = 0; step < max_steps; step++) {
         uint32_t eip = cpu->eip;
@@ -372,6 +396,50 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                     }
                 }
                 break;
+            }
+            // ── E4 kernel32 boundary — indirect IAT call / jump ───────────
+            case I386_OP_CALL_RM:               // FF /2 [..]
+            case I386_OP_JMP_RM: {              // FF /4 [..]
+                // The canonical IAT thunk is the memory-indirect [disp32] form
+                // (ModR/M mod=00, rm=101): `FF 15 [slot]` (call) / `FF 25 [slot]`
+                // (tail jump). insn.disp holds the IAT slot VA. Other indirect
+                // forms (register / [reg] vtable dispatch) are NOT imports →
+                // honest UNSUPPORTED, unchanged from r3.
+                int rm = insn.modrm & 7;
+                if (!(mod == 0 && rm == 5)) {
+                    res->halt = I386_HALT_UNSUPPORTED; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint32_t slot_va = (uint32_t)insn.disp;
+                const i386_import_t *imp = i386_iat_lookup(cpu->iat, slot_va);
+                if (!imp) {
+                    // Slot is an IAT thunk but no binding is registered — the
+                    // next kernel32 import to implement. own1: we never invent
+                    // the function; we stop and name the slot.
+                    res->halt = I386_HALT_UNBOUND_IMPORT; res->halt_va = eip;
+                    res->halt_op = insn.op; res->import_slot = slot_va; return;
+                }
+                // BIND: dispatch to the native shim, place the result in EAX
+                // (Win32 ABI), pop stdcall callee-popped args, and continue.
+                // own1: loading the OS API to a native impl, not a bypass.
+                uint32_t eax = imp->fn(cpu, img);
+                cpu->gpr[I386_REG_EAX] = eax;
+                cpu->gpr[I386_REG_ESP] += imp->arg_bytes;   // stdcall callee-pop
+                res->last_import = imp->name;
+                res->imports_bound++;
+                res->insns++;
+                if (insn.op == I386_OP_JMP_RM) {
+                    // Tail-call thunk: the import's RET returns to the ORIGINAL
+                    // caller, so emulate that return (pop the return address).
+                    uint32_t ret;
+                    if (!i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &ret)) {
+                        res->halt = I386_HALT_OOB; res->halt_va = eip; return;
+                    }
+                    cpu->gpr[I386_REG_ESP] += 4;
+                    cpu->eip = ret;
+                } else {
+                    cpu->eip = eip + insn.len;              // call: fall through
+                }
+                continue;
             }
             default: {
                 // Decoded, but the interpreter does not execute it yet.
