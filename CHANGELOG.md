@@ -4,6 +4,19 @@ All notable changes to `gamebox` are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(ci): CI 가 **아무것도 검증하지 않던** 공허 통과를 root-cause 교정 —
+  8 테스트 파일은 전부 `fn self_test()` + `main()` dispatch(own2 mandate)이고
+  `@test` fn 은 0개인데, CI 가 `hexa test <file>`(=@test 러너)을 써서 0개 실행 →
+  무조건 green 이었다. `hexa run <file> self-test`(main→self_test dispatch)로
+  교정 → 8 self_test 가 비로소 실제 실행·검증된다. (로컬 실측: `hexa test` 는
+  무출력/행, `hexa run self-test` 는 own2 PASS 라인 출력.)
+- test(battlenet cond.3): `test_d2r_archive_round_trip` 에
+  `check_battlenet_cond_3_oauth()` 추가 — OAuth2 6 op_kind(특히 device_code_grant)
+  emit 마커를 skeleton-validate(live + grep fallback). cond.3 deepening 이 CI 8파일
+  루프에서 실제 검증되도록 배선(wire-to-prod). cond.3 status 는 partial 유지.
+
 ### Added
 
 - feat(battlenet cond.3): `pe_battle_net_oauth_token` self_test 가 op_kind 6
