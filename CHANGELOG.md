@@ -4,6 +4,19 @@ All notable changes to `gamebox` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- ci(blacksmith): `.github/workflows/ci.yml` — gamebox 빌드+테스트를
+  Blacksmith 클라우드 Apple-Silicon 러너(`blacksmith-6vcpu-macos-15`)에서 실행.
+  gamebox 는 Apple-native(Win32 PE + D3DMetal)라 컴파일+apple-only 테스트에
+  macOS 호스트가 필요한데, 그걸 로컬 dev Mac 에서 돌리면 242+ perf 모듈 +
+  8 테스트가 메모리를 스파이크해 머신이 죽었다. 이제 push 마다 클라우드 Mac 이
+  빌드/테스트를 맡고 로컬 박스는 `git push` 만 한다. 러너는 macos-15 핀
+  (hexa-lang `release.yml` 와 동일 근거 — SDK min-OS 베이스라인 안정). hexa
+  툴체인은 릴리스 바이너리를 canonical 설치 한 줄(`install.sh`)로 깐다. D3DMetal
+  SDK 부재는 warn-only(skeleton-tier 로더는 importable). same-org 라
+  Blacksmith 활성화 별도 작업 불필요(hexa-lang 이 이미 사용).
+
 ### Changed
 
 - docs(architecture): restructure `ARCHITECTURE.json` into a deeper `children`
