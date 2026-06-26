@@ -78,6 +78,27 @@ fn valid_code_len_count() -> int {
     return to_int(s)
 }
 
+// ─── count_by_window — 특정 window_idx (RFC 6238 30s window) 의 항목 수 ───
+fn count_by_window(window_idx: int) -> int {
+    let exists = exec("test -f '" + TOTP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let s = exec("awk -F'\\t' -v w=" + to_string(window_idx) + " '$3==w {c++} END{print c+0}' '" + TOTP_LOG + "'").trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ─── device_window_span — 해당 device 의 (max window_idx − min window_idx) ───
+//   RFC 6238 §5.2 resync window: 동일 device 가 clock drift 로 인접 window
+//   (N, N+1) 에 걸쳐 코드를 생성하는 상황. span ≤ 1 이면 서버 ±1 resync
+//   window 수용 범위 — drift 가 허용 한도 내임을 정량 확인. device 부재 → 0.
+fn device_window_span(device_id: int) -> int {
+    let exists = exec("test -f '" + TOTP_LOG + "' && echo ok").trim()
+    if exists != "ok" { return 0 }
+    let r = exec("awk -F'\\t' -v d=" + to_string(device_id) + " '$1==d {c++; if(c==1){mn=$3;mx=$3}else{if($3<mn)mn=$3; if($3>mx)mx=$3}} END{print (c? mx-mn : 0)}' '" + TOTP_LOG + "'").trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
 // ─── p2tp_stats — [totp_count, total_hmac_us, avg_hmac_us, valid_code_len_count] ───
 fn p2tp_stats() -> array {
     return [totp_count(), total_hmac_us(), avg_hmac_us(), valid_code_len_count()]
@@ -93,25 +114,32 @@ fn self_test() -> void {
 
     cleanup_p2tp()
 
-    // 합성 TOTP 3 종 (3 devices):
+    // 합성 TOTP 5 행 (4 devices) — 기존 3 device + window-drift resync 2 행:
     //   device_id=5001 (NC 인증기 mobile)   — hmac_us=850, window=58000000, code_len=6
     //   device_id=5002 (TOTP backup tablet) — hmac_us=920, window=58000000, code_len=6
     //   device_id=5003 (legacy 8자리 cmprt) — hmac_us=780, window=58000001, code_len=8
+    //   device_id=5004 (clock-drift mobile) — hmac_us=860, window=58000010, code_len=6  (drift leg N)
+    //   device_id=5004 (clock-drift mobile) — hmac_us=870, window=58000011, code_len=6  (drift leg N+1)
     record_totp(5001, 850, 58000000, 6)
     record_totp(5002, 920, 58000000, 6)
     record_totp(5003, 780, 58000001, 8)
+    // RFC 6238 §5.2 resync window — 동일 device(5004) 가 clock drift 로 인접
+    // window(N=58000010, N+1=58000011) 에 걸쳐 코드 생성. 서버는 ±1 window 까지
+    // 수용하므로 span ≤ 1 이 drift 허용 한도 내임을 정량 확인하는 transition.
+    record_totp(5004, 860, 58000010, 6)
+    record_totp(5004, 870, 58000011, 6)
 
-    // totp_count = 3
+    // totp_count = 5
     let tc = totp_count()
-    if tc != 3 { panic("c_purple_2fa_totp_proxy FAIL [totp_count] expected=3 got=" + to_string(tc)) }
+    if tc != 5 { panic("c_purple_2fa_totp_proxy FAIL [totp_count] expected=5 got=" + to_string(tc)) }
 
-    // total_hmac_us = 850+920+780 = 2550
+    // total_hmac_us = 850+920+780+860+870 = 4280
     let th = total_hmac_us()
-    if th != 2550 { panic("c_purple_2fa_totp_proxy FAIL [total_hmac_us] expected=2550 got=" + to_string(th)) }
+    if th != 4280 { panic("c_purple_2fa_totp_proxy FAIL [total_hmac_us] expected=4280 got=" + to_string(th)) }
 
-    // avg_hmac_us = 2550 / 3 = 850 (int trunc)
+    // avg_hmac_us = 4280 / 5 = 856 (int trunc)
     let av = avg_hmac_us()
-    if av != 850 { panic("c_purple_2fa_totp_proxy FAIL [avg_hmac_us] expected=850 got=" + to_string(av)) }
+    if av != 856 { panic("c_purple_2fa_totp_proxy FAIL [avg_hmac_us] expected=856 got=" + to_string(av)) }
 
     // device_hmac_us — 마지막 항목의 hmac_us (없으면 0)
     let d1 = device_hmac_us(5001)
@@ -122,26 +150,44 @@ fn self_test() -> void {
     if d3 != 780 { panic("c_purple_2fa_totp_proxy FAIL [device 5003] expected=780 got=" + to_string(d3)) }
     let d4 = device_hmac_us(9999)
     if d4 != 0 { panic("c_purple_2fa_totp_proxy FAIL [device unknown] expected=0 got=" + to_string(d4)) }
+    // 5004 의 마지막 항목 = drift leg N+1 (hmac_us=870)
+    let d5 = device_hmac_us(5004)
+    if d5 != 870 { panic("c_purple_2fa_totp_proxy FAIL [device 5004] expected=870 got=" + to_string(d5)) }
 
-    // valid_code_len_count = 2 (5001+5002 = code_len 6, 5003 = 8 비표준)
+    // valid_code_len_count = 4 (5001+5002+5004×2 = code_len 6, 5003 = 8 비표준)
     let vc = valid_code_len_count()
-    if vc != 2 { panic("c_purple_2fa_totp_proxy FAIL [valid_code_len] expected=2 got=" + to_string(vc)) }
+    if vc != 4 { panic("c_purple_2fa_totp_proxy FAIL [valid_code_len] expected=4 got=" + to_string(vc)) }
+
+    // ─── window-drift / RFC 6238 §5.2 ±1 resync transition 검증 ───
+    // 인접 window 각각 정확히 1 행 (drift leg N / N+1).
+    let wN = count_by_window(58000010)
+    if wN != 1 { panic("c_purple_2fa_totp_proxy FAIL [window N count] expected=1 got=" + to_string(wN)) }
+    let wN1 = count_by_window(58000011)
+    if wN1 != 1 { panic("c_purple_2fa_totp_proxy FAIL [window N+1 count] expected=1 got=" + to_string(wN1)) }
+    // device 5004 span = 58000011 − 58000010 = 1 → ±1 resync window 수용 범위 내.
+    let span = device_window_span(5004)
+    if span != 1 { panic("c_purple_2fa_totp_proxy FAIL [drift span 5004] expected=1 got=" + to_string(span)) }
+    // 단일 window device(5001, both 5001/5002 at 58000000) span = 0 (drift 없음).
+    let span_single = device_window_span(5001)
+    if span_single != 0 { panic("c_purple_2fa_totp_proxy FAIL [drift span 5001] expected=0 got=" + to_string(span_single)) }
+
+    r0_emit("totp_window_drift", "\"device\":5004,\"window_n\":58000010,\"window_n1\":58000011,\"span\":" + to_string(span) + ",\"resync\":\"accepted_pm1\",\"rfc\":\"6238_5.2\"")
 
     let stats = p2tp_stats()
-    if stats[0] != 3 { panic("c_purple_2fa_totp_proxy FAIL [stats count] expected=3 got=" + to_string(stats[0])) }
-    if stats[1] != 2550 { panic("c_purple_2fa_totp_proxy FAIL [stats total_us] expected=2550 got=" + to_string(stats[1])) }
-    if stats[2] != 850 { panic("c_purple_2fa_totp_proxy FAIL [stats avg_us] expected=850 got=" + to_string(stats[2])) }
-    if stats[3] != 2 { panic("c_purple_2fa_totp_proxy FAIL [stats valid] expected=2 got=" + to_string(stats[3])) }
+    if stats[0] != 5 { panic("c_purple_2fa_totp_proxy FAIL [stats count] expected=5 got=" + to_string(stats[0])) }
+    if stats[1] != 4280 { panic("c_purple_2fa_totp_proxy FAIL [stats total_us] expected=4280 got=" + to_string(stats[1])) }
+    if stats[2] != 856 { panic("c_purple_2fa_totp_proxy FAIL [stats avg_us] expected=856 got=" + to_string(stats[2])) }
+    if stats[3] != 4 { panic("c_purple_2fa_totp_proxy FAIL [stats valid] expected=4 got=" + to_string(stats[3])) }
 
     r0_emit("p2tp_summary", "\"count\":" + to_string(stats[0]) + ",\"total_us\":" + to_string(stats[1]) + ",\"avg_us\":" + to_string(stats[2]) + ",\"valid6\":" + to_string(stats[3]))
 
-    // record × 3 + summary × 1 = ≥ 4 emits
+    // record × 5 + window-drift × 1 + summary × 1 = ≥ 7 emits
     let cnt = r0_session_count(sid)
-    if cnt < 4 { panic("c_purple_2fa_totp_proxy FAIL [emit count] expected>=4 got=" + to_string(cnt)) }
+    if cnt < 7 { panic("c_purple_2fa_totp_proxy FAIL [emit count] expected>=7 got=" + to_string(cnt)) }
 
     cleanup_p2tp()
 
-    println("  ✅ c_purple_2fa_totp_proxy self_test PASS (3 devices, total_us=2550, avg_us=850, valid6=2, emits=" + to_string(cnt) + ", sid=" + sid + ")")
+    println("  ✅ c_purple_2fa_totp_proxy self_test PASS (4 devices/5 rows, total_us=4280, avg_us=856, valid6=4, drift_span=" + to_string(span) + ", emits=" + to_string(cnt) + ", sid=" + sid + ")")
 }
 
 fn main() -> void {
