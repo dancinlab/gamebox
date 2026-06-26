@@ -67,4 +67,17 @@ echo "[build] codesigning d3d11_bridge_test (ad-hoc)"
 codesign --force --sign - --timestamp=none d3d11_bridge_test
 codesign --verify --verbose=2 d3d11_bridge_test || true
 
-echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]  /  ./metal_offscreen_smoke  /  ./d3d11_bridge_test"
+# e5_end_to_end_test — F-NSWINDOW-E5 r12: PE→D3D11→Metal end-to-end (own1).
+# Self-authored i386 PE32 + interpreter IAT autobind → D3D11 bridge shims →
+# d3d11_metal_bridge.m → Apple Metal headless → pixel readback.
+# own1: no Wine, no DXVK, no game asset, no DRM.
+echo "[build] compiling e5_end_to_end_test (arch=arm64, sdk=macosx, ObjC+Metal)"
+"$CC" -arch arm64 -isysroot "$SDK" -fobjc-arc -O2 -Wall -Wextra \
+    -framework Metal -framework Foundation \
+    -o e5_end_to_end_test \
+    e5_end_to_end_test.c i386_cpu.c i386_decode.c pe_parse.c d3d11_metal_bridge.m
+echo "[build] codesigning e5_end_to_end_test (ad-hoc)"
+codesign --force --sign - --timestamp=none e5_end_to_end_test
+codesign --verify --verbose=2 e5_end_to_end_test || true
+
+echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]  /  ./metal_offscreen_smoke  /  ./d3d11_bridge_test  /  ./e5_end_to_end_test"
