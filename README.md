@@ -23,8 +23,13 @@
 > Skeleton-tier 100% Win32 fn coverage (435/435) + 18+ perf families at 100%
 > manjeom + 15 .roadmap.* SSOT (14 active + 1 historical wow) + 7 .checkpoint.*
 > (3 met post Track BV) + 4 hexa-lang upstream RFCs merged.
-> **Forensic verdict (2026-05-05): SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0**
-> honest C3: validated_manjeom = 0 (no real game frames evidenced).
+> **Forensic verdict: SKELETON_TIER_WIN32 + E5_PIPELINE_PROVEN** — the
+> PE→D3D11→Metal pipeline is proven end-to-end (r12: a self-authored own1 D3D11
+> PE runs through the i386 interpreter → D3D11→Metal bridge → real Metal frame,
+> pixel-readback verified). honest C3: validated_manjeom =
+> `first_own1_authored_d3d11_pe_to_metal_frame` (infrastructure milestone) —
+> **NO commercial game frame evidenced yet** (a real game needs the full
+> Win32/D3D11 surface + real assets + the real game's PE).
 
 > **Distribution**: GitHub canonical at <https://github.com/dancinlab/gamebox>.
 > CLI tooling installed via `hx install gamebox` from the hexa-lang registry,
@@ -36,7 +41,7 @@
 - 18+ perf families at 100% manjeom; 242 c_*_*.hexa modules across 104 unique families
 - 15 .roadmap.* SSOT (14 active + 1 historical wow), 7 .checkpoint.* (3 met post Track BV)
 - 4 hexa-lang upstream RFCs merged
-- Forensic verdict: `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0` — honest C3, no real game frames evidenced
+- Forensic verdict: `SKELETON_TIER_WIN32 + E5_PIPELINE_PROVEN` — honest C3: PE→D3D11→Metal proven end-to-end with a self-authored own1 PE (r12); no commercial game frame evidenced yet
 
 ---
 
@@ -329,14 +334,19 @@ PR #47 squash-merged 2026-05-04 (Track AY). PR #48 merged 2026-05-04 (Track BD/B
 ---
 
 
-> The forensic verdict `SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0` carries
+> The forensic verdict `SKELETON_TIER_WIN32 + E5_PIPELINE_PROVEN` carries
 > 5 explicit honesty caveats. **Read these before assuming gamebox runs games.**
 
-1. **`validated_manjeom = 0`**. Skeleton-tier means the loader / perf modules
-   are present and individually compile / probe; **no real game frames have
-   been evidenced**. Closure milestones CM-26..CM-30 (per
-   `docs/CLOSURE_ROADMAP.md` §5) — hexa interp full launch + first-frame
-   render + sustained-frame render — are **NOT** done.
+1. **`validated_manjeom = first_own1_authored_d3d11_pe_to_metal_frame` (infra
+   milestone, NOT a commercial game)**. The PE→D3D11→Metal pipeline is proven
+   end-to-end: a self-authored own1 49-byte D3D11 PE executes through the i386
+   interpreter → D3D11→Metal bridge → a real Apple Metal headless offscreen
+   frame, pixel-readback verified (r12 · `native/e5_end_to_end_test.c`). But
+   **no commercial game frame has been evidenced** — a real game (Diablo /
+   Lineage / …) needs the full Win32/D3D11 API surface, real assets, and the
+   real game's PE. Closure milestones CM-26..CM-30 (per
+   `docs/CLOSURE_ROADMAP.md` §5) — full launch + first-frame + sustained-frame
+   render of a **real game** — are **NOT** done.
 
 2. **own1 invariant carries**. Wine 0 / DRM bypass 0 / Warden bypass 0 /
    anti-cheat bypass 0 / anima clone 0. `c_bnet_warden_environment_compat`
@@ -366,13 +376,16 @@ PR #47 squash-merged 2026-05-04 (Track AY). PR #48 merged 2026-05-04 (Track BD/B
 ## Forensic verdict
 
 ```
-SKELETON_TIER_100PCT_WIN32_VALIDATED_MANJEOM_0
+SKELETON_TIER_WIN32 + E5_PIPELINE_PROVEN
 ```
 
 - **skeleton_manjeom = 100%**: 435/435 Win32 fn coverage + 18+ perf families
   at 100% (Track BL/BM forensic). Win32 100% milestone (Track BP) attained
   2026-05-05.
-- **validated_manjeom = 0%**: no real game frames; closure CM-26..CM-30 not done.
+- **validated_manjeom = `first_own1_authored_d3d11_pe_to_metal_frame`**: the
+  PE→D3D11→Metal pipeline renders a real Metal frame from a self-authored own1
+  D3D11 PE (r12, pixel-readback verified) — an infrastructure milestone. **No
+  commercial game frame yet**; real-game closure CM-26..CM-30 not done.
 - **provenance**: 67 BG cycles cumulative session (2026-05-03 to 2026-05-05).
 - **session predecessor**: `dancinlife/airgenome-gamebox` (DELETED 2026-05-05
   per Option B + closure cycle directive; history not transferred per D3 fresh-start
