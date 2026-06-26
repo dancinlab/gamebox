@@ -40,6 +40,46 @@ uint32_t i386_shim_GetCurrentThreadId(i386_cpu_t *cpu, const struct i386_image *
     return 0x00001A2Bu;   // stub TID — deterministic; not the real OS thread id
 }
 
+// GetCurrentProcessId (WINAPI/stdcall, 0 args, → DWORD). own1: a deterministic
+// plausible PID; the OS API surface bound to a native impl, not a bypass.
+uint32_t i386_shim_GetCurrentProcessId(i386_cpu_t *cpu, const struct i386_image *img) {
+    (void)cpu; (void)img;
+    return 0x00000D04u;   // stub PID (3332) — deterministic; not the real OS pid
+}
+
+// GetTickCount (WINAPI/stdcall, 0 args, → DWORD ms since boot). own1: stub.
+uint32_t i386_shim_GetTickCount(i386_cpu_t *cpu, const struct i386_image *img) {
+    (void)cpu; (void)img;
+    return 0x0001D4C0u;   // stub tick = 120000 ms — deterministic, not real uptime
+}
+
+// GetSystemTimeAsFileTime(LPFILETIME lpft) — WINAPI/stdcall, 1 pointer arg,
+// returns void. This is the first BUFFER-WRITING shim: it reads the caller's
+// pushed pointer arg off the emulated stack ([esp], since we intercept BEFORE
+// the call's return address would be pushed) and writes an 8-byte FILETIME
+// (dwLowDateTime, dwHighDateTime) into image memory at that pointer.
+// own1: a CRT-startup OS-API call (time, not DRM/Warden); a native impl writing
+// a deterministic timestamp into the program's OWN buffer — loading, not bypass.
+uint32_t i386_shim_GetSystemTimeAsFileTime(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t pft;                                  // LPFILETIME arg
+    if (!i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &pft)) return 0;
+    // Deterministic FILETIME (100ns ticks since 1601). Plausible, fixed.
+    i386_mem_write32(img, pft + 0, 0xC3D4E5F6u);   // dwLowDateTime
+    i386_mem_write32(img, pft + 4, 0x01D7A1B2u);   // dwHighDateTime
+    return 0;                                       // void → EAX irrelevant
+}
+
+// QueryPerformanceCounter(LARGE_INTEGER *lpPerformanceCount) — WINAPI/stdcall,
+// 1 pointer arg, returns BOOL (nonzero = success). Buffer-writing: writes an
+// 8-byte counter into image memory at the pushed pointer ([esp]). own1: stub.
+uint32_t i386_shim_QueryPerformanceCounter(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t plc;                                  // LARGE_INTEGER* arg
+    if (!i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &plc)) return 0;
+    i386_mem_write32(img, plc + 0, 0x12345678u);   // QuadPart low  (deterministic)
+    i386_mem_write32(img, plc + 4, 0x00000000u);   // QuadPart high
+    return 1;                                       // BOOL success
+}
+
 const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va) {
     if (!iat || !iat->imports) return NULL;
     for (uint32_t i = 0; i < iat->count; i++) {
@@ -394,6 +434,79 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                     if (!rm_set32(cpu, img, &insn, out_v, &why)) {
                         res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
                     }
+                }
+                break;
+            }
+            // ── Group-2 shift/rotate r/m32 (E5 r5) — C1 /r ib · D1 /r · D3 /r ─
+            // Sub-op by ModR/M.reg; count by encoding (imm8 / 1 / CL), masked to
+            // 5 bits per SDM Vol.2. SHL/SHR/SAL/SAR + ROL/ROR with CF/OF/ZF/SF/PF.
+            // RCL/RCR (reg 2/3) carry-chain not modeled → honest UNSUPPORTED.
+            case I386_OP_SHIFT_RM_IMM8:
+            case I386_OP_SHIFT_RM_1:
+            case I386_OP_SHIFT_RM_CL: {
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint32_t v;
+                if (!rm_get32(cpu, img, &insn, &v, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint32_t count = (insn.op == I386_OP_SHIFT_RM_CL)
+                               ? (cpu->gpr[I386_REG_ECX] & 0xFFu)
+                               : (uint32_t)insn.imm;
+                count &= 0x1Fu;                      // SDM: 32-bit shift count masked to 5 bits
+                int sub = (insn.modrm >> 3) & 7;     // group-2 operation selector
+                if (count == 0) {
+                    break;                           // SDM: count==0 → no change, no flags
+                }
+                uint32_t out_v;
+                switch (sub) {
+                    case 4: case 6: {                // SHL / SAL
+                        uint32_t cf = (v >> (32 - count)) & 1u;
+                        out_v = v << count;
+                        set_szp32(&cpu->eflags, out_v);
+                        set_flag(&cpu->eflags, EFL_CF, (int)cf);
+                        if (count == 1)
+                            set_flag(&cpu->eflags, EFL_OF, (int)(((out_v >> 31) & 1u) ^ cf));
+                        break;
+                    }
+                    case 5: {                        // SHR (logical)
+                        uint32_t cf = (v >> (count - 1)) & 1u;
+                        out_v = v >> count;
+                        set_szp32(&cpu->eflags, out_v);
+                        set_flag(&cpu->eflags, EFL_CF, (int)cf);
+                        if (count == 1)
+                            set_flag(&cpu->eflags, EFL_OF, (int)((v >> 31) & 1u));
+                        break;
+                    }
+                    case 7: {                        // SAR (arithmetic)
+                        uint32_t cf = (v >> (count - 1)) & 1u;
+                        out_v = (uint32_t)((int32_t)v >> count);
+                        set_szp32(&cpu->eflags, out_v);
+                        set_flag(&cpu->eflags, EFL_CF, (int)cf);
+                        if (count == 1) set_flag(&cpu->eflags, EFL_OF, 0);
+                        break;
+                    }
+                    case 0: {                        // ROL (rotates don't touch SZP)
+                        out_v = (v << count) | (v >> (32 - count));
+                        uint32_t cf = out_v & 1u;
+                        set_flag(&cpu->eflags, EFL_CF, (int)cf);
+                        if (count == 1)
+                            set_flag(&cpu->eflags, EFL_OF, (int)(((out_v >> 31) & 1u) ^ cf));
+                        break;
+                    }
+                    case 1: {                        // ROR
+                        out_v = (v >> count) | (v << (32 - count));
+                        uint32_t msb = (out_v >> 31) & 1u;
+                        set_flag(&cpu->eflags, EFL_CF, (int)msb);
+                        if (count == 1)
+                            set_flag(&cpu->eflags, EFL_OF, (int)(msb ^ ((out_v >> 30) & 1u)));
+                        break;
+                    }
+                    default:                          // RCL/RCR (2/3) — not modeled
+                        res->halt = I386_HALT_UNSUPPORTED; res->halt_va = eip;
+                        res->halt_op = insn.op; return;
+                }
+                if (!rm_set32(cpu, img, &insn, out_v, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
                 }
                 break;
             }

@@ -6,6 +6,49 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r5): **CRT-init import 5개 연속 바인딩 + 첫 버퍼-쓰기 셰임 +
+  0xC1 shift-group 디코더 갭 종결** — r4 의 벽(미등록 IAT 호출 @`0x53927C`,
+  insns=11)을 **넘는다**. `native/i386_cpu.{c,h}` 에 네 개의 kernel32 셰임 추가:
+  `GetCurrentProcessId`(0-arg → 결정적 PID `0xD04`), `GetTickCount`(0-arg → `0x1D4C0`),
+  그리고 **첫 버퍼-쓰기형 셰임** `GetSystemTimeAsFileTime(LPFILETIME)` —
+  스택에서 caller 가 push 한 포인터 인자(`[esp]`, 호출 가로채기 시점이라 반환주소가
+  아직 안 쌓임)를 읽어 이미지 메모리에 8-byte FILETIME(`mem_write32`×2)을 기록하고
+  void 반환(stdcall 1-arg, callee-pop 4) — r4 의 0-arg 셰임 대비 **stub→이미지 메모리
+  쓰기 + 실제 push 된 포인터 인자**라는 새 능력을 행사. `QueryPerformanceCounter(
+  LARGE_INTEGER*)` 도 동일 패턴(8-byte 카운터 기록, BOOL=1 반환). 실행 루프는 이제
+  bound 호출을 연달아 디스패치해 프롤로그가 다섯 import(GetCurrentThreadId →
+  GetCurrentProcessId → GetSystemTimeAsFileTime → QueryPerformanceCounter →
+  GetTickCount)를 통과하고, **여섯 번째·미등록 IAT 호출 @`0x5392A1`** 에서 정직하게
+  HALT(`UNBOUND_IMPORT`, 다음 슬롯 `0x538014` 보고).
+- feat(F-NSWINDOW-E5 r5): **0xC1/0xD1/0xD3 group-2 shift/rotate 디코더+실행** —
+  r3 sentinel 이 지목한 `0xC1` 갭을 종결. `native/i386_decode.{c,h}` +
+  byte-equal `.hexa` 미러에 enum `I386_OP_SHIFT_RM_IMM8`(50)/`_RM_1`(51)/`_RM_CL`(52)
+  + 디코드 분기(count 출처: imm8 / 1 / CL) 추가, op_name="shift". 인터프리터
+  (`i386_cpu.c`)는 ModR/M.reg 로 SHL/SAL(4/6)·SHR(5)·SAR(7)·ROL(0)·ROR(1) 을
+  분기하고 SDM 대로 count 를 5-bit 마스킹 + CF/OF/ZF/SF/PF 갱신(count==0 → 무변화·
+  무플래그); RCL/RCR(2/3) carry-chain 은 미모델 → 정직한 UNSUPPORTED. RUNEQ 는
+  C/hexa 양쪽이 동일하게 바뀌므로 그린 유지(corpus A 의 0xC1/D1/D3 행만 동시 변화).
+  hermetic 테스트(`native/i386_cpu_test.c`) Run A 는 합성 프롤로그를 0x53927C 까지
+  유지하고 뒤에 `call GetCurrentProcessId` / `push &filetime; call
+  GetSystemTimeAsFileTime` / `push &perfcount; call QueryPerformanceCounter` /
+  `shl edx,4`(group-2 shift) / `call GetTickCount` / 미등록 `call` 을 이어 붙여
+  경계 통과를 증명: **insns 11→18, halt `0x53927C`→`0x5392A1`**(reason=
+  UNBOUND_IMPORT, slot `0x538014`), bound=5, last=GetTickCount, eax=GetTickCount
+  stub, edx=TID<<4=`0x1A2B0`(shift 실증), ecx=0xEF(프롤로그 보존), esp=esp0-4,
+  그리고 **버퍼 두 곳 검증**: `[0x539F00]`=FILETIME `01D7A1B2:C3D4E5F6`,
+  `[0x539F10]`=counter `00000000:12345678`. B/D sentinel 은 `0xC1`(이제 실행됨)→
+  `0F B6`(MOVZX, 다음 진짜 디코더 갭) 으로 교체. 측정 라인 `__SHIM__ PARTIAL
+  phase=e4_kernel32_iat_bind insns=18 bound=5 last=GetTickCount halt_va=0x5392A1
+  halt=unbound_import halt_op=call unbound_slot=0x538014`, `__SHIM_TEST__ PASS`
+  (CI 게이트, Run A 16 checks 전부 green, 로컬 clang `-Wall -Wextra -std=c11` 청정).
+  **own1**: 로더가 자기 프로세스의 **자기 import**(kernel32 OS API 표면)를 네이티브
+  구현에 묶는 **로딩** — 우회 아님. FILETIME/perf-counter/tick/pid 는 CRT init 의
+  결정적 STUB 이지 보호장치(DRM/Warden/anti-cheat)와 무관하고, 버퍼 쓰기는 프로그램
+  **자기 버퍼**에 한정. `validated_manjeom` 은 여전히 **0**(로더 진척이지 렌더된
+  프레임 아님). 다음 r6: 미등록 slot `0x538014` 바인딩 + `0F B6` MOVZX 디코더 갭 +
+  더 깊은 CRT init(보안쿠키 XOR/__security_init_cookie, TEB/PEB 접근) → `main`/
+  `WinMain` 도달, 그리고 user32 `CreateWindowEx` 까지의 거리 측정.
+
 - feat(F-NSWINDOW-E5 r4): **첫 E4 kernel32 IAT 바인딩** — i386 인터프리터가 r3 의
   벽(`FF 15 [disp32]` 간접 IAT 호출 @`0x539274`, insns=9 에서 HALT)을 **넘는다**.
   `native/i386_cpu.{c,h}` 에 import-stub 레지스트리(`i386_iat_t`/`i386_import_t` +
