@@ -4,6 +4,35 @@ All notable changes to `gamebox` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- feat(F-NSWINDOW-E5 r4): **첫 E4 kernel32 IAT 바인딩** — i386 인터프리터가 r3 의
+  벽(`FF 15 [disp32]` 간접 IAT 호출 @`0x539274`, insns=9 에서 HALT)을 **넘는다**.
+  `native/i386_cpu.{c,h}` 에 import-stub 레지스트리(`i386_iat_t`/`i386_import_t` +
+  `i386_iat_lookup`) 와 첫 네이티브 kernel32 셰임(`i386_shim_GetCurrentThreadId`,
+  stdcall 0-arg → 결정적 plausible TID `0x1A2B`)을 추가. 실행 루프의 `CALL_RM`/`JMP_RM`
+  케이스는 이제 정규 IAT thunk 형태(ModR/M mod=00,rm=101 = `[disp32]`)를 인식해
+  slot VA(=`insn.disp`)를 레지스트리에서 조회한다 — **바인딩되어 있으면** 네이티브
+  셰임을 디스패치하고 EAX 에 반환값을 싣고(Win32 ABI) stdcall 인자를 pop 한 뒤
+  실행을 **계속**한다. `__scrt_common_main` security-cookie init 의 첫 호출
+  GetCurrentThreadId 가 바인딩되어 0x539274 의 호출이 **실행**되고(insn 10), 다음
+  `mov edx,eax`(insn 11)까지 진행한 뒤 **두 번째·미등록 IAT 호출 @`0x53927C`** 에서
+  정직하게 HALT(`UNBOUND_IMPORT` — 다음에 바인딩할 import 슬롯 `0x538004` 를 보고).
+  hermetic 테스트(`native/i386_cpu_test.c`) Run A 는 합성 프롤로그를 0x539274 까지
+  r3 와 byte-동일하게 유지하고 그 뒤에 bound-call/mov/unbound-call 을 이어 붙여
+  경계 통과를 증명: **insns 9→11, halt 0x539274→0x53927C**, eax=TID, edx=TID,
+  ecx=0xEF(프롤로그 보존), esp=esp0-4(0-arg stdcall 균형). 새 측정 라인
+  `__SHIM__ PARTIAL phase=e4_kernel32_iat_bind insns=11 bound=GetCurrentThreadId
+  halt_va=0x53927C halt=unbound_import unbound_slot=0x538004` 발신, `__SHIM_TEST__
+  PASS`(CI 게이트, 24 checks). decoder(`i386_decode.c`/`.hexa`)는 미변경 → RUNEQ
+  영향 없음. **own1**: 이것은 로더가 자기 프로세스의 **자기 import** 를 네이티브
+  구현에 묶는 것 — 모든 PE 로더가 하는 **로딩**이지 우회가 아니다. kernel32 는 OS
+  API 표면이지 보호장치(DRM/Warden/anti-cheat)가 아니며, 본 프롤로그 호출은 CRT
+  init 일 뿐 보호와 무관. `validated_manjeom` 은 여전히 **0**(이것은 로더 진척이지
+  렌더된 프레임이 아니다). 다음 r5: 두 번째 import(미등록 slot 0x538004) 바인딩 +
+  버퍼-쓰기형 셰임(GetSystemTimeAsFileTime/QueryPerformanceCounter) + 0xC1 shift
+  group 디코더 갭.
+
 ### Fixed
 
 - test(purple cond.3): 2FA TOTP state machine 의 **window-drift / RFC 6238 §5.2 ±1
