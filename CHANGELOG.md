@@ -6,6 +6,48 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r8): **CRT→user-entry 핸드오프 도달(합성) + BT/BTS/BTR/BTC
+  디코더 갭 종결 + 마지막 CRT import 2개 바인딩** — r7 의 벽(미등록 IAT 호출
+  @`0x539318`, insns=44)을 **넘어 CRT-init 의 종착점인 `call WinMain`(CRT→user-entry
+  핸드오프)에 도달**한다. **이것이 정직한 E4 완료 마일스톤이며, 렌더된 게임 프레임이
+  아니다 — `validated_manjeom` 은 여전히 0.** (1) `native/i386_cpu.{c,h}` 에 두 개의
+  kernel32 셰임: `GetCommandLineW()`(0-arg → **합성 in-image 커맨드라인 포인터**
+  `base+0x1FE0`), `SetUnhandledExceptionFilter(fn)`(1-arg → 이전 필터 NULL=0). IAT
+  슬롯 `0x53802C`/`0x538030` 으로 13개(count=13). (2) `native/i386_decode.{c,h}` +
+  byte-equal `.hexa` 미러: enum `I386_OP_BT_RM_R`(61,`0F A3`)/`_BTS`(62,`0F AB`)/
+  `_BTR`(63,`0F B3`)/`_BTC`(64,`0F BB`) + 0F 2-byte 분기(0F AF IMUL 과 동일한 `/r`
+  ModR/M 형태), op_name="bt"/"bts"/"btr"/"btc". 인터프리터: **CF ← bit(r/m, idx)**
+  (idx=ModR/M.reg 레지스터, mod 32 마스크), BTS/BTR/BTC 는 수정 비트 write-back —
+  평범한 Intel SDM Vol.2 비트 연산(보호 아님). RUNEQ corpus D(0F 전수)에서 C↔hexa
+  byte-equal 확인. (3) **핸드오프 검출**: `i386_cpu_t.user_entry_va` 필드 + halt
+  `I386_HALT_USER_ENTRY` 추가 — `call` 의 타깃이 `user_entry_va` 와 같으면 리턴 주소를
+  push 한 뒤(faithful "about to enter") 정직하게 정지. (4) hermetic 테스트
+  (`native/i386_cpu_test.c`) Run A 는 r7 체인(44) 뒤에 `GetCommandLineW` → `pop ecx`
+  (잔여 push 정리) → `mov esi,eax` → `SetUnhandledExceptionFilter` → `bt/bts/btr/btc`
+  → WinMain 4-인자 stdcall 프레임 push(nShowCmd/lpCmdLine/hPrevInstance/hInstance) →
+  `call 0x539400`(합성 user entry) 를 이어 붙여 **insns 44→60, halt
+  `0x539318`(unbound)→`0x539400`(user_entry)**, bound=13, last=SetUnhandledException-
+  Filter 를 증명. WinMain 인자 프레임([esp+4..0x10] = hInstance·hPrevInstance·
+  lpCmdLine·nShowCmd) + entry CALL 리턴주소(`0x5388AB`) 무결성까지 검증. B/D
+  sentinel 은 `0F A3`(이제 BT 로 실행됨) → `0F B1`(CMPXCHG, 다음 진짜 갭, r9) 으로
+  교체. 측정 라인 `__SHIM__ PARTIAL phase=e4_reached_user_entry insns=60 bound=13
+  last=SetUnhandledExceptionFilter entry_va=0x539400 halt=user_entry halt_op=call
+  (SYNTHETIC user-entry; validated_manjeom=0)` + `__SHIM__ INFO
+  real_pe_path=structurally_ready needs:real_i386_PE+IAT_autobind_by_import_name+
+  wider_opcode_coverage+D3DMetal+display`, `__SHIM_TEST__ PASS`(CI 게이트, Run A 25
+  checks 전부 green, 로컬 clang `-Wall -Wextra -Wpedantic -std=c11` 청정). (5)
+  **실-바이너리 경로 점검**: `i386_cpu_load_pe`(argv[1]) 는 섹션 매핑·엔트리 설정·
+  이미지 할당까지 **구조적으로 배선됨** — 실제 i386 PE 를 주면 엔트리부터 실행 가능.
+  단, K32_IAT 슬롯이 hermetic 합성 VA(`0x538000..`)라 실제 PE 의 IAT 와는 매칭되지
+  않으므로, 실행이 첫 import 를 넘으려면 **PE import 테이블 파싱 + 이름 기반 자동
+  바인딩**이 필요(real-PE emit 가 INFO 로 명시). **own1**: 자기 import 를 네이티브
+  구현에 묶는 **로딩**(우회 아님), 합성 TEB/커맨드라인/user-entry VA 는 **정직 라벨**,
+  BT 류는 평범한 CPU 비트 연산 — Wine/보호 없음. **`validated_manjeom>0`(실 프레임)
+  까지 남은 거리**: real-asset 게이트(실 i386 게임 PE + D3DMetal SDK + 실 디스플레이 —
+  사용자만 제공 가능) + 남은 엔지니어링(실 PE IAT 이름 자동바인딩, 더 넓은 opcode
+  커버리지, 게임 자신의 WinMain → 메시지 루프 → CreateWindowEx → D3D→Metal 프레임).
+  현재는 **합성 user-entry 도달**까지이며 실 프레임은 자율 범위 밖(real-asset-gated).
+
 - feat(F-NSWINDOW-E5 r7): **CRT import 3개 추가 바인딩 + IMUL/CPUID/RDTSC 디코더
   갭 종결 + `__security_init_cookie` 산술 실행** — r6 의 벽(미등록 IAT 호출
   @`0x5392D4`, insns=30)을 **넘는다**. (1) `native/i386_cpu.{c,h}` 에 세 개의

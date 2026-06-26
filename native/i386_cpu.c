@@ -24,6 +24,7 @@ const char *i386_halt_name(i386_halt_t h) {
         case I386_HALT_TRUNC:       return "trunc";
         case I386_HALT_GUARD:       return "guard";
         case I386_HALT_UNBOUND_IMPORT: return "unbound_import";
+        case I386_HALT_USER_ENTRY:  return "user_entry";
         default:                    return "?";
     }
 }
@@ -146,6 +147,26 @@ uint32_t i386_shim_GetProcAddress(i386_cpu_t *cpu, const struct i386_image *img)
     i386_mem_read32(img, cpu->gpr[I386_REG_ESP] + 4, &pname);  // arg2 lpProcName
     (void)hmod; (void)pname;
     return img->base + 0x1FF0u;                     // synthetic in-image stub addr
+}
+
+// GetCommandLineW() — WINAPI/stdcall, 0 args, returns LPWSTR. own1: the LOADER
+// hands the program a SYNTHETIC in-image command-line pointer (its own argv
+// blob). The CRT-startup `__scrt_common_main_seh` reads this before invoking the
+// user entry. Not a bypass — this is the program's OWN command line.
+uint32_t i386_shim_GetCommandLineW(i386_cpu_t *cpu, const struct i386_image *img) {
+    (void)cpu;
+    return img->base + 0x1FE0u;                     // synthetic in-image cmdline ptr
+}
+
+// SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER) — WINAPI/stdcall, 1
+// ptr arg, returns the PREVIOUS top-level filter. own1: a CRT-startup OS-API
+// call installing the program's OWN handler; we return NULL (none installed).
+// An exception-handler registration, NOT a protection / anti-debug mechanism.
+uint32_t i386_shim_SetUnhandledExceptionFilter(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t pfn = 0;
+    i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &pfn);   // arg (unused — no real SEH)
+    (void)pfn;
+    return 0;                                       // previous filter == NULL
 }
 
 const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va) {
@@ -427,8 +448,18 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                 if (!i386_mem_write32(img, cpu->gpr[I386_REG_ESP], ret)) {
                     res->halt = I386_HALT_OOB; res->halt_va = eip; return;
                 }
-                cpu->eip = eip + insn.len + (uint32_t)insn.imm;   // same formula as the disassembler
+                uint32_t target = eip + insn.len + (uint32_t)insn.imm;  // disassembler formula
+                cpu->eip = target;
                 res->insns++;
+                // CRT→user-entry handoff: this CALL transfers control to the
+                // user entry (main/WinMain). Faithful "about to enter" — the
+                // return address is already pushed. Honest E4 milestone, NOT a
+                // rendered frame. own1: we stop AT the handoff; we do not run
+                // the (absent) real game body.
+                if (cpu->user_entry_va && target == cpu->user_entry_va) {
+                    res->halt = I386_HALT_USER_ENTRY; res->halt_va = target;
+                    res->halt_op = insn.op; return;
+                }
                 continue;                       // branch — skip linear advance
             }
             case I386_OP_JMP_REL: {             // E9 cd / EB cb
@@ -711,6 +742,38 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                 cpu->tsc += I386_TSC_STEP;
                 cpu->gpr[I386_REG_EAX] = (uint32_t)cpu->tsc;
                 cpu->gpr[I386_REG_EDX] = (uint32_t)(cpu->tsc >> 32);
+                break;
+            }
+            // ── BT / BTS / BTR / BTC r/m32, r32 (E5 r8) — 0F A3/AB/B3/BB ─────
+            // CF ← bit(r/m, index). The bit index is the ModR/M.reg register.
+            // For a register-direct operand the index is masked mod 32 (SDM);
+            // for a memory operand we model the same 32-bit-window form (bounded
+            // — bit base + index/8 byte-stride not modeled). BTS/BTR/BTC write
+            // the modified value back. own1: plain Intel SDM Vol.2 bit ops.
+            case I386_OP_BT_RM_R:  case I386_OP_BTS_RM_R:
+            case I386_OP_BTR_RM_R: case I386_OP_BTC_RM_R: {
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint32_t v;
+                if (!rm_get32(cpu, img, &insn, &v, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint32_t idx = cpu->gpr[(insn.modrm >> 3) & 7] & 0x1Fu;  // bit index
+                uint32_t bit = (v >> idx) & 1u;
+                set_flag(&cpu->eflags, EFL_CF, (int)bit);
+                uint32_t out_v = v;
+                int wb = 1;
+                switch (insn.op) {
+                    case I386_OP_BT_RM_R:  wb = 0;                       break;
+                    case I386_OP_BTS_RM_R: out_v = v |  (1u << idx);     break;
+                    case I386_OP_BTR_RM_R: out_v = v & ~(1u << idx);     break;
+                    case I386_OP_BTC_RM_R: out_v = v ^  (1u << idx);     break;
+                    default: break;
+                }
+                if (wb) {
+                    if (!rm_set32(cpu, img, &insn, out_v, &why)) {
+                        res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                    }
+                }
                 break;
             }
             // ── E4 kernel32 boundary — indirect IAT call / jump ───────────

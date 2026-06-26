@@ -118,6 +118,13 @@ struct i386_cpu {
     // I386_TSC_STEP and writes the running 64-bit count to edx:eax. own1: a
     // plausible synthetic counter, NOT the host TSC and NOT a protection clock.
     uint64_t tsc;
+    // ── E5 r8 CRT→user-entry handoff marker (NOT a frame) ────────────────────
+    // When non-zero, a CALL (rel32 or bound import-thunk) whose computed target
+    // equals user_entry_va is the CRT→user-entry handoff: the interpreter pushes
+    // the return address (faithful "about to enter"), records it, and halts
+    // I386_HALT_USER_ENTRY. This is the honest E4 milestone (CRT init reached the
+    // `call main`/`call WinMain` site) — it is NOT a rendered game frame.
+    uint32_t user_entry_va;
 };
 
 // Per-rdtsc increment for the synthetic timestamp counter (plausible, fixed).
@@ -163,6 +170,15 @@ uint32_t i386_shim_GetStartupInfoW(i386_cpu_t *cpu, const struct i386_image *img
 uint32_t i386_shim_GetSystemInfo(i386_cpu_t *cpu, const struct i386_image *img);
 uint32_t i386_shim_GetProcAddress(i386_cpu_t *cpu, const struct i386_image *img);
 
+// CRT→user-entry kernel32 shims (E5 r8). own1: native re-impls of the OS API
+// surface bound to the program's OWN imports — loading, not a bypass.
+//   GetCommandLineW()                 — 0 args, returns a synthetic in-image
+//       command-line pointer (the loader hands the program its own argv blob).
+//   SetUnhandledExceptionFilter(fn)   — 1 ptr arg, returns the previous filter
+//       (NULL — none installed). A CRT-startup OS-API call, not a protection.
+uint32_t i386_shim_GetCommandLineW(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_SetUnhandledExceptionFilter(i386_cpu_t *cpu, const struct i386_image *img);
+
 // Look up an IAT slot VA in the registry. Returns NULL if `iat` is NULL or
 // the slot is not bound (→ the caller halts UNBOUND_IMPORT honestly).
 const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va);
@@ -191,6 +207,9 @@ typedef enum {
     I386_HALT_UNBOUND_IMPORT, // indirect IAT call FF 15 [slot] to an UNregistered
                               // kernel32 import — the next import to bind (own1:
                               // honest stop, we never invent the function)
+    I386_HALT_USER_ENTRY,  // CRT init reached the `call main`/`call WinMain` site
+                           // (cpu->user_entry_va). The honest E4 milestone — the
+                           // CRT→user-entry handoff. NOT a rendered game frame.
 } i386_halt_t;
 
 typedef struct {

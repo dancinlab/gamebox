@@ -92,6 +92,10 @@ const char *i386_op_name(i386_op_t op) {
         case I386_OP_IMUL_R_RM_IMM: return "imul";
         case I386_OP_CPUID:       return "cpuid";
         case I386_OP_RDTSC:       return "rdtsc";
+        case I386_OP_BT_RM_R:     return "bt";
+        case I386_OP_BTS_RM_R:    return "bts";
+        case I386_OP_BTR_RM_R:    return "btr";
+        case I386_OP_BTC_RM_R:    return "btc";
         case I386_OP_PREFIX_ONLY: return "(prefix-only)";
         case I386_OP_UNKNOWN:
         default:                return "(unknown)";
@@ -347,6 +351,22 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
         } else if (op2 == 0x31) {
             out->op = I386_OP_RDTSC;     // 0F 31 (E5 r7) — no operands
             taken += 1;
+        } else if (op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB) {
+            // BT/BTS/BTR/BTC r/m32, r32 (E5 r8) — bit index in ModR/M.reg
+            // register; CF ← selected bit. Same /r ModR/M shape as 0F AF.
+            int m_n = decode_modrm_disp(p + 2, avail - 2,
+                                        &out->modrm, &out->sib,
+                                        &out->disp, &out->has_disp);
+            if (m_n == 0) return 0;
+            out->reg_a = (int8_t)((out->modrm >> 3) & 7);   // bit-index register
+            if (((out->modrm >> 6) & 3) == 3) out->reg_b = (int8_t)(out->modrm & 7);
+            switch (op2) {
+                case 0xA3: out->op = I386_OP_BT_RM_R;  break;
+                case 0xAB: out->op = I386_OP_BTS_RM_R; break;
+                case 0xB3: out->op = I386_OP_BTR_RM_R; break;
+                case 0xBB: out->op = I386_OP_BTC_RM_R; break;
+            }
+            taken += 1 + m_n;   // +1 for op2, +m_n for ModR/M
         } else {
             out->op = I386_OP_UNKNOWN;
             taken = n + 1;  // skip 0x0F only

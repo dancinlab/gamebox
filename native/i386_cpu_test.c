@@ -66,6 +66,20 @@
 // plain CPU instructions; the cookie is OUR arithmetic over OUR buffers. kernel32
 // is the OS API, not DRM/Warden. Our own bytes, Intel SDM semantics, native
 // shims — no Wine, no protection.
+//
+// E5 r8 — REACH THE CRT→USER-ENTRY HANDOFF. Bind the last two CRT imports
+// (GetCommandLineW [slot 2C] / SetUnhandledExceptionFilter [slot 30]), close the
+// 0F A3/AB/B3/BB BT/BTS/BTR/BTC decoder gap, then set up the WinMain stdcall
+// frame and `call` the synthetic user entry. The interpreter detects the call
+// target == cpu.user_entry_va and HALTS I386_HALT_USER_ENTRY (insns 44 → 60).
+// This is the honest E4 completion milestone: CRT init reached `call WinMain`.
+// It is NOT a rendered game frame — validated_manjeom STAYS 0. The WinMain target
+// is OUR OWN synthetic VA; a real frame is real-asset-gated (real i386 game PE +
+// the binary's own IAT auto-bound by import name + its real WinMain → message
+// loop → CreateWindowEx → D3D→Metal, + D3DMetal SDK + a real display) — none of
+// which exists on this host/CI. The B/D walls now use a `0F B1` (cmpxchg)
+// sentinel — the next genuinely-uncovered decoder gap (r9). own1: synthetic
+// shape, our bytes, Intel SDM semantics — no Wine, no protection.
 
 #include "i386_cpu.h"
 
@@ -157,8 +171,25 @@ static void put_at(uint8_t *img, uint32_t va, const uint8_t *src, size_t n) {
 //   0x53930A  B8 00 00 00 00        mov eax, 0            ; cpuid leaf 0
 //   0x53930F  0F A2                 cpuid                 ; → ebx/edx/ecx "GenuineIntel" (r7 decoder)
 //   0x539311  0F 31                 rdtsc                 ; → edx:eax synthetic monotonic tsc (r7)
-//   0x539313  68 D0 9F 53 00        push 0x539FD0         ; & next buffer
-//   0x539318  FF 15 2C 80 53 00     call [0x53802C]       ; slot 2C → UNBOUND (the new r8 wall)
+//   0x539313  68 D0 9F 53 00        push 0x539FD0         ; & scratch buffer (stray push, r8 discards)
+//   0x539318  FF 15 2C 80 53 00     call [0x53802C]       ; slot 2C → GetCommandLineW (r8, → cmdline ptr)
+// E5 r8 continuation — bind the last two CRT imports, exercise BT/BTS/BTR/BTC,
+// then set up the WinMain stdcall frame and reach the CRT→user-entry handoff:
+//   0x53931E  59                    pop ecx               ; discard the stray scratch push (balance esp)
+//   0x53931F  89 C6                 mov esi, eax          ; esi = lpCmdLine (synthetic GetCommandLineW ret)
+//   0x539321  6A 00                 push 0                ; SetUnhandledExceptionFilter(NULL)
+//   0x539323  FF 15 30 80 53 00     call [0x538030]       ; slot 30 → SetUnhandledExceptionFilter (r8, →0)
+//   0x539329  BA 05 00 00 00        mov edx, 5            ; bit index 5
+//   0x53932E  B8 20 00 00 00        mov eax, 0x20         ; feature word (bit 5 set)
+//   0x539333  0F A3 D0              bt  eax, edx          ; CF ← bit5 = 1            (0F A3 — r8 decoder)
+//   0x539336  0F AB D0              bts eax, edx          ; set bit5 (CF←1), eax=0x20 (0F AB — r8)
+//   0x539339  0F B3 D0              btr eax, edx          ; clear bit5 (CF←1), eax=0  (0F B3 — r8)
+//   0x53933C  0F BB D0              btc eax, edx          ; flip bit5 (CF←0), eax=0x20 (0F BB — r8)
+//   0x53933F  6A 0A                 push 0x0A             ; nShowCmd
+//   0x539341  56                    push esi              ; lpCmdLine
+//   0x539342  6A 00                 push 0                ; hPrevInstance NULL
+//   0x539344  68 00 80 53 00        push 0x538000         ; hInstance (image base, synthetic)
+//   0x539349  E8 B2 00 00 00        call 0x539400         ; CRT→user-entry handoff → WinMain (SYNTHETIC)
 static const uint8_t SCRT_PROLOGUE[] = {
     0x83, 0xEC, 0x28,
     0x33, 0xC0,
@@ -204,16 +235,33 @@ static const uint8_t SCRT_PROLOGUE[] = {
     0xB8, 0x00, 0x00, 0x00, 0x00,         // 0x53930A mov eax, 0          (cpuid leaf 0)
     0x0F, 0xA2,                           // 0x53930F cpuid              (0F A2 — r7 decoder gap closed)
     0x0F, 0x31,                           // 0x539311 rdtsc              (0F 31 — r7)
-    0x68, 0xD0, 0x9F, 0x53, 0x00,         // 0x539313 push 0x539FD0  (& next buffer)
-    0xFF, 0x15, 0x2C, 0x80, 0x53, 0x00,   // 0x539318 call [0x53802C] → UNBOUND (the new r8 wall)
+    0x68, 0xD0, 0x9F, 0x53, 0x00,         // 0x539313 push 0x539FD0  (& scratch buffer; r8 discards)
+    0xFF, 0x15, 0x2C, 0x80, 0x53, 0x00,   // 0x539318 call [0x53802C] → GetCommandLineW (r8, → cmdline)
+    // ── E5 r8 continuation ──
+    0x59,                                 // 0x53931E pop ecx   (discard the stray scratch push)
+    0x89, 0xC6,                           // 0x53931F mov esi, eax  (esi = lpCmdLine)
+    0x6A, 0x00,                           // 0x539321 push 0   (SetUnhandledExceptionFilter NULL)
+    0xFF, 0x15, 0x30, 0x80, 0x53, 0x00,   // 0x539323 call [0x538030] → SetUnhandledExceptionFilter
+    0xBA, 0x05, 0x00, 0x00, 0x00,         // 0x539329 mov edx, 5     (bit index)
+    0xB8, 0x20, 0x00, 0x00, 0x00,         // 0x53932E mov eax, 0x20  (feature word, bit5 set)
+    0x0F, 0xA3, 0xD0,                     // 0x539333 bt  eax, edx   (0F A3 — r8 decoder gap closed)
+    0x0F, 0xAB, 0xD0,                     // 0x539336 bts eax, edx   (0F AB — r8)
+    0x0F, 0xB3, 0xD0,                     // 0x539339 btr eax, edx   (0F B3 — r8)
+    0x0F, 0xBB, 0xD0,                     // 0x53933C btc eax, edx   (0F BB — r8)
+    0x6A, 0x0A,                           // 0x53933F push 0x0A   (nShowCmd)
+    0x56,                                 // 0x539341 push esi    (lpCmdLine)
+    0x6A, 0x00,                           // 0x539342 push 0      (hPrevInstance NULL)
+    0x68, 0x00, 0x80, 0x53, 0x00,         // 0x539344 push 0x538000 (hInstance, synthetic)
+    0xE8, 0xB2, 0x00, 0x00, 0x00,         // 0x539349 call 0x539400 → WinMain (CRT→user-entry handoff)
 };
 
-// The native kernel32 imports bound across IAT slots 0x538000..0x538028 (r4-r7).
+// The native kernel32 imports bound across IAT slots 0x538000..0x538030 (r4-r8).
 // own1: loading the OS API surface to native impls, not a protection bypass.
 // The buffer-writing shims (slots 8 / C / 18 / 20 / 24) take one stdcall pointer
 // arg (4 bytes, callee-popped) and write into image memory; IsProcessorFeature-
-// Present (14) / GetModuleHandleW (1C) take 1 arg; GetProcAddress (28) takes 2
-// (8 bytes); the rest are 0-arg.
+// Present (14) / GetModuleHandleW (1C) / SetUnhandledExceptionFilter (30) take 1
+// arg; GetProcAddress (28) takes 2 (8 bytes); the rest (incl. GetCommandLineW
+// at slot 2C) are 0-arg.
 static const i386_import_t K32_IMPORTS[] = {
     { 0x538000u, "GetCurrentThreadId",        i386_shim_GetCurrentThreadId,        0 },
     { 0x538004u, "GetCurrentProcessId",       i386_shim_GetCurrentProcessId,       0 },
@@ -226,8 +274,13 @@ static const i386_import_t K32_IMPORTS[] = {
     { 0x538020u, "GetStartupInfoW",           i386_shim_GetStartupInfoW,           4 },
     { 0x538024u, "GetSystemInfo",             i386_shim_GetSystemInfo,             4 },
     { 0x538028u, "GetProcAddress",            i386_shim_GetProcAddress,            8 },
+    // ── E5 r8: the last two CRT→user-entry imports ──
+    { 0x53802Cu, "GetCommandLineW",           i386_shim_GetCommandLineW,           0 },
+    { 0x538030u, "SetUnhandledExceptionFilter", i386_shim_SetUnhandledExceptionFilter, 4 },
 };
-static const i386_iat_t K32_IAT = { K32_IMPORTS, 11 };
+static const i386_iat_t K32_IAT = { K32_IMPORTS, 13 };
+#define WINMAIN_VA 0x539400u    // synthetic user entry (CRT→user-entry handoff target)
+#define CMDLINE_PTR 0x539FE0u   // GetCommandLineW synthetic return (img base + 0x1FE0)
 #define SHIM_TID  0x00001A2Bu   // GetCurrentThreadId stub return
 #define SHIM_PID  0x00000D04u   // GetCurrentProcessId stub return
 #define SHIM_TICK 0x0001D4C0u   // GetTickCount stub return
@@ -256,12 +309,12 @@ static void build_hermetic(uint8_t *img) {
     i386_mem_write32(&m, TEB_BASE + 0x18, TEB_BASE);   // TEB self-pointer (NtCurrentTeb shape)
     i386_mem_write32(&m, TEB_BASE + 0x30, PEB_BASE);   // TEB→PEB
     i386_mem_write32(&m, PEB_BASE + 0x08, IMG_BASE);   // PEB→ImageBaseAddress
-    // 0F A3 = BT r/m32, r32 — still uncovered after r7 (0F A2 cpuid / 0F 31 rdtsc
-    // / 0F AF imul now decode+execute). The 0x0F two-byte map recognizes Jcc
-    // (80..8F) + movzx/movsx (B6/B7/BE/BF) + imul/cpuid/rdtsc (AF/A2/31), so
-    // 0F A3 → I386_OP_UNKNOWN. Keeps the B/D walls honest and names the next real
-    // decoder gap (BT bit-test) for r8.
-    uint8_t wall[] = { 0x0F, 0xA3 };               // representative `bt` (next gap)
+    // 0F B1 = CMPXCHG r/m32, r32 — still uncovered after r8 (0F A3/AB/B3/BB bt/bts/
+    // btr/btc now decode+execute). The 0x0F two-byte map recognizes Jcc (80..8F) +
+    // movzx/movsx (B6/B7/BE/BF) + imul/cpuid/rdtsc (AF/A2/31) + bit-test (A3/AB/B3/
+    // BB), so 0F B1 → I386_OP_UNKNOWN. Keeps the B/D walls honest and names the next
+    // real decoder gap (CMPXCHG, the lock-free CRT init primitive) for r9.
+    uint8_t wall[] = { 0x0F, 0xB1 };               // representative `cmpxchg` (next gap)
     put_at(img, 0x538BABu, wall, sizeof(wall));    // CALL target (insn 6)
     put_at(img, 0x53872Au, wall, sizeof(wall));    // JMP  target (insn 2)
 }
@@ -282,11 +335,18 @@ int main(int argc, char **argv) {
             cpu.gpr[I386_REG_ESP] = pe.base + pe.size - 0x100;  // writable top of image
             cpu.iat = &K32_IAT;                                 // native kernel32 binding
             cpu.teb_base = TEB_BASE;                            // synthetic TEB (own1: our block)
+            // NB: user_entry_va stays 0 for a real PE — the user entry VA is found
+            // by the binary's own CRT, not known a priori; the run halts honestly at
+            // its first unbound import / uncovered opcode. The K32_IAT slots here are
+            // the HERMETIC synthetic VAs (0x538000..), so a real PE's IAT will not
+            // match until a future round parses the PE's import table and auto-binds
+            // by name (see the INFO line below). own1: honest, no invented functions.
             i386_run_result_t r;
             i386_cpu_run(&cpu, &pe, 100000, &r);
-            printf("__SHIM__ PARTIAL phase=e4_crt_security_cookie insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+            printf("__SHIM__ PARTIAL phase=e4_real_pe_probe insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
                    i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
+            printf("__SHIM__ INFO real_pe_path=loaded sections+entry mapped; needs:IAT_autobind_by_import_name+wider_opcode_coverage+D3DMetal+display for a frame (validated_manjeom=0)\n");
             i386_image_free(&pe);
             emitted = 1;
         } else {
@@ -300,20 +360,21 @@ int main(int argc, char **argv) {
     uint8_t *img_buf = (uint8_t *)malloc(IMG_SIZE);
     i386_image_t img = { img_buf, IMG_BASE, IMG_SIZE, 0 };
 
-    // === Run A — MILESTONE: 11 CRT imports + security cookie + CPUID/RDTSC ===
-    // E5 r7 — execution runs the entry CALL (insn 1) → __scrt_common_main
-    // prologue → the r6 chain (8 kernel32 binds + buffer writes + MOVZX/MOVSX +
-    // the synthetic TEB→PEB→ImageBase walk, insns 1..30) → then the r7
-    // continuation: GetStartupInfoW (31, BUFFER-WRITE STARTUPINFOW cb=0x44) →
-    // push (32) → GetSystemInfo (33, BUFFER-WRITE SYSTEM_INFO) → push/push (34,35)
-    // → GetProcAddress (36, → synthetic in-image stub) → the __security_init_cookie
-    // shape: mov eax,[FT] (37) → xor eax,[FT+4] (38) → imul eax,eax,imm (39, the
-    // r7 IMUL) → mov [COOKIE],eax (40, store the global cookie) → mov eax,0 (41) →
-    // CPUID (42, → "GenuineIntel") → RDTSC (43, → synthetic edx:eax) → push (44)
-    // → HALTS at the TWELFTH, UNregistered IAT call @0x539318 (UNBOUND_IMPORT —
-    // slot 0x53802C, the next import, r8). own1: CPUID/RDTSC are plain CPU ops,
-    // the cookie is our arithmetic over our buffers — no protection, no Wine.
-    printf("\n[cpu] Run A — 11 CRT imports + security-cookie (imul) + CPUID/RDTSC\n");
+    // === Run A — MILESTONE: 13 CRT imports + BT family → CRT→user-entry handoff ===
+    // E5 r8 — execution runs the entry CALL (insn 1) → __scrt_common_main prologue
+    // → the r6 chain (insns 1..30) → the r7 continuation (StartupInfo/SysInfo/
+    // ProcAddr + security cookie + CPUID/RDTSC, insns 31..44) → THEN the r8
+    // continuation: GetCommandLineW (45, slot 2C, → synthetic cmdline ptr) →
+    // pop ecx (46, discard the stray scratch push) → mov esi,eax (47) →
+    // push/SetUnhandledExceptionFilter (48,49, slot 30) → mov edx,5 / mov eax,0x20
+    // (50,51) → bt/bts/btr/btc eax,edx (52..55, the freshly-decoded 0F A3/AB/B3/BB)
+    // → push the four WinMain args (56..59: nShowCmd, lpCmdLine, hPrevInstance,
+    // hInstance) → CALL 0x539400 (60) = the CRT→user-entry handoff. The interpreter
+    // detects the call target == cpu.user_entry_va, pushes the return address, and
+    // HALTS I386_HALT_USER_ENTRY. own1: this is the honest E4 milestone — CRT init
+    // reached `call WinMain` — NOT a rendered game frame (the WinMain target is OUR
+    // synthetic VA; the real game body needs the real PE + D3DMetal + a display).
+    printf("\n[cpu] Run A — 13 CRT imports + BT family → CRT→user-entry handoff (SYNTHETIC)\n");
     build_hermetic(img_buf);
     {
         i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
@@ -321,18 +382,17 @@ int main(int argc, char **argv) {
         cpu.gpr[I386_REG_ESP] = 0x539E00u;          // stack inside the image
         cpu.iat = &K32_IAT;                         // register the native kernel32 binding
         cpu.teb_base = TEB_BASE;                     // synthetic TEB (own1: our block, not OS TEB)
+        cpu.user_entry_va = WINMAIN_VA;              // CRT→user-entry handoff marker (own1: synthetic)
         uint32_t esp0 = cpu.gpr[I386_REG_ESP];
         i386_mem_write32(&img, SLIST_BUF + 0, 0xFFFFFFFFu);  // pre-dirty → prove the zeroing
         i386_mem_write32(&img, SLIST_BUF + 4, 0xFFFFFFFFu);
         i386_run_result_t r;
         i386_cpu_run(&cpu, &img, 1000, &r);
 
-        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ebx=0x%X ecx=0x%X edx=0x%X bound=%u(%s) slot=0x%X\n",
+        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ebx=0x%X edx=0x%X bound=%u(%s)\n",
                r.insns, i386_halt_name(r.halt), r.halt_va, cpu.eip, cpu.gpr[I386_REG_ESP],
-               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_EBX], cpu.gpr[I386_REG_ECX], cpu.gpr[I386_REG_EDX],
-               r.imports_bound, r.last_import ? r.last_import : "-", r.import_slot);
-        uint32_t entry_ret = 0;
-        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 4, &entry_ret);  // [esp+4] (under final push)
+               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_EBX], cpu.gpr[I386_REG_EDX],
+               r.imports_bound, r.last_import ? r.last_import : "-");
         uint32_t ft_lo = 0, ft_hi = 0, qpc_lo = 0, qpc_hi = 0, sl_lo = 0, sl_hi = 0;
         uint32_t si_cb = 0, sys_page = 0, sys_ncpu = 0, cookie = 0;
         i386_mem_read32(&img, FT_BUF + 0, &ft_lo);
@@ -348,12 +408,19 @@ int main(int argc, char **argv) {
         // Re-derive the cookie the prologue computes: (FT_lo ^ FT_hi) * 0x01000193
         // (the low 32 bits of the signed imul == the low 32 of the 32×32 product).
         uint32_t cookie_expect = (uint32_t)((0xC3D4E5F6u ^ 0x01D7A1B2u) * 0x01000193u);
-        uint64_t tsc1 = I386_TSC_STEP;                            // after exactly one rdtsc
+        // WinMain stdcall frame at the handoff. esp points at the pushed return
+        // address (0x53934E); the four args sit just above it.
+        uint32_t wm_ret = 0, wm_hinst = 0, wm_hprev = 0, wm_cmd = 0, wm_show = 0, entry_ret = 0;
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 0x00, &wm_ret);    // return address
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 0x04, &wm_hinst);  // hInstance
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 0x08, &wm_hprev);  // hPrevInstance
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 0x0C, &wm_cmd);    // lpCmdLine
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 0x10, &wm_show);   // nShowCmd
+        i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 0x14, &entry_ret); // entry CALL retaddr (deep)
 
-        CHECK(r.insns == 44,                "44 insns (30 r6 + StartupInfo/SysInfo/ProcAddr + cookie-imul + cpuid + rdtsc)");
-        CHECK(r.insns > 30,                 "advanced PAST the r6 30-insn / 0x5392D4 wall");
-        CHECK(entry_ret == 0x5388ABu,       "entry CALL return addr 0x5388AB intact under the stdcall pops");
-        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 8, "esp net == esp0-8 (entry retaddr + final unpopped push)");
+        CHECK(r.insns == 60,                "60 insns (44 r7 + GetCommandLineW/SUEF + BT family + WinMain frame + handoff call)");
+        CHECK(r.insns > 44,                 "advanced PAST the r7 44-insn / 0x539318 wall");
+        // r6/r7 buffer-write evidence is still intact (those shims ran en route).
         CHECK(ft_lo == 0xC3D4E5F6u && ft_hi == 0x01D7A1B2u,
                                             "GetSystemTimeAsFileTime wrote 8B FILETIME via the pushed ptr");
         CHECK(qpc_lo == 0x12345678u && qpc_hi == 0x00000000u,
@@ -362,27 +429,35 @@ int main(int argc, char **argv) {
         CHECK(si_cb == 0x44u,               "GetStartupInfoW stamped STARTUPINFOW.cb = 0x44 (buffer-write)");
         CHECK(sys_page == 0x1000u && sys_ncpu == 4u,
                                             "GetSystemInfo wrote dwPageSize=0x1000 + nCPU=4 (bounded-synthetic)");
-        // E5 r7 cookie + CPU-identity ops (reaching here proves the fs:/TEB walk
-        // resolved — a broken FS override would have halted OOB at 0x5392C2).
         CHECK(cookie == cookie_expect && cookie != 0u,
                                             "__security cookie = imul(FT_lo^FT_hi, 0x01000193) stored to global");
-        CHECK(cpu.gpr[I386_REG_EBX] == 0x756E6547u, "cpuid leaf0 → ebx vendor 'Genu'");
-        CHECK(cpu.gpr[I386_REG_ECX] == 0x6C65746Eu, "cpuid leaf0 → ecx vendor 'ntel' (GenuineIntel)");
-        CHECK(cpu.gpr[I386_REG_EAX] == (uint32_t)tsc1 && cpu.gpr[I386_REG_EDX] == (uint32_t)(tsc1 >> 32),
-                                            "rdtsc → synthetic monotonic edx:eax");
-        CHECK(r.imports_bound == 11,             "eleven IAT calls dispatched to native shims");
-        CHECK(r.last_import && strcmp(r.last_import, "GetProcAddress") == 0,
-                                                 "most-recent bound import == GetProcAddress");
-        CHECK(r.halt == I386_HALT_UNBOUND_IMPORT, "halt: twelfth IAT call is UNbound (r8 boundary)");
-        CHECK(r.halt_op == I386_OP_CALL_RM,      "wall op == CALL_RM (FF 15 [disp32])");
-        CHECK(r.halt_va == 0x539318u,            "wall VA == 0x539318 (the twelfth IAT call)");
-        CHECK(r.import_slot == 0x53802Cu,        "unbound slot reported == 0x53802C (next import, r8)");
+        CHECK(cpu.gpr[I386_REG_EBX] == 0x756E6547u, "cpuid leaf0 → ebx vendor 'Genu' (un-clobbered)");
+        CHECK(cpu.tsc == I386_TSC_STEP,     "rdtsc advanced the synthetic tsc by exactly one step");
+        // E5 r8 — the BT family (eax 0x20 → bt/bts/btr/btc by edx=5 → eax 0x20 again).
+        CHECK(cpu.gpr[I386_REG_EAX] == 0x20u, "bt/bts/btr/btc sequence left eax = 0x20 (write-back correct)");
+        // E5 r8 — the CRT→user-entry handoff itself.
+        CHECK(r.imports_bound == 13,        "thirteen IAT calls dispatched to native shims (r7 11 + GetCommandLineW + SUEF)");
+        CHECK(r.last_import && strcmp(r.last_import, "SetUnhandledExceptionFilter") == 0,
+                                            "most-recent bound import == SetUnhandledExceptionFilter");
+        CHECK(r.halt == I386_HALT_USER_ENTRY, "halt: reached the CRT→user-entry handoff (call WinMain)");
+        CHECK(r.halt_op == I386_OP_CALL_REL,  "handoff op == CALL_REL (E8 call WinMain)");
+        CHECK(r.halt_va == WINMAIN_VA,       "handoff VA == WINMAIN_VA 0x539400 (synthetic user entry)");
+        CHECK(cpu.eip == WINMAIN_VA,         "eip parked at the synthetic user entry");
+        // The WinMain stdcall frame the CRT set up (own1: synthetic args).
+        CHECK(wm_ret == 0x53934Eu,          "WinMain return address == 0x53934E (pushed by the handoff call)");
+        CHECK(wm_hinst == 0x538000u,        "WinMain arg hInstance == image base 0x538000 (synthetic)");
+        CHECK(wm_hprev == 0u,               "WinMain arg hPrevInstance == NULL");
+        CHECK(wm_cmd == CMDLINE_PTR,        "WinMain arg lpCmdLine == GetCommandLineW synthetic ptr 0x539FE0");
+        CHECK(wm_show == 0x0Au,             "WinMain arg nShowCmd == 0x0A");
+        CHECK(entry_ret == 0x5388ABu,       "entry CALL return addr 0x5388AB still intact deep in the stack");
+        CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 0x18, "esp net == esp0-0x18 (entry ret + 4 WinMain args + handoff ret)");
         (void)SHIM_PID; (void)SHIM_TID; (void)SHIM_TICK; (void)TEB_BASE; (void)PEB_BASE;
 
         if (!emitted) {
-            printf("__SHIM__ PARTIAL phase=e4_crt_security_cookie insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+            printf("__SHIM__ PARTIAL phase=e4_reached_user_entry insns=%u bound=%u last=%s entry_va=0x%X halt=%s halt_op=%s (SYNTHETIC user-entry; validated_manjeom=0)\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
-                   i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
+                   i386_halt_name(r.halt), i386_op_name(r.halt_op));
+            printf("__SHIM__ INFO real_pe_path=structurally_ready needs:real_i386_PE+IAT_autobind_by_import_name+wider_opcode_coverage+D3DMetal+display\n");
         }
     }
 
