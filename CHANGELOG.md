@@ -6,6 +6,12 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- docs(CLAUDE.md): CI(Blacksmith) 규율 박제 — `## CI — builds run on Blacksmith,
+  NOT locally` 섹션 추가(워크플로/러너/툴체인/실행 내용 + "로컬 빌드 말고 push
+  하라" 규칙) + Structure 트리에 `.github/workflows/` 항목. 같은 결함(로컬 빌드로
+  Mac 죽음) 재발 방지를 위해 거버넌스 SSOT 에 명시.
+
+
 - ci(blacksmith): `.github/workflows/ci.yml` — gamebox 빌드+테스트를
   Blacksmith 클라우드 Apple-Silicon 러너(`blacksmith-6vcpu-macos-15`)에서 실행.
   gamebox 는 Apple-native(Win32 PE + D3DMetal)라 컴파일+apple-only 테스트에

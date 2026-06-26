@@ -31,6 +31,7 @@ gamebox/
 ├─ ARCHITECTURE.md         — architecture SSOT (update-in-place)
 ├─ CHANGELOG.md            — append-only history
 ├─ harness.config.json     — harness config (lockdown, lint, docs discipline)
+├─ .github/workflows/      — CI (ci.yml — Blacksmith macOS build+test)
 └─ .harness-engine/        — dancinlab harness submodule (governance engine)
 ```
 
@@ -55,6 +56,31 @@ without the engine checked out.
 
 Run via `bash .harness-engine/bin/harness <cmd>` (or, with an external tsx,
 `HARNESS_REPO_ROOT="$PWD" <tsx> .harness-engine/cli/index.ts <cmd>`).
+
+## CI — builds run on Blacksmith, NOT locally
+
+gamebox is Apple-native (Win32 PE + D3DMetal), so its hexa compile + the
+apple-only test suite need a macOS host. Running that locally (242+ perf
+modules + 8 test files) spikes memory and **crashes the dev Mac** — so CI runs
+on a Blacksmith cloud Apple-Silicon runner instead.
+
+- **Workflow** — `.github/workflows/ci.yml`, job `build-test`, on every
+  push to `main`/`master` + every PR + `workflow_dispatch`.
+- **Runner** — `blacksmith-6vcpu-macos-15` (native Apple-Silicon cloud Mac).
+  Pinned to `macos-15` (NOT `-26`) — same rationale as hexa-lang `release.yml`:
+  the Mach-O min-OS baseline rides the builder SDK, so the pin keeps it stable.
+  same-org (`dancinlab`) Blacksmith is already enabled (hexa-lang uses it), so
+  no extra activation is needed.
+- **Toolchain** — the released `hexa` binary, installed via the canonical
+  one-liner (`install.sh` → `~/.hx/bin`). gamebox is a downstream consumer, not
+  the compiler repo, so it installs the release — it does not build hexa.
+- **What it runs** — `hexa test` over the 8 `[test].files` in `hexa.toml`
+  (own2 PASS/FAIL honest), then a gamebox CLI smoke (`status` / `selftest
+  --quick`, warn-only since D3DMetal SDK is absent on the runner).
+
+**Rule for working here**: don't run heavy `hexa test` / builds on the local
+Mac — just `git push` and let Blacksmith build. The dev box should only ever
+push. Check results with `gh pr checks` / `gh run list`.
 
 ## Quick reference
 
