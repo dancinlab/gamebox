@@ -6,6 +6,14 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(battlenet cond.3): `pe_battle_net_oauth_token` self_test 가 op_kind 6
+  `device_code_grant`(`/oauth/device` RFC8628) 을 비로소 exercise — 헤더에
+  문서화됐으나 self_test 미커버였던 갭을 닫음(6 op_kind 전부 round-trip). 합성
+  데이터·token 실값 0·length-only·실 네트워크 0(own1 준수). 어서션 정합:
+  op_count 6→7, total_token_lifetime_sec 345600→432000, total_token_size_bytes
+  5120→6144, count_by_op_kind(6) 0→1, stats `[7,432000,6144,2]`, emit ≥8.
+  cond.3 status 는 partial 유지(실 OAuth 엔드포인트 network smoke 게이트 = blk.1).
+
 - docs(CLAUDE.md): CI(Blacksmith) 규율 박제 — `## CI — builds run on Blacksmith,
   NOT locally` 섹션 추가(워크플로/러너/툴체인/실행 내용 + "로컬 빌드 말고 push
   하라" 규칙) + Structure 트리에 `.github/workflows/` 항목. 같은 결함(로컬 빌드로
