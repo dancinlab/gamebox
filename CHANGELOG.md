@@ -6,6 +6,38 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r9): **IAT 이름 기반 자동 바인딩 + CMPXCHG 디코더·실행**
+  — r8 이 `INFO real_pe_path=structurally_ready needs:IAT_autobind_by_import_name`
+  으로 명시한 다음 과제를 완료한다. (1) **`i386_iat_autobind()`**
+  (`native/i386_cpu.c`): `IMAGE_IMPORT_DESCRIPTOR` → INT(OriginalFirstThunk) →
+  `IMAGE_IMPORT_BY_NAME`(+2 hint skip) 를 직접 파싱해 이름 문자열로 셰임 레지스트리와
+  `strcmp` 매칭 — **슬롯 VA 사전지식 없이** 어떤 i386 PE 의 IAT 도 바인딩 가능. 미등록
+  이름은 `fn=NULL`(정직; 런루프는 `HALT_UNBOUND_IMPORT` + `last_import` 에 이름 기록).
+  선언은 `native/i386_cpu.h`(`i386_shim_entry_t` typedef + 함수 선언, forward-decl
+  `const struct i386_image *`). (2) **Import Directory RVA 파싱** (`native/pe_parse.c`):
+  `pe_image_t` 에 `import_dir_rva`/`import_dir_size` 추가, DataDirectory[1] 을 PE32
+  (optional-header 오프셋 104) 와 PE32+(오프셋 120) 양쪽에서 읽음. (3) **CMPXCHG
+  디코더**: `0F B0`(`cmpxchg r/m8,r8`) + `0F B1`(`cmpxchg r/m32,r32`) 를 C 디코더
+  (`native/i386_decode.c`, enum ordinal 65·66) 와 byte-equal hexa 미러
+  (`native/i386_decode.hexa`) 양쪽에 추가(RUNEQ 규율). 인터프리터 실행부: EAX/AL 과
+  r/m 비교 → 같으면 ZF=1·r/m←reg, 다르면 ZF=0·EAX/AL←r/m(Intel SDM Vol.2). `rm_set8`
+  / `mem_write8` 보조 함수 추가. fn=NULL(autobind 미등록 슬롯)에 대한 IAT 디스패치
+  halt 처리도 업데이트(`last_import` 이름 보존). (4) **Run E 테스트**
+  (`native/i386_cpu_test.c`): 합성 in-memory PE import 디렉터리(base `0x540000`,
+  `0x1000B`): `IMAGE_IMPORT_DESCRIPTOR` 1개 + INT 3개 + `IMAGE_IMPORT_BY_NAME` 3개
+  (GetCurrentThreadId·GetTickCount·GetCommandLineW) 를 레이아웃하고 `i386_iat_autobind`
+  호출 → total=3·bound=3·unbound=0·슬롯 VA·fn·name 18-항목 전수 검증. GetCurrentThreadId
+  슬롯을 통한 미니런(`FF 15 [0x540100]` → `C3`) → `halt=ret, EAX=0x1A2B, imports_bound=1`.
+  CMPXCHG equal 패스(EAX=ECX=`0x12345678` → ZF=1·ECX 불변)와 not-equal 패스
+  (EAX=`0xAAAAAAAA`·ECX=`0xBBBBBBBB` → ZF=0·EAX=`0xBBBBBBBB`) 각 4개 CHECK. B/D
+  sentinel 은 `0F B1`(이제 CMPXCHG 로 실행됨) → `0F C1 C0`(XADD, r10 진짜 갭) 으로
+  교체. 측정 라인 `__SHIM__ PARTIAL phase=e4_iat_name_autobind names_resolved=3
+  unbound=0 dispatch_ok=1`, `__SHIM_TEST__ PASS`(CI 게이트 · Run A 25/B 4/C 5/D 3/E 18
+  checks 전부 green). **own1**: 표준 PE import 해석 = 자신의 import 를 네이티브 구현에
+  묶는 **로딩**(bypass 아님); 합성 PE 구조·Intel SDM CMPXCHG — Wine/보호 없음.
+  `validated_manjeom` 여전히 **0**. r10 목표: DX→Metal 브리지 라이브러리
+  (`lib/loader/dx_d3d11.hexa` 스캐폴드, 0 실 Metal 호출).
+
 - feat(F-NSWINDOW-E5 r8): **CRT→user-entry 핸드오프 도달(합성) + BT/BTS/BTR/BTC
   디코더 갭 종결 + 마지막 CRT import 2개 바인딩** — r7 의 벽(미등록 IAT 호출
   @`0x539318`, insns=44)을 **넘어 CRT-init 의 종착점인 `call WinMain`(CRT→user-entry

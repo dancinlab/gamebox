@@ -207,6 +207,12 @@ static int mem_read16(const i386_image_t *img, uint32_t va, uint16_t *out) {
     *out = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
     return 1;
 }
+// Byte write (E5 r9 — for CMPXCHG r/m8,r8 write-back).
+static int mem_write8(const i386_image_t *img, uint32_t va, uint8_t val) {
+    if (va < img->base || (uint64_t)va + 1 > (uint64_t)img->base + img->size) return 0;
+    img->host[va - img->base] = val;
+    return 1;
+}
 
 // Compute the effective address for a memory-form ModR/M (mod != 3).
 // Supports the [reg+disp] / [disp32] forms the entry block uses; SIB is
@@ -245,6 +251,25 @@ static int rm_get8(const i386_cpu_t *cpu, const i386_image_t *img,
     uint32_t a;
     if (!i386_ea(cpu, insn, &a)) { *why = I386_HALT_UNSUPPORTED; return 0; }
     if (!mem_read8(img, a, val)) { *why = I386_HALT_OOB; return 0; }
+    return 1;
+}
+
+// Write an 8-bit value to the r/m operand. Register-direct: same byte-
+// register map as rm_get8 (rm<4 = low byte of gpr[rm]; rm>=4 = high byte
+// of gpr[rm-4] / ah/ch/dh/bh). (E5 r9 — for CMPXCHG r/m8,r8 write-back.)
+static int rm_set8(i386_cpu_t *cpu, const i386_image_t *img,
+                   const i386_insn_t *insn, uint8_t val, i386_halt_t *why) {
+    int mod = (insn->modrm >> 6) & 3;
+    if (mod == 3) {
+        int rm = insn->modrm & 7;
+        if (rm < 4) cpu->gpr[rm] = (cpu->gpr[rm] & ~(uint32_t)0xFFu) | (uint32_t)val;
+        else        cpu->gpr[rm - 4] = (cpu->gpr[rm - 4] & ~(uint32_t)0xFF00u)
+                                     | ((uint32_t)val << 8);
+        return 1;
+    }
+    uint32_t a;
+    if (!i386_ea(cpu, insn, &a)) { *why = I386_HALT_UNSUPPORTED; return 0; }
+    if (!mem_write8(img, a, val)) { *why = I386_HALT_OOB; return 0; }
     return 1;
 }
 
@@ -776,6 +801,65 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                 }
                 break;
             }
+            // ── CMPXCHG r/m32,r32 (E5 r9) — 0F B1 /r ─────────────────────────────
+            // Compare EAX with r/m32; if equal: ZF=1, r/m32←reg32; else ZF=0,
+            // EAX←r/m32. Flags set per alu_sub (CF/OF/AF/SF/ZF/PF). Intel SDM
+            // Vol.2 CMPXCHG. Plain lock-free CRT init primitive — no protection.
+            case I386_OP_CMPXCHG_RM_R: {
+                int reg = (insn.modrm >> 3) & 7;   // the "new value" source register
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint32_t rm_v;
+                if (!rm_get32(cpu, img, &insn, &rm_v, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint32_t eax_v = cpu->gpr[I386_REG_EAX];
+                (void)alu_sub(&cpu->eflags, eax_v, rm_v, 0); // flags per SDM CMP
+                if (eax_v == rm_v) {
+                    // ZF already set to 1 by alu_sub (result==0); write reg into r/m
+                    if (!rm_set32(cpu, img, &insn, cpu->gpr[reg], &why)) {
+                        res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                    }
+                } else {
+                    // ZF already 0; EAX ← r/m32
+                    cpu->gpr[I386_REG_EAX] = rm_v;
+                }
+                break;
+            }
+            // ── CMPXCHG r/m8,r8 (E5 r9) — 0F B0 /r ──────────────────────────────
+            // Compare AL with r/m8; if equal: ZF=1, r/m8←reg8; else ZF=0, AL←r/m8.
+            // Flags set per 8-bit alu_sub semantics. Intel SDM Vol.2 CMPXCHG.
+            case I386_OP_CMPXCHG_RM8_R8: {
+                int reg = (insn.modrm >> 3) & 7;   // 8-bit "new value" source reg
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint8_t rm_v8;
+                if (!rm_get8(cpu, img, &insn, &rm_v8, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                uint8_t al = (uint8_t)(cpu->gpr[I386_REG_EAX] & 0xFFu);
+                // Compute 8-bit flags via 32-bit alu_sub (zero-extended operands),
+                // then fixup SF and PF for the 8-bit result width.
+                (void)alu_sub(&cpu->eflags, (uint32_t)al, (uint32_t)rm_v8, 0);
+                uint8_t r8 = (uint8_t)(al - rm_v8);
+                set_flag(&cpu->eflags, EFL_SF, (int)((r8 >> 7) & 1u)); // 8-bit sign
+                { int ones8 = 0;
+                  uint8_t pr = r8;
+                  for (int ii = 0; ii < 8; ii++) ones8 += (pr >> ii) & 1;
+                  set_flag(&cpu->eflags, EFL_PF, (ones8 & 1) == 0); }
+                if (al == rm_v8) {
+                    // Get reg8 value (same byte-reg map as rm_get8)
+                    uint8_t reg_v8;
+                    if (reg < 4) reg_v8 = (uint8_t)(cpu->gpr[reg] & 0xFFu);
+                    else         reg_v8 = (uint8_t)((cpu->gpr[reg - 4] >> 8) & 0xFFu);
+                    if (!rm_set8(cpu, img, &insn, reg_v8, &why)) {
+                        res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                    }
+                } else {
+                    // AL ← r/m8
+                    cpu->gpr[I386_REG_EAX] = (cpu->gpr[I386_REG_EAX] & 0xFFFFFF00u)
+                                            | (uint32_t)rm_v8;
+                }
+                break;
+            }
             // ── E4 kernel32 boundary — indirect IAT call / jump ───────────
             case I386_OP_CALL_RM:               // FF /2 [..]
             case I386_OP_JMP_RM: {              // FF /4 [..]
@@ -790,12 +874,15 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                 }
                 uint32_t slot_va = (uint32_t)insn.disp;
                 const i386_import_t *imp = i386_iat_lookup(cpu->iat, slot_va);
-                if (!imp) {
-                    // Slot is an IAT thunk but no binding is registered — the
-                    // next kernel32 import to implement. own1: we never invent
-                    // the function; we stop and name the slot.
+                if (!imp || !imp->fn) {
+                    // Slot is an IAT thunk but no binding is registered (imp==NULL),
+                    // OR the import was found by name but has no shim (fn==NULL from
+                    // autobind for an unknown import). own1: we never invent the
+                    // function; we stop honestly and record the slot + name if known.
                     res->halt = I386_HALT_UNBOUND_IMPORT; res->halt_va = eip;
-                    res->halt_op = insn.op; res->import_slot = slot_va; return;
+                    res->halt_op = insn.op; res->import_slot = slot_va;
+                    if (imp && imp->name) res->last_import = imp->name; // name from autobind
+                    return;
                 }
                 // BIND: dispatch to the native shim, place the result in EAX
                 // (Win32 ABI), pop stdcall callee-popped args, and continue.
@@ -873,6 +960,102 @@ int i386_cpu_load_pe(const char *path, i386_image_t *out, uint32_t *entry_va) {
     out->owns = 1;
     if (entry_va) *entry_va = (uint32_t)(pe.image_base + pe.entry_point_rva);
     return 0;
+}
+
+// ── IAT name-based autobind (E5 r9) ─────────────────────────────────────────
+// Walk the PE Import Directory in `img` at RVA `import_dir_rva` and match
+// each import name against the name-keyed registry. Writes entries to
+// bound_out[]; fn==NULL entries mark unresolved names (honest: the run loop
+// halts UNBOUND_IMPORT + records last_import=name for those). Returns total
+// imports seen; *bound_count_out = resolved (fn!=NULL); *unbound_count_out =
+// unresolved (fn==NULL). own1: standard PE import resolution over OUR sections
+// — binding our OWN imports to native impls is LOADING, not a bypass. No Wine.
+static const char *img_cstr(const i386_image_t *img, uint32_t va) {
+    // Return a pointer to a C string in the flat image at `va`, or NULL if OOB.
+    if (va < img->base || va >= img->base + img->size) return NULL;
+    return (const char *)(img->host + (va - img->base));
+}
+
+int i386_iat_autobind(
+    const struct i386_image *img,
+    uint32_t                 import_dir_rva,
+    const i386_shim_entry_t *registry,
+    uint32_t                 reg_count,
+    i386_import_t           *bound_out,
+    uint32_t                 max_bound,
+    uint32_t                *bound_count_out,
+    uint32_t                *unbound_count_out)
+{
+    uint32_t n_total = 0, n_bound = 0, n_unbound = 0;
+    if (!img || !img->host || import_dir_rva == 0) {
+        if (bound_count_out)   *bound_count_out   = 0;
+        if (unbound_count_out) *unbound_count_out = 0;
+        return 0;
+    }
+    uint32_t base     = img->base;
+    uint32_t desc_va  = base + import_dir_rva;
+
+    // Walk IMAGE_IMPORT_DESCRIPTOR array (20 bytes each, null-terminated).
+    for (;;) {
+        uint32_t orig_first_thunk, unused1, unused2, name_rva, first_thunk;
+        if (!i386_mem_read32(img, desc_va + 0,  &orig_first_thunk)) break;
+        if (!i386_mem_read32(img, desc_va + 4,  &unused1))          break;
+        if (!i386_mem_read32(img, desc_va + 8,  &unused2))          break;
+        if (!i386_mem_read32(img, desc_va + 12, &name_rva))         break;
+        if (!i386_mem_read32(img, desc_va + 16, &first_thunk))      break;
+        (void)unused1; (void)unused2;
+        // Null terminator: all-zero descriptor (valid entry always has name+thunk).
+        if (orig_first_thunk == 0 && name_rva == 0 && first_thunk == 0) break;
+
+        // Use OriginalFirstThunk (INT) when present, else FirstThunk (IAT).
+        // Both hold RVAs to IMAGE_IMPORT_BY_NAME pre-binding.
+        uint32_t int_va = base + (orig_first_thunk ? orig_first_thunk : first_thunk);
+        uint32_t iat_va = base + first_thunk;
+
+        // Walk INT in lockstep with IAT slots (4 bytes per entry for PE32).
+        for (uint32_t si = 0; ; si++) {
+            uint32_t int_entry;
+            if (!i386_mem_read32(img, int_va + si * 4, &int_entry)) break;
+            if (int_entry == 0) break; // null terminator
+
+            uint32_t slot_va = iat_va + si * 4;
+            const i386_shim_entry_t *found = NULL;
+            const char *imp_name = NULL;
+
+            if (int_entry & 0x80000000u) {
+                // Ordinal import (bit31=1) — not shimmed by name.
+                imp_name = "(ordinal)";
+            } else {
+                // Named import: IMAGE_IMPORT_BY_NAME at base+int_entry.
+                // Skip 2-byte Hint; name follows immediately.
+                uint32_t ibn_va = base + int_entry;
+                imp_name = img_cstr(img, ibn_va + 2);
+                if (imp_name) {
+                    for (uint32_t r = 0; r < reg_count; r++) {
+                        if (strcmp(imp_name, registry[r].name) == 0) {
+                            found = &registry[r];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (n_total < max_bound) {
+                bound_out[n_total].slot_va   = slot_va;
+                bound_out[n_total].name      = found ? found->name
+                                             : (imp_name ? imp_name : "?");
+                bound_out[n_total].fn        = found ? found->fn  : NULL;
+                bound_out[n_total].arg_bytes = found ? found->arg_bytes : 0;
+            }
+            n_total++;
+            if (found) n_bound++;
+            else       n_unbound++;
+        }
+        desc_va += 20; // next descriptor
+    }
+    if (bound_count_out)   *bound_count_out   = n_bound;
+    if (unbound_count_out) *unbound_count_out = n_unbound;
+    return (int)n_total;
 }
 
 void i386_image_free(i386_image_t *img) {

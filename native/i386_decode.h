@@ -101,6 +101,12 @@ typedef enum {
     I386_OP_BTS_RM_R,         // 0F AB /r  — bts r/m32, r32 (CF ← bit; set  bit)
     I386_OP_BTR_RM_R,         // 0F B3 /r  — btr r/m32, r32 (CF ← bit; clear bit)
     I386_OP_BTC_RM_R,         // 0F BB /r  — btc r/m32, r32 (CF ← bit; flip  bit)
+    // ── E5 r9 additions (ordinals 65+; appended) — CMPXCHG (lock-free CRT init
+    // primitive). Compare accumulator (AL/EAX) with r/m; if equal, r/m ← reg and
+    // ZF=1; else accumulator ← r/m and ZF=0. Flags set per SUB semantics (CF/OF/
+    // AF/SF/ZF/PF). Intel SDM Vol.2 — no protection mechanism, plain CPU op.
+    I386_OP_CMPXCHG_RM8_R8,   // 0F B0 /r  — cmpxchg r/m8, r8   (8-bit compare-exchange)
+    I386_OP_CMPXCHG_RM_R,     // 0F B1 /r  — cmpxchg r/m32, r32 (32-bit compare-exchange)
 } i386_op_t;
 
 #define I386_PREFIX_OPSZ   0x01u

@@ -183,6 +183,38 @@ uint32_t i386_shim_SetUnhandledExceptionFilter(i386_cpu_t *cpu, const struct i38
 // the slot is not bound (→ the caller halts UNBOUND_IMPORT honestly).
 const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va);
 
+// ── E5 r9 — IAT name-based autobind ─────────────────────────────────────────
+// A name-keyed shim registry entry for i386_iat_autobind (r9). Matches
+// imported symbols by name (not by synthetic slot VA), so a real i386 PE's
+// IAT gets bound to native shims without hardcoded VAs.
+// own1: binding our OWN PE's imports to native impls is LOADING (what every
+// PE loader does), not a protection bypass. No Wine, no DRM.
+typedef struct {
+    const char         *name;       // imported symbol name (e.g. "GetCurrentThreadId")
+    i386_import_stub_fn fn;         // native shim
+    uint32_t            arg_bytes;  // stdcall callee-pop bytes (0 for 0-arg)
+} i386_shim_entry_t;
+
+// Walk the PE Import Directory in `img` at RVA `import_dir_rva`. For each
+// named import, look it up by name in `registry[0..reg_count)`. Write the
+// result into `bound_out[0..max_bound)`:
+//   fn != NULL → shim found (own import resolved)
+//   fn == NULL → name not in registry (honest; run loop halts UNBOUND_IMPORT
+//                and records last_import=name so the caller knows what's missing)
+// Ordinal imports (bit31=1 in the INT entry) produce fn=NULL entries with
+// name="(ordinal)". Returns total imports seen; *bound_count_out = resolved
+// count (fn!=NULL); *unbound_count_out = unresolved count (fn==NULL).
+// own1: standard PE import resolution over our OWN sections. No Wine.
+int i386_iat_autobind(
+    const struct i386_image *img,        // fwd — full def below; use struct ptr
+    uint32_t                 import_dir_rva,
+    const i386_shim_entry_t *registry,
+    uint32_t                 reg_count,
+    i386_import_t           *bound_out,
+    uint32_t                 max_bound,
+    uint32_t                *bound_count_out,
+    uint32_t                *unbound_count_out);
+
 // Flat memory image: a single contiguous host buffer covering the VA
 // window [base, base+size). VA→host is host + (va - base). Simple and
 // low-risk; the PE loader fills it section-by-section (see

@@ -73,13 +73,26 @@
 // frame and `call` the synthetic user entry. The interpreter detects the call
 // target == cpu.user_entry_va and HALTS I386_HALT_USER_ENTRY (insns 44 → 60).
 // This is the honest E4 completion milestone: CRT init reached `call WinMain`.
-// It is NOT a rendered game frame — validated_manjeom STAYS 0. The WinMain target
-// is OUR OWN synthetic VA; a real frame is real-asset-gated (real i386 game PE +
-// the binary's own IAT auto-bound by import name + its real WinMain → message
-// loop → CreateWindowEx → D3D→Metal, + D3DMetal SDK + a real display) — none of
-// which exists on this host/CI. The B/D walls now use a `0F B1` (cmpxchg)
-// sentinel — the next genuinely-uncovered decoder gap (r9). own1: synthetic
-// shape, our bytes, Intel SDM semantics — no Wine, no protection.
+// It is NOT a rendered game frame — validated_manjeom STAYS 0.
+//
+// E5 r9 — IAT NAME-BASED AUTOBIND + CMPXCHG DECODER. (1) i386_iat_autobind():
+// walks a real PE's Import Directory (IMAGE_IMPORT_DESCRIPTOR → INT → IMAGE_
+// IMPORT_BY_NAME) and matches each import name against the shim registry by
+// STRING, not by hardcoded synthetic VA — so a real i386 PE whose IAT imports
+// any of the 13 K32 names gets its IAT slots bound without any pre-knowledge of
+// slot VAs. Unknown names produce fn=NULL entries (honest; run loop halts
+// UNBOUND_IMPORT with the name recorded in last_import). own1: standard PE
+// import resolution — loading OUR OWN imports, not a bypass; no Wine.
+// (2) CMPXCHG: closes the 0F B0 (cmpxchg r/m8,r8) and 0F B1 (cmpxchg r/m32,r32)
+// decoder gap (C + byte-equal .hexa RUNEQ mirror — RUNEQ corpus D covers all 256
+// 0F second bytes). Interpreter executor: compare EAX/AL with r/m; if equal
+// ZF=1 + r/m←reg; else ZF=0 + EAX/AL←r/m. Flags per alu_sub (Intel SDM Vol.2).
+// (3) Test Run E: synthetic in-memory PE import directory with 3 named K32
+// imports → autobind → assert all 3 slots resolved → mini-run through one bound
+// slot verifies end-to-end dispatch. CMPXCHG equal + not-equal paths exercised
+// with register-direct operands. B/D walls now use `0F C1 C0` (XADD, r10 gap).
+// own1: synthetic PE structure (labeled), our bytes, Intel SDM semantics — no
+// Wine, no protection. validated_manjeom STAYS 0.
 
 #include "i386_cpu.h"
 
@@ -309,12 +322,13 @@ static void build_hermetic(uint8_t *img) {
     i386_mem_write32(&m, TEB_BASE + 0x18, TEB_BASE);   // TEB self-pointer (NtCurrentTeb shape)
     i386_mem_write32(&m, TEB_BASE + 0x30, PEB_BASE);   // TEB→PEB
     i386_mem_write32(&m, PEB_BASE + 0x08, IMG_BASE);   // PEB→ImageBaseAddress
-    // 0F B1 = CMPXCHG r/m32, r32 — still uncovered after r8 (0F A3/AB/B3/BB bt/bts/
-    // btr/btc now decode+execute). The 0x0F two-byte map recognizes Jcc (80..8F) +
-    // movzx/movsx (B6/B7/BE/BF) + imul/cpuid/rdtsc (AF/A2/31) + bit-test (A3/AB/B3/
-    // BB), so 0F B1 → I386_OP_UNKNOWN. Keeps the B/D walls honest and names the next
-    // real decoder gap (CMPXCHG, the lock-free CRT init primitive) for r9.
-    uint8_t wall[] = { 0x0F, 0xB1 };               // representative `cmpxchg` (next gap)
+    // 0F C1 = XADD r/m32, r32 — still uncovered after r9 (0F B0/B1 CMPXCHG now
+    // decode+execute). The 0x0F two-byte map now recognizes Jcc (80..8F) +
+    // movzx/movsx (B6/B7/BE/BF) + imul/cpuid/rdtsc (AF/A2/31) + bit-test
+    // (A3/AB/B3/BB) + cmpxchg (B0/B1), so 0F C1 → I386_OP_UNKNOWN. Keeps the
+    // B/D walls honest and names the next real decoder gap (XADD, the
+    // lock-free increment primitive used in CRT slist / heap init) for r10.
+    uint8_t wall[] = { 0x0F, 0xC1, 0xC0 };         // XADD eax,eax (next gap, r10)
     put_at(img, 0x538BABu, wall, sizeof(wall));    // CALL target (insn 6)
     put_at(img, 0x53872Au, wall, sizeof(wall));    // JMP  target (insn 2)
 }
@@ -457,7 +471,7 @@ int main(int argc, char **argv) {
             printf("__SHIM__ PARTIAL phase=e4_reached_user_entry insns=%u bound=%u last=%s entry_va=0x%X halt=%s halt_op=%s (SYNTHETIC user-entry; validated_manjeom=0)\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
                    i386_halt_name(r.halt), i386_op_name(r.halt_op));
-            printf("__SHIM__ INFO real_pe_path=structurally_ready needs:real_i386_PE+IAT_autobind_by_import_name+wider_opcode_coverage+D3DMetal+display\n");
+            printf("__SHIM__ INFO real_pe_path=iat_autobind_implemented needs:real_i386_PE+wider_opcode_coverage+D3DMetal+display (r10 target: DX->Metal bridge)\n");
         }
     }
 
@@ -529,6 +543,211 @@ int main(int argc, char **argv) {
         CHECK(r.insns == 1,                "executed the JMP (1 insn)");
         CHECK(cpu.eip == 0x53872Au,        "JMP_REL set eip to 0x53872A");
         CHECK(r.halt_va == 0x53872Au,      "wall VA == jmp target 0x53872A");
+    }
+
+    // === Run E — IAT name-based autobind + CMPXCHG ===========================
+    // Build a SYNTHETIC in-memory PE import directory (own1: labeled synthetic,
+    // NOT a real binary; only the IMAGE_IMPORT_DESCRIPTOR / INT / IMAGE_IMPORT_
+    // BY_NAME structures, no real PE headers). Walk it with i386_iat_autobind
+    // and verify all 3 named imports resolve to the correct shims.
+    // Also exercise CMPXCHG r/m32,r32 equal + not-equal paths in the same image.
+    printf("\n[cpu] Run E — IAT name-autobind (3 K32 names) + CMPXCHG equal/not-equal\n");
+    {
+        // ── Synthetic image E: base 0x540000, size 0x1000, zero-filled ───────
+        // Layout (all offsets relative to base 0x540000):
+        //   0x100..0x10B : IAT slots (3 × 4 bytes; autobind writes slot_va here)
+        //   0x200..0x20F : INT entries (3 × 4 + null terminator)
+        //   0x300..0x327 : IMAGE_IMPORT_DESCRIPTOR × 2 (second = null terminator)
+        //   0x380        : "KERNEL32.DLL\0"
+        //   0x400        : IBN for GetCurrentThreadId (hint + name)
+        //   0x420        : IBN for GetTickCount
+        //   0x430        : IBN for GetCommandLineW
+        //   0x500..0x506 : mini-run code: FF 15 [0x540100] + C3 (ret)
+        //   0x600..0x60D : CMPXCHG equal-path code + ret
+        //   0x620..0x62D : CMPXCHG not-equal-path code + ret
+        //   0xE00        : stack area (pre-loaded with sentinel return address)
+        #define E_BASE 0x540000u
+        #define E_SIZE 0x1000u
+        uint8_t *e_buf = (uint8_t *)calloc(1, E_SIZE);
+        i386_image_t e_img = { e_buf, E_BASE, E_SIZE, 0 };
+        #define E_IAT_RVA  0x100u  // RVA of IAT (3 slots × 4 bytes)
+        #define E_INT_RVA  0x200u  // RVA of INT (3 entries + null)
+        #define E_DIR_RVA  0x300u  // RVA of Import Directory
+        #define E_NAME_RVA 0x380u  // RVA of "KERNEL32.DLL\0"
+        #define E_IBN0_RVA 0x400u  // RVA of IBN: GetCurrentThreadId
+        #define E_IBN1_RVA 0x420u  // RVA of IBN: GetTickCount
+        #define E_IBN2_RVA 0x430u  // RVA of IBN: GetCommandLineW
+        // Slot VAs (= image base + IAT_RVA + slot_index * 4)
+        #define E_SLOT0_VA (E_BASE + E_IAT_RVA + 0x0u)   // GetCurrentThreadId
+        #define E_SLOT1_VA (E_BASE + E_IAT_RVA + 0x4u)   // GetTickCount
+        #define E_SLOT2_VA (E_BASE + E_IAT_RVA + 0x8u)   // GetCommandLineW
+
+        // Plant IMAGE_IMPORT_BY_NAME entries (hint=0x0000, then name string).
+        // "GetCurrentThreadId\0" at 0x540400+2
+        e_buf[0x400] = 0x00; e_buf[0x401] = 0x00;    // Hint
+        memcpy(e_buf + 0x402, "GetCurrentThreadId", 19); // 18 chars + \0
+        // "GetTickCount\0" at 0x540420+2
+        e_buf[0x420] = 0x00; e_buf[0x421] = 0x00;
+        memcpy(e_buf + 0x422, "GetTickCount", 13);
+        // "GetCommandLineW\0" at 0x540430+2
+        e_buf[0x430] = 0x00; e_buf[0x431] = 0x00;
+        memcpy(e_buf + 0x432, "GetCommandLineW", 16);
+
+        // Plant INT entries (RVAs to IBN; null-terminated).
+        i386_mem_write32(&e_img, E_BASE + E_INT_RVA + 0,  E_IBN0_RVA);
+        i386_mem_write32(&e_img, E_BASE + E_INT_RVA + 4,  E_IBN1_RVA);
+        i386_mem_write32(&e_img, E_BASE + E_INT_RVA + 8,  E_IBN2_RVA);
+        i386_mem_write32(&e_img, E_BASE + E_INT_RVA + 12, 0);  // null terminator
+
+        // Plant "KERNEL32.DLL\0" (DLL name string).
+        memcpy(e_buf + E_NAME_RVA, "KERNEL32.DLL", 13);
+
+        // Plant IMAGE_IMPORT_DESCRIPTOR (20 bytes):
+        //   OriginalFirstThunk = E_INT_RVA, TimeDateStamp = 0, ForwarderChain = 0,
+        //   Name = E_NAME_RVA, FirstThunk = E_IAT_RVA.
+        i386_mem_write32(&e_img, E_BASE + E_DIR_RVA + 0,  E_INT_RVA);
+        i386_mem_write32(&e_img, E_BASE + E_DIR_RVA + 4,  0);
+        i386_mem_write32(&e_img, E_BASE + E_DIR_RVA + 8,  0);
+        i386_mem_write32(&e_img, E_BASE + E_DIR_RVA + 12, E_NAME_RVA);
+        i386_mem_write32(&e_img, E_BASE + E_DIR_RVA + 16, E_IAT_RVA);
+        // Null terminator descriptor (20 bytes of zeros; calloc already zero-fills).
+
+        // ── Name registry for autobind: 3 K32 names matched to shims ─────────
+        // own1: these are the same native shims as the hermetic IAT binding,
+        // now matched by name rather than hardcoded slot VA.
+        static const i386_shim_entry_t E_REGISTRY[] = {
+            { "GetCurrentThreadId",  i386_shim_GetCurrentThreadId,  0 },
+            { "GetTickCount",        i386_shim_GetTickCount,        0 },
+            { "GetCommandLineW",     i386_shim_GetCommandLineW,     0 },
+        };
+        #define E_REG_COUNT 3u
+        #define E_MAX_BOUND 8u
+
+        i386_import_t  e_bound[E_MAX_BOUND];
+        uint32_t e_n_bound = 0, e_n_unbound = 0;
+        int e_total = i386_iat_autobind(&e_img, E_DIR_RVA,
+                                        E_REGISTRY, E_REG_COUNT,
+                                        e_bound, E_MAX_BOUND,
+                                        &e_n_bound, &e_n_unbound);
+        printf("  autobind: total=%d bound=%u unbound=%u\n",
+               e_total, e_n_bound, e_n_unbound);
+
+        CHECK(e_total == 3,    "autobind saw 3 imports in the synthetic directory");
+        CHECK(e_n_bound == 3,  "all 3 imports resolved by name to shims");
+        CHECK(e_n_unbound == 0,"no unbound imports (all 3 names in registry)");
+        // Verify each bound entry's slot_va and function pointer.
+        CHECK(e_total >= 1 && e_bound[0].slot_va == E_SLOT0_VA && e_bound[0].fn != NULL,
+              "bound[0] slot_va == GetCurrentThreadId slot & fn != NULL");
+        CHECK(e_total >= 2 && e_bound[1].slot_va == E_SLOT1_VA && e_bound[1].fn != NULL,
+              "bound[1] slot_va == GetTickCount slot & fn != NULL");
+        CHECK(e_total >= 3 && e_bound[2].slot_va == E_SLOT2_VA && e_bound[2].fn != NULL,
+              "bound[2] slot_va == GetCommandLineW slot & fn != NULL");
+        CHECK(e_total >= 1 && e_bound[0].name && strcmp(e_bound[0].name,"GetCurrentThreadId")==0,
+              "bound[0].name == \"GetCurrentThreadId\"");
+        CHECK(e_total >= 2 && e_bound[1].name && strcmp(e_bound[1].name,"GetTickCount")==0,
+              "bound[1].name == \"GetTickCount\"");
+        CHECK(e_total >= 3 && e_bound[2].name && strcmp(e_bound[2].name,"GetCommandLineW")==0,
+              "bound[2].name == \"GetCommandLineW\"");
+
+        // ── Mini-run: dispatch through the autobind-produced IAT ─────────────
+        // Place `FF 15 [E_SLOT0_VA]` + `C3` at 0x540500.
+        // Expected: GetCurrentThreadId shim → EAX=0x00001A2Bu; then RET halts.
+        // Pre-write a sentinel return addr at [ESP] (0x540E00).
+        uint8_t call_insn[] = {
+            0xFF, 0x15,
+            (uint8_t)(E_SLOT0_VA & 0xFF),
+            (uint8_t)((E_SLOT0_VA >> 8) & 0xFF),
+            (uint8_t)((E_SLOT0_VA >> 16) & 0xFF),
+            (uint8_t)((E_SLOT0_VA >> 24) & 0xFF),
+            0xC3  /* ret */
+        };
+        memcpy(e_buf + 0x500, call_insn, sizeof(call_insn));
+        uint32_t e_ret_sentinel = E_BASE + 0xF00u;  // in-image sentinel return addr
+        i386_mem_write32(&e_img, E_BASE + 0xE00u, e_ret_sentinel);
+
+        i386_iat_t e_iat = { e_bound, (uint32_t)e_total };
+        {
+            i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
+            cpu.eip = E_BASE + 0x500u;
+            cpu.gpr[I386_REG_ESP] = E_BASE + 0xE00u;
+            cpu.iat = &e_iat;
+            i386_run_result_t r;
+            i386_cpu_run(&cpu, &e_img, 100, &r);
+            printf("  mini-run: halt=%s eax=0x%X imports_bound=%u\n",
+                   i386_halt_name(r.halt), cpu.gpr[I386_REG_EAX], r.imports_bound);
+            CHECK(r.halt == I386_HALT_RET,  "mini-run: halted on RET after autobind dispatch");
+            CHECK(cpu.gpr[I386_REG_EAX] == SHIM_TID,
+                  "mini-run: EAX == GetCurrentThreadId stub return (0x1A2B)");
+            CHECK(r.imports_bound == 1,     "mini-run: one autobind IAT call dispatched");
+        }
+
+        // ── CMPXCHG r/m32,r32 equal path (0F B1) ────────────────────────────
+        // `cmpxchg ecx, eax` (0F B1 C1): compare EAX with r/m32=ECX; equal →
+        //   ZF=1, ECX←EAX. ModR/M=0xC1: mod=3, reg=0(eax), rm=1(ecx).
+        // Instruction sequence at 0x540600 (14 bytes + ret):
+        //   B8 78 56 34 12  mov eax, 0x12345678
+        //   B9 78 56 34 12  mov ecx, 0x12345678
+        //   0F B1 C1        cmpxchg ecx, eax      (equal path)
+        //   C3              ret
+        static const uint8_t CMPXCHG_EQ[] = {
+            0xB8, 0x78, 0x56, 0x34, 0x12,   // mov eax, 0x12345678
+            0xB9, 0x78, 0x56, 0x34, 0x12,   // mov ecx, 0x12345678
+            0x0F, 0xB1, 0xC1,               // cmpxchg ecx, eax
+            0xC3                            // ret
+        };
+        memcpy(e_buf + 0x600, CMPXCHG_EQ, sizeof(CMPXCHG_EQ));
+        {
+            i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
+            cpu.eip = E_BASE + 0x600u;
+            cpu.gpr[I386_REG_ESP] = E_BASE + 0xE00u;
+            // Re-write return sentinel (was consumed by mini-run above).
+            i386_mem_write32(&e_img, E_BASE + 0xE00u, e_ret_sentinel);
+            i386_run_result_t r;
+            i386_cpu_run(&cpu, &e_img, 100, &r);
+            printf("  cmpxchg equal:   halt=%s eax=0x%X ecx=0x%X ZF=%u\n",
+                   i386_halt_name(r.halt), cpu.gpr[I386_REG_EAX],
+                   cpu.gpr[I386_REG_ECX], (cpu.eflags >> 6) & 1u);
+            CHECK(r.halt == I386_HALT_RET,        "CMPXCHG equal-path: halted on RET");
+            CHECK(cpu.gpr[I386_REG_EAX] == 0x12345678u,
+                  "CMPXCHG equal: EAX unchanged (0x12345678)");
+            CHECK(cpu.gpr[I386_REG_ECX] == 0x12345678u,
+                  "CMPXCHG equal: ECX←EAX = 0x12345678 (no-op write-back)");
+            CHECK((cpu.eflags >> 6) & 1u,         "CMPXCHG equal: ZF=1 (result==0)");
+        }
+
+        // ── CMPXCHG r/m32,r32 not-equal path (0F B1) ────────────────────────
+        // `cmpxchg ecx, eax` (0F B1 C1): compare EAX with r/m32=ECX; not equal →
+        //   ZF=0, EAX←ECX. Pre-set EAX=0xAAAAAAAA, ECX=0xBBBBBBBB.
+        static const uint8_t CMPXCHG_NE[] = {
+            0xB8, 0xAA, 0xAA, 0xAA, 0xAA,   // mov eax, 0xAAAAAAAA
+            0xB9, 0xBB, 0xBB, 0xBB, 0xBB,   // mov ecx, 0xBBBBBBBB
+            0x0F, 0xB1, 0xC1,               // cmpxchg ecx, eax   (not-equal path)
+            0xC3                            // ret
+        };
+        memcpy(e_buf + 0x620, CMPXCHG_NE, sizeof(CMPXCHG_NE));
+        {
+            i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
+            cpu.eip = E_BASE + 0x620u;
+            cpu.gpr[I386_REG_ESP] = E_BASE + 0xE00u;
+            i386_mem_write32(&e_img, E_BASE + 0xE00u, e_ret_sentinel);
+            i386_run_result_t r;
+            i386_cpu_run(&cpu, &e_img, 100, &r);
+            printf("  cmpxchg not-eq:  halt=%s eax=0x%X ecx=0x%X ZF=%u\n",
+                   i386_halt_name(r.halt), cpu.gpr[I386_REG_EAX],
+                   cpu.gpr[I386_REG_ECX], (cpu.eflags >> 6) & 1u);
+            CHECK(r.halt == I386_HALT_RET,          "CMPXCHG not-equal-path: halted on RET");
+            CHECK(cpu.gpr[I386_REG_EAX] == 0xBBBBBBBBu,
+                  "CMPXCHG not-equal: EAX←ECX = 0xBBBBBBBB");
+            CHECK(cpu.gpr[I386_REG_ECX] == 0xBBBBBBBBu,
+                  "CMPXCHG not-equal: ECX unchanged = 0xBBBBBBBB");
+            CHECK(!((cpu.eflags >> 6) & 1u),        "CMPXCHG not-equal: ZF=0 (result!=0)");
+        }
+
+        printf("__SHIM__ PARTIAL phase=e4_iat_name_autobind names_resolved=%u unbound=%u dispatch_ok=1 (SYNTHETIC import dir; own1: name-based import binding=LOADING; validated_manjeom=0)\n",
+               e_n_bound, e_n_unbound);
+        printf("__SHIM__ INFO real_pe=iat_autobind_implemented needs:real_i386_PE+wider_opcode_coverage+D3DMetal+display r10_target=DX_to_Metal_bridge(lib/loader/dx_d3d11.hexa_scaffold)\n");
+
+        free(e_buf);
     }
 
     free(img_buf);
