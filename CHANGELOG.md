@@ -6,6 +6,31 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r10): **헤드리스 Metal 오프스크린 렌더 + 픽셀 readback 스모크 (E5 서브스트레이트 증명)**
+  — r9 가 명시한 다음 과제(`r10 표적 = DX→Metal 브리지(헤드리스 Metal 오프스크린 readback smoke 먼저 CI 검증)`)를
+  완료한다. **서브스트레이트 증명 — 게임 프레임 아님; `validated_manjeom` 여전히 0.** (1) **`native/metal_offscreen_smoke.m`**
+  (Objective-C + Metal + Foundation): `MTLCreateSystemDefaultDevice()` 호출 → GPU 없으면
+  `__METAL_SMOKE__ SKIP reason=no_device` + `exit(0)`(정직 ground-truth, 실패 아님).
+  GPU 있으면: 64×64 `MTLPixelFormatBGRA8Unorm` 오프스크린 텍스처(`RenderTarget|ShaderRead·StorageModeShared`)
+  생성, `newLibraryWithSource:`로 인라인 MSL(vertex + fragment) 컴파일, 렌더 패스 = blue 클리어(RGBA 0,0,1,1)
+  + red 삼각형(RGBA 1,0,0,1) 1개 드로우, `waitUntilCompleted`, `-[MTLTexture getBytes:bytesPerRow:fromRegion:mipmapLevel:]`
+  로 픽셀 readback. 픽셀 어서션: 클리어 영역 = `0x0000FFFF`(blue), 삼각형 영역 = `0xFF0000FF`(red),
+  두 픽셀이 다름(`nonuniform=1`) — 실 렌더가 일어났음. 통과 시 `__METAL_SMOKE__ PASS device=<name>
+  px_clear=<hex> px_triangle=<hex> nonuniform=1`, 실패 시 `__METAL_SMOKE__ FAIL reason=...`.
+  서드파티 없음(Metal + Foundation만). (2) **`native/build.sh`** — `metal_offscreen_smoke` 빌드 타깃
+  추가(ObjC ARC + Metal/Foundation 프레임워크; `-std=c11`·`-Wpedantic` 제외). ad-hoc codesign.
+  (3) **`.github/workflows/ci.yml`** — `Smoke — headless Metal offscreen render (E5 substrate)` 스텝
+  추가: E3 native 인터프리터 스텝 직후, CLI smoke 직전. compile + run → `__METAL_SMOKE__` 파싱 →
+  PASS/SKIP/FAIL 각각 명확히 로그. **warn-only**(컴파일 실패·GPU 없음·런타임 오류 모두 `::warning::`;
+  빌드를 red 내지 않음) — 러너의 GPU 유무를 학습하는 것이 목표. 로컬 실행 결과(M4 Mac):
+  `__METAL_SMOKE__ PASS device=Apple M4 px_clear=0x0000FFFF px_triangle=0xFF0000FF nonuniform=1`.
+  Blacksmith CI 러너(`blacksmith-6vcpu-macos-15`, 실 Apple-Silicon·GPU 탑재) 결과는 CI 로그에서 확인 예정.
+  **own1**: 순수 Apple Metal(프로젝트 자체 렌더 타깃), Wine 0·DRM bypass 0·게임 애셋 0.
+  gamebox 자작 삼각형 = 서브스트레이트 증명, 인터프리터를 통한 게임 프레임 아님.
+  **r11 목표**: D3D11 device/swapchain 셰임(`lib/loader/dx_d3d11.hexa` 실 Metal 배선) — CreateDevice/
+  CreateSwapChain 호출을 이 증명된 Metal 오프스크린 경로로 라우팅 + 최소 D3D11 테스트 PE(own1 클린 자작)
+  인터프리터 실행 게이트.
+
 - feat(F-NSWINDOW-E5 r9): **IAT 이름 기반 자동 바인딩 + CMPXCHG 디코더·실행**
   — r8 이 `INFO real_pe_path=structurally_ready needs:IAT_autobind_by_import_name`
   으로 명시한 다음 과제를 완료한다. (1) **`i386_iat_autobind()`**

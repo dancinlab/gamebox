@@ -36,11 +36,22 @@ build_signed "pe_to_macho_shim" pe_to_macho_shim.c pe_parse.c
 build_signed "i386_decode_test" i386_decode_test.c i386_decode.c pe_parse.c
 build_signed "i386_cpu_test" i386_cpu_test.c i386_cpu.c i386_decode.c pe_parse.c
 
+# metal_offscreen_smoke — Objective-C + Metal; own1: plain Apple Metal,
+# no game asset, substrate proof (validated_manjeom stays 0).
+# Does NOT use -std=c11 / -Wpedantic (ObjC, not C11).
+echo "[build] compiling metal_offscreen_smoke (arch=arm64, sdk=macosx, ObjC+Metal)"
+"$CC" -arch arm64 -isysroot "$SDK" -fobjc-arc -O2 -Wall -Wextra \
+    -framework Metal -framework Foundation \
+    -o metal_offscreen_smoke metal_offscreen_smoke.m
+echo "[build] codesigning metal_offscreen_smoke (ad-hoc)"
+codesign --force --sign - --timestamp=none metal_offscreen_smoke
+
 echo "[build] verifying signatures"
 codesign --verify --verbose=2 pe_to_macho_shim || true
 codesign --verify --verbose=2 i386_decode_test || true
 codesign -d --entitlements - pe_to_macho_shim 2>&1 | head -10 || true
 
 codesign --verify --verbose=2 i386_cpu_test || true
+codesign --verify --verbose=2 metal_offscreen_smoke || true
 
-echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]"
+echo "[build] done — ./pe_to_macho_shim <pe.exe>  /  ./i386_decode_test <pe.exe> [count]  /  ./i386_cpu_test [pe.exe]  /  ./metal_offscreen_smoke"
