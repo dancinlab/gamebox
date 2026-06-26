@@ -6,6 +6,43 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r6): **CRT-security import 3개 추가 바인딩 + 0F B6/B7/BE/BF
+  MOVZX/MOVSX 디코더 갭 종결 + 합성 TEB→PEB→ImageBase 체인** — r5 의 벽(미등록 IAT
+  호출 @`0x5392A1`, insns=18)을 **넘는다**. (1) `native/i386_cpu.{c,h}` 에 세 개의
+  kernel32 셰임 추가: `IsProcessorFeaturePresent(DWORD)`(1-arg → BOOL 1, 기능
+  present 결정적 주장), `InitializeSListHead(PSLIST_HEADER)`(1-arg ptr, push 된
+  포인터 `[esp]` 의 8-byte SLIST 헤더를 0 으로 — 버퍼-쓰기), `GetModuleHandleW(
+  LPCWSTR)`(1-arg, HMODULE=로더가 아는 **자기 이미지 베이스** 반환). IAT 등록
+  슬롯 `0x538000..0x53801C` 로 8개(count=8). (2) `native/i386_decode.{c,h}` +
+  byte-equal `.hexa` 미러: 2-byte(0F) 맵에 enum `I386_OP_MOVZX_RM8`(53)/`_RM16`(54)/
+  `I386_OP_MOVSX_RM8`(55)/`_RM16`(56) + 디코드 분기(B6/B7/BE/BF, ModR/M reg=dst
+  r32, r/m8|r/m16 src) 추가, op_name="movzx"/"movsx"; 0F 의 `avail<6` 가드를
+  `avail<2`(+Jcc 만 `<6`)로 분리해 짧은 movzx 도 디코드. 인터프리터는 r/m8(레지스터
+  바이트맵 al..bh / mem `mem_read8`)·r/m16 을 zero/sign-extend → r32, **EFLAGS 불변**.
+  (3) **BOUNDED-SYNTHETIC TEB**: `i386_cpu` 에 `teb_base` 필드 추가 — 메모리 오퍼랜드가
+  FS 세그먼트-override 프리픽스(0x64, 이미 디코드됨)를 달면 `i386_ea` 가 유효주소를
+  `teb_base+disp` 로 리디렉트. 합성 TEB(self@+0x18) → PEB(@TEB+0x30) → ImageBase
+  (@PEB+8) 의 몇 개 필드만 이미지 메모리에 깔아 보안쿠키/CRT-startup 프롤로그의
+  `mov ecx, fs:[0x18]` 체인이 **돈다**(OS TEB 아님·보호구조 아님, 정직 라벨). hermetic
+  테스트(`native/i386_cpu_test.c`) Run A 는 r5 합성 프롤로그 뒤에 `push 0xA; call
+  IsProcessorFeaturePresent` / `movzx ecx,al; movsx edx,cl`(신규 두-바이트 실증) /
+  `push &slist; call InitializeSListHead`(8B 제로화 검증, 사전 더티 `0xFFFFFFFF`) /
+  `push 0; call GetModuleHandleW`(→ 이미지 베이스) / `mov ecx,fs:[0x18]; mov edx,
+  [ecx+0x30]; mov eax,[edx+8]`(TEB→PEB→ImageBase) / 미등록 `call` 을 이어 붙여
+  경계 통과를 증명: **insns 18→30, halt `0x5392A1`→`0x5392D4`**(reason=
+  UNBOUND_IMPORT, slot `0x538020`), bound=8, last=GetModuleHandleW,
+  eax=ImageBase(`0x538000`)·ecx=TEB(`0x539C00`)·edx=PEB(`0x539C80`) 실증,
+  esp=esp0-8(엔트리 반환주소+미pop push). B/D sentinel 은 `0F B6`(이제 실행됨)→
+  `0F A2`(CPUID, 다음 진짜 디코더 갭) 으로 교체. 측정 라인 `__SHIM__ PARTIAL
+  phase=e4_crt_security_teb insns=30 bound=8 last=GetModuleHandleW
+  halt_va=0x5392D4 halt=unbound_import halt_op=call unbound_slot=0x538020`,
+  `__SHIM_TEST__ PASS`(CI 게이트, Run A 17 checks 전부 green, 로컬 clang
+  `-Wall -Wextra -Wpedantic -std=c11` 청정). **own1**: 로더가 자기 프로세스의 **자기
+  import**(kernel32 OS API)를 네이티브 구현에 묶는 **로딩** — 우회 아님; TEB 는 **자기
+  합성 블록**(필드 몇 개)이지 OS TEB 도, 보호장치도 아님. `validated_manjeom` 은
+  여전히 **0**(로더 진척이지 렌더된 프레임 아님). 다음 r7: 미등록 slot `0x538020`
+  바인딩(GetStartupInfoW/GetProcAddress 등) + `0F A2` CPUID 디코더 갭 + 풀 보안쿠키
+  연산(time/pid/tid XOR·mul) → `main`/`WinMain` 도달, user32 `CreateWindowEx` 거리.
 - feat(F-NSWINDOW-E5 r5): **CRT-init import 5개 연속 바인딩 + 첫 버퍼-쓰기 셰임 +
   0xC1 shift-group 디코더 갭 종결** — r4 의 벽(미등록 IAT 호출 @`0x53927C`,
   insns=11)을 **넘는다**. `native/i386_cpu.{c,h}` 에 네 개의 kernel32 셰임 추가:

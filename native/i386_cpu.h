@@ -34,6 +34,15 @@
 //       (GetSystemTimeAsFileTime — reads a pushed pointer arg, writes 8 bytes
 //       into image memory). Anything else halts honestly (UNKNOWN / UNSUPPORTED
 //       / UNBOUND_IMPORT) with the wall VA.
+//
+// Coverage (E5 r6 — CRT security/startup + MOVZX/MOVSX + synthetic TEB):
+//   MOVZX/MOVSX r32, r/m8|r/m16 (0F B6/B7/BE/BF — zero/sign-extend, no EFLAGS) ·
+//   three more kernel32 shims (IsProcessorFeaturePresent / InitializeSListHead
+//   [buffer-zero] / GetModuleHandleW → image base) · a BOUNDED-SYNTHETIC TEB:
+//   an FS segment-override (0x64) on a memory operand redirects the effective
+//   address into a few-field synthetic TEB/PEB (teb_base; self@+0x18, PEB@+0x30,
+//   ImageBase@PEB+8) so the security-cookie / CRT-startup `fs:[..]` chain runs.
+//   own1: synthetic block, NOT the OS TEB and NOT a protection structure.
 
 #ifndef GAMEBOX_I386_CPU_H
 #define GAMEBOX_I386_CPU_H
@@ -81,6 +90,16 @@ struct i386_cpu {
     uint32_t eip;
     uint32_t eflags;
     const i386_iat_t *iat;   // optional import registry (NULL → no bindings)
+    // ── E5 r6 SYNTHETIC TEB (NOT the real OS TEB) ───────────────────────────
+    // Linear base of a BOUNDED-SYNTHETIC Thread Environment Block modeled in
+    // image memory, so the MSVC security-cookie / CRT-startup prologue can read
+    // `fs:[disp]` (e.g. fs:[0x18] = TEB self, [TEB+0x30] = PEB, [PEB+8] =
+    // ImageBaseAddress). When a memory operand carries the FS segment-override
+    // prefix, the interpreter redirects its effective address to teb_base+disp.
+    // own1: this is OUR synthetic block (a few fields), NOT the OS-supplied TEB
+    // and NOT a protection structure — just enough for the cookie math to run.
+    // 0 → no TEB modeled (an fs: access then halts OOB honestly).
+    uint32_t teb_base;
 };
 
 // Native kernel32 shim — GetCurrentThreadId (WINAPI/stdcall, 0 args, → DWORD).
@@ -99,6 +118,17 @@ uint32_t i386_shim_GetCurrentProcessId(i386_cpu_t *cpu, const struct i386_image 
 uint32_t i386_shim_GetTickCount(i386_cpu_t *cpu, const struct i386_image *img);
 uint32_t i386_shim_GetSystemTimeAsFileTime(i386_cpu_t *cpu, const struct i386_image *img);
 uint32_t i386_shim_QueryPerformanceCounter(i386_cpu_t *cpu, const struct i386_image *img);
+
+// Further CRT-security/startup kernel32 shims (E5 r6). own1: native re-impls of
+// the OS API surface bound to the program's OWN imports — loading, not a bypass.
+//   IsProcessorFeaturePresent(DWORD)  — 1-arg, returns BOOL 1 (feature present).
+//   InitializeSListHead(PSLIST_HEADER)— 1 ptr arg, void; zeroes the 8-byte
+//       SLIST header in image memory at the pushed pointer (buffer-write).
+//   GetModuleHandleW(LPCWSTR)         — 1 ptr arg, returns HMODULE == the loaded
+//       module's image base (the loader knows its own base).
+uint32_t i386_shim_IsProcessorFeaturePresent(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_InitializeSListHead(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_GetModuleHandleW(i386_cpu_t *cpu, const struct i386_image *img);
 
 // Look up an IAT slot VA in the registry. Returns NULL if `iat` is NULL or
 // the slot is not bound (→ the caller halts UNBOUND_IMPORT honestly).
