@@ -4,7 +4,28 @@ All notable changes to `gamebox` are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(ci): CI 가 **아무것도 검증하지 않던** 공허 통과를 root-cause 교정 —
+  8 테스트 파일은 전부 `fn self_test()` + `main()` dispatch(own2 mandate)이고
+  `@test` fn 은 0개인데, CI 가 `hexa test <file>`(=@test 러너)을 써서 0개 실행 →
+  무조건 green 이었다. `hexa run <file> self-test`(main→self_test dispatch)로
+  교정 → 8 self_test 가 비로소 실제 실행·검증된다. (로컬 실측: `hexa test` 는
+  무출력/행, `hexa run self-test` 는 own2 PASS 라인 출력.)
+- test(battlenet cond.3): `test_d2r_archive_round_trip` 에
+  `check_battlenet_cond_3_oauth()` 추가 — OAuth2 6 op_kind(특히 device_code_grant)
+  emit 마커를 skeleton-validate(live + grep fallback). cond.3 deepening 이 CI 8파일
+  루프에서 실제 검증되도록 배선(wire-to-prod). cond.3 status 는 partial 유지.
+
 ### Added
+
+- feat(battlenet cond.3): `pe_battle_net_oauth_token` self_test 가 op_kind 6
+  `device_code_grant`(`/oauth/device` RFC8628) 을 비로소 exercise — 헤더에
+  문서화됐으나 self_test 미커버였던 갭을 닫음(6 op_kind 전부 round-trip). 합성
+  데이터·token 실값 0·length-only·실 네트워크 0(own1 준수). 어서션 정합:
+  op_count 6→7, total_token_lifetime_sec 345600→432000, total_token_size_bytes
+  5120→6144, count_by_op_kind(6) 0→1, stats `[7,432000,6144,2]`, emit ≥8.
+  cond.3 status 는 partial 유지(실 OAuth 엔드포인트 network smoke 게이트 = blk.1).
 
 - docs(CLAUDE.md): CI(Blacksmith) 규율 박제 — `## CI — builds run on Blacksmith,
   NOT locally` 섹션 추가(워크플로/러너/툴체인/실행 내용 + "로컬 빌드 말고 push
