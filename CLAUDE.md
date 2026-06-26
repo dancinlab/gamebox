@@ -57,33 +57,12 @@ without the engine checked out.
 Run via `bash .harness-engine/bin/harness <cmd>` (or, with an external tsx,
 `HARNESS_REPO_ROOT="$PWD" <tsx> .harness-engine/cli/index.ts <cmd>`).
 
-## CI — builds run on Blacksmith, NOT locally
+## CI — cloud macOS runner, NOT local
 
-gamebox is Apple-native (Win32 PE + D3DMetal), so its hexa compile + the
-apple-only test suite need a macOS host. Running that locally (242+ perf
-modules + 8 test files) spikes memory and **crashes the dev Mac** — so CI runs
-on a Blacksmith cloud Apple-Silicon runner instead.
-
-- **Workflow** — `.github/workflows/ci.yml`, job `build-test`, on every
-  push to `main`/`master` + every PR + `workflow_dispatch`.
-- **Runner** — `blacksmith-6vcpu-macos-15` (native Apple-Silicon cloud Mac).
-  Pinned to `macos-15` (NOT `-26`) — same rationale as hexa-lang `release.yml`:
-  the Mach-O min-OS baseline rides the builder SDK, so the pin keeps it stable.
-  same-org (`dancinlab`) Blacksmith is already enabled (hexa-lang uses it), so
-  no extra activation is needed.
-- **Toolchain** — the released `hexa` binary, installed via the canonical
-  one-liner (`install.sh` → `~/.hx/bin`). gamebox is a downstream consumer, not
-  the compiler repo, so it installs the release — it does not build hexa.
-- **What it runs** — `hexa run <file> self-test` over the 8 `[test].files` in
-  `hexa.toml` (NOT `hexa test`, which runs `@test` fns — these files are
-  `self_test()`/`main()` and would pass vacuously); then the native i386
-  interpreter test (`native/i386_cpu_test`, the E3 first-execution gate, clang
-  on the runner); then a gamebox CLI smoke (`status` / `selftest --quick`,
-  warn-only since D3DMetal SDK is absent on the runner).
-
-**Rule for working here**: don't run heavy `hexa test` / builds on the local
-Mac — just `git push` and let Blacksmith build. The dev box should only ever
-push. Check results with `gh pr checks` / `gh run list`.
+- do: build on GitHub-hosted `macos-15` (Apple-Silicon) via `.github/workflows/ci.yml` job `build-test` (push to `main`/`master` + PR + dispatch); gamebox is PUBLIC so these macOS minutes are FREE.
+- do: just `git push` then check `gh pr checks` / `gh run list` — CI installs released `hexa`, runs the 8 `self-test` files + native i386 (`i386_cpu_test`) + Metal/D3D11 substrate smokes.
+- dont: use the paid Blacksmith runner (`blacksmith-6vcpu-macos-15`) — removed on owner instruction for cost (deliberate per-repo override of the `blacksmith-ci` default).
+- dont: run heavy `hexa test` / full builds on the dev Mac (242+ perf modules crash it); use `hexa test` for the suite (vacuous — use `hexa run <file> self-test`); unpin from `macos-15`.
 
 ## Quick reference
 
