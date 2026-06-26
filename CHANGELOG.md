@@ -16,6 +16,19 @@ All notable changes to `gamebox` are documented in this file.
   `check_battlenet_cond_3_oauth()` 추가 — OAuth2 6 op_kind(특히 device_code_grant)
   emit 마커를 skeleton-validate(live + grep fallback). cond.3 deepening 이 CI 8파일
   루프에서 실제 검증되도록 배선(wire-to-prod). cond.3 status 는 partial 유지.
+- test(purple cond.3): plaync OAuth state machine 의 **token_refresh-FAIL leg** gap 종결 —
+  `c_purple_plaync_oauth_proxy.hexa` self_test 는 stage=3(token_refresh) 을 `success=1`
+  (refresh OK) 으로만 행사했으나, header line 6(token_refresh stage) + line 29(success=0
+  사유 "token 만료")가 DOCUMENT 한 **refresh_token 만료 → 재로그인(stage=3 success=0)**
+  leg 는 MISSING 이었다. 합성 행 `record_oauth(4004, 3, 90000, 0)` 추가로 행사하고
+  의존 assertion 전부 내부정합 갱신(oauth_count 4→5, fail_count 1→2, total_us
+  740000→830000, count_by_stage(3) 1→2, ppop_stats[2] 740000→830000, emit ≥5→≥7) +
+  새 emit 마커 `plaync_oauth_refresh_fail` 발신. CI 8파일 중
+  `test_purple_lineage_offline_shim.hexa` 에 `check_purple_cond3_oauth_refresh_fail()`
+  추가(grep 마커 + live `out.contains("refresh_fail=1")`) + `track_b_purple_cond3` emit
+  배선 → 변경이 dead 가 아니라 CI 검증됨. **cond.3 status 는 partial 유지**
+  (purple_launcher.blk.1 — plaync online endpoint network-gated). own1: 합성 데이터만,
+  실제 plaync account/network/token 0건, **GameGuard blocked-not-bypassed**.
 
 ### Added
 
