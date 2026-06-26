@@ -6,6 +6,44 @@ All notable changes to `gamebox` are documented in this file.
 
 ### Added
 
+- feat(F-NSWINDOW-E5 r7): **CRT import 3개 추가 바인딩 + IMUL/CPUID/RDTSC 디코더
+  갭 종결 + `__security_init_cookie` 산술 실행** — r6 의 벽(미등록 IAT 호출
+  @`0x5392D4`, insns=30)을 **넘는다**. (1) `native/i386_cpu.{c,h}` 에 세 개의
+  kernel32 셰임 추가: `GetStartupInfoW(LPSTARTUPINFOW)`(1-arg ptr, push 된 포인터
+  `[esp]` 의 STARTUPINFOW 0x44B 를 0 으로 + `cb=0x44` 스탬프 — 버퍼-쓰기),
+  `GetSystemInfo(LPSYSTEM_INFO)`(1-arg ptr, **bounded-synthetic** SYSTEM_INFO
+  0x24B — dwPageSize=0x1000·nCPU=4·arch=INTEL, 나머지 0), `GetProcAddress(HMODULE,
+  LPCSTR)`(2-arg → **합성 in-image 스텁 주소** `base+0x1FF0`). IAT 등록 슬롯
+  `0x538000..0x538028` 로 11개(count=11). (2) `native/i386_decode.{c,h}` +
+  byte-equal `.hexa` 미러: enum `I386_OP_IMUL_R_RM`(57, `0F AF`)/`_IMM`(58, `69 id`/
+  `6B ib`)/`I386_OP_CPUID`(59, `0F A2`)/`I386_OP_RDTSC`(60, `0F 31`) + 디코드
+  분기 추가, op_name="imul"/"cpuid"/"rdtsc". 인터프리터: **IMUL** 은 32-bit signed
+  곱의 하위 32-bit 를 dst(ModR/M.reg)에, int32 오버플로면 CF=OF=1(SDM Vol.2);
+  **CPUID** 는 leaf(eax)별 **합성** 피처셋(leaf0 vendor "GenuineIntel"·max-leaf,
+  leaf1 family/feature) 을 eax/ebx/ecx/edx 에; **RDTSC** 는 `cpu->tsc += step` 합성
+  단조 카운터를 edx:eax 에 기록. CPUID/RDTSC 는 평범한 CPU 명령(보호 아님). (3)
+  **보안쿠키 산술**: hermetic 프롤로그가 FILETIME 엔트로피 로드 → `xor` →
+  `imul eax,eax,0x01000193`(신규 0x69 IMUL) → 글로벌 슬롯에 **비기본 쿠키** 저장 →
+  `cpuid`(GenuineIntel) → `rdtsc`. (4) hermetic 테스트(`native/i386_cpu_test.c`)
+  Run A 는 r6 체인 뒤에 `call GetStartupInfoW`(cb=0x44 검증) / `call GetSystemInfo`
+  (page=0x1000·nCPU=4 검증) / `push×2; call GetProcAddress` / 쿠키 `mov/xor/imul/mov`
+  (쿠키 == `(FT_lo^FT_hi)*0x01000193` 재유도 검증, ≠0) / `cpuid`(ebx="Genu"·
+  ecx="ntel" 검증) / `rdtsc`(edx:eax 합성 검증) / 미등록 `call` 을 이어 붙여 경계
+  통과를 증명: **insns 30→44, halt `0x5392D4`→`0x539318`**(reason=UNBOUND_IMPORT,
+  slot `0x53802C`), bound=11, last=GetProcAddress. B/D sentinel 은 `0F A2`(이제 실행됨)
+  → `0F A3`(BT, 다음 진짜 디코더 갭) 으로 교체. 측정 라인 `__SHIM__ PARTIAL
+  phase=e4_crt_security_cookie insns=44 bound=11 last=GetProcAddress
+  halt_va=0x539318 halt=unbound_import halt_op=call unbound_slot=0x53802C`,
+  `__SHIM_TEST__ PASS`(CI 게이트, Run A 18 checks 전부 green, 로컬 clang
+  `-Wall -Wextra -Wpedantic -std=c11` 청정). **own1**: 로더가 자기 프로세스의 **자기
+  import**(kernel32 OS API)를 네이티브 구현에 묶는 **로딩** — 우회 아님; CPUID/RDTSC
+  는 평범한 CPU 명령, 쿠키는 **자기 버퍼 위의 자기 산술**, 합성 SYSTEM_INFO/스텁은
+  정직 라벨. **`main`/`WinMain` 미도달**: 아직 CRT-init(import 바인딩) 단계이며
+  hermetic 프롤로그는 실제 바이너리가 아닌 문서화된 SHAPE 라 진짜 `call main` 은
+  없음 — 남은 CRT 단계(추가 import + `__scrt_common_main_seh` → user entry). `validated_manjeom`
+  은 여전히 **0**(로더 진척이지 렌더된 프레임 아님). 다음 r8: 미등록 slot `0x53802C`
+  바인딩 + `0F A3` BT 디코더 갭 + 실제 바이너리에서 `mainCRTStartup→main` 거리 측정.
+
 - feat(F-NSWINDOW-E5 r6): **CRT-security import 3개 추가 바인딩 + 0F B6/B7/BE/BF
   MOVZX/MOVSX 디코더 갭 종결 + 합성 TEB→PEB→ImageBase 체인** — r5 의 벽(미등록 IAT
   호출 @`0x5392A1`, insns=18)을 **넘는다**. (1) `native/i386_cpu.{c,h}` 에 세 개의

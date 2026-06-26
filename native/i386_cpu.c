@@ -109,6 +109,45 @@ uint32_t i386_shim_GetModuleHandleW(i386_cpu_t *cpu, const struct i386_image *im
     return img->base;                               // HMODULE == loaded image base
 }
 
+// GetStartupInfoW(LPSTARTUPINFOW lpStartupInfo) — WINAPI/stdcall, 1 ptr arg,
+// returns void. Buffer-writing: zeroes a STARTUPINFOW (0x44 bytes on x86) in
+// image memory at the pushed pointer ([esp]) and stamps cb = 0x44 at offset 0.
+// own1: a CRT-startup OS-API call filling the program's OWN buffer — loading.
+uint32_t i386_shim_GetStartupInfoW(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t psi;                                   // LPSTARTUPINFOW arg
+    if (!i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &psi)) return 0;
+    for (uint32_t o = 0; o < 0x44u; o += 4) i386_mem_write32(img, psi + o, 0u);
+    i386_mem_write32(img, psi + 0x00u, 0x44u);      // cb = sizeof(STARTUPINFOW) (x86)
+    return 0;                                       // void → EAX irrelevant
+}
+
+// GetSystemInfo(LPSYSTEM_INFO lpSystemInfo) — WINAPI/stdcall, 1 ptr arg, void.
+// Buffer-writing: a BOUNDED-SYNTHETIC SYSTEM_INFO (0x24 bytes on x86) — a few
+// plausible fields (page size / processor count / type), the rest zeroed.
+// own1: native re-impl of the OS API filling the program's OWN buffer — loading.
+uint32_t i386_shim_GetSystemInfo(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t psi;                                   // LPSYSTEM_INFO arg
+    if (!i386_mem_read32(img, cpu->gpr[I386_REG_ESP], &psi)) return 0;
+    for (uint32_t o = 0; o < 0x24u; o += 4) i386_mem_write32(img, psi + o, 0u);
+    i386_mem_write32(img, psi + 0x00u, 0x00000000u);// wProcessorArchitecture = INTEL(0)
+    i386_mem_write32(img, psi + 0x04u, 0x00001000u);// dwPageSize = 4096
+    i386_mem_write32(img, psi + 0x14u, 0x00000004u);// dwNumberOfProcessors = 4 (synthetic)
+    i386_mem_write32(img, psi + 0x18u, 0x000006F0u);// dwProcessorType (synthetic)
+    return 0;                                       // void → EAX irrelevant
+}
+
+// GetProcAddress(HMODULE hModule, LPCSTR lpProcName) — WINAPI/stdcall, 2 args,
+// returns FARPROC. own1: the LOADER hands back a SYNTHETIC in-image stub address
+// (we never resolve to a real OS export here); a later round can bind it. Not a
+// bypass — this is import resolution, exactly what a loader does.
+uint32_t i386_shim_GetProcAddress(i386_cpu_t *cpu, const struct i386_image *img) {
+    uint32_t hmod = 0, pname = 0;
+    i386_mem_read32(img, cpu->gpr[I386_REG_ESP] + 0, &hmod);   // arg1 hModule
+    i386_mem_read32(img, cpu->gpr[I386_REG_ESP] + 4, &pname);  // arg2 lpProcName
+    (void)hmod; (void)pname;
+    return img->base + 0x1FF0u;                     // synthetic in-image stub addr
+}
+
 const i386_import_t *i386_iat_lookup(const i386_iat_t *iat, uint32_t slot_va) {
     if (!iat || !iat->imports) return NULL;
     for (uint32_t i = 0; i < iat->count; i++) {
@@ -612,6 +651,66 @@ void i386_cpu_run(i386_cpu_t *cpu, const i386_image_t *img,
                            ? (uint32_t)(int32_t)(int16_t)w  // sign-extend
                            : (uint32_t)w;                   // zero-extend
                 cpu->gpr[(insn.modrm >> 3) & 7] = v;
+                break;
+            }
+            // ── IMUL r32, r/m32[, imm] (E5 r7) — 0F AF · 69 /r id · 6B /r ib ─
+            // 32-bit signed multiply. Low 32 bits of the product → dst register
+            // (ModR/M.reg). CF=OF=1 if the full signed product does not fit in a
+            // sign-extended 32-bit result (per SDM Vol.2 IMUL); SF/ZF/AF/PF
+            // undefined (left unchanged). own1: a plain CPU multiply.
+            case I386_OP_IMUL_R_RM:
+            case I386_OP_IMUL_R_RM_IMM: {
+                int dst = (insn.modrm >> 3) & 7;
+                i386_halt_t why = I386_HALT_UNSUPPORTED;
+                uint32_t rm_v;
+                if (!rm_get32(cpu, img, &insn, &rm_v, &why)) {
+                    res->halt = why; res->halt_va = eip; res->halt_op = insn.op; return;
+                }
+                int64_t a = (insn.op == I386_OP_IMUL_R_RM_IMM)
+                          ? (int64_t)(int32_t)rm_v        // src1 = r/m32
+                          : (int64_t)(int32_t)cpu->gpr[dst];
+                int64_t b = (insn.op == I386_OP_IMUL_R_RM_IMM)
+                          ? (int64_t)(int32_t)insn.imm    // src2 = imm
+                          : (int64_t)(int32_t)rm_v;       // src2 = r/m32
+                int64_t prod = a * b;
+                uint32_t low = (uint32_t)prod;
+                cpu->gpr[dst] = low;
+                int ovf = (prod != (int64_t)(int32_t)low);
+                set_flag(&cpu->eflags, EFL_CF, ovf);
+                set_flag(&cpu->eflags, EFL_OF, ovf);
+                break;
+            }
+            // ── CPUID (E5 r7) — 0F A2 — SYNTHETIC CPU-identity / feature set ─
+            // Leaf in EAX selects the result. We return a plausible synthetic
+            // set (vendor "GenuineIntel" + a max-leaf for leaf 0; family/feature
+            // bits for leaf 1). own1: CPUID is a plain CPU instruction — the CRT
+            // probes it to pick code paths; NOT a protection mechanism.
+            case I386_OP_CPUID: {
+                uint32_t leaf = cpu->gpr[I386_REG_EAX];
+                if (leaf == 0) {
+                    cpu->gpr[I386_REG_EAX] = 0x00000016u;   // max basic leaf (synthetic)
+                    cpu->gpr[I386_REG_EBX] = 0x756E6547u;   // "Genu"
+                    cpu->gpr[I386_REG_EDX] = 0x49656E69u;   // "ineI"
+                    cpu->gpr[I386_REG_ECX] = 0x6C65746Eu;   // "ntel"  → "GenuineIntel"
+                } else if (leaf == 1) {
+                    cpu->gpr[I386_REG_EAX] = 0x000006F0u;   // family/model/stepping (synthetic)
+                    cpu->gpr[I386_REG_EBX] = 0x00000000u;
+                    cpu->gpr[I386_REG_ECX] = 0x00000201u;   // a couple ECX feature bits (synthetic)
+                    cpu->gpr[I386_REG_EDX] = 0x078BFBFFu;   // common base EDX feature bits (synthetic)
+                } else {
+                    cpu->gpr[I386_REG_EAX] = 0u; cpu->gpr[I386_REG_EBX] = 0u;
+                    cpu->gpr[I386_REG_ECX] = 0u; cpu->gpr[I386_REG_EDX] = 0u;
+                }
+                break;
+            }
+            // ── RDTSC (E5 r7) — 0F 31 — SYNTHETIC monotonic timestamp counter ─
+            // Each rdtsc advances cpu->tsc by a fixed step and returns the running
+            // 64-bit count in edx:eax. own1: a deterministic synthetic counter,
+            // NOT the host TSC and NOT a protection clock.
+            case I386_OP_RDTSC: {
+                cpu->tsc += I386_TSC_STEP;
+                cpu->gpr[I386_REG_EAX] = (uint32_t)cpu->tsc;
+                cpu->gpr[I386_REG_EDX] = (uint32_t)(cpu->tsc >> 32);
                 break;
             }
             // ── E4 kernel32 boundary — indirect IAT call / jump ───────────

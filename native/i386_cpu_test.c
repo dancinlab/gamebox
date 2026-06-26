@@ -49,13 +49,23 @@
 // segment-override redirects to teb_base) and walks TEB→PEB→ImageBaseAddress.
 // Execution advances PAST the r5 wall (insns 18 → 30) and halts at a NINTH,
 // UNregistered IAT call @0x5392D4 (slot 0x538020, the next import to bind, r7).
-// The B/D walls now use a `0F A2` (cpuid) sentinel — the next genuinely-
-// uncovered decoder gap (0F B6 movzx is no longer a wall).
+//
+// E5 r7 — DRAIN 3 more CRT imports (GetStartupInfoW [buffer-write STARTUPINFOW
+// cb=0x44] / GetSystemInfo [bounded-synthetic SYSTEM_INFO] / GetProcAddress [→ a
+// synthetic in-image stub addr]), then run the MSVC __security_init_cookie shape:
+// load the FILETIME entropy, `xor`, `imul eax,eax,0x01000193` (the freshly-decoded
+// 0x69 IMUL), and STORE a non-default cookie to a global slot. Then `cpuid` (the
+// 0F A2 gap closed → synthetic "GenuineIntel") and `rdtsc` (0F 31 → a synthetic
+// monotonic edx:eax). Execution advances PAST the r6 wall (insns 30 → 44) and
+// halts at a TWELFTH, UNregistered IAT call @0x539318 (slot 0x53802C, r8). The
+// B/D walls now use a `0F A3` (bt) sentinel — the next genuinely-uncovered gap
+// (0F A2 cpuid / 0F 31 rdtsc / 0F AF imul are no longer walls).
 // own1: binding the program's OWN imports to native impls is LOADING (what
 // every PE loader does), NOT a bypass; the TEB here is OUR OWN synthetic block
-// (a few fields), NOT the OS TEB and NOT a protection structure. kernel32 is the
-// OS API, not DRM/Warden. Our own bytes, Intel SDM semantics, native shims — no
-// Wine, no protection.
+// (a few fields), NOT the OS TEB and NOT a protection structure. CPUID/RDTSC are
+// plain CPU instructions; the cookie is OUR arithmetic over OUR buffers. kernel32
+// is the OS API, not DRM/Warden. Our own bytes, Intel SDM semantics, native
+// shims — no Wine, no protection.
 
 #include "i386_cpu.h"
 
@@ -132,7 +142,23 @@ static void put_at(uint8_t *img, uint32_t va, const uint8_t *src, size_t n) {
 //   0x5392C9  8B 51 30              mov edx, [ecx+0x30]   ; [TEB+0x30] → synthetic PEB
 //   0x5392CC  8B 42 08              mov eax, [edx+8]      ; [PEB+8]    → ImageBaseAddress (= image base)
 //   0x5392CF  68 30 9F 53 00        push 0x539F30         ; &STARTUPINFOW
-//   0x5392D4  FF 15 20 80 53 00     call [0x538020]       ; slot 20 → UNBOUND (the new r7 wall)
+//   0x5392D4  FF 15 20 80 53 00     call [0x538020]       ; slot 20 → GetStartupInfoW (r7, buffer-write)
+// E5 r7 continuation — drain 3 more CRT imports, then run the __security_init_cookie
+// shape (imul-mix → store global cookie) + CPUID + RDTSC (plain CPU ops):
+//   0x5392DA  68 90 9F 53 00        push 0x539F90         ; &SYSTEM_INFO
+//   0x5392DF  FF 15 24 80 53 00     call [0x538024]       ; slot 24 → GetSystemInfo (r7, buffer-write)
+//   0x5392E5  68 C0 9F 53 00        push 0x539FC0         ; lpProcName (arg2)
+//   0x5392EA  6A 00                 push 0                ; hModule NULL (arg1)
+//   0x5392EC  FF 15 28 80 53 00     call [0x538028]       ; slot 28 → GetProcAddress (r7, → synth stub)
+//   0x5392F2  8B 05 00 9F 53 00     mov eax, [0x539F00]   ; FILETIME low entropy = 0xC3D4E5F6
+//   0x5392F8  33 05 04 9F 53 00     xor eax, [0x539F04]   ; ^ FILETIME high → 0xC2034444
+//   0x5392FE  69 C0 93 01 00 01     imul eax, eax, 0x01000193 ; cookie mix (69 /r id — r7 decoder)
+//   0x539304  89 05 80 9F 53 00     mov [0x539F80], eax   ; store the security cookie (global slot)
+//   0x53930A  B8 00 00 00 00        mov eax, 0            ; cpuid leaf 0
+//   0x53930F  0F A2                 cpuid                 ; → ebx/edx/ecx "GenuineIntel" (r7 decoder)
+//   0x539311  0F 31                 rdtsc                 ; → edx:eax synthetic monotonic tsc (r7)
+//   0x539313  68 D0 9F 53 00        push 0x539FD0         ; & next buffer
+//   0x539318  FF 15 2C 80 53 00     call [0x53802C]       ; slot 2C → UNBOUND (the new r8 wall)
 static const uint8_t SCRT_PROLOGUE[] = {
     0x83, 0xEC, 0x28,
     0x33, 0xC0,
@@ -164,14 +190,30 @@ static const uint8_t SCRT_PROLOGUE[] = {
     0x8B, 0x51, 0x30,                     // 0x5392C9 mov edx, [ecx+0x30]      ([TEB+0x30] → synthetic PEB)
     0x8B, 0x42, 0x08,                     // 0x5392CC mov eax, [edx+8]         ([PEB+8] → ImageBaseAddress)
     0x68, 0x30, 0x9F, 0x53, 0x00,         // 0x5392CF push 0x539F30  (&STARTUPINFOW)
-    0xFF, 0x15, 0x20, 0x80, 0x53, 0x00,   // 0x5392D4 call [0x538020] → UNBOUND (the new r7 wall)
+    0xFF, 0x15, 0x20, 0x80, 0x53, 0x00,   // 0x5392D4 call [0x538020] → GetStartupInfoW (r7, buffer-write)
+    // ── E5 r7 continuation ──
+    0x68, 0x90, 0x9F, 0x53, 0x00,         // 0x5392DA push 0x539F90  (&SYSTEM_INFO)
+    0xFF, 0x15, 0x24, 0x80, 0x53, 0x00,   // 0x5392DF call [0x538024] → GetSystemInfo (buffer-write)
+    0x68, 0xC0, 0x9F, 0x53, 0x00,         // 0x5392E5 push 0x539FC0  (lpProcName arg2)
+    0x6A, 0x00,                           // 0x5392EA push 0       (hModule NULL arg1)
+    0xFF, 0x15, 0x28, 0x80, 0x53, 0x00,   // 0x5392EC call [0x538028] → GetProcAddress (→ synth stub)
+    0x8B, 0x05, 0x00, 0x9F, 0x53, 0x00,   // 0x5392F2 mov eax, [0x539F00]  (FILETIME low entropy)
+    0x33, 0x05, 0x04, 0x9F, 0x53, 0x00,   // 0x5392F8 xor eax, [0x539F04]  (^ FILETIME high)
+    0x69, 0xC0, 0x93, 0x01, 0x00, 0x01,   // 0x5392FE imul eax, eax, 0x01000193  (cookie mix — r7)
+    0x89, 0x05, 0x80, 0x9F, 0x53, 0x00,   // 0x539304 mov [0x539F80], eax  (store global cookie)
+    0xB8, 0x00, 0x00, 0x00, 0x00,         // 0x53930A mov eax, 0          (cpuid leaf 0)
+    0x0F, 0xA2,                           // 0x53930F cpuid              (0F A2 — r7 decoder gap closed)
+    0x0F, 0x31,                           // 0x539311 rdtsc              (0F 31 — r7)
+    0x68, 0xD0, 0x9F, 0x53, 0x00,         // 0x539313 push 0x539FD0  (& next buffer)
+    0xFF, 0x15, 0x2C, 0x80, 0x53, 0x00,   // 0x539318 call [0x53802C] → UNBOUND (the new r8 wall)
 };
 
-// The native kernel32 imports bound across IAT slots 0x538000..0x53801C (r4-r6).
+// The native kernel32 imports bound across IAT slots 0x538000..0x538028 (r4-r7).
 // own1: loading the OS API surface to native impls, not a protection bypass.
-// The buffer-writing trio (slots 8 / C / 18) take one stdcall pointer arg
-// (4 bytes, callee-popped) and write into image memory; IsProcessorFeaturePresent
-// (14) / GetModuleHandleW (1C) take 1 arg too; the rest are 0-arg.
+// The buffer-writing shims (slots 8 / C / 18 / 20 / 24) take one stdcall pointer
+// arg (4 bytes, callee-popped) and write into image memory; IsProcessorFeature-
+// Present (14) / GetModuleHandleW (1C) take 1 arg; GetProcAddress (28) takes 2
+// (8 bytes); the rest are 0-arg.
 static const i386_import_t K32_IMPORTS[] = {
     { 0x538000u, "GetCurrentThreadId",        i386_shim_GetCurrentThreadId,        0 },
     { 0x538004u, "GetCurrentProcessId",       i386_shim_GetCurrentProcessId,       0 },
@@ -181,14 +223,20 @@ static const i386_import_t K32_IMPORTS[] = {
     { 0x538014u, "IsProcessorFeaturePresent", i386_shim_IsProcessorFeaturePresent, 4 },
     { 0x538018u, "InitializeSListHead",       i386_shim_InitializeSListHead,       4 },
     { 0x53801Cu, "GetModuleHandleW",          i386_shim_GetModuleHandleW,          4 },
+    { 0x538020u, "GetStartupInfoW",           i386_shim_GetStartupInfoW,           4 },
+    { 0x538024u, "GetSystemInfo",             i386_shim_GetSystemInfo,             4 },
+    { 0x538028u, "GetProcAddress",            i386_shim_GetProcAddress,            8 },
 };
-static const i386_iat_t K32_IAT = { K32_IMPORTS, 8 };
+static const i386_iat_t K32_IAT = { K32_IMPORTS, 11 };
 #define SHIM_TID  0x00001A2Bu   // GetCurrentThreadId stub return
 #define SHIM_PID  0x00000D04u   // GetCurrentProcessId stub return
 #define SHIM_TICK 0x0001D4C0u   // GetTickCount stub return
 #define FT_BUF    0x539F00u     // FILETIME scratch (above the stack base, in-image)
 #define QPC_BUF   0x539F10u     // LARGE_INTEGER scratch
 #define SLIST_BUF 0x539F20u     // SLIST_HEADER scratch (InitializeSListHead zeroes 8B)
+#define STARTUP_BUF 0x539F30u   // STARTUPINFOW scratch (GetStartupInfoW writes 0x44 B, cb@0)
+#define COOKIE_BUF  0x539F80u   // global security-cookie slot (imul-mix stored here)
+#define SYSINFO_BUF 0x539F90u   // SYSTEM_INFO scratch (GetSystemInfo writes 0x24 B)
 // ── BOUNDED-SYNTHETIC TEB/PEB (E5 r6) — OUR own block, NOT the OS TEB ────────
 // A few fields, just enough for the security-cookie / CRT-startup chain to read
 // fs:[0x18] (TEB self) → [TEB+0x30] (PEB) → [PEB+8] (ImageBaseAddress). own1:
@@ -208,11 +256,12 @@ static void build_hermetic(uint8_t *img) {
     i386_mem_write32(&m, TEB_BASE + 0x18, TEB_BASE);   // TEB self-pointer (NtCurrentTeb shape)
     i386_mem_write32(&m, TEB_BASE + 0x30, PEB_BASE);   // TEB→PEB
     i386_mem_write32(&m, PEB_BASE + 0x08, IMG_BASE);   // PEB→ImageBaseAddress
-    // 0F A2 = CPUID — still uncovered after r6 (0F B6/B7/BE/BF movzx/movsx now
-    // decode+execute). The 0x0F two-byte map recognizes Jcc (80..8F) + the
-    // movzx/movsx family only, so 0F A2 → I386_OP_UNKNOWN. Keeps the B/D walls
-    // honest and names the next real decoder gap (cpuid, ubiquitous in CRT) for r7.
-    uint8_t wall[] = { 0x0F, 0xA2 };               // representative `cpuid`
+    // 0F A3 = BT r/m32, r32 — still uncovered after r7 (0F A2 cpuid / 0F 31 rdtsc
+    // / 0F AF imul now decode+execute). The 0x0F two-byte map recognizes Jcc
+    // (80..8F) + movzx/movsx (B6/B7/BE/BF) + imul/cpuid/rdtsc (AF/A2/31), so
+    // 0F A3 → I386_OP_UNKNOWN. Keeps the B/D walls honest and names the next real
+    // decoder gap (BT bit-test) for r8.
+    uint8_t wall[] = { 0x0F, 0xA3 };               // representative `bt` (next gap)
     put_at(img, 0x538BABu, wall, sizeof(wall));    // CALL target (insn 6)
     put_at(img, 0x53872Au, wall, sizeof(wall));    // JMP  target (insn 2)
 }
@@ -235,7 +284,7 @@ int main(int argc, char **argv) {
             cpu.teb_base = TEB_BASE;                            // synthetic TEB (own1: our block)
             i386_run_result_t r;
             i386_cpu_run(&cpu, &pe, 100000, &r);
-            printf("__SHIM__ PARTIAL phase=e4_crt_security_teb insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+            printf("__SHIM__ PARTIAL phase=e4_crt_security_cookie insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
                    i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
             i386_image_free(&pe);
@@ -251,18 +300,20 @@ int main(int argc, char **argv) {
     uint8_t *img_buf = (uint8_t *)malloc(IMG_SIZE);
     i386_image_t img = { img_buf, IMG_BASE, IMG_SIZE, 0 };
 
-    // === Run A — MILESTONE: 8 CRT imports + MOVZX/MOVSX + synthetic TEB =====
-    // E5 r6 — execution runs the entry CALL (insn 1) → __scrt_common_main
-    // prologue (sub/xor/or/cmp/mov/and/test/add — 8 insns, with EFLAGS) → binds
-    // FIVE kernel32 imports (GetCurrentThreadId..GetTickCount, with a buffer-
-    // writing FILETIME/QPC pair + a shl) → then the r6 continuation: push (19) →
-    // IsProcessorFeaturePresent (20) → movzx ecx,al (21) → movsx edx,cl (22) →
-    // push (23) → InitializeSListHead (24, BUFFER-ZERO [SLIST_BUF]) → push (25) →
-    // GetModuleHandleW (26, → image base) → mov ecx,fs:[0x18] (27, SYNTHETIC TEB
-    // self) → mov edx,[ecx+0x30] (28, → synthetic PEB) → mov eax,[edx+8] (29, →
-    // ImageBaseAddress) → push (30) → HALTS at the NINTH, UNregistered IAT call
-    // @0x5392D4 (UNBOUND_IMPORT — slot 0x538020, the next import, r7).
-    printf("\n[cpu] Run A — 8 CRT imports + MOVZX/MOVSX + synthetic TEB→PEB→ImageBase chain\n");
+    // === Run A — MILESTONE: 11 CRT imports + security cookie + CPUID/RDTSC ===
+    // E5 r7 — execution runs the entry CALL (insn 1) → __scrt_common_main
+    // prologue → the r6 chain (8 kernel32 binds + buffer writes + MOVZX/MOVSX +
+    // the synthetic TEB→PEB→ImageBase walk, insns 1..30) → then the r7
+    // continuation: GetStartupInfoW (31, BUFFER-WRITE STARTUPINFOW cb=0x44) →
+    // push (32) → GetSystemInfo (33, BUFFER-WRITE SYSTEM_INFO) → push/push (34,35)
+    // → GetProcAddress (36, → synthetic in-image stub) → the __security_init_cookie
+    // shape: mov eax,[FT] (37) → xor eax,[FT+4] (38) → imul eax,eax,imm (39, the
+    // r7 IMUL) → mov [COOKIE],eax (40, store the global cookie) → mov eax,0 (41) →
+    // CPUID (42, → "GenuineIntel") → RDTSC (43, → synthetic edx:eax) → push (44)
+    // → HALTS at the TWELFTH, UNregistered IAT call @0x539318 (UNBOUND_IMPORT —
+    // slot 0x53802C, the next import, r8). own1: CPUID/RDTSC are plain CPU ops,
+    // the cookie is our arithmetic over our buffers — no protection, no Wine.
+    printf("\n[cpu] Run A — 11 CRT imports + security-cookie (imul) + CPUID/RDTSC\n");
     build_hermetic(img_buf);
     {
         i386_cpu_t cpu; memset(&cpu, 0, sizeof(cpu));
@@ -276,43 +327,60 @@ int main(int argc, char **argv) {
         i386_run_result_t r;
         i386_cpu_run(&cpu, &img, 1000, &r);
 
-        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ecx=0x%X edx=0x%X bound=%u(%s) slot=0x%X\n",
+        printf("  executed=%u halt=%s halt_va=0x%X eip=0x%X esp=0x%X eax=0x%X ebx=0x%X ecx=0x%X edx=0x%X bound=%u(%s) slot=0x%X\n",
                r.insns, i386_halt_name(r.halt), r.halt_va, cpu.eip, cpu.gpr[I386_REG_ESP],
-               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_ECX], cpu.gpr[I386_REG_EDX],
+               cpu.gpr[I386_REG_EAX], cpu.gpr[I386_REG_EBX], cpu.gpr[I386_REG_ECX], cpu.gpr[I386_REG_EDX],
                r.imports_bound, r.last_import ? r.last_import : "-", r.import_slot);
         uint32_t entry_ret = 0;
         i386_mem_read32(&img, cpu.gpr[I386_REG_ESP] + 4, &entry_ret);  // [esp+4] (under final push)
         uint32_t ft_lo = 0, ft_hi = 0, qpc_lo = 0, qpc_hi = 0, sl_lo = 0, sl_hi = 0;
+        uint32_t si_cb = 0, sys_page = 0, sys_ncpu = 0, cookie = 0;
         i386_mem_read32(&img, FT_BUF + 0, &ft_lo);
         i386_mem_read32(&img, FT_BUF + 4, &ft_hi);
         i386_mem_read32(&img, QPC_BUF + 0, &qpc_lo);
         i386_mem_read32(&img, QPC_BUF + 4, &qpc_hi);
         i386_mem_read32(&img, SLIST_BUF + 0, &sl_lo);
         i386_mem_read32(&img, SLIST_BUF + 4, &sl_hi);
+        i386_mem_read32(&img, STARTUP_BUF + 0x00, &si_cb);       // STARTUPINFOW.cb
+        i386_mem_read32(&img, SYSINFO_BUF + 0x04, &sys_page);    // SYSTEM_INFO.dwPageSize
+        i386_mem_read32(&img, SYSINFO_BUF + 0x14, &sys_ncpu);    // SYSTEM_INFO.dwNumberOfProcessors
+        i386_mem_read32(&img, COOKIE_BUF + 0x00, &cookie);       // stored security cookie
+        // Re-derive the cookie the prologue computes: (FT_lo ^ FT_hi) * 0x01000193
+        // (the low 32 bits of the signed imul == the low 32 of the 32×32 product).
+        uint32_t cookie_expect = (uint32_t)((0xC3D4E5F6u ^ 0x01D7A1B2u) * 0x01000193u);
+        uint64_t tsc1 = I386_TSC_STEP;                            // after exactly one rdtsc
 
-        CHECK(r.insns == 30,                "30 insns (18 r5 + push/IPFP/movzx/movsx/push/ISLH/push/GMHW/3×mov/push)");
-        CHECK(r.insns > 18,                 "advanced PAST the r5 18-insn / 0x5392A1 wall");
+        CHECK(r.insns == 44,                "44 insns (30 r6 + StartupInfo/SysInfo/ProcAddr + cookie-imul + cpuid + rdtsc)");
+        CHECK(r.insns > 30,                 "advanced PAST the r6 30-insn / 0x5392D4 wall");
         CHECK(entry_ret == 0x5388ABu,       "entry CALL return addr 0x5388AB intact under the stdcall pops");
         CHECK(cpu.gpr[I386_REG_ESP] == esp0 - 8, "esp net == esp0-8 (entry retaddr + final unpopped push)");
-        CHECK(cpu.gpr[I386_REG_EAX] == IMG_BASE, "[PEB+8] → eax = ImageBaseAddress (synthetic TEB chain)");
-        CHECK(cpu.gpr[I386_REG_ECX] == TEB_BASE, "mov ecx,fs:[0x18] → ecx = synthetic TEB self");
-        CHECK(cpu.gpr[I386_REG_EDX] == PEB_BASE, "mov edx,[ecx+0x30] → edx = synthetic PEB");
         CHECK(ft_lo == 0xC3D4E5F6u && ft_hi == 0x01D7A1B2u,
                                             "GetSystemTimeAsFileTime wrote 8B FILETIME via the pushed ptr");
         CHECK(qpc_lo == 0x12345678u && qpc_hi == 0x00000000u,
                                             "QueryPerformanceCounter wrote 8B counter via the pushed ptr");
         CHECK(sl_lo == 0u && sl_hi == 0u,   "InitializeSListHead zeroed the 8B SLIST header (was 0xFFFFFFFF)");
-        CHECK(r.imports_bound == 8,              "eight IAT calls dispatched to native shims");
-        CHECK(r.last_import && strcmp(r.last_import, "GetModuleHandleW") == 0,
-                                                 "most-recent bound import == GetModuleHandleW");
-        CHECK(r.halt == I386_HALT_UNBOUND_IMPORT, "halt: ninth IAT call is UNbound (r7 boundary)");
+        CHECK(si_cb == 0x44u,               "GetStartupInfoW stamped STARTUPINFOW.cb = 0x44 (buffer-write)");
+        CHECK(sys_page == 0x1000u && sys_ncpu == 4u,
+                                            "GetSystemInfo wrote dwPageSize=0x1000 + nCPU=4 (bounded-synthetic)");
+        // E5 r7 cookie + CPU-identity ops (reaching here proves the fs:/TEB walk
+        // resolved — a broken FS override would have halted OOB at 0x5392C2).
+        CHECK(cookie == cookie_expect && cookie != 0u,
+                                            "__security cookie = imul(FT_lo^FT_hi, 0x01000193) stored to global");
+        CHECK(cpu.gpr[I386_REG_EBX] == 0x756E6547u, "cpuid leaf0 → ebx vendor 'Genu'");
+        CHECK(cpu.gpr[I386_REG_ECX] == 0x6C65746Eu, "cpuid leaf0 → ecx vendor 'ntel' (GenuineIntel)");
+        CHECK(cpu.gpr[I386_REG_EAX] == (uint32_t)tsc1 && cpu.gpr[I386_REG_EDX] == (uint32_t)(tsc1 >> 32),
+                                            "rdtsc → synthetic monotonic edx:eax");
+        CHECK(r.imports_bound == 11,             "eleven IAT calls dispatched to native shims");
+        CHECK(r.last_import && strcmp(r.last_import, "GetProcAddress") == 0,
+                                                 "most-recent bound import == GetProcAddress");
+        CHECK(r.halt == I386_HALT_UNBOUND_IMPORT, "halt: twelfth IAT call is UNbound (r8 boundary)");
         CHECK(r.halt_op == I386_OP_CALL_RM,      "wall op == CALL_RM (FF 15 [disp32])");
-        CHECK(r.halt_va == 0x5392D4u,            "wall VA == 0x5392D4 (the ninth IAT call)");
-        CHECK(r.import_slot == 0x538020u,        "unbound slot reported == 0x538020 (next import, r7)");
-        (void)SHIM_PID; (void)SHIM_TID; (void)SHIM_TICK;
+        CHECK(r.halt_va == 0x539318u,            "wall VA == 0x539318 (the twelfth IAT call)");
+        CHECK(r.import_slot == 0x53802Cu,        "unbound slot reported == 0x53802C (next import, r8)");
+        (void)SHIM_PID; (void)SHIM_TID; (void)SHIM_TICK; (void)TEB_BASE; (void)PEB_BASE;
 
         if (!emitted) {
-            printf("__SHIM__ PARTIAL phase=e4_crt_security_teb insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
+            printf("__SHIM__ PARTIAL phase=e4_crt_security_cookie insns=%u bound=%u last=%s halt_va=0x%X halt=%s halt_op=%s unbound_slot=0x%X\n",
                    r.insns, r.imports_bound, r.last_import ? r.last_import : "-", r.halt_va,
                    i386_halt_name(r.halt), i386_op_name(r.halt_op), r.import_slot);
         }

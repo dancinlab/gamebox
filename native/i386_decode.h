@@ -85,6 +85,14 @@ typedef enum {
     I386_OP_MOVZX_RM16,       // 0F B7 /r — movzx r32, r/m16 (zero-extend)
     I386_OP_MOVSX_RM8,        // 0F BE /r — movsx r32, r/m8  (sign-extend)
     I386_OP_MOVSX_RM16,       // 0F BF /r — movsx r32, r/m16 (sign-extend)
+    // ── E5 r7 additions (ordinals 57+; appended) — IMUL + CPUID + RDTSC.
+    // The security-cookie / CRT-startup path multiplies (imul) and the CRT
+    // probes the CPU (cpuid leaf 0/1) + reads the timestamp counter (rdtsc).
+    // None touch a protection mechanism — plain Intel SDM Vol.2 CPU ops.
+    I386_OP_IMUL_R_RM,        // 0F AF /r  — imul r32, r/m32          (2-operand)
+    I386_OP_IMUL_R_RM_IMM,    // 69 /r id / 6B /r ib — imul r32, r/m32, imm (3-operand)
+    I386_OP_CPUID,            // 0F A2     — CPUID (synthetic feature set into eax/ebx/ecx/edx)
+    I386_OP_RDTSC,            // 0F 31     — RDTSC (synthetic monotonic counter into edx:eax)
 } i386_op_t;
 
 #define I386_PREFIX_OPSZ   0x01u
