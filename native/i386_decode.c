@@ -81,6 +81,9 @@ const char *i386_op_name(i386_op_t op) {
         case I386_OP_OR_R_RM:   return "or";
         case I386_OP_AND_RM_R:
         case I386_OP_AND_R_RM:  return "and";
+        case I386_OP_SHIFT_RM_IMM8:
+        case I386_OP_SHIFT_RM_1:
+        case I386_OP_SHIFT_RM_CL: return "shift";
         case I386_OP_PREFIX_ONLY: return "(prefix-only)";
         case I386_OP_UNKNOWN:
         default:                return "(unknown)";
@@ -388,6 +391,35 @@ int i386_decode_one(const uint8_t *code, size_t buf_len, size_t off,
             taken += imm_size;
         }
         taken += m_n;
+    } else if (op == 0xC1 || op == 0xD1 || op == 0xD3) {
+        // Group-2 shift/rotate r/m32 (ROL/ROR/RCL/RCR/SHL/SHR/SAL/SAR by
+        // ModR/M.reg). Count source: 0xC1 = imm8, 0xD1 = 1, 0xD3 = CL.
+        // Intel SDM Vol.2 — own1, no Wine. The interpreter reads modrm.reg.
+        int m_n = decode_modrm_disp(p + 1, avail - 1,
+                                    &out->modrm, &out->sib,
+                                    &out->disp, &out->has_disp);
+        if (m_n == 0) return 0;
+        // reg_a carries the r/m base register (interpreter reads modrm directly).
+        out->reg_a = (int8_t)(out->modrm & 7);
+        if (((out->modrm >> 6) & 3) == 3) {
+            out->reg_b = (int8_t)(out->modrm & 7);
+        }
+        if (op == 0xC1) {
+            size_t imm_off = (size_t)(1 + m_n);
+            if (imm_off + 1 > avail) return 0;
+            out->imm = (int32_t)(uint8_t)p[imm_off];   // imm8 count (unsigned 0..255)
+            out->has_imm = 1;
+            out->op = I386_OP_SHIFT_RM_IMM8;
+            taken += m_n + 1;
+        } else if (op == 0xD1) {
+            out->imm = 1;                              // shift-by-1 form
+            out->has_imm = 1;
+            out->op = I386_OP_SHIFT_RM_1;
+            taken += m_n;
+        } else {                                        // 0xD3 — count in CL
+            out->op = I386_OP_SHIFT_RM_CL;
+            taken += m_n;
+        }
     } else if (op == 0xFF) {
         // Group 5 — distinguish CALL r/m32 (/2) and JMP r/m32 (/4) by ModR/M.reg
         int m_n = decode_modrm_disp(p + 1, avail - 1,

@@ -23,10 +23,17 @@
 //     31/33/09/0B/21/23/85) ·
 //   group-1 r/m32,imm  ADD/OR/ADC/SBB/AND/SUB/XOR/CMP (81 id / 83 ib).
 // Byte-width forms (80, C6, 88, 8A, 84) decode but are NOT executed (width
-// not modeled) → honest UNSUPPORTED. Indirect IAT CALL (FF /2 [disp32]) is
-// decoded (CALL_RM) but deliberately NOT executed — the E4 kernel32 boundary
-// (own1: no IAT resolution / no DRM interaction). Anything else halts
-// honestly (UNKNOWN / UNSUPPORTED) with the wall VA.
+// not modeled) → honest UNSUPPORTED.
+//
+// Coverage (E5 r4/r5 — cross the E4 kernel32 boundary):
+//   r4: indirect IAT CALL/JMP (FF /2 · FF /4 [disp32]) dispatched to a native
+//       kernel32 shim registry (own1: loading our OWN imports, not a bypass).
+//   r5: group-2 shift/rotate (C1 /r ib · D1 /r · D3 /r — SHL/SHR/SAL/SAR + ROL/
+//       ROR with CF/OF/ZF/SF/PF; RCL/RCR carry-chain not modeled → UNSUPPORTED),
+//       plus four more CRT-startup shims including the first BUFFER-WRITING stub
+//       (GetSystemTimeAsFileTime — reads a pushed pointer arg, writes 8 bytes
+//       into image memory). Anything else halts honestly (UNKNOWN / UNSUPPORTED
+//       / UNBOUND_IMPORT) with the wall VA.
 
 #ifndef GAMEBOX_I386_CPU_H
 #define GAMEBOX_I386_CPU_H
@@ -80,6 +87,18 @@ struct i386_cpu {
 // own1: returns a deterministic plausible thread id. This is the OS API
 // surface bound to a native impl (loading), not a protection bypass.
 uint32_t i386_shim_GetCurrentThreadId(i386_cpu_t *cpu, const struct i386_image *img);
+
+// More CRT-startup kernel32 shims (E5 r5). own1: native re-impls of the OS API
+// surface bound to the program's OWN imports — loading, not a bypass.
+//   GetCurrentProcessId / GetTickCount   — 0-arg, deterministic DWORD.
+//   GetSystemTimeAsFileTime(LPFILETIME)  — 1 stdcall ptr arg; WRITES an 8-byte
+//       FILETIME into image memory at the pushed pointer (first buffer-writing
+//       shim — exercises stub→image writes + a real pushed pointer arg).
+//   QueryPerformanceCounter(LARGE_INTEGER*) — 1 ptr arg; writes 8 bytes, → BOOL.
+uint32_t i386_shim_GetCurrentProcessId(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_GetTickCount(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_GetSystemTimeAsFileTime(i386_cpu_t *cpu, const struct i386_image *img);
+uint32_t i386_shim_QueryPerformanceCounter(i386_cpu_t *cpu, const struct i386_image *img);
 
 // Look up an IAT slot VA in the registry. Returns NULL if `iat` is NULL or
 // the slot is not bound (→ the caller halts UNBOUND_IMPORT honestly).

@@ -71,6 +71,13 @@ typedef enum {
     I386_OP_OR_R_RM,          // 0B /r    — or  r32, r/m32
     I386_OP_AND_RM_R,         // 21 /r    — and r/m32, r32
     I386_OP_AND_R_RM,         // 23 /r    — and r32, r/m32
+    // ── E5 r5 additions (ordinals 50+; appended) — group-2 shift/rotate.
+    // The sub-operation (ROL/ROR/RCL/RCR/SHL/SHR/SAL/SAR) is selected by
+    // ModR/M.reg (0..7); the interpreter reads modrm.reg to pick it. The
+    // count source distinguishes the three encodings:
+    I386_OP_SHIFT_RM_IMM8,    // C1 /r ib — group-2 r/m32, imm8 count
+    I386_OP_SHIFT_RM_1,       // D1 /r    — group-2 r/m32, 1
+    I386_OP_SHIFT_RM_CL,      // D3 /r    — group-2 r/m32, CL
 } i386_op_t;
 
 #define I386_PREFIX_OPSZ   0x01u
