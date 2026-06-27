@@ -399,7 +399,7 @@ SKELETON_TIER_WIN32 + E5_PIPELINE_PROVEN
 gamebox/
 ├── README.md
 ├── LICENSE                          Apache-2.0
-├── CHANGELOG.md
+├── CHANGELOG.jsonl
 ├── hexa.toml                        hx manifest (name, version, entry)
 ├── install.hexa                     hx build hook
 ├── cli/

@@ -7,7 +7,7 @@ Warden / anti-cheat bypass, no anima clone). The PE→D3D11→Metal pipeline is
 proven end-to-end with a self-authored own1 D3D11 PE (`validated_manjeom =
 first_own1_authored_d3d11_pe_to_metal_frame`, an infrastructure milestone) — but
 **no commercial game frame is evidenced yet**. Full design lives in
-[ARCHITECTURE.md](ARCHITECTURE.md); history in [CHANGELOG.md](CHANGELOG.md).
+[ARCHITECTURE.md](ARCHITECTURE.md); history in [CHANGELOG.jsonl](CHANGELOG.jsonl).
 
 ## Structure
 
@@ -30,7 +30,7 @@ gamebox/
 ├─ .checkpoint.*           — cross-roadmap forensic checkpoint snapshots
 ├─ hexa.toml               — hx manifest (name, version, entry)
 ├─ ARCHITECTURE.md         — architecture SSOT (update-in-place)
-├─ CHANGELOG.md            — append-only history
+├─ CHANGELOG.jsonl            — append-only history
 ├─ harness.config.json     — harness config (lockdown, lint, docs discipline)
 ├─ .github/workflows/      — CI (ci.yml — github-hosted macOS build+test)
 └─ .harness-engine/        — dancinlab harness submodule (governance engine)
@@ -43,7 +43,7 @@ gamebox/
 - **own2 honesty** — subcommands emit explicit PASS/FAIL/PARTIAL reasons;
   predecessor markers preserved verbatim.
 - **Single-doc discipline** — architecture goes to `ARCHITECTURE.md` (overwrite,
-  SSOT); history to `CHANGELOG.md` (append); transient output to
+  SSOT); history to `CHANGELOG.jsonl` (append); transient output to
   `scripts/scratch/`. Don't scatter `*-report.md` / dated notes at the repo root.
 - **Protected branches** — `main` / `master`. Open a PR from a feature branch.
 

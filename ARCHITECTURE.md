@@ -3,7 +3,7 @@
 > Single source of truth for the **final** architecture (component-level prose).
 > Update (overwrite) this file in place when the design changes — it is **not**
 > append-only. History and per-change decisions live in
-> [CHANGELOG.md](CHANGELOG.md). The **domain tree** (per-subsystem / per-game
+> [CHANGELOG.jsonl](CHANGELOG.jsonl). The **domain tree** (per-subsystem / per-game
 > goals + milestones) is `ARCHITECTURE.json` (tree SSOT, human viewer
 > `ARCHITECTURE.html` via `python3 serve.py`) — it retired the former
 > `DOMAINS.tape` + `domains/` snapshots on 2026-06-18.
@@ -79,7 +79,7 @@ CM-26..CM-30 (full launch + first-frame + sustained-frame render) land.
   reason; predecessor markers are preserved verbatim for traceability.
 - **Harness** — this repo is governed by the dancinlab harness
   (`.harness-engine/` submodule, `harness.config.json`). Architecture changes
-  update **this file** (SSOT); history goes to `CHANGELOG.md`; transient output
+  update **this file** (SSOT); history goes to `CHANGELOG.jsonl`; transient output
   goes under `scripts/scratch/`. Run `bash .harness-engine/bin/harness verify`
   (wraps `hexa verify`) and `bash .harness-engine/bin/harness docs check`
   before shipping. See [CLAUDE.md](CLAUDE.md) for the harness quick reference.
